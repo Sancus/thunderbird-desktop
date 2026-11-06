@@ -332,6 +332,24 @@ struct PurgeCustody {
 };
 
 mozilla::StaticAutoPtr<nsTArray<nsCString>> sPurging;
+struct MigrationPurgeOwner {
+  nsCOMPtr<nsIMsgFolder> folder;
+  RefPtr<mozilla::mailnews::LocalStoreMigrationWork> work;
+};
+nsTArray<MigrationPurgeOwner> sMigrationPurges;
+mozilla::mailnews::LocalStoreMigrationWork* MigrationPurgeFor(
+    nsIMsgFolder* folder) {
+  for (auto& owner : sMigrationPurges)
+    if (owner.folder == folder) return owner.work;
+  return nullptr;
+}
+void ForgetMigrationPurge(nsIMsgFolder* folder,
+                          mozilla::mailnews::LocalStoreMigrationWork* work) {
+  sMigrationPurges.RemoveElementsBy([&](const MigrationPurgeOwner& owner) {
+    return owner.folder == folder && owner.work == work;
+  });
+}
+
 // Only the synchronous explicit-token provider call below may pass the fence.
 nsIMsgFolder* sPurgeCleanupFolder = nullptr;
 const nsCString* sPurgeCleanupToken = nullptr;
@@ -579,6 +597,8 @@ nsresult CleanPurgeMember(nsIMsgFolder* folder, PurgeCustody& custody,
     mozilla::AutoRestore<const nsCString*> restoreToken(sPurgeCleanupToken);
     sPurgeCleanupFolder = folder;
     sPurgeCleanupToken = &*member.body.storeToken;
+    mozilla::mailnews::AutoLocalStoreMigrationContinuation continuation(
+        MigrationPurgeFor(folder));
     MOZ_TRY(store->DeleteStoreMessages(folder, {*member.body.storeToken}));
   }
   member.phase = PurgePhase::ProviderDone;
@@ -658,18 +678,44 @@ nsresult CheckNativePurgeRemoval(nsIMsgFolder* folder,
 }
 
 nsresult RecoverNativePurge(nsIMsgFolder* folder) {
-  if (!mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) return NS_OK;
-  PurgeCustody custody;
-  MOZ_TRY(PurgeLocation(folder, custody));
-  bool exists;
-  MOZ_TRY(custody.directory->Exists(&exists));
-  if (!exists) return NS_OK;
-  MOZ_TRY(EnterPurge(custody));
-  auto leave =
-      mozilla::MakeScopeExit([&] { sPurging->RemoveElement(custody.path); });
-  nsresult rv = RecoverPurge(folder, custody);
-  return NS_FAILED(rv) && NS_FAILED(custody.firstError) ? custody.firstError
-                                                        : rv;
+  RefPtr<mozilla::mailnews::LocalStoreMigrationWork> migration =
+      MigrationPurgeFor(folder);
+  bool retained = !!migration;
+  if (migration)
+    MOZ_TRY(migration->Validate());
+  else
+    MOZ_TRY(mozilla::mailnews::LocalStoreMigrationWork::Begin(folder, folder,
+                                                              migration));
+  bool foundCustody = false;
+  nsresult migrationResult = [&]() -> nsresult {
+    if (!mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) return NS_OK;
+    PurgeCustody custody;
+    MOZ_TRY(PurgeLocation(folder, custody));
+    bool exists;
+    MOZ_TRY(custody.directory->Exists(&exists));
+    if (!exists) {
+      // Missing retained evidence cannot certify that an uncertain purge ended.
+      return retained ? NS_ERROR_NOT_AVAILABLE : NS_OK;
+    }
+    foundCustody = true;
+    MOZ_TRY(migration->AddPath(custody.directory));
+    MOZ_TRY(EnterPurge(custody));
+    auto leave =
+        mozilla::MakeScopeExit([&] { sPurging->RemoveElement(custody.path); });
+    nsresult rv = RecoverPurge(folder, custody);
+    return NS_FAILED(rv) && NS_FAILED(custody.firstError) ? custody.firstError
+                                                          : rv;
+  }();
+  if (NS_SUCCEEDED(migrationResult)) {
+    migration->Complete(migrationResult);
+    ForgetMigrationPurge(folder, migration);
+  } else if (retained || foundCustody) {
+    migration->RecordError(migrationResult);
+    if (!retained)
+      sMigrationPurges.AppendElement(MigrationPurgeOwner{folder, migration});
+  } else
+    migration->Complete(migrationResult);
+  return migrationResult;
 }
 
 nsresult PurgeNativeMessages(
@@ -677,122 +723,166 @@ nsresult PurgeNativeMessages(
     const nsTArray<RefPtr<nsIMsgDBHdr>>& headers,
     nsTArray<RefPtr<nsIMsgDBHdr>>& removed,
     const std::function<void(nsIMsgDBHdr*)>& beforeRemove) {
-  removed.Clear();
-  MOZ_TRY(RecoverNativePurge(folder));
-  PurgeCustody custody;
-  MOZ_TRY(PurgeLocation(folder, custody));
-  MOZ_TRY(mozilla::mailnews::CheckFolderStorageMove(folder));
-  MOZ_TRY(EnterPurge(custody));
-  auto leave =
-      mozilla::MakeScopeExit([&] { sPurging->RemoveElement(custody.path); });
-  RefPtr<DatabaseCore> core = DatabaseCore::GetInstanceForService();
-  NS_ENSURE_STATE(core);
-  nsCOMPtr<nsIMsgPluggableStore> store;
-  MOZ_TRY(folder->GetMsgStore(getter_AddRefs(store)));
-  for (const auto& header : headers) {
-    nsCOMPtr<nsIMsgFolder> owner;
-    MOZ_TRY(header->GetFolder(getter_AddRefs(owner)));
-    NS_ENSURE_TRUE(owner == folder, NS_ERROR_ILLEGAL_VALUE);
-    nsMsgKey key;
-    MOZ_TRY(header->GetMessageKey(&key));
-    auto& member = *custody.members.AppendElement();
-    MOZ_TRY(core->MessageDB().GetMessageBodyState(key, member.body));
-    NS_ENSURE_TRUE(member.body.folderId == custody.folder,
-                   NS_ERROR_ILLEGAL_VALUE);
-    nsAutoCString token;
-    MOZ_TRY(header->GetStoreToken(token));
-    NS_ENSURE_TRUE(token == member.body.storeToken.valueOr(nsCString()),
-                   NS_ERROR_NOT_AVAILABLE);
-    for (size_t j = 0; j + 1 < custody.members.Length(); ++j) {
-      NS_ENSURE_TRUE(
-          custody.members[j].body.key != key &&
-              (token.IsEmpty() ||
-               custody.members[j].body.storeToken != member.body.storeToken),
-          NS_ERROR_ILLEGAL_VALUE);
+  RefPtr<mozilla::mailnews::LocalStoreMigrationWork> migration;
+  NS_ENSURE_FALSE(MigrationPurgeFor(folder), NS_ERROR_IN_PROGRESS);
+  MOZ_TRY(mozilla::mailnews::LocalStoreMigrationWork::Begin(folder, folder,
+                                                            migration));
+  bool migrationCustody = false;
+  sMigrationPurges.AppendElement(MigrationPurgeOwner{folder, migration});
+  nsresult migrationResult = [&]() -> nsresult {
+    removed.Clear();
+    {
+      mozilla::mailnews::AutoLocalStoreMigrationContinuation continuation(
+          migration);
+      // Recover any prior durable custody before this new selection. The
+      // current owner has not created custody yet and stays registered.
+      PurgeCustody prior;
+      MOZ_TRY(PurgeLocation(folder, prior));
+      bool priorExists;
+      MOZ_TRY(prior.directory->Exists(&priorExists));
+      if (priorExists) {
+        migrationCustody = true;
+        MOZ_TRY(migration->AddPath(prior.directory));
+        MOZ_TRY(EnterPurge(prior));
+        auto leavePrior = mozilla::MakeScopeExit(
+            [&] { sPurging->RemoveElement(prior.path); });
+        MOZ_TRY(RecoverPurge(folder, prior));
+        migrationCustody = false;
+      }
     }
-    MOZ_TRY(CheckPurgeTokenOwner(folder, core, custody, member.body, true));
-    if (custody.store == "maildir" && !token.IsEmpty()) {
-      // Preserve the ordinary nonempty-directory refusal before SQL changes.
-      NS_ENSURE_TRUE(token.FindCharInSet("/\\") == kNotFound && token != "." &&
-                         token != "..",
+    PurgeCustody custody;
+    MOZ_TRY(PurgeLocation(folder, custody));
+    MOZ_TRY(mozilla::mailnews::CheckFolderStorageMove(folder));
+    MOZ_TRY(EnterPurge(custody));
+    auto leave =
+        mozilla::MakeScopeExit([&] { sPurging->RemoveElement(custody.path); });
+    RefPtr<DatabaseCore> core = DatabaseCore::GetInstanceForService();
+    NS_ENSURE_STATE(core);
+    nsCOMPtr<nsIMsgPluggableStore> store;
+    MOZ_TRY(folder->GetMsgStore(getter_AddRefs(store)));
+    for (const auto& header : headers) {
+      nsCOMPtr<nsIMsgFolder> owner;
+      MOZ_TRY(header->GetFolder(getter_AddRefs(owner)));
+      NS_ENSURE_TRUE(owner == folder, NS_ERROR_ILLEGAL_VALUE);
+      nsMsgKey key;
+      MOZ_TRY(header->GetMessageKey(&key));
+      auto& member = *custody.members.AppendElement();
+      MOZ_TRY(core->MessageDB().GetMessageBodyState(key, member.body));
+      NS_ENSURE_TRUE(member.body.folderId == custody.folder,
                      NS_ERROR_ILLEGAL_VALUE);
-      nsCOMPtr<nsIFile> physical;
-      MOZ_TRY(folder->GetFilePath(getter_AddRefs(physical)));
-      MOZ_TRY(physical->AppendNative("cur"_ns));
-      MOZ_TRY(physical->AppendNative(token));
-      bool directory;
-      MOZ_TRY(physical->IsDirectory(&directory));
-      NS_ENSURE_FALSE(directory, NS_ERROR_FILE_DIR_NOT_EMPTY);
+      nsAutoCString token;
+      MOZ_TRY(header->GetStoreToken(token));
+      NS_ENSURE_TRUE(token == member.body.storeToken.valueOr(nsCString()),
+                     NS_ERROR_NOT_AVAILABLE);
+      for (size_t j = 0; j + 1 < custody.members.Length(); ++j) {
+        NS_ENSURE_TRUE(
+            custody.members[j].body.key != key &&
+                (token.IsEmpty() ||
+                 custody.members[j].body.storeToken != member.body.storeToken),
+            NS_ERROR_ILLEGAL_VALUE);
+      }
+      MOZ_TRY(CheckPurgeTokenOwner(folder, core, custody, member.body, true));
+      if (custody.store == "maildir" && !token.IsEmpty()) {
+        // Preserve the ordinary nonempty-directory refusal before SQL changes.
+        NS_ENSURE_TRUE(token.FindCharInSet("/\\") == kNotFound &&
+                           token != "." && token != "..",
+                       NS_ERROR_ILLEGAL_VALUE);
+        nsCOMPtr<nsIFile> physical;
+        MOZ_TRY(folder->GetFilePath(getter_AddRefs(physical)));
+        MOZ_TRY(physical->AppendNative("cur"_ns));
+        MOZ_TRY(physical->AppendNative(token));
+        bool directory;
+        MOZ_TRY(physical->IsDirectory(&directory));
+        NS_ENSURE_FALSE(directory, NS_ERROR_FILE_DIR_NOT_EMPTY);
+      }
     }
-  }
-  if (headers.IsEmpty()) return NS_OK;
-  // Create only this operation's generated private directory. No provider path
-  // or arbitrary serialized filename is used for recovery-file writes.
-  MOZ_TRY(custody.directory->Create(nsIFile::DIRECTORY_TYPE, 00700));
-  MOZ_TRY(SavePurge(custody));
-  auto fail = [&](nsresult rv) {
-    if (NS_SUCCEEDED(custody.firstError)) custody.firstError = rv;
-    SavePurge(custody);  // A secondary persistence error never hides rv.
-    return rv;
-  };
-  for (size_t i = 0; i < headers.Length(); ++i) {
-    auto& member = custody.members[i];
-    if (!member.body.storeToken || member.body.storeToken->IsEmpty()) continue;
-    nsCOMPtr<nsIFile> recovery;
-    nsresult rv = PurgeBodyFile(custody, i, getter_AddRefs(recovery));
-    if (NS_FAILED(rv)) return fail(rv);
-    nsCOMPtr<nsIInputStream> input;
-    rv = store->GetMsgInputStream(folder, *member.body.storeToken, 0,
-                                  getter_AddRefs(input));
-    if (NS_FAILED(rv)) return fail(rv);
-    nsCOMPtr<nsIOutputStream> output;
-    rv = MsgNewBufferedFileOutputStream(getter_AddRefs(output), recovery,
-                                        PR_WRONLY | PR_CREATE_FILE | PR_EXCL,
-                                        00600);
-    if (NS_FAILED(rv)) {
-      input->Close();
-      return fail(rv);
+    if (headers.IsEmpty()) return NS_OK;
+    // Create only this operation's generated private directory. No provider
+    // path or arbitrary serialized filename is used for recovery-file writes.
+    migrationCustody = true;
+    MOZ_TRY(migration->AddPath(custody.directory));
+    MOZ_TRY(custody.directory->Create(nsIFile::DIRECTORY_TYPE, 00700));
+    MOZ_TRY(SavePurge(custody));
+    auto fail = [&](nsresult rv) {
+      if (NS_SUCCEEDED(custody.firstError)) custody.firstError = rv;
+      migration->RecordError(rv);
+      nsresult saved = SavePurge(custody);
+      migration->RecordError(
+          saved);  // Keep the real secondary persistence error.
+      return rv;
+    };
+    for (size_t i = 0; i < headers.Length(); ++i) {
+      auto& member = custody.members[i];
+      if (!member.body.storeToken || member.body.storeToken->IsEmpty())
+        continue;
+      nsCOMPtr<nsIFile> recovery;
+      nsresult rv = PurgeBodyFile(custody, i, getter_AddRefs(recovery));
+      if (NS_FAILED(rv)) return fail(rv);
+      nsCOMPtr<nsIInputStream> input;
+      rv = store->GetMsgInputStream(folder, *member.body.storeToken, 0,
+                                    getter_AddRefs(input));
+      if (NS_FAILED(rv)) return fail(rv);
+      nsCOMPtr<nsIOutputStream> output;
+      rv = MsgNewBufferedFileOutputStream(getter_AddRefs(output), recovery,
+                                          PR_WRONLY | PR_CREATE_FILE | PR_EXCL,
+                                          00600);
+      if (NS_FAILED(rv)) {
+        input->Close();
+        return fail(rv);
+      }
+      uint64_t bytes;
+      rv = SyncCopyStream(input, output, bytes);
+      migration->RecordError(rv);
+      nsresult readClose = input->Close();
+      migration->RecordError(readClose);
+      nsresult writeClose = output->Close();
+      migration->RecordError(writeClose);
+      if (NS_FAILED(rv)) return fail(rv);
+      if (NS_FAILED(readClose)) return fail(readClose);
+      if (NS_FAILED(writeClose)) return fail(writeClose);
+      if (bytes != member.body.messageSize) return fail(NS_ERROR_NOT_AVAILABLE);
     }
-    uint64_t bytes;
-    rv = SyncCopyStream(input, output, bytes);
-    nsresult readClose = input->Close();
-    nsresult writeClose = output->Close();
-    if (NS_FAILED(rv)) return fail(rv);
-    if (NS_FAILED(readClose)) return fail(readClose);
-    if (NS_FAILED(writeClose)) return fail(writeClose);
-    if (bytes != member.body.messageSize) return fail(NS_ERROR_NOT_AVAILABLE);
+    for (size_t i = 0; i < headers.Length(); ++i) {
+      auto& member = custody.members[i];
+      MessageBodyState current;
+      nsresult rv =
+          core->MessageDB().GetMessageBodyState(member.body.key, current);
+      if (NS_FAILED(rv)) return fail(rv);
+      if (!SamePurgeBody(current, member.body))
+        return fail(NS_ERROR_NOT_AVAILABLE);
+      rv = CheckPurgeTokenOwner(folder, core, custody, member.body, true);
+      if (NS_FAILED(rv)) return fail(rv);
+      member.phase = PurgePhase::CommitRequested;
+      rv = SavePurge(custody);
+      if (NS_FAILED(rv)) return fail(rv);
+      beforeRemove(headers[i]);
+      // The callback may synchronously run application observers. Recheck the
+      // exact committed physical guard before admitting the SQL deletion.
+      rv = core->MessageDB().GetMessageBodyState(member.body.key, current);
+      if (NS_FAILED(rv)) return fail(rv);
+      if (!SamePurgeBody(current, member.body))
+        return fail(NS_ERROR_NOT_AVAILABLE);
+      rv = database->DeleteHeader(headers[i], nullptr, false, true);
+      if (NS_FAILED(rv)) return fail(rv);
+      removed.AppendElement(headers[i]);
+      member.phase = PurgePhase::MetadataRemoved;
+      rv = SavePurge(custody);
+      if (NS_FAILED(rv)) return fail(rv);
+      rv = CleanPurgeMember(folder, custody, member);
+      if (NS_FAILED(rv)) return fail(rv);
+    }
+    nsresult rv = RemovePurgeCustody(custody);
+    return NS_FAILED(rv) ? fail(rv) : rv;
+  }();
+  if (NS_SUCCEEDED(migrationResult) || !migrationCustody) {
+    migration->Complete(migrationResult);
+    ForgetMigrationPurge(folder, migration);
+  } else {
+    migration->RecordError(migrationResult);
+    // The retained custody operation, not sPurging/absence, owns later
+    // recovery.
   }
-  for (size_t i = 0; i < headers.Length(); ++i) {
-    auto& member = custody.members[i];
-    MessageBodyState current;
-    nsresult rv =
-        core->MessageDB().GetMessageBodyState(member.body.key, current);
-    if (NS_FAILED(rv)) return fail(rv);
-    if (!SamePurgeBody(current, member.body))
-      return fail(NS_ERROR_NOT_AVAILABLE);
-    rv = CheckPurgeTokenOwner(folder, core, custody, member.body, true);
-    if (NS_FAILED(rv)) return fail(rv);
-    member.phase = PurgePhase::CommitRequested;
-    rv = SavePurge(custody);
-    if (NS_FAILED(rv)) return fail(rv);
-    beforeRemove(headers[i]);
-    // The callback may synchronously run application observers. Recheck the
-    // exact committed physical guard before admitting the SQL deletion.
-    rv = core->MessageDB().GetMessageBodyState(member.body.key, current);
-    if (NS_FAILED(rv)) return fail(rv);
-    if (!SamePurgeBody(current, member.body))
-      return fail(NS_ERROR_NOT_AVAILABLE);
-    rv = database->DeleteHeader(headers[i], nullptr, false, true);
-    if (NS_FAILED(rv)) return fail(rv);
-    removed.AppendElement(headers[i]);
-    member.phase = PurgePhase::MetadataRemoved;
-    rv = SavePurge(custody);
-    if (NS_FAILED(rv)) return fail(rv);
-    rv = CleanPurgeMember(folder, custody, member);
-    if (NS_FAILED(rv)) return fail(rv);
-  }
-  nsresult rv = RemovePurgeCustody(custody);
-  return NS_FAILED(rv) ? fail(rv) : rv;
+  return migrationResult;
 }
 
 #endif

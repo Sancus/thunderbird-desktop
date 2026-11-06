@@ -47,3 +47,7 @@ EXTRA_JS_MODULES += [
 XPCOM_MANIFESTS += [
     "components.conf",
 ]
+
+if CONFIG["MOZ_PANORAMA"]:
+    EXPORTS += ["LocalStoreMigrationLease.h"]
+    SOURCES += ["LocalStoreMigrationLease.cpp"]

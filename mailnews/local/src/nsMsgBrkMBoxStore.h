@@ -14,6 +14,10 @@
 #include "nsTStringHasher.h"  // IWYU pragma: keep, mozilla::DefaultHasher<nsCString>
 #include "mozilla/HashTable.h"
 
+#ifdef MOZ_PANORAMA
+#  include "LocalStoreMigrationLease.h"
+#endif
+
 class nsIFile;
 class nsIOutputStream;
 
@@ -59,6 +63,9 @@ class nsMsgBrkMBoxStore final : public nsMsgLocalStoreUtils,
     bool quarantined{false};
     // Retain the first Finish or rollback error; later calls cannot clear it.
     nsresult status{NS_OK};
+#ifdef MOZ_PANORAMA
+    RefPtr<mozilla::mailnews::LocalStoreMigrationWork> migration;
+#endif
   };
   mozilla::HashMap<nsCString, StreamDetails> mOngoingWrites;
 };

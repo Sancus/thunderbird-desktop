@@ -164,6 +164,8 @@ nsresult RemoveLocalUndo(nsIMsgFolder* folder, nsMsgKey key,
   return NS_OK;
 }
 
+mozilla::mailnews::LocalStoreMigrationWork* sMigrationUndoWork = nullptr;
+
 nsresult RestoreLocalUndo(nsIMsgFolder* folder, nsTArray<nsMsgKey>& keys,
                           NativeUndoEntries& entries) {
   NS_ENSURE_TRUE(entries.Length() == keys.Length(), NS_ERROR_NOT_AVAILABLE);
@@ -188,11 +190,20 @@ nsresult RestoreLocalUndo(nsIMsgFolder* folder, nsTArray<nsMsgKey>& keys,
       nsCOMPtr<nsIInputStream> input;
       MOZ_TRY(
           NS_NewLocalFileInputStream(getter_AddRefs(input), entry.recovery));
-      auto closeInput = mozilla::MakeScopeExit([&] { input->Close(); });
+      auto closeInput = mozilla::MakeScopeExit([&] {
+        nsresult closeResult = input->Close();
+        if (sMigrationUndoWork) sMigrationUndoWork->RecordError(closeResult);
+      });
       nsCOMPtr<nsIOutputStream> output;
-      MOZ_TRY(store->GetNewMsgOutputStream(folder, getter_AddRefs(output)));
-      auto discard = mozilla::MakeScopeExit(
-          [&] { store->DiscardNewMessage(folder, output); });
+      {
+        mozilla::mailnews::AutoLocalStoreMigrationContinuation continuation(
+            sMigrationUndoWork);
+        MOZ_TRY(store->GetNewMsgOutputStream(folder, getter_AddRefs(output)));
+      }
+      auto discard = mozilla::MakeScopeExit([&] {
+        nsresult discardResult = store->DiscardNewMessage(folder, output);
+        if (sMigrationUndoWork) sMigrationUndoWork->RecordError(discardResult);
+      });
       uint64_t bytes;
       MOZ_TRY(SyncCopyStream(input, output, bytes));
       nsresult readClose = input->Close();
@@ -335,6 +346,10 @@ nsLocalMoveCopyMsgTxn::UndoTransaction() {
 #ifdef MOZ_PANORAMA
   if (mNativeUndo) return RunNativeUndo(true);
 #endif
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(mozilla::mailnews::CheckLocalStoreMigrationAdmission());
+#endif
+
   nsresult rv;
   nsCOMPtr<nsIMsgDatabase> dstDB;
 
@@ -453,6 +468,10 @@ nsLocalMoveCopyMsgTxn::RedoTransaction() {
 #ifdef MOZ_PANORAMA
   if (mNativeUndo) return RunNativeUndo(false);
 #endif
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(mozilla::mailnews::CheckLocalStoreMigrationAdmission());
+#endif
+
   nsresult rv;
   nsCOMPtr<nsIMsgDatabase> srcDB;
   nsCOMPtr<nsIMsgDatabase> dstDB;
@@ -509,8 +528,14 @@ nsresult nsLocalMoveCopyMsgTxn::PrepareNativeSourceRemoval(
   return NS_OK;
 }
 
-nsresult nsLocalMoveCopyMsgTxn::RemoveNativeSourceHeader(nsIMsgFolder* folder,
-                                                         nsIMsgDBHdr* header) {
+nsresult nsLocalMoveCopyMsgTxn::RemoveNativeSourceHeader(
+    nsIMsgFolder* folder, nsIMsgDBHdr* header,
+    mozilla::mailnews::LocalStoreMigrationWork* migrationParent) {
+  if (migrationParent)
+    MOZ_TRY(migrationParent->Validate());
+  else
+    MOZ_TRY(mozilla::mailnews::CheckLocalStoreMigrationAdmission());
+
   NS_ENSURE_TRUE(mNativeUndo && !mNativeUndo->changing, NS_ERROR_IN_PROGRESS);
   nsCOMPtr<nsIMsgFolder> source = do_QueryReferent(m_srcFolder);
   NS_ENSURE_TRUE(folder == source, NS_ERROR_INVALID_ARG);
@@ -534,63 +559,88 @@ nsresult nsLocalMoveCopyMsgTxn::RemoveNativeSourceHeader(nsIMsgFolder* folder,
 }
 
 nsresult nsLocalMoveCopyMsgTxn::RunNativeUndo(bool undoing) {
-  NS_ENSURE_FALSE(mNativeUndo->changing, NS_ERROR_IN_PROGRESS);
-  if (mNativeUndo->pending && *mNativeUndo->pending != undoing) {
-    return mNativeUndo->firstError;
+  nsCOMPtr<nsIMsgFolder> migrationSource = do_QueryReferent(m_srcFolder);
+  nsCOMPtr<nsIMsgFolder> migrationDestination = do_QueryReferent(m_dstFolder);
+  NS_ENSURE_TRUE(migrationSource && migrationDestination,
+                 NS_ERROR_NOT_AVAILABLE);
+  if (mMigrationUndoWork && !mMigrationUndoWork->IsTerminal()) {
+    MOZ_TRY(mMigrationUndoWork->Validate());
+  } else {
+    MOZ_TRY(mozilla::mailnews::LocalStoreMigrationWork::Begin(
+        static_cast<nsIFolderListener*>(this), migrationSource,
+        mMigrationUndoWork));
+    MOZ_TRY(mMigrationUndoWork->AddFolder(migrationDestination));
   }
-  if (!mNativeUndo->pending && mNativeUndo->undone == undoing) return NS_OK;
-  nsCOMPtr<nsIMsgFolder> source = do_QueryReferent(m_srcFolder);
-  nsCOMPtr<nsIMsgFolder> destination = do_QueryReferent(m_dstFolder);
-  NS_ENSURE_TRUE(source && destination, NS_ERROR_NOT_AVAILABLE);
-  bool sourceLocked, destinationLocked;
-  MOZ_TRY(source->GetLocked(&sourceLocked));
-  MOZ_TRY(destination->GetLocked(&destinationLocked));
-  if (sourceLocked || destinationLocked) {
-    return mNativeUndo->pending ? mNativeUndo->firstError : NS_MSG_FOLDER_BUSY;
-  }
-  if (!mNativeUndo->pending) mNativeUndo->pending.emplace(undoing);
-  RefPtr<nsLocalMoveCopyMsgTxn> self(this);
-  mozilla::AutoRestore<bool> changing(mNativeUndo->changing);
-  mNativeUndo->changing = true;
-  nsresult result = [&]() -> nsresult {
-    if (undoing) {
-      // Capture all destination bodies before any source restoration or
-      // removal.
-      MOZ_TRY(CaptureLocalUndo(destination, m_dstKeyArray,
-                               mNativeUndo->destination));
-      if (m_isMove) {
-        MOZ_TRY(RestoreLocalUndo(source, m_srcKeyArray, mNativeUndo->source));
-      }
-      for (size_t i = 0; i < m_dstKeyArray.Length(); ++i) {
-        MOZ_TRY(RemoveLocalUndo(destination, m_dstKeyArray[i],
-                                *mNativeUndo->destination[i]));
-      }
-    } else {
-      // Validate the whole current source set before publishing any redo row.
-      MOZ_TRY(CaptureLocalUndo(source, m_srcKeyArray, mNativeUndo->source));
-      MOZ_TRY(RestoreLocalUndo(destination, m_dstKeyArray,
-                               mNativeUndo->destination));
-      if (m_isMove) {
-        for (size_t i = 0; i < m_srcKeyArray.Length(); ++i) {
-          MOZ_TRY(RemoveLocalUndo(source, m_srcKeyArray[i],
-                                  *mNativeUndo->source[i]));
+  mozilla::AutoRestore<mozilla::mailnews::LocalStoreMigrationWork*> restore(
+      sMigrationUndoWork);
+  sMigrationUndoWork = mMigrationUndoWork;
+  nsresult migrationResult = [&]() -> nsresult {
+    NS_ENSURE_FALSE(mNativeUndo->changing, NS_ERROR_IN_PROGRESS);
+    if (mNativeUndo->pending && *mNativeUndo->pending != undoing) {
+      return mNativeUndo->firstError;
+    }
+    if (!mNativeUndo->pending && mNativeUndo->undone == undoing) return NS_OK;
+    nsCOMPtr<nsIMsgFolder> source = do_QueryReferent(m_srcFolder);
+    nsCOMPtr<nsIMsgFolder> destination = do_QueryReferent(m_dstFolder);
+    NS_ENSURE_TRUE(source && destination, NS_ERROR_NOT_AVAILABLE);
+    bool sourceLocked, destinationLocked;
+    MOZ_TRY(source->GetLocked(&sourceLocked));
+    MOZ_TRY(destination->GetLocked(&destinationLocked));
+    if (sourceLocked || destinationLocked) {
+      return mNativeUndo->pending ? mNativeUndo->firstError
+                                  : NS_MSG_FOLDER_BUSY;
+    }
+    if (!mNativeUndo->pending) mNativeUndo->pending.emplace(undoing);
+    RefPtr<nsLocalMoveCopyMsgTxn> self(this);
+    mozilla::AutoRestore<bool> changing(mNativeUndo->changing);
+    mNativeUndo->changing = true;
+    nsresult result = [&]() -> nsresult {
+      if (undoing) {
+        // Capture all destination bodies before any source restoration or
+        // removal.
+        MOZ_TRY(CaptureLocalUndo(destination, m_dstKeyArray,
+                                 mNativeUndo->destination));
+        if (m_isMove) {
+          MOZ_TRY(RestoreLocalUndo(source, m_srcKeyArray, mNativeUndo->source));
+        }
+        for (size_t i = 0; i < m_dstKeyArray.Length(); ++i) {
+          MOZ_TRY(RemoveLocalUndo(destination, m_dstKeyArray[i],
+                                  *mNativeUndo->destination[i]));
+        }
+      } else {
+        // Validate the whole current source set before publishing any redo row.
+        MOZ_TRY(CaptureLocalUndo(source, m_srcKeyArray, mNativeUndo->source));
+        MOZ_TRY(RestoreLocalUndo(destination, m_dstKeyArray,
+                                 mNativeUndo->destination));
+        if (m_isMove) {
+          for (size_t i = 0; i < m_srcKeyArray.Length(); ++i) {
+            MOZ_TRY(RemoveLocalUndo(source, m_srcKeyArray[i],
+                                    *mNativeUndo->source[i]));
+          }
         }
       }
+      return NS_OK;
+    }();
+    if (NS_SUCCEEDED(result)) {
+      mNativeUndo->undone = undoing;
+      mNativeUndo->pending.reset();
+      mNativeUndo->firstError = NS_OK;
+      // Explicit history cleanup can release settled recovery. Failed
+      // operations keep their independent bytes even if the original copy state
+      // is dropped.
+      for (auto& entry : mNativeUndo->source) entry->retainRecovery = false;
+      for (auto& entry : mNativeUndo->destination)
+        entry->retainRecovery = false;
+    } else if (NS_SUCCEEDED(mNativeUndo->firstError)) {
+      mNativeUndo->firstError = result;
     }
-    return NS_OK;
+    return NS_FAILED(result) ? mNativeUndo->firstError : result;
   }();
-  if (NS_SUCCEEDED(result)) {
-    mNativeUndo->undone = undoing;
-    mNativeUndo->pending.reset();
-    mNativeUndo->firstError = NS_OK;
-    // Explicit history cleanup can release settled recovery. Failed operations
-    // keep their independent bytes even if the original copy state is dropped.
-    for (auto& entry : mNativeUndo->source) entry->retainRecovery = false;
-    for (auto& entry : mNativeUndo->destination) entry->retainRecovery = false;
-  } else if (NS_SUCCEEDED(mNativeUndo->firstError)) {
-    mNativeUndo->firstError = result;
-  }
-  return NS_FAILED(result) ? mNativeUndo->firstError : result;
+  if (!mNativeUndo->pending)
+    mMigrationUndoWork->Complete(migrationResult);
+  else
+    mMigrationUndoWork->RecordError(migrationResult);
+  return migrationResult;
 }
 #endif
 

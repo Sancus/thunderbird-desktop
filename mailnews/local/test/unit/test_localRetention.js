@@ -935,3 +935,53 @@ if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
     await checkRetentionProcessRestart("maildir");
   });
 }
+
+/**
+ * Refuses an actual foreign native subject without granting a live lease.
+ * Live selected-owner assertions are in the original Core native fixture.
+ *
+ * @param {string} domain - The fixed native domain whose real IO started.
+ */
+function assertMigrationForeignContext(domain) {
+  const gate = Cc["@mozilla.org/mailnews/migration-writer-lease;1"].getService(
+    Ci.nsIObserver
+  );
+  const bag = gate.QueryInterface(Ci.nsIPropertyBag2);
+  const subject = bag.getPropertyAsInterface(
+    "writer-admission-subject",
+    Ci.nsISupports
+  );
+  const before = bag.getPropertyAsUint32(`writer-history.${domain}`);
+  Assert.equal(before, 1, "The real operation irreversibly marked Started");
+  Assert.throws(
+    () => gate.observe(subject, "check-writer-never-started", domain),
+    error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+  );
+  Assert.throws(
+    () =>
+      gate.observe(Services.appinfo, "validate-selected-view", "after-await"),
+    error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+  );
+  Assert.equal(bag.getPropertyAsUint32(`writer-history.${domain}`), before);
+}
+
+/** @param {string} store - Actual mbox or maildir provider. */
+async function checkMigrationRetentionRefusal(store) {
+  await withRetentionFolder(store, async folder => {
+    const originals = addRetentionMessages(folder);
+    assertMigrationForeignContext("local-store");
+    assertRetentionMessages(folder, originals);
+    setLocalRetention(folder, false);
+    await folder.applyRetentionSettings();
+    assertRetentionMessages(folder, originals.slice(1));
+    Assert.ok(!folder.locked);
+  });
+}
+if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+  add_task(async function test_migrationRetainedPurgeCustodyMbox() {
+    await checkMigrationRetentionRefusal("mbox");
+  });
+  add_task(async function test_migrationRetainedPurgeCustodyMaildir() {
+    await checkMigrationRetentionRefusal("maildir");
+  });
+}

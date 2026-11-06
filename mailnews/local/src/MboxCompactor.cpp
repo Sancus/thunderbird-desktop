@@ -29,45 +29,71 @@ NS_IMPL_ISUPPORTS(MboxCompactor, nsIStoreScanListener);
 nsresult MboxCompactor::BeginCompaction(nsIFile* srcMbox,
                                         nsIStoreCompactListener* listener,
                                         bool patchXMozillaHeaders) {
-  MOZ_ASSERT(!mCompactListener);  // Already running?
-  mCompactListener = listener;
-  mPatchXMozillaHeaders = patchXMozillaHeaders;
-  nsresult rv = SetupPaths(srcMbox);
-  NS_ENSURE_SUCCESS(rv, rv);
-  rv = SanityCheck(srcMbox);
-  NS_ENSURE_SUCCESS(rv, rv);
+#ifdef MOZ_PANORAMA
+  NS_ENSURE_FALSE(mMigrationWork && !mMigrationWork->IsTerminal(),
+                  NS_ERROR_IN_PROGRESS);
+  MOZ_TRY(mozilla::mailnews::LocalStoreMigrationWork::Begin(
+      static_cast<nsIStoreScanListener*>(this), srcMbox, mMigrationWork));
+  nsresult migrationResult = [&]() -> nsresult {
+#endif
+    MOZ_ASSERT(!mCompactListener);  // Already running?
+    mCompactListener = listener;
+    mPatchXMozillaHeaders = patchXMozillaHeaders;
+    nsresult rv = SetupPaths(srcMbox);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = SanityCheck(srcMbox);
+    NS_ENSURE_SUCCESS(rv, rv);
 
-  MOZ_LOG(gCompactLog, LogLevel::Info,
-          ("MboxCompactor - Compacting '%s' into '%s'.",
-           mPaths.Source->HumanReadablePath().get(),
-           mPaths.Compacting->HumanReadablePath().get()));
+    MOZ_LOG(gCompactLog, LogLevel::Info,
+            ("MboxCompactor - Compacting '%s' into '%s'.",
+             mPaths.Source->HumanReadablePath().get(),
+             mPaths.Compacting->HumanReadablePath().get()));
 
-  // Create output stream for our dest mbox.
-  rv = NS_NewLocalFileOutputStream(getter_AddRefs(mDestStream),
-                                   mPaths.Compacting,
-                                   PR_WRONLY | PR_CREATE_FILE | PR_EXCL, 0600);
-  NS_ENSURE_SUCCESS(rv, rv);
+    // Create output stream for our dest mbox.
+    rv = NS_NewLocalFileOutputStream(
+        getter_AddRefs(mDestStream), mPaths.Compacting,
+        PR_WRONLY | PR_CREATE_FILE | PR_EXCL, 0600);
+    NS_ENSURE_SUCCESS(rv, rv);
 
-  // Start iterating over the src mbox.
-  // The scanner will hold a reference to us until it's completed, so
-  // no kungfudeathgrippery required here (and MboxScanner holds itself
-  // in existence until finished).
-  RefPtr<MboxScanner> scanner(new MboxScanner());
-  rv = scanner->BeginScan(mPaths.Source, this);
-  if (NS_FAILED(rv)) {
-    nsresult cleanupRv = mDestStream->Close();
-    if (NS_FAILED(cleanupRv)) {
-      NS_WARNING("Could not close unused compaction output");
+    // Start iterating over the src mbox.
+    // The scanner will hold a reference to us until it's completed, so
+    // no kungfudeathgrippery required here (and MboxScanner holds itself
+    // in existence until finished).
+    RefPtr<MboxScanner> scanner(new MboxScanner());
+    rv = scanner->BeginScan(mPaths.Source, this);
+    if (NS_FAILED(rv)) {
+#ifdef MOZ_PANORAMA
+      mMigrationWork->RecordError(rv);
+#endif
+      nsresult cleanupRv = mDestStream->Close();
+#ifdef MOZ_PANORAMA
+      mMigrationWork->RecordError(cleanupRv);
+      mMigrationCloseSafe = NS_SUCCEEDED(cleanupRv);
+#endif
+      if (NS_FAILED(cleanupRv)) {
+        NS_WARNING("Could not close unused compaction output");
+      }
+      mDestStream = nullptr;
+      cleanupRv = mPaths.Compacting->Remove(false);
+#ifdef MOZ_PANORAMA
+      mMigrationWork->RecordError(cleanupRv);
+#endif
+      if (NS_FAILED(cleanupRv)) {
+        NS_WARNING("Could not remove unused compaction output");
+      }
+      return rv;
     }
-    mDestStream = nullptr;
-    cleanupRv = mPaths.Compacting->Remove(false);
-    if (NS_FAILED(cleanupRv)) {
-      NS_WARNING("Could not remove unused compaction output");
-    }
-    return rv;
+
+    return NS_OK;
+
+#ifdef MOZ_PANORAMA
+  }();
+  if (NS_FAILED(migrationResult)) {
+    mMigrationWork->Complete(migrationResult,
+                             mMigrationCloseSafe && !mDestStream);
   }
-
-  return NS_OK;
+  return migrationResult;
+#endif
 }
 
 // Make sure the given mbox file exists and looks readable and writeable.
@@ -169,6 +195,10 @@ nsresult MboxCompactor::SetupPaths(nsIFile* srcMbox) {
 
 // nsIStoreScanListener callback called when the scan starts.
 NS_IMETHODIMP MboxCompactor::OnStartScan() {
+#ifdef MOZ_PANORAMA
+  if (mMigrationWork) MOZ_TRY(mMigrationWork->Validate());
+#endif
+
   return mCompactListener->OnCompactionBegin();
 }
 
@@ -176,6 +206,10 @@ NS_IMETHODIMP MboxCompactor::OnStartScan() {
 NS_IMETHODIMP MboxCompactor::OnStartMessage(nsACString const& storeToken,
                                             nsACString const& envAddr,
                                             PRTime envDate) {
+#ifdef MOZ_PANORAMA
+  if (mMigrationWork) MOZ_TRY(mMigrationWork->Validate());
+#endif
+
   MOZ_ASSERT(mCurToken.IsEmpty());  // We should _not_ be processing a msg yet!
 
   // Ask compactListener if we should keep this message.
@@ -240,6 +274,10 @@ static nsresult writeSpan(nsIOutputStream* writeable,
 NS_IMETHODIMP MboxCompactor::OnDataAvailable(nsIRequest* req,
                                              nsIInputStream* stream,
                                              uint64_t offset, uint32_t count) {
+#ifdef MOZ_PANORAMA
+  if (mMigrationWork) MOZ_TRY(mMigrationWork->Validate());
+#endif
+
   if (!mMsgOut) {
     // We're discarding this message.
     return readAndDiscard(stream, count);
@@ -268,6 +306,10 @@ NS_IMETHODIMP MboxCompactor::OnDataAvailable(nsIRequest* req,
 
 // nsIStoreScanListener callback called at end of each message.
 NS_IMETHODIMP MboxCompactor::OnStopRequest(nsIRequest* req, nsresult status) {
+#ifdef MOZ_PANORAMA
+  if (mMigrationWork) MOZ_TRY(mMigrationWork->Validate());
+#endif
+
   MOZ_LOG(gCompactLog, NS_SUCCEEDED(status) ? LogLevel::Debug : LogLevel::Error,
           ("MboxCompactor - OnStopRequest(status=0x%x)", (uint32_t)status));
 
@@ -302,7 +344,18 @@ NS_IMETHODIMP MboxCompactor::OnStopRequest(nsIRequest* req, nsresult status) {
 
 // nsIStoreScanListener callback called when the scan completes.
 NS_IMETHODIMP MboxCompactor::OnStopScan(nsresult status) {
+#ifdef MOZ_PANORAMA
+  if (mMigrationWork) {
+    MOZ_TRY(mMigrationWork->Validate());
+    mMigrationWork->RecordError(status);
+  }
+#endif
+
   nsresult rv = mDestStream->Close();
+#ifdef MOZ_PANORAMA
+  if (mMigrationWork) mMigrationWork->RecordError(rv);
+  mMigrationCloseSafe = NS_SUCCEEDED(rv);
+#endif
   mDestStream = nullptr;
 
   MOZ_LOG(gCompactLog, NS_SUCCEEDED(status) ? LogLevel::Debug : LogLevel::Error,
@@ -317,6 +370,9 @@ NS_IMETHODIMP MboxCompactor::OnStopScan(nsresult status) {
     // ".../foo/bar/.temp-compact/folder.compacting" ->
     // ".../foo/bar/.temp-compact/folder.compacted"
     rv = mPaths.Compacting->RenameTo(mPaths.TempDir, mPaths.CompactedName);
+#ifdef MOZ_PANORAMA
+    if (mMigrationWork) mMigrationWork->RecordError(rv);
+#endif
     MOZ_LOG(gCompactLog, NS_SUCCEEDED(rv) ? LogLevel::Debug : LogLevel::Error,
             ("MboxCompactor - Compacted OK. Rename '%s' -> '%s' (rv=0x%x)",
              mPaths.Compacting->HumanReadablePath().get(),
@@ -328,9 +384,15 @@ NS_IMETHODIMP MboxCompactor::OnStopScan(nsresult status) {
   int64_t compactedSize = 0;
   if (NS_SUCCEEDED(rv)) {
     rv = mPaths.Source->GetFileSize(&originalSize);
+#ifdef MOZ_PANORAMA
+    if (mMigrationWork) mMigrationWork->RecordError(rv);
+#endif
   }
   if (NS_SUCCEEDED(rv)) {
     rv = mPaths.Compacted->GetFileSize(&compactedSize);
+#ifdef MOZ_PANORAMA
+    if (mMigrationWork) mMigrationWork->RecordError(rv);
+#endif
   }
 
   nsCOMPtr<nsIMboxCompactionCommit> commit =
@@ -344,6 +406,9 @@ NS_IMETHODIMP MboxCompactor::OnStopScan(nsresult status) {
     keepRecoveryFiles = true;
     rv = commit->PrepareBodyRelocation(mPaths.Source, mPaths.Compacted,
                                        mPaths.Backup);
+#ifdef MOZ_PANORAMA
+    if (mMigrationWork) mMigrationWork->RecordError(rv);
+#endif
     relocationPrepared = NS_SUCCEEDED(rv);
   }
 
@@ -356,6 +421,9 @@ NS_IMETHODIMP MboxCompactor::OnStopScan(nsresult status) {
     // OnCompactionComplete() (e.g. power cut), something can see that we died
     // mid-compaction and recover.
     rv = mPaths.Source->RenameTo(mPaths.TempDir, mPaths.BackupName);
+#ifdef MOZ_PANORAMA
+    if (mMigrationWork) mMigrationWork->RecordError(rv);
+#endif
     MOZ_LOG(gCompactLog, NS_SUCCEEDED(rv) ? LogLevel::Debug : LogLevel::Error,
             ("MboxCompactor - Move original '%s' -> '%s' (rv=0x%x)",
              mPaths.Source->HumanReadablePath().get(),
@@ -366,6 +434,9 @@ NS_IMETHODIMP MboxCompactor::OnStopScan(nsresult status) {
       // RenameTo does not fall back to copy/delete on failure. The original is
       // untouched; core rechecks the complete intent before acknowledging it.
       nsresult abandonRv = commit->AbandonBodyRelocation();
+#ifdef MOZ_PANORAMA
+      if (mMigrationWork) mMigrationWork->RecordError(abandonRv);
+#endif
       if (NS_SUCCEEDED(abandonRv)) keepRecoveryFiles = false;
       MOZ_LOG(gCompactLog,
               NS_SUCCEEDED(abandonRv) ? LogLevel::Debug : LogLevel::Error,
@@ -381,6 +452,9 @@ NS_IMETHODIMP MboxCompactor::OnStopScan(nsresult status) {
   // by returning a failure code.
   // (FolderCompactor uses this callback to apply its changes to the database).
   nsresult rv2 = mCompactListener->OnCompactionComplete(rv);
+#ifdef MOZ_PANORAMA
+  if (mMigrationWork) mMigrationWork->RecordError(rv2);
+#endif
   if (NS_SUCCEEDED(rv) && NS_FAILED(rv2)) {
     // Listener requested rollback.
     rv = rv2;
@@ -390,6 +464,9 @@ NS_IMETHODIMP MboxCompactor::OnStopScan(nsresult status) {
     // We've got the all-clear, so install the compacted mbox file (this is
     // as atomic as we've got).
     rv = mPaths.Compacted->RenameTo(mPaths.SourceDir, mPaths.SourceName);
+#ifdef MOZ_PANORAMA
+    if (mMigrationWork) mMigrationWork->RecordError(rv);
+#endif
     MOZ_LOG(gCompactLog, NS_SUCCEEDED(rv) ? LogLevel::Debug : LogLevel::Error,
             ("MboxCompactor - Install new mbox. Rename '%s' -> '%s' (rv=0x%x), "
              "PR_Now()=%" PRIu64 "",
@@ -400,9 +477,15 @@ NS_IMETHODIMP MboxCompactor::OnStopScan(nsresult status) {
       // A metadata failure leaves the installed body and original backup for
       // recovery, with the native intent/read gate still pending as needed.
       rv = commit->CompleteBodyRelocation();
+#ifdef MOZ_PANORAMA
+      if (mMigrationWork) mMigrationWork->RecordError(rv);
+#endif
     }
     if (NS_SUCCEEDED(rv)) {
       nsresult rvTemp = mPaths.Backup->Remove(false);
+#ifdef MOZ_PANORAMA
+      if (mMigrationWork) mMigrationWork->RecordError(rvTemp);
+#endif
       MOZ_LOG(gCompactLog,
               NS_SUCCEEDED(rvTemp) ? LogLevel::Debug : LogLevel::Error,
               ("MboxCompactor - Delete '%s' (rv=0x%x)",
@@ -429,17 +512,42 @@ NS_IMETHODIMP MboxCompactor::OnStopScan(nsresult status) {
     }
     // The compaction didn't happen, so we don't need the .compacting or
     // .compacted mbox files.
-    mPaths.Compacted->Remove(false);
-    mPaths.Compacting->Remove(false);
+    nsresult removeCompacted = mPaths.Compacted->Remove(false);
+    nsresult removeCompacting = mPaths.Compacting->Remove(false);
+#ifdef MOZ_PANORAMA
+    if (mMigrationWork) {
+      mMigrationWork->RecordError(removeCompacted);
+      mMigrationWork->RecordError(removeCompacting);
+    }
+#else
+    (void)removeCompacted;
+    (void)removeCompacting;
+#endif
   }
 
   // Provide our final report.
-  mCompactListener->OnFinalSummary(rv, originalSize, compactedSize);
+  nsresult finalSummary =
+      mCompactListener->OnFinalSummary(rv, originalSize, compactedSize);
+#ifdef MOZ_PANORAMA
+  if (mMigrationWork) mMigrationWork->RecordError(finalSummary);
+#else
+  (void)finalSummary;
+#endif
 
   // Delete the temp dir. But only if it's empty. Even if we succeeded,
   // there might be a failed compaction from another folder which could
   // be recovered.
-  mPaths.TempDir->Remove(false);
+  nsresult removeTemp = mPaths.TempDir->Remove(false);
+#ifdef MOZ_PANORAMA
+  if (mMigrationWork) {
+    mMigrationWork->RecordError(removeTemp);
+    // OnFinalSummary is deliberately not the terminal. All original cleanup
+    // above has returned; a failed native close still retains uncertain IO.
+    mMigrationWork->Complete(rv, mMigrationCloseSafe);
+  }
+#else
+  (void)removeTemp;
+#endif
 
   MOZ_LOG(gCompactLog, LogLevel::Debug,
           ("MboxCompactor - Finished. status=0x%x, originalSize=%" PRIi64
@@ -453,6 +561,10 @@ NS_IMETHODIMP MboxCompactor::OnStopScan(nsresult status) {
 // Also handles on-the-fly patching of X-Mozilla-Headers if that was requested.
 // If this succeeds, the buffer will be empty upon return.
 nsresult MboxCompactor::FlushBuffer() {
+#ifdef MOZ_PANORAMA
+  if (mMigrationWork) MOZ_TRY(mMigrationWork->Validate());
+#endif
+
   MOZ_ASSERT(mMsgOut);  // Shouldn't get here if we're skipping msg!
   nsresult rv;
   auto buf = mBuffer.AsSpan().First(mBufferCount);

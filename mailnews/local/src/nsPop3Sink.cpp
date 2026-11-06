@@ -46,6 +46,34 @@ mozilla::LazyLogModule POP3LOGMODULE("POP3");
 
 NS_IMPL_ISUPPORTS(nsPop3Sink, nsIPop3Sink, nsIMsgOperationListener)
 
+#ifdef MOZ_PANORAMA
+class PopMigrationIncorporationTerminal final : public nsIMsgOperationListener {
+ public:
+  NS_DECL_ISUPPORTS
+  PopMigrationIncorporationTerminal(
+      nsPop3Sink* aSink, mozilla::mailnews::LocalStoreMigrationWork* aWork,
+      uint64_t aSerial)
+      : mSink(aSink), mWork(aWork), mSerial(aSerial) {}
+  NS_IMETHOD OnStopOperation(nsresult aResult) override {
+    if (mDone) return NS_OK;
+    mDone = true;
+    NS_ENSURE_TRUE(mSink->mMigrationIncorporation == mSerial &&
+                       mSink->mMigrationDelivery == mWork,
+                   NS_ERROR_NOT_AVAILABLE);
+    if (mWork && !mWork->IsTerminal()) MOZ_TRY(mWork->Validate());
+    return mSink->OnStopOperation(aResult);
+  }
+
+ private:
+  ~PopMigrationIncorporationTerminal() = default;
+  RefPtr<nsPop3Sink> mSink;
+  RefPtr<mozilla::mailnews::LocalStoreMigrationWork> mWork;
+  const uint64_t mSerial;
+  bool mDone = false;
+};
+NS_IMPL_ISUPPORTS(PopMigrationIncorporationTerminal, nsIMsgOperationListener)
+#endif
+
 nsPop3Sink::nsPop3Sink() {
   m_biffState = 0;
   m_numNewMessages = 0;
@@ -156,6 +184,18 @@ NS_IMETHODIMP nsPop3Sink::BeginMailDelivery(bool uidlDownload,
     return NS_FAILED(m_incorporateStatus) ? m_incorporateStatus
                                           : NS_ERROR_IN_PROGRESS;
   }
+#ifdef MOZ_PANORAMA
+  NS_ENSURE_TRUE(m_folder, NS_ERROR_NOT_INITIALIZED);
+  if (!mMigrationDelivery || mMigrationDelivery->IsTerminal()) {
+    MOZ_TRY(mozilla::mailnews::LocalStoreMigrationWork::Begin(
+        static_cast<nsIPop3Sink*>(this), m_folder, mMigrationDelivery));
+  } else {
+    MOZ_TRY(mMigrationDelivery->AddFolder(m_folder));
+    MOZ_TRY(mMigrationDelivery->Validate());
+  }
+  mMigrationDelivery->StartPopDelivery();
+  mMigrationDeliveryEnding = false;
+#endif
   m_incorporateStatus = NS_OK;
   nsCOMPtr<nsIMsgIncomingServer> server = do_QueryInterface(m_popServer);
   if (!server) return NS_ERROR_UNEXPECTED;
@@ -209,77 +249,89 @@ NS_IMETHODIMP nsPop3Sink::BeginMailDelivery(bool uidlDownload,
 }
 
 NS_IMETHODIMP nsPop3Sink::EndMailDelivery(nsIPop3Protocol* protocol) {
-  if (m_completionPending) return NS_ERROR_IN_PROGRESS;
-  if (m_outFileStream && NS_SUCCEEDED(m_incorporateStatus)) {
-    RecordIncorporateResult(NS_ERROR_UNEXPECTED);
-  }
-  if (NS_FAILED(m_incorporateStatus)) {
-    AbortMailDelivery(protocol);
-    return m_incorporateStatus;
-  }
-  if (!m_uidlDownload) {
-    DiscardStalePartialMessages(protocol);
-  }
-
-  if (m_newMailParser) {
-    m_newMailParser->DoneParsing();
-    m_newMailParser->EndMsgDownload();
-  }
-
-  // tell the parser to mark the db valid *after* closing the mailbox.
-  if (m_newMailParser) m_newMailParser->UpdateDBFolderInfo();
-
-  MOZ_LOG(POP3LOGMODULE, mozilla::LogLevel::Debug,
-          (POP3LOG("Calling ReleaseFolderLock from EndMailDelivery")));
-  nsresult rv = ReleaseFolderLock();
-  NS_ASSERTION(NS_SUCCEEDED(rv), "folder lock not released successfully");
-
-  bool filtersRun;
-  m_folder->CallFilterPlugins(nullptr,
-                              &filtersRun);  // ??? do we need msgWindow?
-  int32_t numNewMessagesInFolder;
-  // if filters have marked msgs read or deleted, the num new messages count
-  // will go negative by the number of messages marked read or deleted,
-  // so if we add that number to the number of msgs downloaded, that will give
-  // us the number of actual new messages.
-  m_folder->GetNumNewMessages(false, &numNewMessagesInFolder);
-  m_numNewMessages -= (m_numNewMessagesInFolder - numNewMessagesInFolder);
-  m_folder->SetNumNewMessages(
-      m_numNewMessages);  // we'll adjust this for spam later
-  if (!filtersRun && m_numNewMessages > 0) {
-    nsCOMPtr<nsIMsgIncomingServer> server;
-    m_folder->GetServer(getter_AddRefs(server));
-    if (server) {
-      server->SetPerformingBiff(true);
-      m_folder->SetBiffState(m_biffState);
-      server->SetPerformingBiff(false);
+#ifdef MOZ_PANORAMA
+  if (mMigrationDelivery && !mMigrationDelivery->IsTerminal())
+    MOZ_TRY(mMigrationDelivery->Validate());
+  mMigrationDeliveryEnding = true;
+  nsresult migrationResult = [&]() -> nsresult {
+#endif
+    if (m_completionPending) return NS_ERROR_IN_PROGRESS;
+    if (m_outFileStream && NS_SUCCEEDED(m_incorporateStatus)) {
+      RecordIncorporateResult(NS_ERROR_UNEXPECTED);
     }
-  }
-  // note that size on disk has possibly changed.
-  nsCOMPtr<nsIMsgLocalMailFolder> localFolder = do_QueryInterface(m_folder);
-  if (localFolder) (void)localFolder->RefreshSizeOnDisk();
-  nsCOMPtr<nsIMsgIncomingServer> server = do_QueryInterface(m_popServer);
-  if (server) {
-    nsCOMPtr<nsIMsgFilterList> filterList;
-    rv = server->GetFilterList(nullptr, getter_AddRefs(filterList));
-    NS_ENSURE_SUCCESS(rv, rv);
+    if (NS_FAILED(m_incorporateStatus)) {
+      AbortMailDelivery(protocol);
+      return m_incorporateStatus;
+    }
+    if (!m_uidlDownload) {
+      DiscardStalePartialMessages(protocol);
+    }
 
-    if (filterList) (void)filterList->FlushLogIfNecessary();
-  }
+    if (m_newMailParser) {
+      m_newMailParser->DoneParsing();
+      m_newMailParser->EndMsgDownload();
+    }
 
-  // fix for bug #161999
-  // we should update the summary totals for the folder (inbox)
-  // in case it's not the open folder
-  m_folder->UpdateSummaryTotals(true);
+    // tell the parser to mark the db valid *after* closing the mailbox.
+    if (m_newMailParser) m_newMailParser->UpdateDBFolderInfo();
+
+    MOZ_LOG(POP3LOGMODULE, mozilla::LogLevel::Debug,
+            (POP3LOG("Calling ReleaseFolderLock from EndMailDelivery")));
+    nsresult rv = ReleaseFolderLock();
+    NS_ASSERTION(NS_SUCCEEDED(rv), "folder lock not released successfully");
+
+    bool filtersRun;
+    m_folder->CallFilterPlugins(nullptr,
+                                &filtersRun);  // ??? do we need msgWindow?
+    int32_t numNewMessagesInFolder;
+    // if filters have marked msgs read or deleted, the num new messages count
+    // will go negative by the number of messages marked read or deleted,
+    // so if we add that number to the number of msgs downloaded, that will give
+    // us the number of actual new messages.
+    m_folder->GetNumNewMessages(false, &numNewMessagesInFolder);
+    m_numNewMessages -= (m_numNewMessagesInFolder - numNewMessagesInFolder);
+    m_folder->SetNumNewMessages(
+        m_numNewMessages);  // we'll adjust this for spam later
+    if (!filtersRun && m_numNewMessages > 0) {
+      nsCOMPtr<nsIMsgIncomingServer> server;
+      m_folder->GetServer(getter_AddRefs(server));
+      if (server) {
+        server->SetPerformingBiff(true);
+        m_folder->SetBiffState(m_biffState);
+        server->SetPerformingBiff(false);
+      }
+    }
+    // note that size on disk has possibly changed.
+    nsCOMPtr<nsIMsgLocalMailFolder> localFolder = do_QueryInterface(m_folder);
+    if (localFolder) (void)localFolder->RefreshSizeOnDisk();
+    nsCOMPtr<nsIMsgIncomingServer> server = do_QueryInterface(m_popServer);
+    if (server) {
+      nsCOMPtr<nsIMsgFilterList> filterList;
+      rv = server->GetFilterList(nullptr, getter_AddRefs(filterList));
+      NS_ENSURE_SUCCESS(rv, rv);
+
+      if (filterList) (void)filterList->FlushLogIfNecessary();
+    }
+
+    // fix for bug #161999
+    // we should update the summary totals for the folder (inbox)
+    // in case it's not the open folder
+    m_folder->UpdateSummaryTotals(true);
 
 #ifdef DEBUG
-  printf("End mail message delivery.\n");
+    printf("End mail message delivery.\n");
 #endif
-  nsCOMPtr<nsIPop3Service> pop3Service(
-      do_GetService("@mozilla.org/messenger/popservice;1", &rv));
-  NS_ENSURE_SUCCESS(rv, rv);
-  pop3Service->NotifyDownloadCompleted(m_folder, m_numNewMessages);
-  return NS_OK;
+    nsCOMPtr<nsIPop3Service> pop3Service(
+        do_GetService("@mozilla.org/messenger/popservice;1", &rv));
+    NS_ENSURE_SUCCESS(rv, rv);
+    pop3Service->NotifyDownloadCompleted(m_folder, m_numNewMessages);
+    return NS_OK;
+
+#ifdef MOZ_PANORAMA
+  }();
+  MaybeSettleMigration(migrationResult);
+  return migrationResult;
+#endif
 }
 
 nsresult nsPop3Sink::ReleaseFolderLock() {
@@ -300,27 +352,43 @@ nsresult nsPop3Sink::ReleaseFolderLock() {
 }
 
 NS_IMETHODIMP nsPop3Sink::AbortMailDelivery(nsIPop3Protocol* protocol) {
-  IncorporateAbort();
+#ifdef MOZ_PANORAMA
+  if (mMigrationDelivery && !mMigrationDelivery->IsTerminal())
+    MOZ_TRY(mMigrationDelivery->Validate());
+  mMigrationDeliveryEnding = true;
+  nsresult migrationResult = [&]() -> nsresult {
+#endif
+    IncorporateAbort();
 
-  if (!m_outFileStream && m_newMailParser) {
-    m_newMailParser->UpdateDBFolderInfo();
-  }
-  MOZ_LOG(POP3LOGMODULE, mozilla::LogLevel::Debug,
-          (POP3LOG("Calling ReleaseFolderLock from AbortMailDelivery")));
+    if (!m_outFileStream && m_newMailParser) {
+      m_newMailParser->UpdateDBFolderInfo();
+    }
+    MOZ_LOG(POP3LOGMODULE, mozilla::LogLevel::Debug,
+            (POP3LOG("Calling ReleaseFolderLock from AbortMailDelivery")));
 
-  nsresult rv = ReleaseFolderLock();
-  NS_ASSERTION(NS_SUCCEEDED(rv), "folder lock not released successfully");
-  RecordIncorporateResult(rv);
+    nsresult rv = ReleaseFolderLock();
+    NS_ASSERTION(NS_SUCCEEDED(rv), "folder lock not released successfully");
+    RecordIncorporateResult(rv);
 
-  nsCOMPtr<nsIPop3Service> pop3Service(
-      do_GetService("@mozilla.org/messenger/popservice;1", &rv));
-  if (NS_SUCCEEDED(rv)) {
-    rv = pop3Service->NotifyDownloadCompleted(m_folder, 0);
-  }
-  return RecordIncorporateResult(rv);
+    nsCOMPtr<nsIPop3Service> pop3Service(
+        do_GetService("@mozilla.org/messenger/popservice;1", &rv));
+    if (NS_SUCCEEDED(rv)) {
+      rv = pop3Service->NotifyDownloadCompleted(m_folder, 0);
+    }
+    return RecordIncorporateResult(rv);
+
+#ifdef MOZ_PANORAMA
+  }();
+  MaybeSettleMigration(migrationResult);
+  return migrationResult;
+#endif
 }
 
 nsresult nsPop3Sink::RecordIncorporateResult(nsresult status) {
+#ifdef MOZ_PANORAMA
+  if (mMigrationDelivery) mMigrationDelivery->RecordError(status);
+#endif
+
   if (NS_SUCCEEDED(m_incorporateStatus) && NS_FAILED(status)) {
     m_incorporateStatus = status;
   }
@@ -329,6 +397,11 @@ nsresult nsPop3Sink::RecordIncorporateResult(nsresult status) {
 
 NS_IMETHODIMP nsPop3Sink::IncorporateBegin(const char* uidlString,
                                            uint32_t flags) {
+#ifdef MOZ_PANORAMA
+  if (mMigrationDelivery && !mMigrationDelivery->IsTerminal())
+    MOZ_TRY(mMigrationDelivery->Validate());
+#endif
+
   if (m_completionPending) return NS_ERROR_IN_PROGRESS;
   if (NS_FAILED(m_incorporateStatus)) return m_incorporateStatus;
   if (m_outFileStream) return RecordIncorporateResult(NS_ERROR_IN_PROGRESS);
@@ -362,8 +435,16 @@ nsresult nsPop3Sink::IncorporateBeginInternal(const char* uidlString,
 #endif
   rv = m_folder->GetMsgStore(getter_AddRefs(m_msgStore));
   NS_ENSURE_SUCCESS(rv, rv);
-  rv = m_msgStore->GetNewMsgOutputStream(m_folder,
-                                         getter_AddRefs(m_outFileStream));
+#ifdef MOZ_PANORAMA
+  {
+    mozilla::mailnews::AutoLocalStoreMigrationContinuation continuation(
+        mMigrationDelivery);
+#endif
+    rv = m_msgStore->GetNewMsgOutputStream(m_folder,
+                                           getter_AddRefs(m_outFileStream));
+#ifdef MOZ_PANORAMA
+  }
+#endif
   NS_ENSURE_SUCCESS(rv, rv);
 
   nsCOMPtr<nsIMsgFolder> serverFolder;
@@ -438,6 +519,22 @@ nsresult nsPop3Sink::IncorporateBeginInternal(const char* uidlString,
 
 NS_IMETHODIMP
 nsPop3Sink::SetPopServer(nsIPop3IncomingServer* server) {
+#ifdef MOZ_PANORAMA
+  if (mMigrationDelivery && !mMigrationDelivery->IsTerminal()) {
+    if (server != m_popServer) {
+      NS_ENSURE_TRUE(!server && !m_completionPending && !m_outFileStream &&
+                         !mMigrationCallbackRunning,
+                     NS_ERROR_IN_PROGRESS);
+      // Clearing the actual server association performs no IO. The global
+      // participant still joins the real client/UIDL Promise independently.
+      mMigrationDelivery->Complete(m_incorporateStatus);
+    }
+  } else if (server) {
+    MOZ_TRY(mozilla::mailnews::LocalStoreMigrationWork::PreparePop(
+        static_cast<nsIPop3Sink*>(this), mMigrationDelivery));
+  }
+#endif
+
   m_popServer = server;
   return NS_OK;
 }
@@ -456,6 +553,14 @@ NS_IMETHODIMP nsPop3Sink::GetFolder(nsIMsgFolder** aFolder) {
 }
 
 NS_IMETHODIMP nsPop3Sink::SetFolder(nsIMsgFolder* aFolder) {
+#ifdef MOZ_PANORAMA
+  if (mMigrationDelivery && !mMigrationDelivery->IsTerminal() && aFolder) {
+    NS_ENSURE_FALSE(m_outFileStream || m_completionPending,
+                    NS_ERROR_IN_PROGRESS);
+    MOZ_TRY(mMigrationDelivery->AddFolder(aFolder));
+  }
+#endif
+
   m_folder = aFolder;
   return NS_OK;
 }
@@ -480,11 +585,21 @@ NS_IMETHODIMP nsPop3Sink::SetMsgsToDownload(uint32_t aNumMessages) {
 }
 
 NS_IMETHODIMP nsPop3Sink::IncorporateWrite(const char* block, int32_t length) {
+#ifdef MOZ_PANORAMA
+  if (mMigrationDelivery && !mMigrationDelivery->IsTerminal())
+    MOZ_TRY(mMigrationDelivery->Validate());
+#endif
+
   if (m_completionPending) return NS_ERROR_IN_PROGRESS;
   return WriteLineToMailbox(nsDependentCString(block, length));
 }
 
 nsresult nsPop3Sink::WriteLineToMailbox(const nsACString& buffer) {
+#ifdef MOZ_PANORAMA
+  if (mMigrationDelivery && !mMigrationDelivery->IsTerminal())
+    MOZ_TRY(mMigrationDelivery->Validate());
+#endif
+
   if (NS_FAILED(m_incorporateStatus)) return m_incorporateStatus;
   if (buffer.IsEmpty()) return NS_OK;
   if (!m_outFileStream) {
@@ -501,6 +616,11 @@ nsresult nsPop3Sink::WriteLineToMailbox(const nsACString& buffer) {
 NS_IMETHODIMP nsPop3Sink::IncorporateComplete(
     nsIMsgWindow* aMsgWindow, int32_t aSize,
     nsIMsgOperationListener* aCallback) {
+#ifdef MOZ_PANORAMA
+  if (mMigrationDelivery && !mMigrationDelivery->IsTerminal())
+    MOZ_TRY(mMigrationDelivery->Validate());
+#endif
+
   if (m_completionPending) return NS_ERROR_IN_PROGRESS;
   if (NS_FAILED(m_incorporateStatus)) return m_incorporateStatus;
   if (m_finishCalled) {
@@ -510,6 +630,11 @@ NS_IMETHODIMP nsPop3Sink::IncorporateComplete(
     return RecordIncorporateResult(NS_ERROR_NOT_INITIALIZED);
   // From acceptance onward only the callback reports terminal status.
   if (aCallback) {
+#ifdef MOZ_PANORAMA
+    NS_ENSURE_TRUE(mMigrationIncorporation != UINT64_MAX,
+                   RecordIncorporateResult(NS_ERROR_NOT_AVAILABLE));
+    ++mMigrationIncorporation;
+#endif
     m_completionListener = aCallback;
     m_completionPending = true;
   }
@@ -527,8 +652,13 @@ NS_IMETHODIMP nsPop3Sink::IncorporateComplete(
   RecordIncorporateResult(rv);
 #ifdef MOZ_PANORAMA
   if (completed && NS_SUCCEEDED(m_incorporateStatus)) {
+    nsCOMPtr<nsIMsgOperationListener> migrationTerminal;
+    if (aCallback) {
+      migrationTerminal = new PopMigrationIncorporationTerminal(
+          this, mMigrationDelivery, mMigrationIncorporation);
+    }
     rv = m_newMailParser->ApplyFiltersToCompletedMessage(
-        completed, aCallback ? this : nullptr, !m_partialBody);
+        completed, migrationTerminal, !m_partialBody);
     if (aCallback) {
       // May already have completed synchronously through OnStopOperation.
       if (NS_FAILED(rv)) (void)OnStopOperation(rv);
@@ -544,6 +674,11 @@ NS_IMETHODIMP nsPop3Sink::IncorporateComplete(
 }
 
 nsresult nsPop3Sink::FinishIncorporation(nsresult status) {
+#ifdef MOZ_PANORAMA
+  if (mMigrationDelivery && !mMigrationDelivery->IsTerminal())
+    MOZ_TRY(mMigrationDelivery->Validate());
+#endif
+
   if (NS_FAILED(RecordIncorporateResult(status))) return m_incorporateStatus;
   nsresult rv;
   nsCOMPtr<nsIPop3Service> pop3Service(
@@ -560,7 +695,14 @@ NS_IMETHODIMP nsPop3Sink::OnStopOperation(nsresult status) {
   nsCOMPtr<nsIMsgOperationListener> completion = m_completionListener.forget();
   m_completionPending = false;
   // Retain failed/uncertain provider state; clear only callback ownership.
+#ifdef MOZ_PANORAMA
+  mMigrationCallbackRunning = true;
+#endif
   if (completion) (void)completion->OnStopOperation(status);
+#ifdef MOZ_PANORAMA
+  mMigrationCallbackRunning = false;
+  MaybeSettleMigration(status);
+#endif
   return NS_OK;
 }
 
@@ -823,6 +965,11 @@ nsresult nsPop3Sink::IncorporateCompleteInternal(nsIMsgWindow* aMsgWindow,
 }
 
 NS_IMETHODIMP nsPop3Sink::IncorporateAbort() {
+#ifdef MOZ_PANORAMA
+  if (mMigrationDelivery && !mMigrationDelivery->IsTerminal())
+    MOZ_TRY(mMigrationDelivery->Validate());
+#endif
+
   if (m_completionPending) {
     RecordIncorporateResult(NS_BINDING_ABORTED);
 #ifdef MOZ_PANORAMA
@@ -843,6 +990,24 @@ NS_IMETHODIMP nsPop3Sink::IncorporateAbort() {
   if (m_newMailParser) m_newMailParser->SetNewMsgHdr(nullptr);
   return m_incorporateStatus;
 }
+
+#ifdef MOZ_PANORAMA
+void nsPop3Sink::MaybeSettleMigration(nsresult aResult) {
+  if (!mMigrationDelivery || mMigrationDelivery->IsTerminal()) return;
+  mMigrationDelivery->RecordError(aResult);
+  if (!mMigrationDeliveryEnding || m_completionPending || m_outFileStream ||
+      mMigrationCallbackRunning)
+    return;
+  bool locked = true;
+  nsCOMPtr<nsISupports> self =
+      do_QueryInterface(static_cast<nsIPop3Sink*>(this));
+  nsresult rv = m_folder ? m_folder->TestSemaphore(self, &locked) : NS_OK;
+  mMigrationDelivery->RecordError(rv);
+  if (NS_SUCCEEDED(rv) && (!m_folder || !locked)) {
+    mMigrationDelivery->Complete(m_incorporateStatus);
+  }
+}
+#endif
 
 NS_IMETHODIMP nsPop3Sink::SetBiffStateAndUpdateFE(uint32_t aBiffState,
                                                   int32_t numNewMessages,

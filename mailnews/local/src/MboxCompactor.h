@@ -8,6 +8,9 @@
 #include "mozilla/Buffer.h"
 #include "nsIMsgPluggableStore.h"
 #include "nsIOutputStream.h"
+#ifdef MOZ_PANORAMA
+#  include "LocalStoreMigrationLease.h"
+#endif
 
 class MboxMsgOutputStream;
 class nsIFile;
@@ -70,6 +73,10 @@ class MboxCompactor : public nsIStoreScanListener {
   nsresult FlushBuffer();
 
   nsCOMPtr<nsIStoreCompactListener> mCompactListener;
+#ifdef MOZ_PANORAMA
+  RefPtr<mozilla::mailnews::LocalStoreMigrationWork> mMigrationWork;
+  bool mMigrationCloseSafe = true;
+#endif
 
   // Keep track of all the filenames and paths we're juggling:
   struct {

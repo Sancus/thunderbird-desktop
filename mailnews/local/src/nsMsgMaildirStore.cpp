@@ -12,6 +12,7 @@
 #include "msgCore.h"
 #include "nsMsgMaildirStore.h"
 #ifdef MOZ_PANORAMA
+#  include "LocalStoreMigrationLease.h"
 #  include "nsLocalUtils.h"
 #endif
 #include "nsIMsgFolder.h"
@@ -51,6 +52,9 @@ static mozilla::LazyLogModule MailDirLog("MailDirStore");
  * It keeps a self reference, which will be released when the operation is
  * finished. So the caller doesn't need to hold onto it.
  */
+namespace mozilla::mailnews {
+class LocalStoreMigrationWork;
+}
 class MaildirScanner : public nsIStreamListener {
  public:
   NS_DECL_ISUPPORTS
@@ -60,7 +64,9 @@ class MaildirScanner : public nsIStreamListener {
   // Start scanning.
   // If an error occurs here, it'll be returned directly and no listener
   // methods will be called.
-  nsresult BeginScan(nsIFile* mboxFile, nsIStoreScanListener* scanListener);
+  nsresult BeginScan(
+      nsIFile* mboxFile, nsIStoreScanListener* scanListener,
+      mozilla::mailnews::LocalStoreMigrationWork* migration = nullptr);
 
  private:
   virtual ~MaildirScanner() {}
@@ -74,12 +80,24 @@ class MaildirScanner : public nsIStreamListener {
   nsCOMPtr<nsIDirectoryEnumerator> mDirEnumerator;
   // Pump to use sync stream as async.
   nsCOMPtr<nsIInputStreamPump> mPump;
+  nsCOMPtr<nsIInputStream> mCurrentInput;
+  bool mCloseAttempted = false;
+#ifdef MOZ_PANORAMA
+  RefPtr<mozilla::mailnews::LocalStoreMigrationWork> mMigrationWork;
+#endif
 };
 
 NS_IMPL_ISUPPORTS(MaildirScanner, nsIStreamListener)
 
-nsresult MaildirScanner::BeginScan(nsIFile* maildirPath,
-                                   nsIStoreScanListener* scanListener) {
+nsresult MaildirScanner::BeginScan(
+    nsIFile* maildirPath, nsIStoreScanListener* scanListener,
+    mozilla::mailnews::LocalStoreMigrationWork* migration) {
+#ifdef MOZ_PANORAMA
+  mMigrationWork = migration;
+  if (migration) migration->Retain(static_cast<nsIStreamListener*>(this));
+#else
+  (void)migration;
+#endif
   MOZ_ASSERT(scanListener);
   MOZ_ASSERT(!mScanListener);
   MOZ_ASSERT(!mKungFuDeathGrip);
@@ -117,6 +135,13 @@ nsresult MaildirScanner::BeginScan(nsIFile* maildirPath,
 // member is set and the appropriate nsIStoreScanListener callbacks are
 // invoked.
 void MaildirScanner::NextFile() {
+#ifdef MOZ_PANORAMA
+  if (mMigrationWork && NS_SUCCEEDED(mStatus)) {
+    nsresult ownership = mMigrationWork->Validate();
+    if (NS_FAILED(ownership)) mStatus = ownership;
+  }
+#endif
+
   nsCOMPtr<nsIFile> f;
   bool gotValidStream = false;
 
@@ -145,6 +170,8 @@ void MaildirScanner::NextFile() {
       mStatus = rv;
       break;
     }
+    mCurrentInput = stream;
+    mCloseAttempted = false;
     // We now have a guaranteed valid stream. Proceed with parsing.
 
     PRTime mtime;
@@ -178,6 +205,19 @@ void MaildirScanner::NextFile() {
   // If we exit the loop without a valid stream, we are either finished
   // or a fatal error occurred. Clean up and stop the scan.
   if (!gotValidStream || NS_FAILED(mStatus)) {
+    if (mCurrentInput && !mCloseAttempted) {
+      mCloseAttempted = true;
+      nsresult closed = mCurrentInput->Close();
+#ifdef MOZ_PANORAMA
+      if (mMigrationWork) {
+        mMigrationWork->RecordError(mStatus);
+        if (NS_FAILED(closed))
+          mMigrationWork->HoldUncertainIO(closed, mCurrentInput);
+      }
+#endif
+      if (NS_SUCCEEDED(closed)) mCurrentInput = nullptr;
+      if (NS_SUCCEEDED(mStatus)) mStatus = closed;
+    }
     mScanListener->OnStopScan(mStatus);
     mPump = nullptr;
     mKungFuDeathGrip = nullptr;
@@ -197,6 +237,21 @@ NS_IMETHODIMP MaildirScanner::OnDataAvailable(nsIRequest* req,
 }
 
 NS_IMETHODIMP MaildirScanner::OnStopRequest(nsIRequest* req, nsresult status) {
+  if (mCurrentInput && !mCloseAttempted) {
+    mCloseAttempted = true;
+    nsresult closed = mCurrentInput->Close();
+#ifdef MOZ_PANORAMA
+    if (mMigrationWork) {
+      mMigrationWork->RecordError(mStatus);
+      mMigrationWork->RecordError(status);
+      if (NS_FAILED(closed))
+        mMigrationWork->HoldUncertainIO(closed, mCurrentInput);
+    }
+#endif
+    if (NS_SUCCEEDED(closed)) mCurrentInput = nullptr;
+    if (NS_SUCCEEDED(status)) status = closed;
+  }
+
   nsresult rv = mScanListener->OnStopRequest(req, status);
   if (NS_SUCCEEDED(mStatus)) {
     mStatus = NS_FAILED(status) ? status : rv;
@@ -279,6 +334,10 @@ nsCString nsMsgMaildirStore::UniqueName() {
 
 NS_IMETHODIMP nsMsgMaildirStore::DiscoverSubFolders(nsIMsgFolder* aParentFolder,
                                                     bool aDeep) {
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(mozilla::mailnews::CheckLocalStoreMigrationAdmission());
+#endif
+
   NS_ENSURE_ARG_POINTER(aParentFolder);
 
   nsCOMPtr<nsIFile> path;
@@ -297,6 +356,10 @@ NS_IMETHODIMP nsMsgMaildirStore::DiscoverSubFolders(nsIMsgFolder* aParentFolder,
 
 NS_IMETHODIMP nsMsgMaildirStore::DiscoverChildFolders(
     nsIMsgFolder* parent, nsTArray<nsCString>& children) {
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(mozilla::mailnews::CheckLocalStoreMigrationAdmission());
+#endif
+
   NS_ENSURE_ARG(parent);
 
   children.ClearAndRetainStorage();
@@ -393,98 +456,122 @@ nsresult nsMsgMaildirStore::CreateMaildir(nsIFile* path) {
 NS_IMETHODIMP nsMsgMaildirStore::CreateFolder(nsIMsgFolder* aParent,
                                               const nsACString& aFolderName,
                                               nsIMsgFolder** aResult) {
-  NS_ENSURE_ARG_POINTER(aParent);
-  NS_ENSURE_ARG_POINTER(aResult);
-  if (aFolderName.IsEmpty()) return NS_MSG_ERROR_INVALID_FOLDER_NAME;
+#ifdef MOZ_PANORAMA
+  RefPtr<mozilla::mailnews::LocalStoreMigrationWork> migration;
+  MOZ_TRY(mozilla::mailnews::LocalStoreMigrationWork::Begin(
+      static_cast<nsIMsgPluggableStore*>(this), aParent, migration));
+  nsresult migrationResult = [&]() -> nsresult {
+#endif
+    NS_ENSURE_ARG_POINTER(aParent);
+    NS_ENSURE_ARG_POINTER(aResult);
+    if (aFolderName.IsEmpty()) return NS_MSG_ERROR_INVALID_FOLDER_NAME;
 
-  nsCOMPtr<nsIFile> path;
-  nsresult rv = aParent->GetFilePath(getter_AddRefs(path));
-  NS_ENSURE_SUCCESS(rv, rv);
+    nsCOMPtr<nsIFile> path;
+    nsresult rv = aParent->GetFilePath(getter_AddRefs(path));
+    NS_ENSURE_SUCCESS(rv, rv);
 
-  // Get a directory based on our current path
-  bool isServer;
-  aParent->GetIsServer(&isServer);
-  rv = CreateDirectoryForFolder(path, isServer);
-  NS_ENSURE_SUCCESS(rv, rv);
+    // Get a directory based on our current path
+    bool isServer;
+    aParent->GetIsServer(&isServer);
+    rv = CreateDirectoryForFolder(path, isServer);
+    NS_ENSURE_SUCCESS(rv, rv);
 
-  // Make sure the new folder name is valid
-  nsString safeFolderName16 = NS_MsgHashIfNecessary(aFolderName);
-  nsAutoCString safeFolderName = NS_ConvertUTF16toUTF8(safeFolderName16);
+    // Make sure the new folder name is valid
+    nsString safeFolderName16 = NS_MsgHashIfNecessary(aFolderName);
+    nsAutoCString safeFolderName = NS_ConvertUTF16toUTF8(safeFolderName16);
 
-  path->Append(safeFolderName16);
-  bool exists;
-  path->Exists(&exists);
-  if (exists)  // check this because localized names are different from disk
-               // names
-    return NS_MSG_FOLDER_EXISTS;
+    path->Append(safeFolderName16);
+    bool exists;
+    path->Exists(&exists);
+    if (exists)  // check this because localized names are different from disk
+                 // names
+      return NS_MSG_FOLDER_EXISTS;
 
-  rv = CreateMaildir(path);
-  NS_ENSURE_SUCCESS(rv, rv);
+    rv = CreateMaildir(path);
+    NS_ENSURE_SUCCESS(rv, rv);
 
-  nsCOMPtr<nsIMsgFolder> child;
-  // GetFlags and SetFlags in AddSubfolder will fail because we have no db at
-  // this point but mFlags is set.
-  rv = aParent->AddSubfolder(aFolderName, getter_AddRefs(child));
-  if (!child || NS_FAILED(rv)) {
-    path->Remove(true);  // recursive
-    return rv;
-  }
-
-  // Create an empty database for this mail folder, set its name from the user
-  nsCOMPtr<nsIMsgDBService> msgDBService =
-      do_GetService("@mozilla.org/msgDatabase/msgDBService;1", &rv);
-  if (msgDBService) {
-    nsCOMPtr<nsIMsgDatabase> unusedDB;
-    rv = msgDBService->OpenFolderDB(child, true, getter_AddRefs(unusedDB));
-    if (rv == NS_MSG_ERROR_FOLDER_SUMMARY_MISSING)
-      rv = msgDBService->CreateNewDB(child, getter_AddRefs(unusedDB));
-
-    if ((NS_SUCCEEDED(rv) || rv == NS_MSG_ERROR_FOLDER_SUMMARY_OUT_OF_DATE) &&
-        unusedDB) {
-      // need to set the folder name
-      nsCOMPtr<nsIDBFolderInfo> folderInfo;
-      rv = unusedDB->GetDBFolderInfo(getter_AddRefs(folderInfo));
-      if (NS_SUCCEEDED(rv)) {
-        folderInfo->SetMailboxName(safeFolderName);
-        // If the folder is stored under a hashed on-disk name, persist its
-        // real name in the summary so it survives a restart without the
-        // folder cache.
-        if (!safeFolderName.Equals(aFolderName)) {
-          folderInfo->SetFolderName(aFolderName);
-        }
-      }
-
-      unusedDB->SetSummaryValid(true);
-      unusedDB->Close(true);
-      aParent->UpdateSummaryTotals(true);
-    } else {
-      MOZ_LOG(MailDirLog, mozilla::LogLevel::Info,
-              ("CreateFolder - failed creating db for new folder"));
+    nsCOMPtr<nsIMsgFolder> child;
+    // GetFlags and SetFlags in AddSubfolder will fail because we have no db at
+    // this point but mFlags is set.
+    rv = aParent->AddSubfolder(aFolderName, getter_AddRefs(child));
+    if (!child || NS_FAILED(rv)) {
       path->Remove(true);  // recursive
-      rv = NS_MSG_CANT_CREATE_FOLDER;
+      return rv;
     }
-  }
-  child.forget(aResult);
-  return rv;
+
+    // Create an empty database for this mail folder, set its name from the user
+    nsCOMPtr<nsIMsgDBService> msgDBService =
+        do_GetService("@mozilla.org/msgDatabase/msgDBService;1", &rv);
+    if (msgDBService) {
+      nsCOMPtr<nsIMsgDatabase> unusedDB;
+      rv = msgDBService->OpenFolderDB(child, true, getter_AddRefs(unusedDB));
+      if (rv == NS_MSG_ERROR_FOLDER_SUMMARY_MISSING)
+        rv = msgDBService->CreateNewDB(child, getter_AddRefs(unusedDB));
+
+      if ((NS_SUCCEEDED(rv) || rv == NS_MSG_ERROR_FOLDER_SUMMARY_OUT_OF_DATE) &&
+          unusedDB) {
+        // need to set the folder name
+        nsCOMPtr<nsIDBFolderInfo> folderInfo;
+        rv = unusedDB->GetDBFolderInfo(getter_AddRefs(folderInfo));
+        if (NS_SUCCEEDED(rv)) {
+          folderInfo->SetMailboxName(safeFolderName);
+          // If the folder is stored under a hashed on-disk name, persist its
+          // real name in the summary so it survives a restart without the
+          // folder cache.
+          if (!safeFolderName.Equals(aFolderName)) {
+            folderInfo->SetFolderName(aFolderName);
+          }
+        }
+
+        unusedDB->SetSummaryValid(true);
+        unusedDB->Close(true);
+        aParent->UpdateSummaryTotals(true);
+      } else {
+        MOZ_LOG(MailDirLog, mozilla::LogLevel::Info,
+                ("CreateFolder - failed creating db for new folder"));
+        path->Remove(true);  // recursive
+        rv = NS_MSG_CANT_CREATE_FOLDER;
+      }
+    }
+    child.forget(aResult);
+    return rv;
+
+#ifdef MOZ_PANORAMA
+  }();
+  migration->Complete(migrationResult);
+  return migrationResult;
+#endif
 }
 
 NS_IMETHODIMP nsMsgMaildirStore::EnsureLocalStore(nsIMsgFolder* folder) {
-  NS_ENSURE_ARG(folder);
+#ifdef MOZ_PANORAMA
+  RefPtr<mozilla::mailnews::LocalStoreMigrationWork> migration;
+  MOZ_TRY(mozilla::mailnews::LocalStoreMigrationWork::Begin(
+      static_cast<nsIMsgPluggableStore*>(this), folder, migration));
+  nsresult migrationResult = [&]() -> nsresult {
+#endif
+    NS_ENSURE_ARG(folder);
 
-  nsCOMPtr<nsIFile> path;
-  nsresult rv = folder->GetFilePath(getter_AddRefs(path));
-  NS_ENSURE_SUCCESS(rv, rv);
-
-  bool exists = false;
-  rv = path->Exists(&exists);
-  NS_ENSURE_SUCCESS(rv, rv);
-
-  if (!exists) {
-    rv = CreateMaildir(path);
+    nsCOMPtr<nsIFile> path;
+    nsresult rv = folder->GetFilePath(getter_AddRefs(path));
     NS_ENSURE_SUCCESS(rv, rv);
-  }
 
-  return NS_OK;
+    bool exists = false;
+    rv = path->Exists(&exists);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    if (!exists) {
+      rv = CreateMaildir(path);
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
+
+    return NS_OK;
+
+#ifdef MOZ_PANORAMA
+  }();
+  migration->Complete(migrationResult);
+  return migrationResult;
+#endif
 }
 
 NS_IMETHODIMP nsMsgMaildirStore::HasSpaceAvailable(nsIMsgFolder* aFolder,
@@ -536,332 +623,406 @@ NS_IMETHODIMP nsMsgMaildirStore::IsSummaryFileValid(nsIMsgFolder* aFolder,
 NS_IMETHODIMP nsMsgMaildirStore::SetSummaryFileValid(nsIMsgFolder* aFolder,
                                                      nsIMsgDatabase* aDB,
                                                      bool aValid) {
-  NS_ENSURE_ARG_POINTER(aFolder);
-  NS_ENSURE_ARG_POINTER(aDB);
-  nsCOMPtr<nsIDBFolderInfo> dbFolderInfo;
-  aDB->GetDBFolderInfo(getter_AddRefs(dbFolderInfo));
-  NS_ENSURE_STATE(dbFolderInfo);
-  return dbFolderInfo->SetBooleanProperty("maildirValid", aValid);
+#ifdef MOZ_PANORAMA
+  RefPtr<mozilla::mailnews::LocalStoreMigrationWork> migration;
+  MOZ_TRY(mozilla::mailnews::LocalStoreMigrationWork::Begin(
+      static_cast<nsIMsgPluggableStore*>(this), aFolder, migration));
+  nsresult migrationResult = [&]() -> nsresult {
+#endif
+    NS_ENSURE_ARG_POINTER(aFolder);
+    NS_ENSURE_ARG_POINTER(aDB);
+    nsCOMPtr<nsIDBFolderInfo> dbFolderInfo;
+    aDB->GetDBFolderInfo(getter_AddRefs(dbFolderInfo));
+    NS_ENSURE_STATE(dbFolderInfo);
+    return dbFolderInfo->SetBooleanProperty("maildirValid", aValid);
+
+#ifdef MOZ_PANORAMA
+  }();
+  migration->Complete(migrationResult);
+  return migrationResult;
+#endif
 }
 
 NS_IMETHODIMP nsMsgMaildirStore::DeleteFolder(nsIMsgFolder* aFolder) {
-  NS_ENSURE_ARG_POINTER(aFolder);
 #ifdef MOZ_PANORAMA
-  // A retained native folder must not lose an issued write or its target.
-  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup() &&
-      mOngoingWrites.has(aFolder->URI())) {
-    return NS_ERROR_IN_PROGRESS;
-  }
+  RefPtr<mozilla::mailnews::LocalStoreMigrationWork> migration;
+  MOZ_TRY(mozilla::mailnews::LocalStoreMigrationWork::Begin(
+      static_cast<nsIMsgPluggableStore*>(this), aFolder, migration));
+  nsresult migrationResult = [&]() -> nsresult {
 #endif
-  bool exists;
+    NS_ENSURE_ARG_POINTER(aFolder);
+#ifdef MOZ_PANORAMA
+    // A retained native folder must not lose an issued write or its target.
+    if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup() &&
+        mOngoingWrites.has(aFolder->URI())) {
+      return NS_ERROR_IN_PROGRESS;
+    }
+#endif
+    bool exists;
 
-  // Delete the Maildir itself.
-  nsCOMPtr<nsIFile> pathFile;
-  nsresult rv = aFolder->GetFilePath(getter_AddRefs(pathFile));
-  NS_ENSURE_SUCCESS(rv, rv);
-
-  exists = false;
-  pathFile->Exists(&exists);
-  if (exists) {
-    rv = pathFile->Remove(true);
+    // Delete the Maildir itself.
+    nsCOMPtr<nsIFile> pathFile;
+    nsresult rv = aFolder->GetFilePath(getter_AddRefs(pathFile));
     NS_ENSURE_SUCCESS(rv, rv);
-  }
 
-  // Delete any subfolders (.sbd-suffixed directories).
-  AddDirectorySeparator(pathFile);
-  exists = false;
-  pathFile->Exists(&exists);
-  if (exists) {
-    rv = pathFile->Remove(true);
-    NS_ENSURE_SUCCESS(rv, rv);
-  }
+    exists = false;
+    pathFile->Exists(&exists);
+    if (exists) {
+      rv = pathFile->Remove(true);
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
 
-  return NS_OK;
+    // Delete any subfolders (.sbd-suffixed directories).
+    AddDirectorySeparator(pathFile);
+    exists = false;
+    pathFile->Exists(&exists);
+    if (exists) {
+      rv = pathFile->Remove(true);
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
+
+    return NS_OK;
+
+#ifdef MOZ_PANORAMA
+  }();
+  migration->Complete(migrationResult);
+  return migrationResult;
+#endif
 }
 
 NS_IMETHODIMP nsMsgMaildirStore::RenameFolder(nsIMsgFolder* aFolder,
                                               const nsACString& aNewName,
                                               nsIMsgFolder** aNewFolder) {
-  NS_ENSURE_ARG_POINTER(aFolder);
-  NS_ENSURE_ARG_POINTER(aNewFolder);
+#ifdef MOZ_PANORAMA
+  RefPtr<mozilla::mailnews::LocalStoreMigrationWork> migration;
+  MOZ_TRY(mozilla::mailnews::LocalStoreMigrationWork::Begin(
+      static_cast<nsIMsgPluggableStore*>(this), aFolder, migration));
+  nsresult migrationResult = [&]() -> nsresult {
+#endif
+    NS_ENSURE_ARG_POINTER(aFolder);
+    NS_ENSURE_ARG_POINTER(aNewFolder);
 
-  // old path
-  nsCOMPtr<nsIFile> oldPathFile;
-  nsresult rv = aFolder->GetFilePath(getter_AddRefs(oldPathFile));
-  NS_ENSURE_SUCCESS(rv, rv);
-
-  // old sbd directory
-  nsCOMPtr<nsIFile> sbdPathFile;
-  uint32_t numChildren;
-  aFolder->GetNumSubFolders(&numChildren);
-  if (numChildren > 0) {
-    sbdPathFile = new nsLocalFile();
-    rv = sbdPathFile->InitWithFile(oldPathFile);
+    // old path
+    nsCOMPtr<nsIFile> oldPathFile;
+    nsresult rv = aFolder->GetFilePath(getter_AddRefs(oldPathFile));
     NS_ENSURE_SUCCESS(rv, rv);
-    GetDirectoryForFolder(sbdPathFile);
-  }
 
-  // old summary
-  nsCOMPtr<nsIFile> oldSummaryFile;
-  rv = aFolder->GetSummaryFile(getter_AddRefs(oldSummaryFile));
-  NS_ENSURE_SUCCESS(rv, rv);
+    // old sbd directory
+    nsCOMPtr<nsIFile> sbdPathFile;
+    uint32_t numChildren;
+    aFolder->GetNumSubFolders(&numChildren);
+    if (numChildren > 0) {
+      sbdPathFile = new nsLocalFile();
+      rv = sbdPathFile->InitWithFile(oldPathFile);
+      NS_ENSURE_SUCCESS(rv, rv);
+      GetDirectoryForFolder(sbdPathFile);
+    }
 
-  // Validate new name
-  nsString safeFolderName16 = NS_MsgHashIfNecessary(aNewName);
-  nsAutoCString safeFolderName = NS_ConvertUTF16toUTF8(safeFolderName16);
+    // old summary
+    nsCOMPtr<nsIFile> oldSummaryFile;
+    rv = aFolder->GetSummaryFile(getter_AddRefs(oldSummaryFile));
+    NS_ENSURE_SUCCESS(rv, rv);
 
-  aFolder->ForceDBClosed();
+    // Validate new name
+    nsString safeFolderName16 = NS_MsgHashIfNecessary(aNewName);
+    nsAutoCString safeFolderName = NS_ConvertUTF16toUTF8(safeFolderName16);
 
-  // rename folder
-  rv = oldPathFile->MoveTo(nullptr, safeFolderName16);
-  NS_ENSURE_SUCCESS(rv, rv);
+    aFolder->ForceDBClosed();
 
-  if (numChildren > 0) {
-    // rename "*.sbd" directory
-    nsAutoString sbdName(safeFolderName16);
-    sbdName.AppendLiteral(FOLDER_SUFFIX);
-    sbdPathFile->MoveTo(nullptr, sbdName);
-  }
+    // rename folder
+    rv = oldPathFile->MoveTo(nullptr, safeFolderName16);
+    NS_ENSURE_SUCCESS(rv, rv);
 
-  // rename summary
-  nsAutoString summaryName(safeFolderName16);
-  summaryName.AppendLiteral(SUMMARY_SUFFIX);
-  oldSummaryFile->MoveTo(nullptr, summaryName);
+    if (numChildren > 0) {
+      // rename "*.sbd" directory
+      nsAutoString sbdName(safeFolderName16);
+      sbdName.AppendLiteral(FOLDER_SUFFIX);
+      sbdPathFile->MoveTo(nullptr, sbdName);
+    }
 
-  nsCOMPtr<nsIMsgFolder> parentFolder;
-  rv = aFolder->GetParent(getter_AddRefs(parentFolder));
-  if (!parentFolder) return NS_ERROR_NULL_POINTER;
+    // rename summary
+    nsAutoString summaryName(safeFolderName16);
+    summaryName.AppendLiteral(SUMMARY_SUFFIX);
+    oldSummaryFile->MoveTo(nullptr, summaryName);
 
-  return parentFolder->AddSubfolder(safeFolderName, aNewFolder);
+    nsCOMPtr<nsIMsgFolder> parentFolder;
+    rv = aFolder->GetParent(getter_AddRefs(parentFolder));
+    if (!parentFolder) return NS_ERROR_NULL_POINTER;
+
+    return parentFolder->AddSubfolder(safeFolderName, aNewFolder);
+
+#ifdef MOZ_PANORAMA
+  }();
+  migration->Complete(migrationResult);
+  return migrationResult;
+#endif
 }
 
 NS_IMETHODIMP nsMsgMaildirStore::CopyFolder(
     nsIMsgFolder* aSrcFolder, nsIMsgFolder* aDstFolder, bool aIsMoveFolder,
     nsIMsgWindow* aMsgWindow, nsIMsgCopyServiceListener* aListener,
     const nsACString& aNewName) {
-  NS_ENSURE_ARG_POINTER(aSrcFolder);
-  NS_ENSURE_ARG_POINTER(aDstFolder);
+#ifdef MOZ_PANORAMA
+  RefPtr<mozilla::mailnews::LocalStoreMigrationWork> migration;
+  MOZ_TRY(mozilla::mailnews::LocalStoreMigrationWork::Begin(
+      static_cast<nsIMsgPluggableStore*>(this), aSrcFolder, migration));
+  MOZ_TRY(migration->AddFolder(aDstFolder));
+  nsresult migrationResult = [&]() -> nsresult {
+#endif
+    NS_ENSURE_ARG_POINTER(aSrcFolder);
+    NS_ENSURE_ARG_POINTER(aDstFolder);
 
-  nsAutoCString folderName;
-  if (aNewName.IsEmpty()) {
-    aSrcFolder->GetName(folderName);
-  } else {
-    folderName.Assign(aNewName);
-  }
+    nsAutoCString folderName;
+    if (aNewName.IsEmpty()) {
+      aSrcFolder->GetName(folderName);
+    } else {
+      folderName.Assign(aNewName);
+    }
 
-  nsString safeFolderName16 = NS_MsgHashIfNecessary(folderName);
-  nsAutoCString safeFolderName = NS_ConvertUTF16toUTF8(safeFolderName16);
+    nsString safeFolderName16 = NS_MsgHashIfNecessary(folderName);
+    nsAutoCString safeFolderName = NS_ConvertUTF16toUTF8(safeFolderName16);
 
-  aSrcFolder->ForceDBClosed();
+    aSrcFolder->ForceDBClosed();
 
-  nsCOMPtr<nsIFile> oldPath;
-  nsresult rv = aSrcFolder->GetFilePath(getter_AddRefs(oldPath));
-  NS_ENSURE_SUCCESS(rv, rv);
+    nsCOMPtr<nsIFile> oldPath;
+    nsresult rv = aSrcFolder->GetFilePath(getter_AddRefs(oldPath));
+    NS_ENSURE_SUCCESS(rv, rv);
 
-  nsCOMPtr<nsIFile> summaryFile;
-  GetSummaryFileLocation(oldPath, getter_AddRefs(summaryFile));
+    nsCOMPtr<nsIFile> summaryFile;
+    GetSummaryFileLocation(oldPath, getter_AddRefs(summaryFile));
 
-  nsCOMPtr<nsIFile> newPath;
-  rv = aDstFolder->GetFilePath(getter_AddRefs(newPath));
-  NS_ENSURE_SUCCESS(rv, rv);
+    nsCOMPtr<nsIFile> newPath;
+    rv = aDstFolder->GetFilePath(getter_AddRefs(newPath));
+    NS_ENSURE_SUCCESS(rv, rv);
 
-  // create target directory based on our current path
-  bool isServer;
-  aDstFolder->GetIsServer(&isServer);
-  rv = CreateDirectoryForFolder(newPath, isServer);
-  NS_ENSURE_SUCCESS(rv, rv);
+    // create target directory based on our current path
+    bool isServer;
+    aDstFolder->GetIsServer(&isServer);
+    rv = CreateDirectoryForFolder(newPath, isServer);
+    NS_ENSURE_SUCCESS(rv, rv);
 
-  // Only copy existing Maildir folders. There is no actual folder present for
-  // a saved search (virtual folder).
-  bool exists;
-  oldPath->Exists(&exists);
-  if (exists) {
-    rv = oldPath->CopyTo(newPath, safeFolderName16);
-    NS_ENSURE_SUCCESS(rv, rv);  // Will fail if a file by that name exists.
-  }
-
-  // Copy to dir can fail if file does not exist. If copy fails, we test
-  // if the file exists or not, if it does not that's ok, we continue
-  // without copying it. If it fails and file exist and is not zero sized
-  // there is real problem.
-  nsAutoString dbName(safeFolderName16);
-  dbName.AppendLiteral(SUMMARY_SUFFIX);
-  rv = summaryFile->CopyTo(newPath, dbName);
-  if (!NS_SUCCEEDED(rv)) {
-    // Test if the file is not empty
+    // Only copy existing Maildir folders. There is no actual folder present for
+    // a saved search (virtual folder).
     bool exists;
-    int64_t fileSize;
-    summaryFile->Exists(&exists);
-    summaryFile->GetFileSize(&fileSize);
-    if (exists && fileSize > 0) {
-      NS_ENSURE_SUCCESS(rv, rv);  // Yes, it should have worked!
+    oldPath->Exists(&exists);
+    if (exists) {
+      rv = oldPath->CopyTo(newPath, safeFolderName16);
+      NS_ENSURE_SUCCESS(rv, rv);  // Will fail if a file by that name exists.
     }
-    // else case is file is zero sized, no need to copy it,
-    // not an error
-    // else case is file does not exist - not an error
-  }
 
-  nsCOMPtr<nsIMsgFolder> newMsgFolder;
-  rv = aDstFolder->AddSubfolder(safeFolderName, getter_AddRefs(newMsgFolder));
-  NS_ENSURE_SUCCESS(rv, rv);
+    // Copy to dir can fail if file does not exist. If copy fails, we test
+    // if the file exists or not, if it does not that's ok, we continue
+    // without copying it. If it fails and file exist and is not zero sized
+    // there is real problem.
+    nsAutoString dbName(safeFolderName16);
+    dbName.AppendLiteral(SUMMARY_SUFFIX);
+    rv = summaryFile->CopyTo(newPath, dbName);
+    if (!NS_SUCCEEDED(rv)) {
+      // Test if the file is not empty
+      bool exists;
+      int64_t fileSize;
+      summaryFile->Exists(&exists);
+      summaryFile->GetFileSize(&fileSize);
+      if (exists && fileSize > 0) {
+        NS_ENSURE_SUCCESS(rv, rv);  // Yes, it should have worked!
+      }
+      // else case is file is zero sized, no need to copy it,
+      // not an error
+      // else case is file does not exist - not an error
+    }
 
-  newMsgFolder->SetName(folderName);
-  uint32_t flags;
-  aSrcFolder->GetFlags(&flags);
-  newMsgFolder->SetFlags(flags);
-  bool changed = false;
-  rv = aSrcFolder->MatchOrChangeFilterDestination(newMsgFolder, true, &changed);
-  if (changed) aSrcFolder->AlertFilterChanged(aMsgWindow);
+    nsCOMPtr<nsIMsgFolder> newMsgFolder;
+    rv = aDstFolder->AddSubfolder(safeFolderName, getter_AddRefs(newMsgFolder));
+    NS_ENSURE_SUCCESS(rv, rv);
 
-  nsTArray<RefPtr<nsIMsgFolder>> subFolders;
-  rv = aSrcFolder->GetSubFolders(subFolders);
-  NS_ENSURE_SUCCESS(rv, rv);
+    newMsgFolder->SetName(folderName);
+    uint32_t flags;
+    aSrcFolder->GetFlags(&flags);
+    newMsgFolder->SetFlags(flags);
+    bool changed = false;
+    rv = aSrcFolder->MatchOrChangeFilterDestination(newMsgFolder, true,
+                                                    &changed);
+    if (changed) aSrcFolder->AlertFilterChanged(aMsgWindow);
 
-  // Copy subfolders to the new location
-  nsresult copyStatus = NS_OK;
-  nsCOMPtr<nsIMsgLocalMailFolder> localNewFolder(
-      do_QueryInterface(newMsgFolder, &rv));
-  if (NS_SUCCEEDED(rv)) {
-    for (nsIMsgFolder* folder : subFolders) {
-      copyStatus =
-          localNewFolder->CopyFolderLocal(folder, false, aMsgWindow, aListener);
-      // Test if the call succeeded, if not we have to stop recursive call
-      if (NS_FAILED(copyStatus)) {
-        // Copy failed we have to notify caller to handle the error and stop
-        // moving the folders. In case this happens to the topmost level of
-        // recursive call, then we just need to break from the while loop and
-        // go to error handling code.
-        if (!aIsMoveFolder) return copyStatus;
-        break;
+    nsTArray<RefPtr<nsIMsgFolder>> subFolders;
+    rv = aSrcFolder->GetSubFolders(subFolders);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    // Copy subfolders to the new location
+    nsresult copyStatus = NS_OK;
+    nsCOMPtr<nsIMsgLocalMailFolder> localNewFolder(
+        do_QueryInterface(newMsgFolder, &rv));
+    if (NS_SUCCEEDED(rv)) {
+      for (nsIMsgFolder* folder : subFolders) {
+        copyStatus = localNewFolder->CopyFolderLocal(folder, false, aMsgWindow,
+                                                     aListener);
+        // Test if the call succeeded, if not we have to stop recursive call
+        if (NS_FAILED(copyStatus)) {
+          // Copy failed we have to notify caller to handle the error and stop
+          // moving the folders. In case this happens to the topmost level of
+          // recursive call, then we just need to break from the while loop and
+          // go to error handling code.
+          if (!aIsMoveFolder) return copyStatus;
+          break;
+        }
       }
     }
-  }
 
-  if (aIsMoveFolder && NS_SUCCEEDED(copyStatus)) {
-    if (localNewFolder) {
-      nsCOMPtr<nsISupports> srcSupport(do_QueryInterface(aSrcFolder));
-      localNewFolder->OnCopyCompleted(srcSupport, true);
-    }
+    if (aIsMoveFolder && NS_SUCCEEDED(copyStatus)) {
+      if (localNewFolder) {
+        nsCOMPtr<nsISupports> srcSupport(do_QueryInterface(aSrcFolder));
+        localNewFolder->OnCopyCompleted(srcSupport, true);
+      }
 
-    // Notify that the folder that was dragged and dropped has been created.
-    // No need to do this for its subfolders - isMoveFolder will be true for
-    // folder.
-    aDstFolder->NotifyFolderAdded(newMsgFolder);
+      // Notify that the folder that was dragged and dropped has been created.
+      // No need to do this for its subfolders - isMoveFolder will be true for
+      // folder.
+      aDstFolder->NotifyFolderAdded(newMsgFolder);
 
-    nsCOMPtr<nsIMsgFolder> msgParent;
-    aSrcFolder->GetParent(getter_AddRefs(msgParent));
-    aSrcFolder->SetParent(nullptr);
-    if (msgParent) {
-      // The files have already been moved, so delete storage false
-      msgParent->PropagateDelete(aSrcFolder, false);
-      oldPath->Remove(true);
-      aSrcFolder->DeleteStorage();
-
-      nsCOMPtr<nsIFile> parentPath;
-      rv = msgParent->GetFilePath(getter_AddRefs(parentPath));
-      NS_ENSURE_SUCCESS(rv, rv);
-
-      AddDirectorySeparator(parentPath);
-      nsCOMPtr<nsIDirectoryEnumerator> children;
-      parentPath->GetDirectoryEntries(getter_AddRefs(children));
-      bool more;
-      // checks if the directory is empty or not
-      if (children && NS_SUCCEEDED(children->HasMoreElements(&more)) && !more)
-        parentPath->Remove(true);
-    }
-  } else {
-    // This is the case where the copy of a subfolder failed.
-    // We have to delete the newDirectory tree to make a "rollback".
-    // Someone should add a popup to warn the user that the move was not
-    // possible.
-    if (aIsMoveFolder && NS_FAILED(copyStatus)) {
       nsCOMPtr<nsIMsgFolder> msgParent;
-      newMsgFolder->ForceDBClosed();
-      newMsgFolder->GetParent(getter_AddRefs(msgParent));
-      newMsgFolder->SetParent(nullptr);
+      aSrcFolder->GetParent(getter_AddRefs(msgParent));
+      aSrcFolder->SetParent(nullptr);
       if (msgParent) {
-        msgParent->PropagateDelete(newMsgFolder, false);
-        newMsgFolder->DeleteStorage();
-        AddDirectorySeparator(newPath);
-        newPath->Remove(true);  // berkeley mailbox
+        // The files have already been moved, so delete storage false
+        msgParent->PropagateDelete(aSrcFolder, false);
+        oldPath->Remove(true);
+        aSrcFolder->DeleteStorage();
+
+        nsCOMPtr<nsIFile> parentPath;
+        rv = msgParent->GetFilePath(getter_AddRefs(parentPath));
+        NS_ENSURE_SUCCESS(rv, rv);
+
+        AddDirectorySeparator(parentPath);
+        nsCOMPtr<nsIDirectoryEnumerator> children;
+        parentPath->GetDirectoryEntries(getter_AddRefs(children));
+        bool more;
+        // checks if the directory is empty or not
+        if (children && NS_SUCCEEDED(children->HasMoreElements(&more)) && !more)
+          parentPath->Remove(true);
       }
-      return NS_ERROR_FAILURE;
+    } else {
+      // This is the case where the copy of a subfolder failed.
+      // We have to delete the newDirectory tree to make a "rollback".
+      // Someone should add a popup to warn the user that the move was not
+      // possible.
+      if (aIsMoveFolder && NS_FAILED(copyStatus)) {
+        nsCOMPtr<nsIMsgFolder> msgParent;
+        newMsgFolder->ForceDBClosed();
+        newMsgFolder->GetParent(getter_AddRefs(msgParent));
+        newMsgFolder->SetParent(nullptr);
+        if (msgParent) {
+          msgParent->PropagateDelete(newMsgFolder, false);
+          newMsgFolder->DeleteStorage();
+          AddDirectorySeparator(newPath);
+          newPath->Remove(true);  // berkeley mailbox
+        }
+        return NS_ERROR_FAILURE;
+      }
     }
-  }
-  return NS_OK;
+    return NS_OK;
+
+#ifdef MOZ_PANORAMA
+  }();
+  migration->Complete(migrationResult);
+  return migrationResult;
+#endif
 }
 
 nsresult nsMsgMaildirStore::InternalGetNewMsgOutputStream(
     nsIMsgFolder* folder, nsACString& storeToken, nsIOutputStream** outStream) {
 #ifdef MOZ_PANORAMA
-  MOZ_TRY(CheckNativePurgePending(folder));
+  NS_ENSURE_ARG(folder);
+  NS_ENSURE_ARG_POINTER(outStream);
+  RefPtr<mozilla::mailnews::LocalStoreMigrationWork> migration;
+  MOZ_TRY(mozilla::mailnews::LocalStoreMigrationWork::Begin(
+      static_cast<nsIMsgPluggableStore*>(this), folder, migration));
+#endif
+  [[maybe_unused]] bool migrationSideEffects = false;
+#ifdef MOZ_PANORAMA
+  nsresult migrationResult = [&]() -> nsresult {
 #endif
 
-  // Check path admission before preempting an issued stream. A failed native
-  // relocation can deny this path while the previous stream still owns bytes.
-  nsCOMPtr<nsIFile> admittedPath;
-  nsresult rv = folder->GetFilePath(getter_AddRefs(admittedPath));
-  NS_ENSURE_SUCCESS(rv, rv);
-  // To set up to write a new message:
-  // 1. Discard any ongoing write already active in the folder.
-  // 2. Generate a unique filename.
-  // 3. Open output stream to write to "tmp/{filename}".
-  // 4. Store the stream and filename in the mOngoingWrites map.
+#ifdef MOZ_PANORAMA
+    MOZ_TRY(CheckNativePurgePending(folder));
+#endif
 
-  // Are we already writing to this folder? If so, we'll ditch the existing
-  // write. This behaviour is implicitly expected by the protocol->folder
-  // interface (sigh).
-  auto existing = mOngoingWrites.lookup(folder->URI());
-  if (existing) {
-    // Uhoh.
-    MOZ_LOG(MailDirLog, mozilla::LogLevel::Error,
-            ("Already writing to folder '%s'", folder->URI().get()));
-    NS_WARNING(
-        nsPrintfCString("Already writing to folder '%s'", folder->URI().get())
-            .get());
+    // Check path admission before preempting an issued stream. A failed native
+    // relocation can deny this path while the previous stream still owns bytes.
+    nsCOMPtr<nsIFile> admittedPath;
+    nsresult rv = folder->GetFilePath(getter_AddRefs(admittedPath));
+    NS_ENSURE_SUCCESS(rv, rv);
+    // To set up to write a new message:
+    // 1. Discard any ongoing write already active in the folder.
+    // 2. Generate a unique filename.
+    // 3. Open output stream to write to "tmp/{filename}".
+    // 4. Store the stream and filename in the mOngoingWrites map.
 
-    if (NS_FAILED(existing->value().finishStatus)) {
-      return existing->value().finishStatus;
+    // Are we already writing to this folder? If so, we'll ditch the existing
+    // write. This behaviour is implicitly expected by the protocol->folder
+    // interface (sigh).
+    auto existing = mOngoingWrites.lookup(folder->URI());
+    if (existing) {
+      // Uhoh.
+      MOZ_LOG(MailDirLog, mozilla::LogLevel::Error,
+              ("Already writing to folder '%s'", folder->URI().get()));
+      NS_WARNING(
+          nsPrintfCString("Already writing to folder '%s'", folder->URI().get())
+              .get());
+
+      if (NS_FAILED(existing->value().finishStatus)) {
+        return existing->value().finishStatus;
+      }
+
+      nsCOMPtr<nsIOutputStream> stream = existing->value().stream;
+      rv = DiscardNewMessage(folder, stream);
+      NS_ENSURE_SUCCESS(rv, rv);
     }
 
-    nsCOMPtr<nsIOutputStream> stream = existing->value().stream;
-    rv = DiscardNewMessage(folder, stream);
+    // Time to open a new stream for writing.
+
+    // Generate a unique name for the file.
+    // We need ".eml" for OS search integration (for windows, anyway).
+    nsAutoCString filename(UniqueName());
+    filename.AppendLiteral(".eml");
+
+    // We're going to save the new message into the maildir 'tmp' folder.
+    // When the message is completed, it can be moved to 'cur'.
+    nsCOMPtr<nsIFile> tmpFile;
+    migrationSideEffects = true;
+    rv = EnsureSubDir(folder, u"tmp"_ns, getter_AddRefs(tmpFile));
     NS_ENSURE_SUCCESS(rv, rv);
+    tmpFile->Append(NS_ConvertUTF8toUTF16(filename));
+
+    bool fileExists;
+    tmpFile->Exists(&fileExists);
+    if (fileExists) {
+      return NS_ERROR_FILE_ALREADY_EXISTS;
+    }
+
+    nsCOMPtr<nsIOutputStream> stream;
+    rv = MsgNewBufferedFileOutputStream(getter_AddRefs(stream), tmpFile,
+                                        PR_WRONLY | PR_CREATE_FILE, 00600);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    // Up and running - add the stream to the set of ongoing writes.
+    StreamDetails admitted{filename, stream.get()};
+#ifdef MOZ_PANORAMA
+    admitted.migration = migration;
+#endif
+    MOZ_ALWAYS_TRUE(mOngoingWrites.putNew(folder->URI(), std::move(admitted)));
+
+    // Done! Return stream and filename.
+    storeToken = filename;
+    stream.forget(outStream);
+    return NS_OK;
+
+#ifdef MOZ_PANORAMA
+  }();
+  if (NS_FAILED(migrationResult)) {
+    migration->Complete(migrationResult, !migrationSideEffects);
   }
-
-  // Time to open a new stream for writing.
-
-  // Generate a unique name for the file.
-  // We need ".eml" for OS search integration (for windows, anyway).
-  nsAutoCString filename(UniqueName());
-  filename.AppendLiteral(".eml");
-
-  // We're going to save the new message into the maildir 'tmp' folder.
-  // When the message is completed, it can be moved to 'cur'.
-  nsCOMPtr<nsIFile> tmpFile;
-  rv = EnsureSubDir(folder, u"tmp"_ns, getter_AddRefs(tmpFile));
-  NS_ENSURE_SUCCESS(rv, rv);
-  tmpFile->Append(NS_ConvertUTF8toUTF16(filename));
-
-  bool fileExists;
-  tmpFile->Exists(&fileExists);
-  if (fileExists) {
-    return NS_ERROR_FILE_ALREADY_EXISTS;
-  }
-
-  nsCOMPtr<nsIOutputStream> stream;
-  rv = MsgNewBufferedFileOutputStream(getter_AddRefs(stream), tmpFile,
-                                      PR_WRONLY | PR_CREATE_FILE, 00600);
-  NS_ENSURE_SUCCESS(rv, rv);
-
-  // Up and running - add the stream to the set of ongoing writes.
-  MOZ_ALWAYS_TRUE(mOngoingWrites.putNew(folder->URI(),
-                                        StreamDetails{filename, stream.get()}));
-
-  // Done! Return stream and filename.
-  storeToken = filename;
-  stream.forget(outStream);
-  return NS_OK;
+  return migrationResult;
+#endif
 }
 
 NS_IMETHODIMP
@@ -877,113 +1038,157 @@ NS_IMETHODIMP
 nsMsgMaildirStore::FinishNewMessage(nsIMsgFolder* folder,
                                     nsIOutputStream* outStream,
                                     nsACString& storeToken) {
+#ifdef MOZ_PANORAMA
   NS_ENSURE_ARG(folder);
   NS_ENSURE_ARG(outStream);
-
-  auto entry = mOngoingWrites.lookup(folder->URI());
-  if (!entry || outStream != entry->value().stream) {
-    return NS_ERROR_ILLEGAL_VALUE;
+  RefPtr<mozilla::mailnews::LocalStoreMigrationWork> migration;
+  auto migrationEntry = mOngoingWrites.lookup(folder->URI());
+  if (migrationEntry && migrationEntry->value().stream == outStream) {
+    migration = migrationEntry->value().migration;
+    if (migration) MOZ_TRY(migration->Validate());
   }
-  auto& details = entry->value();
-  if (NS_FAILED(details.finishStatus)) {
-    return details.finishStatus;
-  }
-  auto fail = [&](nsresult status) {
-    details.finishStatus = status;
-    MOZ_LOG(
-        MailDirLog, mozilla::LogLevel::Error,
-        ("Finish failed: folder=%s token=%s mayHaveMoved=%d status=%" PRIx32,
-         folder->URI().get(), details.filename.get(), details.mayHaveMoved,
-         static_cast<uint32_t>(status)));
-    return status;
-  };
+  nsresult migrationResult = [&]() -> nsresult {
+#endif
+    NS_ENSURE_ARG(folder);
+    NS_ENSURE_ARG(outStream);
 
-  nsCOMPtr<nsIFile> curDir;
-  nsresult rv = EnsureSubDir(folder, u"cur"_ns, getter_AddRefs(curDir));
-  if (NS_FAILED(rv)) return fail(rv);
+    auto entry = mOngoingWrites.lookup(folder->URI());
+    if (!entry || outStream != entry->value().stream) {
+      return NS_ERROR_ILLEGAL_VALUE;
+    }
+    auto& details = entry->value();
+    if (NS_FAILED(details.finishStatus)) {
+      return details.finishStatus;
+    }
+    auto fail = [&](nsresult status) {
+      details.finishStatus = status;
+      MOZ_LOG(
+          MailDirLog, mozilla::LogLevel::Error,
+          ("Finish failed: folder=%s token=%s mayHaveMoved=%d status=%" PRIx32,
+           folder->URI().get(), details.filename.get(), details.mayHaveMoved,
+           static_cast<uint32_t>(status)));
+      return status;
+    };
 
-  nsCOMPtr<nsIFile> tmpFile;
-  rv = EnsureSubDir(folder, u"tmp"_ns, getter_AddRefs(tmpFile));
-  if (NS_FAILED(rv)) return fail(rv);
-  rv = tmpFile->Append(NS_ConvertUTF8toUTF16(details.filename));
-  if (NS_FAILED(rv)) return fail(rv);
-
-  rv = outStream->Close();
-  if (NS_FAILED(rv)) return fail(rv);
-
-  // Filters can move the file into cur before the download finishes.
-  bool exists;
-  rv = tmpFile->Exists(&exists);
-  if (NS_FAILED(rv)) return fail(rv);
-  if (!exists) {
-    details.mayHaveMoved = true;
-    nsCOMPtr<nsIFile> destPath;
-    rv = curDir->Clone(getter_AddRefs(destPath));
+    nsCOMPtr<nsIFile> curDir;
+    nsresult rv = EnsureSubDir(folder, u"cur"_ns, getter_AddRefs(curDir));
     if (NS_FAILED(rv)) return fail(rv);
-    rv = destPath->Append(NS_ConvertUTF8toUTF16(details.filename));
+
+    nsCOMPtr<nsIFile> tmpFile;
+    rv = EnsureSubDir(folder, u"tmp"_ns, getter_AddRefs(tmpFile));
     if (NS_FAILED(rv)) return fail(rv);
-    rv = destPath->Exists(&exists);
+    rv = tmpFile->Append(NS_ConvertUTF8toUTF16(details.filename));
+    if (NS_FAILED(rv)) return fail(rv);
+
+    rv = outStream->Close();
+    if (NS_FAILED(rv)) return fail(rv);
+
+    // Filters can move the file into cur before the download finishes.
+    bool exists;
+    rv = tmpFile->Exists(&exists);
     if (NS_FAILED(rv)) return fail(rv);
     if (!exists) {
-      return fail(NS_ERROR_FILE_NOT_FOUND);
+      details.mayHaveMoved = true;
+      nsCOMPtr<nsIFile> destPath;
+      rv = curDir->Clone(getter_AddRefs(destPath));
+      if (NS_FAILED(rv)) return fail(rv);
+      rv = destPath->Append(NS_ConvertUTF8toUTF16(details.filename));
+      if (NS_FAILED(rv)) return fail(rv);
+      rv = destPath->Exists(&exists);
+      if (NS_FAILED(rv)) return fail(rv);
+      if (!exists) {
+        return fail(NS_ERROR_FILE_NOT_FOUND);
+      }
+    } else {
+      // A failed rename may still have settled bytes in cur. Keep its identity.
+      details.mayHaveMoved = true;
+      rv = tmpFile->MoveTo(curDir, EmptyString());
+      if (NS_FAILED(rv)) return fail(rv);
     }
-  } else {
-    // A failed rename may still have settled bytes in cur. Keep its identity.
-    details.mayHaveMoved = true;
-    rv = tmpFile->MoveTo(curDir, EmptyString());
-    if (NS_FAILED(rv)) return fail(rv);
-  }
 
-  storeToken = details.filename;
-  mOngoingWrites.remove(entry);
-  return NS_OK;
+    storeToken = details.filename;
+    mOngoingWrites.remove(entry);
+    return NS_OK;
+
+#ifdef MOZ_PANORAMA
+  }();
+  if (migration && !migration->IsTerminal()) {
+    if (NS_SUCCEEDED(migrationResult))
+      migration->Complete(migrationResult);
+    else
+      migration->RecordError(migrationResult);
+  }
+  return migrationResult;
+#endif
 }
 
 NS_IMETHODIMP
 nsMsgMaildirStore::DiscardNewMessage(nsIMsgFolder* folder,
                                      nsIOutputStream* outStream) {
+#ifdef MOZ_PANORAMA
   NS_ENSURE_ARG(folder);
   NS_ENSURE_ARG(outStream);
-
-  auto entry = mOngoingWrites.lookup(folder->URI());
-  if (!entry || outStream != entry->value().stream) {
-    return NS_ERROR_ILLEGAL_VALUE;
+  RefPtr<mozilla::mailnews::LocalStoreMigrationWork> migration;
+  auto migrationEntry = mOngoingWrites.lookup(folder->URI());
+  if (migrationEntry && migrationEntry->value().stream == outStream) {
+    migration = migrationEntry->value().migration;
+    if (migration) MOZ_TRY(migration->Validate());
   }
-  auto& details = entry->value();
-  if (details.mayHaveMoved) {
-    // Discard only owns unfinished tmp bytes, never a possible cur message.
-    return NS_FAILED(details.finishStatus) ? details.finishStatus
-                                           : NS_ERROR_NOT_AVAILABLE;
+  nsresult migrationResult = [&]() -> nsresult {
+#endif
+    NS_ENSURE_ARG(folder);
+    NS_ENSURE_ARG(outStream);
+
+    auto entry = mOngoingWrites.lookup(folder->URI());
+    if (!entry || outStream != entry->value().stream) {
+      return NS_ERROR_ILLEGAL_VALUE;
+    }
+    auto& details = entry->value();
+    if (details.mayHaveMoved) {
+      // Discard only owns unfinished tmp bytes, never a possible cur message.
+      return NS_FAILED(details.finishStatus) ? details.finishStatus
+                                             : NS_ERROR_NOT_AVAILABLE;
+    }
+    auto fail = [&](nsresult status) {
+      if (NS_SUCCEEDED(details.finishStatus)) details.finishStatus = status;
+      MOZ_LOG(MailDirLog, mozilla::LogLevel::Error,
+              ("Discard failed: folder=%s token=%s status=%" PRIx32,
+               folder->URI().get(), details.filename.get(),
+               static_cast<uint32_t>(status)));
+      return status;
+    };
+
+    nsresult rv = outStream->Close();
+    if (NS_FAILED(rv)) return fail(rv);
+
+    nsCOMPtr<nsIFile> tmpFile;
+    rv = EnsureSubDir(folder, u"tmp"_ns, getter_AddRefs(tmpFile));
+    if (NS_FAILED(rv)) return fail(rv);
+    rv = tmpFile->Append(NS_ConvertUTF8toUTF16(details.filename));
+    if (NS_FAILED(rv)) return fail(rv);
+    bool exists;
+    rv = tmpFile->Exists(&exists);
+    if (NS_FAILED(rv)) return fail(rv);
+    if (!exists) {
+      details.mayHaveMoved = true;
+      return fail(NS_ERROR_FILE_NOT_FOUND);
+    }
+    rv = tmpFile->Remove(false);
+    if (NS_FAILED(rv)) return fail(rv);
+
+    mOngoingWrites.remove(entry);
+    return NS_OK;
+
+#ifdef MOZ_PANORAMA
+  }();
+  if (migration && !migration->IsTerminal()) {
+    if (NS_SUCCEEDED(migrationResult))
+      migration->Complete(migrationResult);
+    else
+      migration->RecordError(migrationResult);
   }
-  auto fail = [&](nsresult status) {
-    if (NS_SUCCEEDED(details.finishStatus)) details.finishStatus = status;
-    MOZ_LOG(MailDirLog, mozilla::LogLevel::Error,
-            ("Discard failed: folder=%s token=%s status=%" PRIx32,
-             folder->URI().get(), details.filename.get(),
-             static_cast<uint32_t>(status)));
-    return status;
-  };
-
-  nsresult rv = outStream->Close();
-  if (NS_FAILED(rv)) return fail(rv);
-
-  nsCOMPtr<nsIFile> tmpFile;
-  rv = EnsureSubDir(folder, u"tmp"_ns, getter_AddRefs(tmpFile));
-  if (NS_FAILED(rv)) return fail(rv);
-  rv = tmpFile->Append(NS_ConvertUTF8toUTF16(details.filename));
-  if (NS_FAILED(rv)) return fail(rv);
-  bool exists;
-  rv = tmpFile->Exists(&exists);
-  if (NS_FAILED(rv)) return fail(rv);
-  if (!exists) {
-    details.mayHaveMoved = true;
-    return fail(NS_ERROR_FILE_NOT_FOUND);
-  }
-  rv = tmpFile->Remove(false);
-  if (NS_FAILED(rv)) return fail(rv);
-
-  mOngoingWrites.remove(entry);
-  return NS_OK;
+  return migrationResult;
+#endif
 }
 
 // aMaxAllowedSize is currently ignored, we always return the full
@@ -1037,41 +1242,54 @@ NS_IMETHODIMP nsMsgMaildirStore::DeleteMessages(
 NS_IMETHODIMP nsMsgMaildirStore::DeleteStoreMessages(
     nsIMsgFolder* folder, nsTArray<nsCString> const& storeTokens) {
 #ifdef MOZ_PANORAMA
-  MOZ_TRY(CheckNativePurgeRemoval(folder, storeTokens));
+  RefPtr<mozilla::mailnews::LocalStoreMigrationWork> migration;
+  MOZ_TRY(mozilla::mailnews::LocalStoreMigrationWork::Begin(
+      static_cast<nsIMsgPluggableStore*>(this), folder, migration));
+  nsresult migrationResult = [&]() -> nsresult {
 #endif
 
-  NS_ENSURE_ARG(folder);
+#ifdef MOZ_PANORAMA
+    MOZ_TRY(CheckNativePurgeRemoval(folder, storeTokens));
+#endif
 
-  for (auto storeToken : storeTokens) {
-    if (storeToken.IsEmpty()) {
-      MOZ_LOG(MailDirLog, mozilla::LogLevel::Info,
-              ("DeleteStoreMessages - empty storeToken!!"));
-      // Perhaps an offline store has not downloaded this particular message.
-      continue;
+    NS_ENSURE_ARG(folder);
+
+    for (auto storeToken : storeTokens) {
+      if (storeToken.IsEmpty()) {
+        MOZ_LOG(MailDirLog, mozilla::LogLevel::Info,
+                ("DeleteStoreMessages - empty storeToken!!"));
+        // Perhaps an offline store has not downloaded this particular message.
+        continue;
+      }
+
+      nsCOMPtr<nsIFile> path;
+      nsresult rv = folder->GetFilePath(getter_AddRefs(path));
+      NS_ENSURE_SUCCESS(rv, rv);
+      rv = path->Append(u"cur"_ns);
+      NS_ENSURE_SUCCESS(rv, rv);
+      rv = path->Append(NS_ConvertUTF8toUTF16(storeToken));
+      NS_ENSURE_SUCCESS(rv, rv);
+
+      // Let's check if the message exists.
+      bool exists;
+      rv = path->Exists(&exists);
+      NS_ENSURE_SUCCESS(rv, rv);
+      if (!exists) {
+        MOZ_LOG(MailDirLog, mozilla::LogLevel::Info,
+                ("DeleteStoreMessages - file does not exist !!"));
+        // Perhaps an offline store has not downloaded this particular message.
+        continue;
+      }
+      rv = path->Remove(false);
+      NS_ENSURE_SUCCESS(rv, rv);
     }
+    return NS_OK;
 
-    nsCOMPtr<nsIFile> path;
-    nsresult rv = folder->GetFilePath(getter_AddRefs(path));
-    NS_ENSURE_SUCCESS(rv, rv);
-    rv = path->Append(u"cur"_ns);
-    NS_ENSURE_SUCCESS(rv, rv);
-    rv = path->Append(NS_ConvertUTF8toUTF16(storeToken));
-    NS_ENSURE_SUCCESS(rv, rv);
-
-    // Let's check if the message exists.
-    bool exists;
-    rv = path->Exists(&exists);
-    NS_ENSURE_SUCCESS(rv, rv);
-    if (!exists) {
-      MOZ_LOG(MailDirLog, mozilla::LogLevel::Info,
-              ("DeleteStoreMessages - file does not exist !!"));
-      // Perhaps an offline store has not downloaded this particular message.
-      continue;
-    }
-    rv = path->Remove(false);
-    NS_ENSURE_SUCCESS(rv, rv);
-  }
-  return NS_OK;
+#ifdef MOZ_PANORAMA
+  }();
+  migration->Complete(migrationResult);
+  return migrationResult;
+#endif
 }
 
 NS_IMETHODIMP
@@ -1080,143 +1298,156 @@ nsMsgMaildirStore::CopyMessages(bool aIsMove,
                                 nsIMsgFolder* aDstFolder,
                                 nsTArray<RefPtr<nsIMsgDBHdr>>& aDstHdrs,
                                 nsITransaction** aUndoAction, bool* aCopyDone) {
-  NS_ENSURE_ARG_POINTER(aDstFolder);
-  NS_ENSURE_ARG_POINTER(aCopyDone);
-  NS_ENSURE_ARG_POINTER(aUndoAction);
+#ifdef MOZ_PANORAMA
+  RefPtr<mozilla::mailnews::LocalStoreMigrationWork> migration;
+  MOZ_TRY(mozilla::mailnews::LocalStoreMigrationWork::Begin(
+      static_cast<nsIMsgPluggableStore*>(this), aDstFolder, migration));
+  nsresult migrationResult = [&]() -> nsresult {
+#endif
+    NS_ENSURE_ARG_POINTER(aDstFolder);
+    NS_ENSURE_ARG_POINTER(aCopyDone);
+    NS_ENSURE_ARG_POINTER(aUndoAction);
 
-  *aCopyDone = false;
-  if (aHdrArray.IsEmpty()) {
-    return NS_ERROR_INVALID_ARG;
-  }
-  nsCOMPtr<nsIMsgFolder> srcFolder;
-  nsresult rv;
-  nsIMsgDBHdr* msgHdr = aHdrArray[0];
-  rv = msgHdr->GetFolder(getter_AddRefs(srcFolder));
-  NS_ENSURE_SUCCESS(rv, rv);
+    *aCopyDone = false;
+    if (aHdrArray.IsEmpty()) {
+      return NS_ERROR_INVALID_ARG;
+    }
+    nsCOMPtr<nsIMsgFolder> srcFolder;
+    nsresult rv;
+    nsIMsgDBHdr* msgHdr = aHdrArray[0];
+    rv = msgHdr->GetFolder(getter_AddRefs(srcFolder));
+    NS_ENSURE_SUCCESS(rv, rv);
 
-  // Both source and destination folders must use maildir type store.
-  nsCOMPtr<nsIMsgPluggableStore> srcStore;
-  nsAutoCString srcType;
-  srcFolder->GetMsgStore(getter_AddRefs(srcStore));
-  if (srcStore) srcStore->GetStoreType(srcType);
-  nsCOMPtr<nsIMsgPluggableStore> dstStore;
-  nsAutoCString dstType;
-  aDstFolder->GetMsgStore(getter_AddRefs(dstStore));
-  if (dstStore) dstStore->GetStoreType(dstType);
-  if (!srcType.EqualsLiteral("maildir") || !dstType.EqualsLiteral("maildir"))
-    return NS_OK;
+    // Both source and destination folders must use maildir type store.
+    nsCOMPtr<nsIMsgPluggableStore> srcStore;
+    nsAutoCString srcType;
+    srcFolder->GetMsgStore(getter_AddRefs(srcStore));
+    if (srcStore) srcStore->GetStoreType(srcType);
+    nsCOMPtr<nsIMsgPluggableStore> dstStore;
+    nsAutoCString dstType;
+    aDstFolder->GetMsgStore(getter_AddRefs(dstStore));
+    if (dstStore) dstStore->GetStoreType(dstType);
+    if (!srcType.EqualsLiteral("maildir") || !dstType.EqualsLiteral("maildir"))
+      return NS_OK;
 
-  // Both source and destination must be local folders. In theory we could
-  //   do efficient copies of the offline store of IMAP, but this is not
-  //   supported yet. For that, we need to deal with both correct handling
-  //   of deletes from the src server, and msgKey = UIDL in the dst folder.
-  nsCOMPtr<nsIMsgLocalMailFolder> destLocalFolder(
-      do_QueryInterface(aDstFolder));
-  if (!destLocalFolder) return NS_OK;
-  nsCOMPtr<nsIMsgLocalMailFolder> srcLocalFolder(do_QueryInterface(srcFolder));
-  if (!srcLocalFolder) return NS_OK;
+    // Both source and destination must be local folders. In theory we could
+    //   do efficient copies of the offline store of IMAP, but this is not
+    //   supported yet. For that, we need to deal with both correct handling
+    //   of deletes from the src server, and msgKey = UIDL in the dst folder.
+    nsCOMPtr<nsIMsgLocalMailFolder> destLocalFolder(
+        do_QueryInterface(aDstFolder));
+    if (!destLocalFolder) return NS_OK;
+    nsCOMPtr<nsIMsgLocalMailFolder> srcLocalFolder(
+        do_QueryInterface(srcFolder));
+    if (!srcLocalFolder) return NS_OK;
 
 #ifdef MOZ_PANORAMA
-  // Panorama cannot clone headers here. Decline before changing any files.
-  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
-    aDstHdrs.Clear();
-    *aUndoAction = nullptr;
-    return NS_OK;
-  }
+    // Panorama cannot clone headers here. Decline before changing any files.
+    if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+      aDstHdrs.Clear();
+      *aUndoAction = nullptr;
+      return NS_OK;
+    }
 #endif
 
-  // We should be able to use a file move for an efficient copy.
+    // We should be able to use a file move for an efficient copy.
 
-  nsCOMPtr<nsIFile> destFolderPath;
-  nsCOMPtr<nsIMsgDatabase> destDB;
-  aDstFolder->GetMsgDatabase(getter_AddRefs(destDB));
-  rv = aDstFolder->GetFilePath(getter_AddRefs(destFolderPath));
-  NS_ENSURE_SUCCESS(rv, rv);
-  destFolderPath->Append(u"cur"_ns);
+    nsCOMPtr<nsIFile> destFolderPath;
+    nsCOMPtr<nsIMsgDatabase> destDB;
+    aDstFolder->GetMsgDatabase(getter_AddRefs(destDB));
+    rv = aDstFolder->GetFilePath(getter_AddRefs(destFolderPath));
+    NS_ENSURE_SUCCESS(rv, rv);
+    destFolderPath->Append(u"cur"_ns);
 
-  nsCOMPtr<nsIFile> srcFolderPath;
-  rv = srcFolder->GetFilePath(getter_AddRefs(srcFolderPath));
-  NS_ENSURE_SUCCESS(rv, rv);
-  srcFolderPath->Append(u"cur"_ns);
+    nsCOMPtr<nsIFile> srcFolderPath;
+    rv = srcFolder->GetFilePath(getter_AddRefs(srcFolderPath));
+    NS_ENSURE_SUCCESS(rv, rv);
+    srcFolderPath->Append(u"cur"_ns);
 
-  nsCOMPtr<nsIMsgDatabase> srcDB;
-  srcFolder->GetMsgDatabase(getter_AddRefs(srcDB));
-  RefPtr<nsLocalMoveCopyMsgTxn> msgTxn = new nsLocalMoveCopyMsgTxn;
-  NS_ENSURE_TRUE(msgTxn, NS_ERROR_OUT_OF_MEMORY);
-  if (NS_SUCCEEDED(msgTxn->Init(srcFolder, aDstFolder, aIsMove))) {
-    if (aIsMove)
-      msgTxn->SetTransactionType(nsIMsgTransactionService::eMoveMsg);
-    else
-      msgTxn->SetTransactionType(nsIMsgTransactionService::eCopyMsg);
-  }
-
-  aDstHdrs.Clear();
-  aDstHdrs.SetCapacity(aHdrArray.Length());
-
-  for (auto srcHdr : aHdrArray) {
-    nsMsgKey srcKey;
-    srcHdr->GetMessageKey(&srcKey);
-    msgTxn->AddSrcKey(srcKey);
-    nsAutoCString fileName;
-    srcHdr->GetStoreToken(fileName);
-    if (fileName.IsEmpty()) {
-      MOZ_LOG(MailDirLog, mozilla::LogLevel::Info,
-              ("GetMsgInputStream - empty storeToken!!"));
-      return NS_ERROR_FAILURE;
+    nsCOMPtr<nsIMsgDatabase> srcDB;
+    srcFolder->GetMsgDatabase(getter_AddRefs(srcDB));
+    RefPtr<nsLocalMoveCopyMsgTxn> msgTxn = new nsLocalMoveCopyMsgTxn;
+    NS_ENSURE_TRUE(msgTxn, NS_ERROR_OUT_OF_MEMORY);
+    if (NS_SUCCEEDED(msgTxn->Init(srcFolder, aDstFolder, aIsMove))) {
+      if (aIsMove)
+        msgTxn->SetTransactionType(nsIMsgTransactionService::eMoveMsg);
+      else
+        msgTxn->SetTransactionType(nsIMsgTransactionService::eCopyMsg);
     }
-    nsAutoString fileName16 = NS_ConvertUTF8toUTF16(fileName);
 
-    nsCOMPtr<nsIFile> srcFile;
-    rv = srcFolderPath->Clone(getter_AddRefs(srcFile));
-    NS_ENSURE_SUCCESS(rv, rv);
-    srcFile->Append(fileName16);
+    aDstHdrs.Clear();
+    aDstHdrs.SetCapacity(aHdrArray.Length());
 
-    nsCOMPtr<nsIFile> destFile;
-    rv = destFolderPath->Clone(getter_AddRefs(destFile));
-    NS_ENSURE_SUCCESS(rv, rv);
-    destFile->Append(fileName16);
-    bool exists;
-    destFile->Exists(&exists);
-    if (exists) {
-      rv = destFile->CreateUnique(nsIFile::NORMAL_FILE_TYPE, 0600);
+    for (auto srcHdr : aHdrArray) {
+      nsMsgKey srcKey;
+      srcHdr->GetMessageKey(&srcKey);
+      msgTxn->AddSrcKey(srcKey);
+      nsAutoCString fileName;
+      srcHdr->GetStoreToken(fileName);
+      if (fileName.IsEmpty()) {
+        MOZ_LOG(MailDirLog, mozilla::LogLevel::Info,
+                ("GetMsgInputStream - empty storeToken!!"));
+        return NS_ERROR_FAILURE;
+      }
+      nsAutoString fileName16 = NS_ConvertUTF8toUTF16(fileName);
+
+      nsCOMPtr<nsIFile> srcFile;
+      rv = srcFolderPath->Clone(getter_AddRefs(srcFile));
       NS_ENSURE_SUCCESS(rv, rv);
-      destFile->GetLeafName(fileName16);
-    }
-    if (aIsMove)
-      rv = srcFile->MoveTo(destFolderPath, fileName16);
-    else
-      rv = srcFile->CopyTo(destFolderPath, fileName16);
-    NS_ENSURE_SUCCESS(rv, rv);
+      srcFile->Append(fileName16);
 
-    nsCOMPtr<nsIMsgDBHdr> destHdr;
-    if (destDB) {
-      rv = destDB->CopyHdrFromExistingHdr(nsMsgKey_None, srcHdr, true,
-                                          getter_AddRefs(destHdr));
+      nsCOMPtr<nsIFile> destFile;
+      rv = destFolderPath->Clone(getter_AddRefs(destFile));
       NS_ENSURE_SUCCESS(rv, rv);
-      destHdr->SetStoreToken(NS_ConvertUTF16toUTF8(fileName16));
-      aDstHdrs.AppendElement(destHdr);
-      nsMsgKey dstKey;
-      destHdr->GetMessageKey(&dstKey);
-      msgTxn->AddDstKey(dstKey);
-    }
-  }
-  nsCOMPtr<nsIMsgFolderNotificationService> notifier =
-      mozilla::components::FolderNotification::Service();
-  notifier->NotifyMsgsMoveCopyCompleted(aIsMove, aHdrArray, aDstFolder,
-                                        aDstHdrs);
+      destFile->Append(fileName16);
+      bool exists;
+      destFile->Exists(&exists);
+      if (exists) {
+        rv = destFile->CreateUnique(nsIFile::NORMAL_FILE_TYPE, 0600);
+        NS_ENSURE_SUCCESS(rv, rv);
+        destFile->GetLeafName(fileName16);
+      }
+      if (aIsMove)
+        rv = srcFile->MoveTo(destFolderPath, fileName16);
+      else
+        rv = srcFile->CopyTo(destFolderPath, fileName16);
+      NS_ENSURE_SUCCESS(rv, rv);
 
-  // For now, we only support local dest folders, and for those we are done and
-  // can delete the messages. Perhaps this should be moved into the folder
-  // when we try to support other folder types.
-  if (aIsMove) {
-    for (auto msgDBHdr : aHdrArray) {
-      srcDB->DeleteHeader(msgDBHdr, nullptr, false, true);
+      nsCOMPtr<nsIMsgDBHdr> destHdr;
+      if (destDB) {
+        rv = destDB->CopyHdrFromExistingHdr(nsMsgKey_None, srcHdr, true,
+                                            getter_AddRefs(destHdr));
+        NS_ENSURE_SUCCESS(rv, rv);
+        destHdr->SetStoreToken(NS_ConvertUTF16toUTF8(fileName16));
+        aDstHdrs.AppendElement(destHdr);
+        nsMsgKey dstKey;
+        destHdr->GetMessageKey(&dstKey);
+        msgTxn->AddDstKey(dstKey);
+      }
     }
-  }
+    nsCOMPtr<nsIMsgFolderNotificationService> notifier =
+        mozilla::components::FolderNotification::Service();
+    notifier->NotifyMsgsMoveCopyCompleted(aIsMove, aHdrArray, aDstFolder,
+                                          aDstHdrs);
 
-  *aCopyDone = true;
-  msgTxn.forget(aUndoAction);
-  return NS_OK;
+    // For now, we only support local dest folders, and for those we are done
+    // and can delete the messages. Perhaps this should be moved into the folder
+    // when we try to support other folder types.
+    if (aIsMove) {
+      for (auto msgDBHdr : aHdrArray) {
+        srcDB->DeleteHeader(msgDBHdr, nullptr, false, true);
+      }
+    }
+
+    *aCopyDone = true;
+    msgTxn.forget(aUndoAction);
+    return NS_OK;
+
+#ifdef MOZ_PANORAMA
+  }();
+  migration->Complete(migrationResult);
+  return migrationResult;
+#endif
 }
 
 NS_IMETHODIMP
@@ -1229,45 +1460,94 @@ nsMsgMaildirStore::GetSupportsCompaction(bool* aSupportsCompaction) {
 NS_IMETHODIMP nsMsgMaildirStore::AsyncCompact(
     nsIMsgFolder* folder, nsIStoreCompactListener* compactListener,
     bool patchXMozillaHeaders) {
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(mozilla::mailnews::CheckLocalStoreMigrationAdmission());
+#endif
+
   return NS_ERROR_NOT_IMPLEMENTED;
 }
 
 NS_IMETHODIMP nsMsgMaildirStore::AsyncScan(nsIMsgFolder* folder,
                                            nsIStoreScanListener* scanListener) {
 #ifdef MOZ_PANORAMA
-  MOZ_TRY(CheckNativePurgePending(folder));
+  RefPtr<mozilla::mailnews::LocalStoreMigrationWork> migration;
+  MOZ_TRY(mozilla::mailnews::LocalStoreMigrationWork::Begin(
+      static_cast<nsIMsgPluggableStore*>(this), folder, migration));
+  nsCOMPtr<nsIStoreScanListener> migrationListener =
+      mozilla::mailnews::WrapLocalStoreMigrationScan(migration, scanListener);
+#else
+  nsIStoreScanListener* migrationListener = scanListener;
 #endif
-  nsCOMPtr<nsIFile> maildirPath;
-  nsresult rv = folder->GetFilePath(getter_AddRefs(maildirPath));
-  NS_ENSURE_SUCCESS(rv, rv);
-  // Fire and forget. MaildirScanner will hold itself in existence until
-  // finished.
-  RefPtr<MaildirScanner> scanner(new MaildirScanner());
-  return scanner->BeginScan(maildirPath, scanListener);
+  [[maybe_unused]] bool migrationAttempted = false;
+#ifdef MOZ_PANORAMA
+  nsresult migrationResult = [&]() -> nsresult {
+#endif
+
+#ifdef MOZ_PANORAMA
+    MOZ_TRY(CheckNativePurgePending(folder));
+#endif
+    nsCOMPtr<nsIFile> maildirPath;
+    nsresult rv = folder->GetFilePath(getter_AddRefs(maildirPath));
+    NS_ENSURE_SUCCESS(rv, rv);
+    // Fire and forget. MaildirScanner will hold itself in existence until
+    // finished.
+    RefPtr<MaildirScanner> scanner(new MaildirScanner());
+    migrationAttempted = true;
+    nsresult started = scanner->BeginScan(maildirPath, migrationListener
+#ifdef MOZ_PANORAMA
+                                          ,
+                                          migration
+#endif
+    );
+
+    return started;
+
+#ifdef MOZ_PANORAMA
+  }();
+  if (NS_FAILED(migrationResult)) {
+    migration->Complete(
+        migrationResult,
+        !migrationAttempted || migrationResult == NS_ERROR_FILE_NOT_FOUND);
+  }
+  return migrationResult;
+#endif
 }
 
 NS_IMETHODIMP nsMsgMaildirStore::ChangeFlags(
     nsIMsgFolder* folder, nsTArray<nsCString> const& storeTokens,
     nsTArray<uint32_t> const& newFlags) {
 #ifdef MOZ_PANORAMA
-  MOZ_TRY(CheckNativePurgePending(folder));
+  RefPtr<mozilla::mailnews::LocalStoreMigrationWork> migration;
+  MOZ_TRY(mozilla::mailnews::LocalStoreMigrationWork::Begin(
+      static_cast<nsIMsgPluggableStore*>(this), folder, migration));
+  nsresult migrationResult = [&]() -> nsresult {
 #endif
 
-  NS_ENSURE_ARG(folder);
-  NS_ENSURE_ARG(storeTokens.Length() == newFlags.Length());
+#ifdef MOZ_PANORAMA
+    MOZ_TRY(CheckNativePurgePending(folder));
+#endif
 
-  for (size_t i = 0; i < storeTokens.Length(); ++i) {
-    // Open a stream to patch the message file.
-    nsCOMPtr<nsIRandomAccessStream> stream;
-    nsresult rv =
-        GetPatchableStream(folder, storeTokens[i], getter_AddRefs(stream));
-    NS_ENSURE_SUCCESS(rv, rv);
+    NS_ENSURE_ARG(folder);
+    NS_ENSURE_ARG(storeTokens.Length() == newFlags.Length());
 
-    auto details = FindXMozillaStatusHeaders(stream, 0);
-    rv = PatchXMozillaStatusHeaders(stream, 0, details, newFlags[i]);
-    NS_ENSURE_SUCCESS(rv, rv);
-  }
-  return NS_OK;
+    for (size_t i = 0; i < storeTokens.Length(); ++i) {
+      // Open a stream to patch the message file.
+      nsCOMPtr<nsIRandomAccessStream> stream;
+      nsresult rv =
+          GetPatchableStream(folder, storeTokens[i], getter_AddRefs(stream));
+      NS_ENSURE_SUCCESS(rv, rv);
+
+      auto details = FindXMozillaStatusHeaders(stream, 0);
+      rv = PatchXMozillaStatusHeaders(stream, 0, details, newFlags[i]);
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
+    return NS_OK;
+
+#ifdef MOZ_PANORAMA
+  }();
+  migration->Complete(migrationResult);
+  return migrationResult;
+#endif
 }
 
 // get output stream from header

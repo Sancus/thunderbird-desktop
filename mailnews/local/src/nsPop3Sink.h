@@ -19,6 +19,7 @@
 #include "nsString.h"
 #ifdef MOZ_PANORAMA
 #  include "MessageDatabase.h"
+#  include "LocalStoreMigrationLease.h"
 #endif
 
 class nsParseNewMailState;
@@ -43,6 +44,14 @@ class nsPop3Sink : public nsIPop3Sink, public nsIMsgOperationListener {
   nsresult RecordIncorporateResult(nsresult status);
   nsresult FinishIncorporation(nsresult status);
   nsresult ReleaseFolderLock();
+#ifdef MOZ_PANORAMA
+  friend class PopMigrationIncorporationTerminal;
+  void MaybeSettleMigration(nsresult aResult);
+  RefPtr<mozilla::mailnews::LocalStoreMigrationWork> mMigrationDelivery;
+  bool mMigrationDeliveryEnding = false;
+  bool mMigrationCallbackRunning = false;
+  uint64_t mMigrationIncorporation = 0;
+#endif
   nsresult DiscardStalePartialMessages(nsIPop3Protocol* protocol);
 
 #ifdef MOZ_PANORAMA

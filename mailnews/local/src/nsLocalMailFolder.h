@@ -28,6 +28,14 @@
 
 #define COPY_BUFFER_SIZE 16384
 
+#ifdef MOZ_PANORAMA
+#  include "LocalStoreMigrationLease.h"
+#endif
+
+namespace mozilla::mailnews {
+class LocalStoreMigrationWork;
+}
+
 class nsParseMailMessageState;
 class LocalFolderCopy;
 class LocalMoveSourceListener;
@@ -198,15 +206,16 @@ class nsMsgLocalMailFolder : public nsMsgDBFolder,
 #ifdef MOZ_PANORAMA
   nsresult DeleteNativePermanentMessages(
       const nsTArray<RefPtr<nsIMsgDBHdr>>& headers, nsIMsgWindow* window,
-      nsIMsgCopyServiceListener* listener);
+      nsIMsgCopyServiceListener* listener,
+      mozilla::mailnews::LocalStoreMigrationWork* migrationParent);
   bool mNativePurging = false;
 #endif
 
-  nsresult DeleteMessagesInternal(const nsTArray<RefPtr<nsIMsgDBHdr>>& messages,
-                                  nsIMsgWindow* msgWindow, bool deleteStorage,
-                                  bool isMove,
-                                  nsIMsgCopyServiceListener* listener,
-                                  bool allowUndo, nsLocalMoveCopyMsgTxn* undo);
+  nsresult DeleteMessagesInternal(
+      const nsTArray<RefPtr<nsIMsgDBHdr>>& messages, nsIMsgWindow* msgWindow,
+      bool deleteStorage, bool isMove, nsIMsgCopyServiceListener* listener,
+      bool allowUndo, nsLocalMoveCopyMsgTxn* undo,
+      mozilla::mailnews::LocalStoreMigrationWork* migrationParent = nullptr);
   MOZ_CAN_RUN_SCRIPT nsresult
   CompleteMoveSource(LocalMoveSourceListener* listener, nsresult status);
   nsresult CompleteCopy(nsISupports* source, nsresult status);
@@ -288,6 +297,11 @@ class nsMsgLocalMailFolder : public nsMsgDBFolder,
   nsresult DiscardCopyMessage();
 #endif
 
+#ifdef MOZ_PANORAMA
+  friend class LocalMigrationCopyListener;
+  RefPtr<mozilla::mailnews::LocalStoreMigrationWork> mMigrationCopyWork;
+  RefPtr<mozilla::mailnews::LocalStoreMigrationWork> mMigrationFolderWork;
+#endif
   RefPtr<LocalFolderCopy> mFolderCopy;
   nsLocalMailCopyState* mCopyState;  // We only allow one of these at a time
   nsCString mType;

@@ -97,6 +97,9 @@ constexpr std::array<std::pair<nsLiteralCString, unsigned>, 8> kDefaultFolders{
 
 // A folder request completes after its messages and each child request settle.
 // Child requests use the existing copy service/listener; no launch is success.
+#ifdef MOZ_PANORAMA
+static nsTArray<LocalFolderCopy*> sMigrationFolderCopies;
+#endif
 class LocalFolderCopy final : public nsIMsgCopyServiceListener {
  public:
   NS_DECL_ISUPPORTS
@@ -113,7 +116,33 @@ class LocalFolderCopy final : public nsIMsgCopyServiceListener {
         mChildren(std::move(children)),
         mWindow(window),
         mListener(listener),
-        mIsMove(isMove) {}
+        mIsMove(isMove) {
+#ifdef MOZ_PANORAMA
+    sMigrationFolderCopies.AppendElement(this);
+#endif
+  }
+#ifdef MOZ_PANORAMA
+  mozilla::mailnews::LocalStoreMigrationWork* MigrationWork() const {
+    return mMigrationWork;
+  }
+  void SetMigrationWork(mozilla::mailnews::LocalStoreMigrationWork* work) {
+    mMigrationWork = work;
+    if (work) work->Retain(static_cast<nsIMsgCopyServiceListener*>(this));
+  }
+  static mozilla::mailnews::LocalStoreMigrationWork* ParentFor(
+      nsIMsgCopyServiceListener* listener, nsIMsgFolder* source,
+      nsIMsgFolder* destination) {
+    for (auto* copy : sMigrationFolderCopies) {
+      if (listener == static_cast<nsIMsgCopyServiceListener*>(copy) &&
+          !copy->mDone && copy->mWaitingForChild &&
+          source == copy->mMigrationChild &&
+          destination == copy->mDestination) {
+        return copy->mMigrationWork;
+      }
+    }
+    return nullptr;
+  }
+#endif
 
   void AdoptSemaphore() { mHoldingSemaphore = true; }
 
@@ -138,7 +167,11 @@ class LocalFolderCopy final : public nsIMsgCopyServiceListener {
   }
 
  private:
-  ~LocalFolderCopy() = default;
+  ~LocalFolderCopy() {
+#ifdef MOZ_PANORAMA
+    sMigrationFolderCopies.RemoveElement(this);
+#endif
+  }
 
   nsresult Finish(nsresult status) {
     if (mDone) {
@@ -166,10 +199,21 @@ class LocalFolderCopy final : public nsIMsgCopyServiceListener {
     // the arrived wrapper. Do not resolve it through that wrapper's parent.
     nsIMsgFolder* completionFolder =
         arrived ? mDestination.get() : mParent.get();
-    return service->NotifyCompletion(mSource, completionFolder, status);
+    nsresult notified =
+        service->NotifyCompletion(mSource, completionFolder, status);
+#ifdef MOZ_PANORAMA
+    if (mMigrationWork) {
+      mMigrationWork->RecordError(notified);
+      mMigrationWork->Complete(status);
+    }
+#endif
+    return notified;
   }
 
   nsresult CopyNextChild() {
+#ifdef MOZ_PANORAMA
+    if (mMigrationWork) MOZ_TRY(mMigrationWork->Validate());
+#endif
     RefPtr<LocalFolderCopy> self(this);
     if (mDone || mWaitingForChild) {
       return NS_OK;
@@ -180,6 +224,9 @@ class LocalFolderCopy final : public nsIMsgCopyServiceListener {
     nsCOMPtr<nsIMsgCopyService> service = mozilla::components::Copy::Service();
     while (mNextChild < mChildren.Length()) {
       RefPtr<nsIMsgFolder> child = mChildren[mNextChild++];
+#ifdef MOZ_PANORAMA
+      mMigrationChild = child;
+#endif
       mWaitingForChild = true;
       mStartingChild = true;
       nsresult rv =
@@ -198,6 +245,10 @@ class LocalFolderCopy final : public nsIMsgCopyServiceListener {
     return Finish(NS_OK);
   }
 
+#ifdef MOZ_PANORAMA
+  RefPtr<mozilla::mailnews::LocalStoreMigrationWork> mMigrationWork;
+  nsCOMPtr<nsIMsgFolder> mMigrationChild;
+#endif
   nsCOMPtr<nsIMsgFolder> mSource;
   RefPtr<nsMsgLocalMailFolder> mDestination;
   nsCOMPtr<nsIMsgFolder> mParent;
@@ -242,6 +293,62 @@ NS_IMETHODIMP LocalFolderCopy::OnStopCopy(nsresult status) {
       "LocalFolderCopy::CopyNextChild", [self] { self->CopyNextChild(); }));
   return NS_FAILED(rv) ? Finish(rv) : NS_OK;
 }
+
+#ifdef MOZ_PANORAMA
+// The existing stream adapter can outlive this logical transfer. Bind all six
+// callbacks to the exact original work, not whichever mCopyState exists later.
+class LocalMigrationCopyListener final : public nsICopyMessageListener {
+ public:
+  NS_DECL_ISUPPORTS
+  LocalMigrationCopyListener(nsMsgLocalMailFolder* aFolder,
+                             mozilla::mailnews::LocalStoreMigrationWork* aWork)
+      : mFolder(aFolder), mWork(aWork) {}
+  NS_IMETHOD BeginCopy() override {
+    MOZ_TRY(CheckData());
+    return mFolder->BeginCopy();
+  }
+  NS_IMETHOD StartMessage() override {
+    MOZ_TRY(CheckData());
+    return mFolder->StartMessage();
+  }
+  NS_IMETHOD CopyData(nsIInputStream* aInput, int32_t aLength) override {
+    MOZ_TRY(CheckData());
+    return mFolder->CopyData(aInput, aLength);
+  }
+  NS_IMETHOD EndMessage(nsMsgKey aKey) override {
+    MOZ_TRY(CheckData());
+    return mFolder->EndMessage(aKey);
+  }
+  NS_IMETHOD EndCopy(bool aSucceeded) override {
+    MOZ_TRY(CheckData());
+    mCopyEnded = true;
+    return mFolder->EndCopy(aSucceeded);
+  }
+  NS_IMETHOD EndMove(bool aSucceeded) override {
+    MOZ_TRY(Check());
+    NS_ENSURE_FALSE(mMoveEnded, NS_ERROR_NOT_AVAILABLE);
+    mMoveEnded = true;
+    return mFolder->EndMove(aSucceeded);
+  }
+
+ private:
+  ~LocalMigrationCopyListener() = default;
+  nsresult Check() {
+    NS_ENSURE_TRUE(mWork && mFolder->mMigrationCopyWork == mWork,
+                   NS_ERROR_NOT_AVAILABLE);
+    return mWork->Validate();
+  }
+  nsresult CheckData() {
+    NS_ENSURE_FALSE(mCopyEnded, NS_ERROR_NOT_AVAILABLE);
+    return Check();
+  }
+  RefPtr<nsMsgLocalMailFolder> mFolder;
+  RefPtr<mozilla::mailnews::LocalStoreMigrationWork> mWork;
+  bool mCopyEnded = false;
+  bool mMoveEnded = false;
+};
+NS_IMPL_ISUPPORTS(LocalMigrationCopyListener, nsICopyMessageListener)
+#endif
 
 // Native IMAP deletion reports its checked URL/SQL outcome through this
 // existing listener only after the destination messages have finished.
@@ -794,6 +901,10 @@ nsMsgLocalMailFolder::UpdateFolder(nsIMsgWindow* aWindow) {
 
 NS_IMETHODIMP nsMsgLocalMailFolder::CreateStorageIfMissing(
     nsIUrlListener* aUrlListener) {
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(mozilla::mailnews::CheckLocalStoreMigrationAdmission());
+#endif
+
   nsresult rv = NS_OK;
   nsCOMPtr<nsIMsgFolder> msgParent;
   GetParent(getter_AddRefs(msgParent));
@@ -828,6 +939,10 @@ NS_IMETHODIMP nsMsgLocalMailFolder::CreateStorageIfMissing(
 NS_IMETHODIMP
 nsMsgLocalMailFolder::CreateSubfolder(const nsACString& folderName,
                                       nsIMsgWindow* msgWindow) {
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(mozilla::mailnews::CheckLocalStoreMigrationAdmission());
+#endif
+
   AUTO_PROFILER_LABEL("nsMsgLocalMailFolder::CreateSubfolder", MAILNEWS);
   nsCOMPtr<nsIMsgFolder> newFolder;
   nsresult rv =
@@ -844,6 +959,10 @@ nsMsgLocalMailFolder::CreateSubfolder(const nsACString& folderName,
 NS_IMETHODIMP
 nsMsgLocalMailFolder::CreateSubfolderWithListener(const nsACString& folderName,
                                                   nsIUrlListener* listener) {
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(mozilla::mailnews::CheckLocalStoreMigrationAdmission());
+#endif
+
   nsresult rv = CreateSubfolder(folderName, nullptr);
   listener->OnStopRunningUrl(nullptr, rv);
   return NS_OK;
@@ -961,6 +1080,10 @@ nsresult nsMsgLocalMailFolder::RetireLocalTrashContents(nsIMsgFolder* folder) {
 #endif
 
 NS_IMETHODIMP nsMsgLocalMailFolder::EmptyTrash(nsIUrlListener* aListener) {
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(mozilla::mailnews::CheckLocalStoreMigrationAdmission());
+#endif
+
   nsresult rv;
   nsCOMPtr<nsIMsgFolder> trashFolder;
   rv = GetTrashFolder(getter_AddRefs(trashFolder));
@@ -1080,6 +1203,10 @@ nsresult nsMsgLocalMailFolder::IsChildOfTrash(bool* result) {
 }
 
 NS_IMETHODIMP nsMsgLocalMailFolder::DeleteSelf(nsIMsgWindow* msgWindow) {
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(mozilla::mailnews::CheckLocalStoreMigrationAdmission());
+#endif
+
   nsresult rv;
   bool isChildOfTrash;
   IsChildOfTrash(&isChildOfTrash);
@@ -1265,6 +1392,10 @@ nsresult nsMsgLocalMailFolder::RelocateNativeLocalFolder(
 
 NS_IMETHODIMP nsMsgLocalMailFolder::Rename(const nsACString& aNewName,
                                            nsIMsgWindow* msgWindow) {
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(mozilla::mailnews::CheckLocalStoreMigrationAdmission());
+#endif
+
   // Renaming to the same name is easy
   if (mName.Equals(aNewName)) return NS_OK;
 
@@ -1528,6 +1659,10 @@ nsMsgLocalMailFolder::DeleteMessages(
     nsTArray<RefPtr<nsIMsgDBHdr>> const& msgHeaders, nsIMsgWindow* msgWindow,
     bool deleteStorage, bool isMove, nsIMsgCopyServiceListener* listener,
     bool allowUndo) {
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(mozilla::mailnews::CheckLocalStoreMigrationAdmission());
+#endif
+
   return DeleteMessagesInternal(msgHeaders, msgWindow, deleteStorage, isMove,
                                 listener, allowUndo, nullptr);
 }
@@ -1535,165 +1670,198 @@ nsMsgLocalMailFolder::DeleteMessages(
 nsresult nsMsgLocalMailFolder::DeleteMessagesInternal(
     const nsTArray<RefPtr<nsIMsgDBHdr>>& msgHeaders, nsIMsgWindow* msgWindow,
     bool deleteStorage, bool isMove, nsIMsgCopyServiceListener* listener,
-    bool allowUndo, nsLocalMoveCopyMsgTxn* undo) {
-  nsresult rv;
-  // Validate the whole input before POP3 marking, deletion notifications or
-  // provider mutations. A later foreign member must not retire a valid prefix.
-  for (const auto& header : msgHeaders) {
-    NS_ENSURE_ARG(header);
-    nsCOMPtr<nsIMsgFolder> owner;
-    rv = header->GetFolder(getter_AddRefs(owner));
-    NS_ENSURE_SUCCESS(rv, rv);
-    NS_ENSURE_TRUE(owner == this, NS_ERROR_ILLEGAL_VALUE);
-  }
-
-  bool isTrashFolder = mFlags & nsMsgFolderFlags::Trash;
+    bool allowUndo, nsLocalMoveCopyMsgTxn* undo,
+    mozilla::mailnews::LocalStoreMigrationWork* migrationParent) {
 #ifdef MOZ_PANORAMA
-  if (mail_panorama_enabled_AtStartup() && !undo && !isMove &&
-      (deleteStorage || isTrashFolder)) {
-    return DeleteNativePermanentMessages(msgHeaders, msgWindow, listener);
+  RefPtr<mozilla::mailnews::LocalStoreMigrationWork> migration;
+  {
+    mozilla::mailnews::AutoLocalStoreMigrationContinuation continuation(
+        migrationParent);
+    MOZ_TRY(mozilla::mailnews::LocalStoreMigrationWork::Begin(
+        static_cast<nsIMsgLocalMailFolder*>(this),
+        static_cast<nsIMsgFolder*>(this), migration));
   }
-  if (mail_panorama_enabled_AtStartup() && (deleteStorage || isTrashFolder)) {
-    RefPtr<mozilla::mailnews::DatabaseCore> core =
-        mozilla::mailnews::DatabaseCore::GetInstanceForService();
-    NS_ENSURE_STATE(core);
-    uint64_t folderId;
-    rv = GetId(&folderId);
-    NS_ENSURE_SUCCESS(rv, rv);
+  nsresult migrationResult = [&]() -> nsresult {
+#else
+  (void)migrationParent;
+#endif
+    nsresult rv;
+    // Validate the whole input before POP3 marking, deletion notifications or
+    // provider mutations. A later foreign member must not retire a valid
+    // prefix.
     for (const auto& header : msgHeaders) {
-      nsMsgKey key;
-      rv = header->GetMessageKey(&key);
+      NS_ENSURE_ARG(header);
+      nsCOMPtr<nsIMsgFolder> owner;
+      rv = header->GetFolder(getter_AddRefs(owner));
       NS_ENSURE_SUCCESS(rv, rv);
-      mozilla::mailnews::MessageBodyState body;
-      rv = core->MessageDB().GetMessageBodyState(key, body);
-      NS_ENSURE_SUCCESS(rv, rv);
-      NS_ENSURE_TRUE(body.folderId == folderId, NS_ERROR_ILLEGAL_VALUE);
-      nsAutoCString token;
-      rv = header->GetStoreToken(token);
-      NS_ENSURE_SUCCESS(rv, rv);
-      NS_ENSURE_TRUE(
-          body.storeToken ? token.Equals(*body.storeToken) : token.IsEmpty(),
-          NS_ERROR_NOT_AVAILABLE);
+      NS_ENSURE_TRUE(owner == this, NS_ERROR_ILLEGAL_VALUE);
     }
-  }
-#endif
 
+    bool isTrashFolder = mFlags & nsMsgFolderFlags::Trash;
 #ifdef MOZ_PANORAMA
-  if (undo) {
-    MOZ_TRY(undo->PrepareNativeSourceRemoval(this, msgHeaders));
-  }
-#endif
-
-  // shift delete case - (delete to trash is handled in EndMove)
-  // this is also the case when applying retention settings.
-  if (deleteStorage && !isMove) {
-    nsTArray<RefPtr<nsIMsgDBHdr>> hdrsToDelete;
-    for (auto msgHdr : msgHeaders) {
-      uint32_t attachmentDetached = 0;
-      msgHdr->GetUint32Property("attachmentDetached", &attachmentDetached);
-      if (!attachmentDetached) {
-        hdrsToDelete.AppendElement(msgHdr);
+    if (mail_panorama_enabled_AtStartup() && !undo && !isMove &&
+        (deleteStorage || isTrashFolder)) {
+      return DeleteNativePermanentMessages(msgHeaders, msgWindow, listener,
+                                           migration);
+    }
+    if (mail_panorama_enabled_AtStartup() && (deleteStorage || isTrashFolder)) {
+      RefPtr<mozilla::mailnews::DatabaseCore> core =
+          mozilla::mailnews::DatabaseCore::GetInstanceForService();
+      NS_ENSURE_STATE(core);
+      uint64_t folderId;
+      rv = GetId(&folderId);
+      NS_ENSURE_SUCCESS(rv, rv);
+      for (const auto& header : msgHeaders) {
+        nsMsgKey key;
+        rv = header->GetMessageKey(&key);
+        NS_ENSURE_SUCCESS(rv, rv);
+        mozilla::mailnews::MessageBodyState body;
+        rv = core->MessageDB().GetMessageBodyState(key, body);
+        NS_ENSURE_SUCCESS(rv, rv);
+        NS_ENSURE_TRUE(body.folderId == folderId, NS_ERROR_ILLEGAL_VALUE);
+        nsAutoCString token;
+        rv = header->GetStoreToken(token);
+        NS_ENSURE_SUCCESS(rv, rv);
+        NS_ENSURE_TRUE(
+            body.storeToken ? token.Equals(*body.storeToken) : token.IsEmpty(),
+            NS_ERROR_NOT_AVAILABLE);
       }
     }
-    MarkMsgsOnPop3Server(hdrsToDelete, POP3_DELETE);
-  }
-
-  const bool notifyDeletion = !isMove && (deleteStorage || isTrashFolder);
-  auto complete = [&](nsresult status) {
-    if (notifyDeletion && listener) listener->OnStopCopy(status);
-    return status;
-  };
-
-  // notify on delete from trash and shift-delete
-  if (notifyDeletion) {
-    nsCOMPtr<nsIMsgFolderNotificationService> notifier =
-        mozilla::components::FolderNotification::Service();
-    if (listener) listener->OnStartCopy();
-    notifier->NotifyMsgsDeleted(msgHeaders);
-  }
-
-  if (!deleteStorage && !isTrashFolder) {
-    // We're moving the messages to trash folder. Start by kicking off a copy.
-    nsCOMPtr<nsIMsgFolder> trashFolder;
-    rv = GetTrashFolder(getter_AddRefs(trashFolder));
-    if (NS_SUCCEEDED(rv)) {
-      nsCOMPtr<nsIMsgCopyService> copyService =
-          mozilla::components::Copy::Service();
-      // When the copy completes, DeleteMessages() will be called again to
-      // perform the actual delete.
-      return copyService->CopyMessages(this, msgHeaders, trashFolder, true,
-                                       listener, msgWindow, allowUndo);
-    }
-  } else {
-    // Performing an _actual_ delete. There are two ways we got here:
-    // 1) We're deleting messages without moving to trash.
-    // 2) We're in the second phase of a Move (to trash or elsewhere). The
-    //    copy succeeded, and now we need to delete the source messages.
-    nsCOMPtr<nsIMsgDatabase> msgDB;
-    rv = GetDatabaseWOReparse(getter_AddRefs(msgDB));
-    if (NS_SUCCEEDED(rv)) {
-      if (deleteStorage && isMove &&
-          Preferences::GetBool("mail.pop3.deleteFromServerOnMove"))
-        MarkMsgsOnPop3Server(msgHeaders, POP3_DELETE);
-
-      nsCOMPtr<nsISupports> msgSupport;
-      rv = EnableNotifications(allMessageCountNotifications, false);
-      if (NS_SUCCEEDED(rv)) {
-        // First, delete the actual messages in the store.
-        nsCOMPtr<nsIMsgPluggableStore> msgStore;
-        rv = GetMsgStore(getter_AddRefs(msgStore));
-        if (NS_SUCCEEDED(rv)) {
-          // Second, remove the message entries from the DB.
-          rv = msgStore->DeleteMessages(msgHeaders);
-          if (NS_SUCCEEDED(rv)) {
-            for (auto hdr : msgHeaders) {
-#ifdef MOZ_PANORAMA
-              if (undo) {
-                rv = undo->RemoveNativeSourceHeader(this, hdr);
-              } else
 #endif
-              {
-                rv = msgDB->DeleteHeader(hdr, nullptr, false, true);
+
+#ifdef MOZ_PANORAMA
+    if (undo) {
+      MOZ_TRY(undo->PrepareNativeSourceRemoval(this, msgHeaders));
+    }
+#endif
+
+    // shift delete case - (delete to trash is handled in EndMove)
+    // this is also the case when applying retention settings.
+    if (deleteStorage && !isMove) {
+      nsTArray<RefPtr<nsIMsgDBHdr>> hdrsToDelete;
+      for (auto msgHdr : msgHeaders) {
+        uint32_t attachmentDetached = 0;
+        msgHdr->GetUint32Property("attachmentDetached", &attachmentDetached);
+        if (!attachmentDetached) {
+          hdrsToDelete.AppendElement(msgHdr);
+        }
+      }
+      MarkMsgsOnPop3Server(hdrsToDelete, POP3_DELETE);
+    }
+
+    const bool notifyDeletion = !isMove && (deleteStorage || isTrashFolder);
+    auto complete = [&](nsresult status) {
+      if (notifyDeletion && listener) listener->OnStopCopy(status);
+      return status;
+    };
+
+    // notify on delete from trash and shift-delete
+    if (notifyDeletion) {
+      nsCOMPtr<nsIMsgFolderNotificationService> notifier =
+          mozilla::components::FolderNotification::Service();
+      if (listener) listener->OnStartCopy();
+      notifier->NotifyMsgsDeleted(msgHeaders);
+    }
+
+    if (!deleteStorage && !isTrashFolder) {
+      // We're moving the messages to trash folder. Start by kicking off a copy.
+      nsCOMPtr<nsIMsgFolder> trashFolder;
+      rv = GetTrashFolder(getter_AddRefs(trashFolder));
+      if (NS_SUCCEEDED(rv)) {
+        nsCOMPtr<nsIMsgCopyService> copyService =
+            mozilla::components::Copy::Service();
+        // When the copy completes, DeleteMessages() will be called again to
+        // perform the actual delete.
+        return copyService->CopyMessages(this, msgHeaders, trashFolder, true,
+                                         listener, msgWindow, allowUndo);
+      }
+    } else {
+      // Performing an _actual_ delete. There are two ways we got here:
+      // 1) We're deleting messages without moving to trash.
+      // 2) We're in the second phase of a Move (to trash or elsewhere). The
+      //    copy succeeded, and now we need to delete the source messages.
+      nsCOMPtr<nsIMsgDatabase> msgDB;
+      rv = GetDatabaseWOReparse(getter_AddRefs(msgDB));
+      if (NS_SUCCEEDED(rv)) {
+        if (deleteStorage && isMove &&
+            Preferences::GetBool("mail.pop3.deleteFromServerOnMove"))
+          MarkMsgsOnPop3Server(msgHeaders, POP3_DELETE);
+
+        nsCOMPtr<nsISupports> msgSupport;
+        rv = EnableNotifications(allMessageCountNotifications, false);
+        if (NS_SUCCEEDED(rv)) {
+          // First, delete the actual messages in the store.
+          nsCOMPtr<nsIMsgPluggableStore> msgStore;
+          rv = GetMsgStore(getter_AddRefs(msgStore));
+          if (NS_SUCCEEDED(rv)) {
+            // Second, remove the message entries from the DB.
+#ifdef MOZ_PANORAMA
+            {
+              mozilla::mailnews::AutoLocalStoreMigrationContinuation
+                  continuation(migration);
+#endif
+              rv = msgStore->DeleteMessages(msgHeaders);
+#ifdef MOZ_PANORAMA
+            }
+#endif
+            if (NS_SUCCEEDED(rv)) {
+              for (auto hdr : msgHeaders) {
+#ifdef MOZ_PANORAMA
+                if (undo) {
+                  rv = undo->RemoveNativeSourceHeader(this, hdr, migration);
+                } else
+#endif
+                {
+                  rv = msgDB->DeleteHeader(hdr, nullptr, false, true);
+                }
+                if (NS_FAILED(rv)) break;
               }
-              if (NS_FAILED(rv)) break;
             }
           }
+        } else if (rv == NS_MSG_FOLDER_BUSY) {
+          ThrowAlertMsg("deletingMsgsFailed", msgWindow);
         }
-      } else if (rv == NS_MSG_FOLDER_BUSY) {
-        ThrowAlertMsg("deletingMsgsFailed", msgWindow);
-      }
 
-      // Let everyone know the operation has finished.
-      NotifyFolderEvent(NS_SUCCEEDED(rv) ? kDeleteOrMoveMsgCompleted
-                                         : kDeleteOrMoveMsgFailed);
-      // NOTE: This reenabling also forces immediate recount + notification.
-      EnableNotifications(allMessageCountNotifications, true);
-      if (msgWindow) {
-        AutoCompact(msgWindow);
+        // Let everyone know the operation has finished.
+        NotifyFolderEvent(NS_SUCCEEDED(rv) ? kDeleteOrMoveMsgCompleted
+                                           : kDeleteOrMoveMsgFailed);
+        // NOTE: This reenabling also forces immediate recount + notification.
+        EnableNotifications(allMessageCountNotifications, true);
+        if (msgWindow) {
+          AutoCompact(msgWindow);
+        }
       }
     }
-  }
 
-  if (msgWindow && !isMove && (deleteStorage || isTrashFolder)) {
-    // Clear undo and redo stack.
-    nsCOMPtr<nsITransactionManager> txnMgr;
-    nsCOMPtr<nsIMsgTransactionService> txns =
-        mozilla::components::Txns::Service();
-    if (!txns) {
-      return complete(NS_FAILED(rv) ? rv : NS_ERROR_UNEXPECTED);
+    if (msgWindow && !isMove && (deleteStorage || isTrashFolder)) {
+      // Clear undo and redo stack.
+      nsCOMPtr<nsITransactionManager> txnMgr;
+      nsCOMPtr<nsIMsgTransactionService> txns =
+          mozilla::components::Txns::Service();
+      if (!txns) {
+        return complete(NS_FAILED(rv) ? rv : NS_ERROR_UNEXPECTED);
+      }
+      txns->GetTransactionManager(getter_AddRefs(txnMgr));
+      if (txnMgr) {
+        txnMgr->Clear();
+      }
     }
-    txns->GetTransactionManager(getter_AddRefs(txnMgr));
-    if (txnMgr) {
-      txnMgr->Clear();
-    }
-  }
-  return complete(rv);
+    return complete(rv);
+
+#ifdef MOZ_PANORAMA
+  }();
+  migration->Complete(migrationResult);
+  return migrationResult;
+#endif
 }
 
 #ifdef MOZ_PANORAMA
 nsresult nsMsgLocalMailFolder::DeleteNativePermanentMessages(
     const nsTArray<RefPtr<nsIMsgDBHdr>>& headers, nsIMsgWindow* window,
-    nsIMsgCopyServiceListener* listener) {
+    nsIMsgCopyServiceListener* listener,
+    mozilla::mailnews::LocalStoreMigrationWork* migrationParent) {
+  if (migrationParent) MOZ_TRY(migrationParent->Validate());
+
   // Keep the original synchronous callback contract. Reentry cannot launch a
   // second selection or retire the source while the first operation settles.
   auto complete = [&](nsresult result) {
@@ -1711,18 +1879,26 @@ nsresult nsMsgLocalMailFolder::DeleteNativePermanentMessages(
   nsCOMPtr<nsIMsgDatabase> database;
   rv = GetDatabaseWOReparse(getter_AddRefs(database));
   if (NS_FAILED(rv)) return complete(rv);
-  rv = RecoverNativePurge(this);
+  {
+    mozilla::mailnews::AutoLocalStoreMigrationContinuation continuation(
+        migrationParent);
+    rv = RecoverNativePurge(this);
+  }
   if (NS_FAILED(rv)) return complete(rv);
   rv = EnableNotifications(allMessageCountNotifications, false);
   if (NS_FAILED(rv)) return complete(rv);
   if (listener) listener->OnStartCopy();
   nsTArray<RefPtr<nsIMsgDBHdr>> removed;
-  rv = PurgeNativeMessages(
-      this, database, headers, removed, [&](nsIMsgDBHdr* header) {
-        uint32_t detached = 0;
-        header->GetUint32Property("attachmentDetached", &detached);
-        if (!detached) MarkMsgsOnPop3Server({header}, POP3_DELETE);
-      });
+  {
+    mozilla::mailnews::AutoLocalStoreMigrationContinuation continuation(
+        migrationParent);
+    rv = PurgeNativeMessages(
+        this, database, headers, removed, [&](nsIMsgDBHdr* header) {
+          uint32_t detached = 0;
+          header->GetUint32Property("attachmentDetached", &detached);
+          if (!detached) MarkMsgsOnPop3Server({header}, POP3_DELETE);
+        });
+  }
   // Notify only the committed prefix. A SQL/provider/custody error must not
   // announce deletion of a later untouched source or erase the primary error.
   if (!removed.IsEmpty()) {
@@ -1899,6 +2075,12 @@ nsMsgLocalMailFolder::OnCopyCompleted(nsISupports* srcSupport,
 
 nsresult nsMsgLocalMailFolder::CompleteCopy(nsISupports* srcSupport,
                                             nsresult copyStatus) {
+#ifdef MOZ_PANORAMA
+  RefPtr<mozilla::mailnews::LocalStoreMigrationWork> migration =
+      mMigrationCopyWork;
+  if (migration) MOZ_TRY(migration->Validate());
+#endif
+
   bool moveCopySucceeded = NS_SUCCEEDED(copyStatus);
   if (mCopyState && NS_FAILED(mCopyState->m_copyError)) {
     moveCopySucceeded = false;
@@ -1946,15 +2128,33 @@ nsresult nsMsgLocalMailFolder::CompleteCopy(nsISupports* srcSupport,
     (void)CloseDB();
   }
 
+#ifdef MOZ_PANORAMA
+  mMigrationCopyWork = nullptr;
+#endif
   delete mCopyState;
   mCopyState = nullptr;
   RefPtr<LocalFolderCopy> folderCopy = std::move(mFolderCopy);
   if (folderCopy) {
-    return folderCopy->MessagesCopied(copyStatus);
+    nsresult notified = folderCopy->MessagesCopied(copyStatus);
+#ifdef MOZ_PANORAMA
+    if (migration) {
+      migration->RecordError(notified);
+      migration->Complete(copyStatus);
+    }
+#endif
+    return notified;
   }
   nsCOMPtr<nsIMsgCopyService> copyService =
       mozilla::components::Copy::Service();
-  return copyService->NotifyCompletion(srcSupport, this, copyStatus);
+  nsresult notified =
+      copyService->NotifyCompletion(srcSupport, this, copyStatus);
+#ifdef MOZ_PANORAMA
+  if (migration) {
+    migration->RecordError(notified);
+    migration->Complete(copyStatus);
+  }
+#endif
+  return notified;
 }
 
 bool nsMsgLocalMailFolder::CheckIfSpaceForCopy(nsIMsgWindow* msgWindow,
@@ -1980,224 +2180,264 @@ nsMsgLocalMailFolder::CopyMessages(nsIMsgFolder* srcFolder,
                                    bool isMove, nsIMsgWindow* msgWindow,
                                    nsIMsgCopyServiceListener* listener,
                                    bool isFolder, bool allowUndo) {
-  nsCOMPtr<nsISupports> srcSupport = do_QueryInterface(srcFolder);
-  bool isServer;
-  nsresult rv = GetIsServer(&isServer);
-  if (NS_SUCCEEDED(rv) && isServer) {
-    NS_ERROR("Destination is the root folder. Cannot move/copy here");
-    if (isMove) srcFolder->NotifyFolderEvent(kDeleteOrMoveMsgFailed);
-    return OnCopyCompleted(srcSupport, false);
-  }
-  if (srcHdrs.IsEmpty()) {
-    NS_WARNING("Cannot copy an empty message array");
-    return NS_ERROR_INVALID_ARG;
-  }
-
-  // If allowUndo is true, this should be a user-initiated action.
-  UpdateTimestamps(allowUndo);
-  nsCString protocolType;
-  rv = srcFolder->GetURI(protocolType);
-  protocolType.SetLength(protocolType.FindChar(':'));
-
-  // If we're offline and the source folder is imap or news, to do the
-  // copy the message bodies MUST reside in offline storage.
-  bool needOfflineBodies =
-      (WeAreOffline() && (protocolType.LowerCaseEqualsLiteral("imap") ||
-                          protocolType.LowerCaseEqualsLiteral("news")));
-  int64_t totalMsgSize = 0;
-  bool allMsgsHaveOfflineStore = true;
-  for (auto message : srcHdrs) {
-    nsMsgKey key;
-    uint32_t msgSize;
-    bool hasMsgOffline = false;
 #ifdef MOZ_PANORAMA
-    if (mail_panorama_enabled_AtStartup()) {
-      // Fail admission before opening or publishing any destination body.
-      rv = message->GetMessageSize(&msgSize);
-      if (NS_SUCCEEDED(rv)) rv = message->GetMessageKey(&key);
-      if (NS_SUCCEEDED(rv)) {
-        rv = srcFolder->HasMsgOffline(key, &hasMsgOffline);
-      }
-      if (NS_FAILED(rv)) {
-        if (isMove) srcFolder->NotifyFolderEvent(kDeleteOrMoveMsgFailed);
-        // No copy state or stream exists yet. Settle this queued request with
-        // the original error without disturbing another request's copy state.
-        nsCOMPtr<nsIMsgCopyService> copyService =
-            mozilla::components::Copy::Service();
-        if (mFolderCopy) {
-          return CompleteCopy(srcSupport, rv);
-        }
-        return copyService->NotifyCompletion(srcSupport, this, rv);
-      }
-    } else
-#endif
-    {
-      message->GetMessageSize(&msgSize);
-      message->GetMessageKey(&key);
-      srcFolder->HasMsgOffline(key, &hasMsgOffline);
+  NS_ENSURE_FALSE(mMigrationCopyWork && !mMigrationCopyWork->IsTerminal(),
+                  NS_MSG_FOLDER_BUSY);
+  MOZ_TRY(mozilla::mailnews::LocalStoreMigrationWork::Begin(
+      static_cast<nsIMsgLocalMailFolder*>(this),
+      static_cast<nsIMsgFolder*>(this), mMigrationCopyWork));
+  {
+    nsresult bound = mMigrationCopyWork->AddFolder(srcFolder);
+    if (NS_FAILED(bound)) {
+      mMigrationCopyWork->Complete(bound);
+      mMigrationCopyWork = nullptr;
+      return bound;
     }
-
-    /* 200 is a per-message overhead to account for any extra data added
-       to the message.
-    */
-    totalMsgSize += msgSize + 200;
-    allMsgsHaveOfflineStore = allMsgsHaveOfflineStore && hasMsgOffline;
-
-    // If we're offline and not all messages are in offline storage, the copy
-    // or move can't occur and a notification for the user to download the
-    // messages is posted.
-    if (needOfflineBodies && !hasMsgOffline) {
+  }
+  RefPtr<mozilla::mailnews::LocalStoreMigrationWork> admitted =
+      mMigrationCopyWork;
+  nsresult migrationResult = [&]() -> nsresult {
+#endif
+    nsCOMPtr<nsISupports> srcSupport = do_QueryInterface(srcFolder);
+    bool isServer;
+    nsresult rv = GetIsServer(&isServer);
+    if (NS_SUCCEEDED(rv) && isServer) {
+      NS_ERROR("Destination is the root folder. Cannot move/copy here");
       if (isMove) srcFolder->NotifyFolderEvent(kDeleteOrMoveMsgFailed);
-      ThrowAlertMsg("cantMoveMsgWOBodyOffline", msgWindow);
       return OnCopyCompleted(srcSupport, false);
     }
-  }
-
-  if (!CheckIfSpaceForCopy(msgWindow, srcFolder, srcSupport, isMove,
-                           totalMsgSize))
-    return NS_OK;
-
-  NS_ENSURE_SUCCESS(rv, rv);
-  bool storeDidCopy = false;
-  nsCOMPtr<nsIMsgPluggableStore> msgStore;
-  rv = GetMsgStore(getter_AddRefs(msgStore));
-  NS_ENSURE_SUCCESS(rv, rv);
-  nsCOMPtr<nsITransaction> undoTxn;
-  nsTArray<RefPtr<nsIMsgDBHdr>> dstHdrs;
-  // Store shortcuts finish only the messages. Folder transfers need the
-  // streamed completion path below to copy or move their subfolders too.
-  if (!isFolder) {
-    rv = msgStore->CopyMessages(isMove, srcHdrs, this, dstHdrs,
-                                getter_AddRefs(undoTxn), &storeDidCopy);
-  }
-  if (storeDidCopy) {
-    NS_ASSERTION(undoTxn, "if store does copy, it needs to add undo action");
-    if (msgWindow && undoTxn) {
-      nsCOMPtr<nsITransactionManager> txnMgr;
-      nsCOMPtr<nsIMsgTransactionService> txns =
-          mozilla::components::Txns::Service();
-      NS_ENSURE_STATE(txns);
-      txns->GetTransactionManager(getter_AddRefs(txnMgr));
-      if (txnMgr) txnMgr->DoTransaction(undoTxn);
-    }
-    if (isMove) {
-      srcFolder->NotifyFolderEvent(NS_SUCCEEDED(rv) ? kDeleteOrMoveMsgCompleted
-                                                    : kDeleteOrMoveMsgFailed);
+    if (srcHdrs.IsEmpty()) {
+      NS_WARNING("Cannot copy an empty message array");
+      return NS_ERROR_INVALID_ARG;
     }
 
-    if (NS_SUCCEEDED(rv)) {
-      // If the store did the copy, like maildir, we need to mark messages on
-      // the server. Otherwise that's done in EndMove().
-      nsCOMPtr<nsIMsgLocalMailFolder> localDstFolder;
-      QueryInterface(NS_GET_IID(nsIMsgLocalMailFolder),
-                     getter_AddRefs(localDstFolder));
-      if (localDstFolder) {
-        // If we are the trash and a local msg is being moved to us, mark the
-        // source for delete from server, if so configured.
-        if (mFlags & nsMsgFolderFlags::Trash) {
-          // If we're deleting on all moves, we'll mark this message for
-          // deletion when we call DeleteMessages on the source folder. So don't
-          // mark it for deletion here, in that case.
-          if (!Preferences::GetBool("mail.pop3.deleteFromServerOnMove")) {
-            localDstFolder->MarkMsgsOnPop3Server(dstHdrs, POP3_DELETE);
+    // If allowUndo is true, this should be a user-initiated action.
+    UpdateTimestamps(allowUndo);
+    nsCString protocolType;
+    rv = srcFolder->GetURI(protocolType);
+    protocolType.SetLength(protocolType.FindChar(':'));
+
+    // If we're offline and the source folder is imap or news, to do the
+    // copy the message bodies MUST reside in offline storage.
+    bool needOfflineBodies =
+        (WeAreOffline() && (protocolType.LowerCaseEqualsLiteral("imap") ||
+                            protocolType.LowerCaseEqualsLiteral("news")));
+    int64_t totalMsgSize = 0;
+    bool allMsgsHaveOfflineStore = true;
+    for (auto message : srcHdrs) {
+      nsMsgKey key;
+      uint32_t msgSize;
+      bool hasMsgOffline = false;
+#ifdef MOZ_PANORAMA
+      if (mail_panorama_enabled_AtStartup()) {
+        // Fail admission before opening or publishing any destination body.
+        rv = message->GetMessageSize(&msgSize);
+        if (NS_SUCCEEDED(rv)) rv = message->GetMessageKey(&key);
+        if (NS_SUCCEEDED(rv)) {
+          rv = srcFolder->HasMsgOffline(key, &hasMsgOffline);
+        }
+        if (NS_FAILED(rv)) {
+          if (isMove) srcFolder->NotifyFolderEvent(kDeleteOrMoveMsgFailed);
+          // No copy state or stream exists yet. Settle this queued request with
+          // the original error without disturbing another request's copy state.
+          nsCOMPtr<nsIMsgCopyService> copyService =
+              mozilla::components::Copy::Service();
+          if (mFolderCopy) {
+            return CompleteCopy(srcSupport, rv);
+          }
+          return copyService->NotifyCompletion(srcSupport, this, rv);
+        }
+      } else
+#endif
+      {
+        message->GetMessageSize(&msgSize);
+        message->GetMessageKey(&key);
+        srcFolder->HasMsgOffline(key, &hasMsgOffline);
+      }
+
+      /* 200 is a per-message overhead to account for any extra data added
+         to the message.
+      */
+      totalMsgSize += msgSize + 200;
+      allMsgsHaveOfflineStore = allMsgsHaveOfflineStore && hasMsgOffline;
+
+      // If we're offline and not all messages are in offline storage, the copy
+      // or move can't occur and a notification for the user to download the
+      // messages is posted.
+      if (needOfflineBodies && !hasMsgOffline) {
+        if (isMove) srcFolder->NotifyFolderEvent(kDeleteOrMoveMsgFailed);
+        ThrowAlertMsg("cantMoveMsgWOBodyOffline", msgWindow);
+        return OnCopyCompleted(srcSupport, false);
+      }
+    }
+
+    if (!CheckIfSpaceForCopy(msgWindow, srcFolder, srcSupport, isMove,
+                             totalMsgSize))
+      return NS_OK;
+
+    NS_ENSURE_SUCCESS(rv, rv);
+    bool storeDidCopy = false;
+    nsCOMPtr<nsIMsgPluggableStore> msgStore;
+    rv = GetMsgStore(getter_AddRefs(msgStore));
+    NS_ENSURE_SUCCESS(rv, rv);
+    nsCOMPtr<nsITransaction> undoTxn;
+    nsTArray<RefPtr<nsIMsgDBHdr>> dstHdrs;
+    // Store shortcuts finish only the messages. Folder transfers need the
+    // streamed completion path below to copy or move their subfolders too.
+    if (!isFolder) {
+#ifdef MOZ_PANORAMA
+      {
+        mozilla::mailnews::AutoLocalStoreMigrationContinuation continuation(
+            mMigrationCopyWork);
+#endif
+        rv = msgStore->CopyMessages(isMove, srcHdrs, this, dstHdrs,
+                                    getter_AddRefs(undoTxn), &storeDidCopy);
+#ifdef MOZ_PANORAMA
+      }
+#endif
+    }
+    if (storeDidCopy) {
+      NS_ASSERTION(undoTxn, "if store does copy, it needs to add undo action");
+      if (msgWindow && undoTxn) {
+        nsCOMPtr<nsITransactionManager> txnMgr;
+        nsCOMPtr<nsIMsgTransactionService> txns =
+            mozilla::components::Txns::Service();
+        NS_ENSURE_STATE(txns);
+        txns->GetTransactionManager(getter_AddRefs(txnMgr));
+        if (txnMgr) txnMgr->DoTransaction(undoTxn);
+      }
+      if (isMove) {
+        srcFolder->NotifyFolderEvent(NS_SUCCEEDED(rv)
+                                         ? kDeleteOrMoveMsgCompleted
+                                         : kDeleteOrMoveMsgFailed);
+      }
+
+      if (NS_SUCCEEDED(rv)) {
+        // If the store did the copy, like maildir, we need to mark messages on
+        // the server. Otherwise that's done in EndMove().
+        nsCOMPtr<nsIMsgLocalMailFolder> localDstFolder;
+        QueryInterface(NS_GET_IID(nsIMsgLocalMailFolder),
+                       getter_AddRefs(localDstFolder));
+        if (localDstFolder) {
+          // If we are the trash and a local msg is being moved to us, mark the
+          // source for delete from server, if so configured.
+          if (mFlags & nsMsgFolderFlags::Trash) {
+            // If we're deleting on all moves, we'll mark this message for
+            // deletion when we call DeleteMessages on the source folder. So
+            // don't mark it for deletion here, in that case.
+            if (!Preferences::GetBool("mail.pop3.deleteFromServerOnMove")) {
+              localDstFolder->MarkMsgsOnPop3Server(dstHdrs, POP3_DELETE);
+            }
           }
         }
       }
+
+      OnCopyCompleted(srcSupport, NS_SUCCEEDED(rv));
+      return rv;
     }
+    // If the store doesn't do the copy, we'll stream the source messages into
+    // the target folder, using getMsgInputStream and getNewMsgOutputStream.
 
-    OnCopyCompleted(srcSupport, NS_SUCCEEDED(rv));
-    return rv;
-  }
-  // If the store doesn't do the copy, we'll stream the source messages into
-  // the target folder, using getMsgInputStream and getNewMsgOutputStream.
+    // don't update the counts in the dest folder until it is all over
+    EnableNotifications(allMessageCountNotifications, false);
 
-  // don't update the counts in the dest folder until it is all over
-  EnableNotifications(allMessageCountNotifications, false);
-
-  // sort the message array by key
-  nsTArray<nsMsgKey> keyArray(srcHdrs.Length());
-  nsTArray<RefPtr<nsIMsgDBHdr>> sortedMsgs(srcHdrs.Length());
-  for (nsIMsgDBHdr* aMessage : srcHdrs) {
-    nsMsgKey key;
-    aMessage->GetMessageKey(&key);
-    keyArray.AppendElement(key);
-  }
-  keyArray.Sort();
-  rv = MessagesInKeyOrder(keyArray, srcFolder, sortedMsgs);
-  NS_ENSURE_SUCCESS(rv, rv);
-
-  rv = InitCopyState(srcSupport, sortedMsgs, isMove, listener, msgWindow,
-                     isFolder, allowUndo);
-
-  if (NS_FAILED(rv)) {
-    ThrowAlertMsg("operationFailedFolderBusy", msgWindow);
-    (void)OnCopyCompleted(srcSupport, false);
-    return rv;
-  }
-
-  if (!protocolType.LowerCaseEqualsLiteral("mailbox")) {
-    // Copying from a non-local source, so we will be adding "X-Mozilla-*"
-    // headers before copying the message proper.
-    mCopyState->m_addXMozillaHeaders = true;
-    nsParseMailMessageState* parseMsgState = new nsParseMailMessageState();
-    if (parseMsgState) {
-      nsCOMPtr<nsIMsgDatabase> msgDb;
-      mCopyState->m_parseMsgState = parseMsgState;
-      GetDatabaseWOReparse(getter_AddRefs(msgDb));
-      if (msgDb) parseMsgState->SetMailDB(msgDb);
+    // sort the message array by key
+    nsTArray<nsMsgKey> keyArray(srcHdrs.Length());
+    nsTArray<RefPtr<nsIMsgDBHdr>> sortedMsgs(srcHdrs.Length());
+    for (nsIMsgDBHdr* aMessage : srcHdrs) {
+      nsMsgKey key;
+      aMessage->GetMessageKey(&key);
+      keyArray.AppendElement(key);
     }
-  }
+    keyArray.Sort();
+    rv = MessagesInKeyOrder(keyArray, srcFolder, sortedMsgs);
+    NS_ENSURE_SUCCESS(rv, rv);
 
-  // undo stuff
-  if (allowUndo)  // no undo for folder move/copy or or move/copy from search
-                  // window
-  {
-    RefPtr<nsLocalMoveCopyMsgTxn> msgTxn = new nsLocalMoveCopyMsgTxn;
-    if (msgTxn && NS_SUCCEEDED(msgTxn->Init(srcFolder, this, isMove))) {
-      if (isMove) {
-        if (mFlags & nsMsgFolderFlags::Trash)
-          msgTxn->SetTransactionType(nsIMsgTransactionService::eDeleteMsg);
-        else
-          msgTxn->SetTransactionType(nsIMsgTransactionService::eMoveMsg);
-      } else
-        msgTxn->SetTransactionType(nsIMsgTransactionService::eCopyMsg);
-      msgTxn.swap(mCopyState->m_undoMsgTxn);
-    }
-  }
+    rv = InitCopyState(srcSupport, sortedMsgs, isMove, listener, msgWindow,
+                       isFolder, allowUndo);
 
-  if (srcHdrs.Length() > 1 &&
-      ((protocolType.LowerCaseEqualsLiteral("imap") &&
-        !allMsgsHaveOfflineStore) ||
-       protocolType.LowerCaseEqualsLiteral("mailbox"))) {
-    // For an imap source folder with more than one message to be copied that
-    // are not all in offline storage, this fetches all the messages from the
-    // imap server to do the copy. When source folder is "mailbox", this is not
-    // a concern since source messages are in local storage.
-    mCopyState->m_copyingMultipleMessages = true;
-    rv = CopyMessagesTo(keyArray, msgWindow, isMove);
     if (NS_FAILED(rv)) {
-      NS_WARNING("copy message failed");
+      ThrowAlertMsg("operationFailedFolderBusy", msgWindow);
       (void)OnCopyCompleted(srcSupport, false);
+      return rv;
     }
-  } else {
-    // This obtains the source messages from local/offline storage to do the
-    // copy. Note: CopyMessageTo() actually handles one or more messages.
-    nsIMsgDBHdr* msgSupport = mCopyState->m_messages[0];
-    if (msgSupport) {
-      rv = CopyMessageTo(msgSupport, msgWindow, isMove);
-      if (NS_FAILED(rv)) {
-        NS_ASSERTION(false, "copy message failed");
-        (void)OnCopyCompleted(srcSupport, false);
+
+    if (!protocolType.LowerCaseEqualsLiteral("mailbox")) {
+      // Copying from a non-local source, so we will be adding "X-Mozilla-*"
+      // headers before copying the message proper.
+      mCopyState->m_addXMozillaHeaders = true;
+      nsParseMailMessageState* parseMsgState = new nsParseMailMessageState();
+      if (parseMsgState) {
+        nsCOMPtr<nsIMsgDatabase> msgDb;
+        mCopyState->m_parseMsgState = parseMsgState;
+        GetDatabaseWOReparse(getter_AddRefs(msgDb));
+        if (msgDb) parseMsgState->SetMailDB(msgDb);
       }
     }
+
+    // undo stuff
+    if (allowUndo)  // no undo for folder move/copy or or move/copy from search
+                    // window
+    {
+      RefPtr<nsLocalMoveCopyMsgTxn> msgTxn = new nsLocalMoveCopyMsgTxn;
+      if (msgTxn && NS_SUCCEEDED(msgTxn->Init(srcFolder, this, isMove))) {
+        if (isMove) {
+          if (mFlags & nsMsgFolderFlags::Trash)
+            msgTxn->SetTransactionType(nsIMsgTransactionService::eDeleteMsg);
+          else
+            msgTxn->SetTransactionType(nsIMsgTransactionService::eMoveMsg);
+        } else
+          msgTxn->SetTransactionType(nsIMsgTransactionService::eCopyMsg);
+        msgTxn.swap(mCopyState->m_undoMsgTxn);
+      }
+    }
+
+    if (srcHdrs.Length() > 1 &&
+        ((protocolType.LowerCaseEqualsLiteral("imap") &&
+          !allMsgsHaveOfflineStore) ||
+         protocolType.LowerCaseEqualsLiteral("mailbox"))) {
+      // For an imap source folder with more than one message to be copied that
+      // are not all in offline storage, this fetches all the messages from the
+      // imap server to do the copy. When source folder is "mailbox", this is
+      // not a concern since source messages are in local storage.
+      mCopyState->m_copyingMultipleMessages = true;
+      rv = CopyMessagesTo(keyArray, msgWindow, isMove);
+      if (NS_FAILED(rv)) {
+        NS_WARNING("copy message failed");
+        (void)OnCopyCompleted(srcSupport, false);
+      }
+    } else {
+      // This obtains the source messages from local/offline storage to do the
+      // copy. Note: CopyMessageTo() actually handles one or more messages.
+      nsIMsgDBHdr* msgSupport = mCopyState->m_messages[0];
+      if (msgSupport) {
+        rv = CopyMessageTo(msgSupport, msgWindow, isMove);
+        if (NS_FAILED(rv)) {
+          NS_ASSERTION(false, "copy message failed");
+          (void)OnCopyCompleted(srcSupport, false);
+        }
+      }
+    }
+    // if this failed immediately, need to turn back on notifications and inform
+    // FE.
+    if (NS_FAILED(rv)) {
+      if (isMove) srcFolder->NotifyFolderEvent(kDeleteOrMoveMsgFailed);
+      EnableNotifications(allMessageCountNotifications, true);
+    }
+    return rv;
+
+#ifdef MOZ_PANORAMA
+  }();
+  // Actual async completion clears the same handle in CompleteCopy. A refusal
+  // before InitCopyState has no issued transfer/callback to wait for.
+  if (mMigrationCopyWork == admitted && !mCopyState) {
+    admitted->Complete(migrationResult);
+    mMigrationCopyWork = nullptr;
+  } else if (NS_FAILED(migrationResult)) {
+    admitted->RecordError(migrationResult);
   }
-  // if this failed immediately, need to turn back on notifications and inform
-  // FE.
-  if (NS_FAILED(rv)) {
-    if (isMove) srcFolder->NotifyFolderEvent(kDeleteOrMoveMsgFailed);
-    EnableNotifications(allMessageCountNotifications, true);
-  }
-  return rv;
+  return migrationResult;
+#endif
 }
 
 // for srcFolder that are on different server than the dstFolder.
@@ -2212,8 +2452,16 @@ nsresult nsMsgLocalMailFolder::CopyFolderAcrossServer(
   NS_ENSURE_SUCCESS(rv, rv);
 
   nsCOMPtr<nsIMsgFolder> destination;
-  rv = CreateSubfolderInternal(folderName, msgWindow,
-                               getter_AddRefs(destination));
+#ifdef MOZ_PANORAMA
+  {
+    mozilla::mailnews::AutoLocalStoreMigrationContinuation continuation(
+        mMigrationFolderWork);
+#endif
+    rv = CreateSubfolderInternal(folderName, msgWindow,
+                                 getter_AddRefs(destination));
+#ifdef MOZ_PANORAMA
+  }
+#endif
   NS_ENSURE_SUCCESS(rv, rv);
 
   nsTArray<RefPtr<nsIMsgFolder>> children;
@@ -2250,6 +2498,10 @@ nsresult nsMsgLocalMailFolder::CopyFolderAcrossServer(
   RefPtr<LocalFolderCopy> operation =
       new LocalFolderCopy(srcFolder, localDestination, this,
                           std::move(children), msgWindow, listener, moveMsgs);
+#ifdef MOZ_PANORAMA
+  operation->SetMigrationWork(mMigrationFolderWork);
+  mMigrationFolderWork = nullptr;
+#endif
   if (headers.IsEmpty()) {
     return operation->MessagesCopied(NS_OK);
   }
@@ -2257,8 +2509,16 @@ nsresult nsMsgLocalMailFolder::CopyFolderAcrossServer(
   // Keep the existing folder-message path, including per-message Finish and
   // source retirement. Its completion advances the subtree instead of
   // completing the root request while child copies are still outstanding.
-  rv = localDestination->CopyMessages(srcFolder, headers, moveMsgs, msgWindow,
-                                      listener, true, false);
+#ifdef MOZ_PANORAMA
+  {
+    mozilla::mailnews::AutoLocalStoreMigrationContinuation continuation(
+        operation->MigrationWork());
+#endif
+    rv = localDestination->CopyMessages(srcFolder, headers, moveMsgs, msgWindow,
+                                        listener, true, false);
+#ifdef MOZ_PANORAMA
+  }
+#endif
   if (NS_FAILED(rv) && localDestination->mFolderCopy == operation) {
     (void)localDestination->CompleteCopy(srcFolder, rv);
   }
@@ -2285,27 +2545,58 @@ NS_IMETHODIMP
 nsMsgLocalMailFolder::CopyFolder(nsIMsgFolder* srcFolder, bool isMoveFolder,
                                  nsIMsgWindow* msgWindow,
                                  nsIMsgCopyServiceListener* listener) {
-  NS_ENSURE_ARG_POINTER(srcFolder);
-  nsresult rv;
-  bool sameServer;
-  rv = IsOnSameServer(this, srcFolder, &sameServer);
-  NS_ENSURE_SUCCESS(rv, rv);
-  if (sameServer && isMoveFolder) {
-    // Do a pure folder move within the same Local Folder account/server. where
-    // "pure" means the folder AND messages are copied to the Local Folders
-    // destination and then both are removed from source account.
-    rv = CopyFolderLocal(srcFolder, isMoveFolder, msgWindow, listener);
-  } else {
-    // !sameServer OR it's a copy. Unit tests expect a successful folder
-    // copy within Local Folders account/server even though the UI forbids copy
-    // and only allows moves inside the same account. CopyFolderAcrossServer(),
-    // called below, handles the folder copy within Local Folders (needed by
-    // unit tests) and it handles the folder move or copy from another account
-    // or server into Local Folders. The move from another account is "impure"
-    // since just the messages are moved but the source folder remains in place.
-    rv = CopyFolderAcrossServer(srcFolder, msgWindow, listener, isMoveFolder);
+#ifdef MOZ_PANORAMA
+  NS_ENSURE_FALSE(mMigrationFolderWork && !mMigrationFolderWork->IsTerminal(),
+                  NS_MSG_FOLDER_BUSY);
+  mozilla::mailnews::AutoLocalStoreMigrationContinuation parent(
+      LocalFolderCopy::ParentFor(listener, srcFolder, this));
+  MOZ_TRY(mozilla::mailnews::LocalStoreMigrationWork::Begin(
+      static_cast<nsIMsgLocalMailFolder*>(this),
+      static_cast<nsIMsgFolder*>(this), mMigrationFolderWork));
+  {
+    nsresult bound = mMigrationFolderWork->AddFolder(srcFolder);
+    if (NS_FAILED(bound)) {
+      mMigrationFolderWork->Complete(bound);
+      mMigrationFolderWork = nullptr;
+      return bound;
+    }
   }
-  return rv;
+  RefPtr<mozilla::mailnews::LocalStoreMigrationWork> admitted =
+      mMigrationFolderWork;
+  nsresult migrationResult = [&]() -> nsresult {
+#endif
+    NS_ENSURE_ARG_POINTER(srcFolder);
+    nsresult rv;
+    bool sameServer;
+    rv = IsOnSameServer(this, srcFolder, &sameServer);
+    NS_ENSURE_SUCCESS(rv, rv);
+    if (sameServer && isMoveFolder) {
+      // Do a pure folder move within the same Local Folder account/server.
+      // where "pure" means the folder AND messages are copied to the Local
+      // Folders destination and then both are removed from source account.
+      rv = CopyFolderLocal(srcFolder, isMoveFolder, msgWindow, listener);
+    } else {
+      // !sameServer OR it's a copy. Unit tests expect a successful folder
+      // copy within Local Folders account/server even though the UI forbids
+      // copy and only allows moves inside the same account.
+      // CopyFolderAcrossServer(), called below, handles the folder copy within
+      // Local Folders (needed by unit tests) and it handles the folder move or
+      // copy from another account or server into Local Folders. The move from
+      // another account is "impure" since just the messages are moved but the
+      // source folder remains in place.
+      rv = CopyFolderAcrossServer(srcFolder, msgWindow, listener, isMoveFolder);
+    }
+    return rv;
+
+#ifdef MOZ_PANORAMA
+  }();
+  if (mMigrationFolderWork == admitted) {
+    admitted->Complete(migrationResult);
+    mMigrationFolderWork = nullptr;
+  } else if (NS_FAILED(migrationResult))
+    admitted->RecordError(migrationResult);
+  return migrationResult;
+#endif
 }
 
 NS_IMETHODIMP
@@ -2411,6 +2702,10 @@ nsMsgLocalMailFolder::CopyFolderLocal(nsIMsgFolder* srcFolder,
   }
 #endif
 
+#ifdef MOZ_PANORAMA
+  mozilla::mailnews::AutoLocalStoreMigrationContinuation continuation(
+      mMigrationFolderWork);
+#endif
   return msgStore->CopyFolder(srcFolder, this, isMoveFolder, msgWindow,
                               aListener, newFolderName);
 }
@@ -2422,124 +2717,156 @@ nsMsgLocalMailFolder::CopyFileMessage(nsIFile* aFile, nsIMsgDBHdr* msgToReplace,
                                       const nsACString& aNewMsgKeywords,
                                       nsIMsgWindow* msgWindow,
                                       nsIMsgCopyServiceListener* listener) {
-  NS_ENSURE_ARG_POINTER(aFile);
-  nsresult rv = NS_ERROR_NULL_POINTER;
-  nsParseMailMessageState* parseMsgState = nullptr;
-  int64_t fileSize = 0;
-
-  nsCOMPtr<nsISupports> fileSupport(aFile);
-
-  aFile->GetFileSize(&fileSize);
-  if (!CheckIfSpaceForCopy(msgWindow, nullptr, fileSupport, false, fileSize))
-    return NS_OK;
-
-  nsTArray<RefPtr<nsIMsgDBHdr>> messages;
-  if (msgToReplace) messages.AppendElement(msgToReplace);
-
-  rv = InitCopyState(fileSupport, messages, msgToReplace ? true : false,
-                     listener, msgWindow, false, false);
-  if (NS_SUCCEEDED(rv)) {
-    if (mCopyState) {
-      mCopyState->m_newMsgKeywords = aNewMsgKeywords;
-      mCopyState->m_flags = newMsgFlags;
+#ifdef MOZ_PANORAMA
+  NS_ENSURE_FALSE(mMigrationCopyWork && !mMigrationCopyWork->IsTerminal(),
+                  NS_MSG_FOLDER_BUSY);
+  MOZ_TRY(mozilla::mailnews::LocalStoreMigrationWork::Begin(
+      static_cast<nsIMsgLocalMailFolder*>(this),
+      static_cast<nsIMsgFolder*>(this), mMigrationCopyWork));
+  {
+    nsresult bound = mMigrationCopyWork->AddPath(aFile);
+    if (NS_FAILED(bound)) {
+      mMigrationCopyWork->Complete(bound);
+      mMigrationCopyWork = nullptr;
+      return bound;
     }
+  }
+  RefPtr<mozilla::mailnews::LocalStoreMigrationWork> admitted =
+      mMigrationCopyWork;
+  nsresult migrationResult = [&]() -> nsresult {
+#endif
+    NS_ENSURE_ARG_POINTER(aFile);
+    nsresult rv = NS_ERROR_NULL_POINTER;
+    nsParseMailMessageState* parseMsgState = nullptr;
+    int64_t fileSize = 0;
 
-    parseMsgState = new nsParseMailMessageState();
-    NS_ENSURE_TRUE(parseMsgState, NS_ERROR_OUT_OF_MEMORY);
-    nsCOMPtr<nsIMsgDatabase> msgDb;
-    mCopyState->m_parseMsgState = parseMsgState;
-    GetDatabaseWOReparse(getter_AddRefs(msgDb));
-    if (msgDb) parseMsgState->SetMailDB(msgDb);
+    nsCOMPtr<nsISupports> fileSupport(aFile);
 
-    nsCOMPtr<nsIInputStream> inputStream;
-    nsCOMPtr<nsISeekableStream> seekableStream;
-    rv = NS_NewLocalFileInputStream(getter_AddRefs(inputStream), aFile);
-    if NS_SUCCEEDED (rv) {
-      seekableStream = do_QueryInterface(inputStream, &rv);
-    }
+    aFile->GetFileSize(&fileSize);
+    if (!CheckIfSpaceForCopy(msgWindow, nullptr, fileSupport, false, fileSize))
+      return NS_OK;
 
-    // All or none for adding a message file to the store
-    if (NS_SUCCEEDED(rv) && fileSize > PR_INT32_MAX)
-      rv = NS_ERROR_ILLEGAL_VALUE;  // may need error code for max msg size
+    nsTArray<RefPtr<nsIMsgDBHdr>> messages;
+    if (msgToReplace) messages.AppendElement(msgToReplace);
 
-    // Sniff the beginning of the message to check for:
-    // 1. An erroneous "From " separator (a proper RFC5322 message file
-    //    shouldn't have one, but they are out there in the wild (e.g.
-    //    previous versions of TB would include a "From " line in emails
-    //    saved out to a file).
-    // 2. X-Mozilla-* headers. If they aren't present, we'll ask for them
-    //    to be added during the copy process.
-    int64_t msgStart = 0;
-    if (NS_SUCCEEDED(rv) && inputStream) {
-      // X-Mozilla-* headers, if present, appear early. So 2KB should be
-      // enough.
-      mozilla::Buffer<char> buf(2048);
-      uint32_t n;
-      rv = inputStream->Read(buf.Elements(), buf.Length(), &n);
+    rv = InitCopyState(fileSupport, messages, msgToReplace ? true : false,
+                       listener, msgWindow, false, false);
+    if (NS_SUCCEEDED(rv)) {
+      if (mCopyState) {
+        mCopyState->m_newMsgKeywords = aNewMsgKeywords;
+        mCopyState->m_flags = newMsgFlags;
+      }
+
+      parseMsgState = new nsParseMailMessageState();
+      NS_ENSURE_TRUE(parseMsgState, NS_ERROR_OUT_OF_MEMORY);
+      nsCOMPtr<nsIMsgDatabase> msgDb;
+      mCopyState->m_parseMsgState = parseMsgState;
+      GetDatabaseWOReparse(getter_AddRefs(msgDb));
+      if (msgDb) parseMsgState->SetMailDB(msgDb);
+
+      nsCOMPtr<nsIInputStream> inputStream;
+      nsCOMPtr<nsISeekableStream> seekableStream;
+      rv = NS_NewLocalFileInputStream(getter_AddRefs(inputStream), aFile);
+      if NS_SUCCEEDED (rv) {
+        seekableStream = do_QueryInterface(inputStream, &rv);
+      }
+
+      // All or none for adding a message file to the store
+      if (NS_SUCCEEDED(rv) && fileSize > PR_INT32_MAX)
+        rv = NS_ERROR_ILLEGAL_VALUE;  // may need error code for max msg size
+
+      // Sniff the beginning of the message to check for:
+      // 1. An erroneous "From " separator (a proper RFC5322 message file
+      //    shouldn't have one, but they are out there in the wild (e.g.
+      //    previous versions of TB would include a "From " line in emails
+      //    saved out to a file).
+      // 2. X-Mozilla-* headers. If they aren't present, we'll ask for them
+      //    to be added during the copy process.
+      int64_t msgStart = 0;
+      if (NS_SUCCEEDED(rv) && inputStream) {
+        // X-Mozilla-* headers, if present, appear early. So 2KB should be
+        // enough.
+        mozilla::Buffer<char> buf(2048);
+        uint32_t n;
+        rv = inputStream->Read(buf.Elements(), buf.Length(), &n);
+
+        if (NS_SUCCEEDED(rv)) {
+          auto data = buf.AsSpan().First(n);
+          // Found a "From " line? If so, note where it ends so we can skip it.
+          auto firstLine = FirstLine(data);
+          if (firstLine.Length() >= 5 &&
+              nsDependentCSubstring(firstLine.First(5))
+                  .EqualsLiteral("From ")) {
+            msgStart = (int64_t)firstLine.Length();  // Includes the EOL.
+            data = data.From(firstLine.Length());
+          }
+
+          // Are there any X-Mozilla-(Status|Status2|Keys) headers?
+          // If not, we'll ask for them to be added.
+          mCopyState->m_addXMozillaHeaders = true;
+          HeaderReader rdr;
+          rdr.Parse(data, [&](HeaderReader::Hdr const& hdr) {
+            auto const name = hdr.Name(data);
+            if (name.EqualsLiteral(X_MOZILLA_STATUS) ||
+                name.EqualsLiteral(X_MOZILLA_STATUS2) ||
+                name.EqualsLiteral("X-Mozilla-Keys")) {
+              mCopyState->m_addXMozillaHeaders = false;
+              return false;  // Early out.
+            }
+            return true;  // Continue scanning headers.
+          });
+
+          // Seek back to beginning of message, ready for copying,
+          // If we did find an initial "From ", skip to the next line.
+          rv = seekableStream->Seek(nsISeekableStream::NS_SEEK_SET, msgStart);
+        }
+      }
 
       if (NS_SUCCEEDED(rv)) {
-        auto data = buf.AsSpan().First(n);
-        // Found a "From " line? If so, note where it ends so we can skip it.
-        auto firstLine = FirstLine(data);
-        if (firstLine.Length() >= 5 &&
-            nsDependentCSubstring(firstLine.First(5)).EqualsLiteral("From ")) {
-          msgStart = (int64_t)firstLine.Length();  // Includes the EOL.
-          data = data.From(firstLine.Length());
-        }
+        rv = BeginCopy();
+      }
+      if (NS_SUCCEEDED(rv)) {
+        rv = CopyData(inputStream, (int32_t)fileSize - msgStart);
+      }
+      if (NS_SUCCEEDED(rv)) {
+        rv = EndCopy(true);
+      }
 
-        // Are there any X-Mozilla-(Status|Status2|Keys) headers?
-        // If not, we'll ask for them to be added.
-        mCopyState->m_addXMozillaHeaders = true;
-        HeaderReader rdr;
-        rdr.Parse(data, [&](HeaderReader::Hdr const& hdr) {
-          auto const name = hdr.Name(data);
-          if (name.EqualsLiteral(X_MOZILLA_STATUS) ||
-              name.EqualsLiteral(X_MOZILLA_STATUS2) ||
-              name.EqualsLiteral("X-Mozilla-Keys")) {
-            mCopyState->m_addXMozillaHeaders = false;
-            return false;  // Early out.
-          }
-          return true;  // Continue scanning headers.
-        });
+      // mDatabase should have been initialized above.
+      // If we were going to delete, here is where we would do it. But because
+      // existing code already supports doing those deletes, we are just going
+      // to end the copy.
+      if (NS_SUCCEEDED(rv) && msgToReplace && mDatabase) {
+        rv = OnCopyCompleted(fileSupport, true);
+      }
 
-        // Seek back to beginning of message, ready for copying,
-        // If we did find an initial "From ", skip to the next line.
-        rv = seekableStream->Seek(nsISeekableStream::NS_SEEK_SET, msgStart);
+      if (inputStream) {
+        inputStream->Close();
       }
     }
 
-    if (NS_SUCCEEDED(rv)) {
-      rv = BeginCopy();
-    }
-    if (NS_SUCCEEDED(rv)) {
-      rv = CopyData(inputStream, (int32_t)fileSize - msgStart);
-    }
-    if (NS_SUCCEEDED(rv)) {
-      rv = EndCopy(true);
-    }
-
-    // mDatabase should have been initialized above.
-    // If we were going to delete, here is where we would do it. But because
-    // existing code already supports doing those deletes, we are just going
-    // to end the copy.
-    if (NS_SUCCEEDED(rv) && msgToReplace && mDatabase) {
-      rv = OnCopyCompleted(fileSupport, true);
-    }
-
-    if (inputStream) {
-      inputStream->Close();
-    }
-  }
-
-  if (NS_FAILED(rv)
+    if (NS_FAILED(rv)
 #ifdef MOZ_PANORAMA
-      && (!mail_panorama_enabled_AtStartup() || mCopyState)
+        && (!mail_panorama_enabled_AtStartup() || mCopyState)
 #endif
-  ) {
-    (void)OnCopyCompleted(fileSupport, false);
-  }
+    ) {
+      (void)OnCopyCompleted(fileSupport, false);
+    }
 
-  return rv;
+    return rv;
+
+#ifdef MOZ_PANORAMA
+  }();
+  // Actual async completion clears the same handle in CompleteCopy. A refusal
+  // before InitCopyState has no issued transfer/callback to wait for.
+  if (mMigrationCopyWork == admitted && !mCopyState) {
+    admitted->Complete(migrationResult);
+    mMigrationCopyWork = nullptr;
+  } else if (NS_FAILED(migrationResult)) {
+    admitted->RecordError(migrationResult);
+  }
+  return migrationResult;
+#endif
 }
 
 NS_IMETHODIMP nsMsgLocalMailFolder::GetNewMessages(nsIMsgWindow* aWindow,
@@ -2744,6 +3071,10 @@ static nsresult CopyLocalHdrProperties(nsIMsgDBHdr* destHdr,
 #endif
 
 nsresult nsMsgLocalMailFolder::InitCopyMsgHdrAndFileStream() {
+#ifdef MOZ_PANORAMA
+  if (mMigrationCopyWork) MOZ_TRY(mMigrationCopyWork->Validate());
+#endif
+
   auto checked = [&](nsresult status) {
     if (NS_FAILED(status)) {
       if (NS_SUCCEEDED(mCopyState->m_copyError)) {
@@ -2785,8 +3116,16 @@ nsresult nsMsgLocalMailFolder::InitCopyMsgHdrAndFileStream() {
     mCopyState->m_storeToken.Truncate();
   }
 #endif
-  rv = mCopyState->m_msgStore->GetNewMsgOutputStream(
-      this, getter_AddRefs(mCopyState->m_fileStream));
+#ifdef MOZ_PANORAMA
+  {
+    mozilla::mailnews::AutoLocalStoreMigrationContinuation continuation(
+        mMigrationCopyWork);
+#endif
+    rv = mCopyState->m_msgStore->GetNewMsgOutputStream(
+        this, getter_AddRefs(mCopyState->m_fileStream));
+#ifdef MOZ_PANORAMA
+  }
+#endif
   NS_ENSURE_SUCCESS(rv, checked(rv));
   if (mCopyState->m_parseMsgState)
     mCopyState->m_parseMsgState->SetNewMsgHdr(mCopyState->m_newHdr);
@@ -2798,6 +3137,10 @@ nsresult nsMsgLocalMailFolder::InitCopyMsgHdrAndFileStream() {
 // transfers between accounts. Messages only and folder transfers are both
 // handled here.
 NS_IMETHODIMP nsMsgLocalMailFolder::BeginCopy() {
+#ifdef MOZ_PANORAMA
+  if (mMigrationCopyWork) MOZ_TRY(mMigrationCopyWork->Validate());
+#endif
+
   if (!mCopyState) return NS_ERROR_NULL_POINTER;
   if (mCopyState->m_writeFailed) return NS_ERROR_FAILURE;
   if (mCopyState->m_curCopyIndex < 2) {
@@ -2855,6 +3198,10 @@ NS_IMETHODIMP nsMsgLocalMailFolder::BeginCopy() {
 // nsICopyMessageListener.copyData()
 NS_IMETHODIMP nsMsgLocalMailFolder::CopyData(nsIInputStream* aIStream,
                                              int32_t aLength) {
+#ifdef MOZ_PANORAMA
+  if (mMigrationCopyWork) MOZ_TRY(mMigrationCopyWork->Validate());
+#endif
+
   // check to make sure we have control of the write.
   bool haveSemaphore;
   nsresult rv = NS_OK;
@@ -3123,6 +3470,10 @@ nsresult nsMsgLocalMailFolder::CompleteCopyMessage(nsIMsgDBHdr** liveHdr) {
 // nsICopyMessageListener.endCopy()
 MOZ_CAN_RUN_SCRIPT_BOUNDARY NS_IMETHODIMP
 nsMsgLocalMailFolder::EndCopy(bool aCopySucceeded) {
+#ifdef MOZ_PANORAMA
+  if (mMigrationCopyWork) MOZ_TRY(mMigrationCopyWork->Validate());
+#endif
+
   if (!mCopyState) return NS_OK;
 
   // Flush any remaining data (i.e if the last line of the message had
@@ -3499,6 +3850,10 @@ nsMsgLocalMailFolder::EndCopy(bool aCopySucceeded) {
 // nsICopyMessageListener.endMove()
 MOZ_CAN_RUN_SCRIPT_BOUNDARY NS_IMETHODIMP
 nsMsgLocalMailFolder::EndMove(bool moveSucceeded) {
+#ifdef MOZ_PANORAMA
+  if (mMigrationCopyWork) MOZ_TRY(mMigrationCopyWork->Validate());
+#endif
+
   nsresult rv;
   if (!mCopyState) return NS_OK;
   if (mCopyState->m_sourceDeleteListener && moveSucceeded &&
@@ -3567,9 +3922,19 @@ nsMsgLocalMailFolder::EndMove(bool moveSucceeded) {
         mCopyState->m_undoMsgTxn->UsesNativeLocalUndo()) {
       RefPtr<nsLocalMoveCopyMsgTxn> undo = mCopyState->m_undoMsgTxn;
       rv = static_cast<nsMsgLocalMailFolder*>(localSrcFolder.get())
+               ->DeleteMessagesInternal(
+                   mCopyState->m_messages, mCopyState->m_msgWindow, true, true,
+                   nullptr, mCopyState->m_allowUndo, undo, mMigrationCopyWork);
+      return CompleteMoveSource(nullptr, rv);
+    }
+#endif
+#ifdef MOZ_PANORAMA
+    if (mail_panorama_enabled_AtStartup() && localSrcFolder) {
+      rv = static_cast<nsMsgLocalMailFolder*>(localSrcFolder.get())
                ->DeleteMessagesInternal(mCopyState->m_messages,
                                         mCopyState->m_msgWindow, true, true,
-                                        nullptr, mCopyState->m_allowUndo, undo);
+                                        nullptr, mCopyState->m_allowUndo,
+                                        nullptr, mMigrationCopyWork);
       return CompleteMoveSource(nullptr, rv);
     }
 #endif
@@ -3633,6 +3998,10 @@ nsresult nsMsgLocalMailFolder::CompleteMoveSource(
 // nsICopyMessageListener.startMessage()
 // this is the beginning of the next message copied
 NS_IMETHODIMP nsMsgLocalMailFolder::StartMessage() {
+#ifdef MOZ_PANORAMA
+  if (mMigrationCopyWork) MOZ_TRY(mMigrationCopyWork->Validate());
+#endif
+
   // We get crashes that we don't understand (bug 284876), so stupidly prevent
   // that.
   NS_ENSURE_ARG_POINTER(mCopyState);
@@ -3813,8 +4182,14 @@ nsresult nsMsgLocalMailFolder::CopyMessagesTo(nsTArray<nsMsgKey>& keyArray,
       NS_ENSURE_SUCCESS(rv, rv);
     }
 
+#ifdef MOZ_PANORAMA
+    RefPtr<nsICopyMessageListener> copyDestination =
+        new LocalMigrationCopyListener(this, mMigrationCopyWork);
+#else
+    nsICopyMessageListener* copyDestination = this;
+#endif
     RefPtr<CopyMessageStreamListener> streamListener =
-        new CopyMessageStreamListener(this, isMove);
+        new CopyMessageStreamListener(copyDestination, isMove);
 
     nsCOMPtr<nsIURI> dummyNull;
     // Pass moveMessage=false to the source message service to prevent it
@@ -3833,6 +4208,10 @@ nsresult nsMsgLocalMailFolder::CopyMessagesTo(nsTArray<nsMsgKey>& keyArray,
 nsresult nsMsgLocalMailFolder::CopyMessageTo(nsISupports* message,
                                              nsIMsgWindow* aMsgWindow,
                                              bool isMove) {
+#ifdef MOZ_PANORAMA
+  if (mMigrationCopyWork) MOZ_TRY(mMigrationCopyWork->Validate());
+#endif
+
   if (!mCopyState) {
     return NS_ERROR_OUT_OF_MEMORY;
   }
@@ -3855,8 +4234,14 @@ nsresult nsMsgLocalMailFolder::CopyMessageTo(nsISupports* message,
   }
 
   if (NS_SUCCEEDED(rv) && mCopyState->m_messageService) {
+#ifdef MOZ_PANORAMA
+    RefPtr<nsICopyMessageListener> copyDestination =
+        new LocalMigrationCopyListener(this, mMigrationCopyWork);
+#else
+    nsICopyMessageListener* copyDestination = this;
+#endif
     RefPtr<CopyMessageStreamListener> streamListener =
-        new CopyMessageStreamListener(this, isMove);
+        new CopyMessageStreamListener(copyDestination, isMove);
 
     // Pass moveMessage=false to the source message service to prevent it
     // from independently deleting source messages (e.g. IMAP's
@@ -4444,6 +4829,10 @@ nsMsgLocalMailFolder::GetUidlFromFolder(nsLocalFolderScanState* aState,
  */
 NS_IMETHODIMP
 nsMsgLocalMailFolder::AddMessage(const char* aMessage, nsIMsgDBHdr** aHdr) {
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(mozilla::mailnews::CheckLocalStoreMigrationAdmission());
+#endif
+
   AUTO_PROFILER_LABEL("nsMsgLocalMailFolder::AddMessage", MAILNEWS);
   NS_ENSURE_ARG_POINTER(aHdr);
   AutoTArray<nsCString, 1> aMessages = {nsDependentCString(aMessage)};
@@ -4458,6 +4847,10 @@ NS_IMETHODIMP
 nsMsgLocalMailFolder::AddMessageBatch(
     const nsTArray<nsCString>& aMessages,
     nsTArray<RefPtr<nsIMsgDBHdr>>& aHdrArray) {
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(mozilla::mailnews::CheckLocalStoreMigrationAdmission());
+#endif
+
   AUTO_PROFILER_LABEL("nsMsgLocalMailFolder::AddMessageBatch", MAILNEWS);
 #ifdef MOZ_PANORAMA
   if (mail_panorama_enabled_AtStartup()) {

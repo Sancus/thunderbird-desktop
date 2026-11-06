@@ -14,6 +14,7 @@
 #include "mozilla/UniquePtr.h"
 
 #ifdef MOZ_PANORAMA
+#  include "LocalStoreMigrationLease.h"
 struct NativeLocalUndoState;
 #endif
 
@@ -44,13 +45,16 @@ class nsLocalMoveCopyMsgTxn : public nsIFolderListener, public nsMsgTxn {
   bool UsesNativeLocalUndo() const { return !!mNativeUndo; }
   nsresult PrepareNativeSourceRemoval(
       nsIMsgFolder* folder, const nsTArray<RefPtr<nsIMsgDBHdr>>& headers);
-  nsresult RemoveNativeSourceHeader(nsIMsgFolder* folder, nsIMsgDBHdr* header);
+  nsresult RemoveNativeSourceHeader(
+      nsIMsgFolder* folder, nsIMsgDBHdr* header,
+      mozilla::mailnews::LocalStoreMigrationWork* migrationParent = nullptr);
 #endif
 
  private:
   virtual ~nsLocalMoveCopyMsgTxn();
 #ifdef MOZ_PANORAMA
   nsresult RunNativeUndo(bool undoing);
+  RefPtr<mozilla::mailnews::LocalStoreMigrationWork> mMigrationUndoWork;
   mozilla::UniquePtr<NativeLocalUndoState> mNativeUndo;
 #endif
   nsWeakPtr m_srcFolder;

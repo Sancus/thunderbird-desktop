@@ -2268,3 +2268,89 @@ if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
     });
   });
 }
+
+/**
+ * Refuses an actual foreign native subject without granting a live lease.
+ * Live selected-owner assertions are in the original Core native fixture.
+ *
+ * @param {string} domain - The fixed native domain whose real IO started.
+ */
+function assertMigrationForeignContext(domain) {
+  const gate = Cc["@mozilla.org/mailnews/migration-writer-lease;1"].getService(
+    Ci.nsIObserver
+  );
+  const bag = gate.QueryInterface(Ci.nsIPropertyBag2);
+  const subject = bag.getPropertyAsInterface(
+    "writer-admission-subject",
+    Ci.nsISupports
+  );
+  const before = bag.getPropertyAsUint32(`writer-history.${domain}`);
+  Assert.equal(before, 1, "The real operation irreversibly marked Started");
+  Assert.throws(
+    () => gate.observe(subject, "check-writer-never-started", domain),
+    error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+  );
+  Assert.throws(
+    () =>
+      gate.observe(Services.appinfo, "validate-selected-view", "after-await"),
+    error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+  );
+  Assert.equal(bag.getPropertyAsUint32(`writer-history.${domain}`), before);
+}
+
+/** @param {string} store - Actual mbox or maildir provider. */
+async function checkMigrationExternalRootRefusal(store) {
+  const external = do_get_tempdir();
+  external.append("migration-owned-external");
+  external.createUnique(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+  const incoming = MailServices.accounts.createIncomingServer(
+    "migration",
+    "migration.invalid",
+    "none"
+  );
+  let account;
+  try {
+    incoming.setStringValue(
+      "storeContractID",
+      store == "mbox"
+        ? "@mozilla.org/msgstore/berkeleystore;1"
+        : "@mozilla.org/msgstore/maildirstore;1"
+    );
+    // Bind the configured external root before any root-folder construction.
+    incoming.localPath = external;
+    account = MailServices.accounts.createAccount();
+    account.incomingServer = incoming;
+    const root = incoming.rootFolder.QueryInterface(Ci.nsIMsgLocalMailFolder);
+    const folder = root
+      .createLocalSubfolder("migration-external")
+      .QueryInterface(Ci.nsIMsgLocalMailFolder);
+    Assert.equal(folder.msgStore.storeType, store);
+    Assert.equal(incoming.localPath.path, external.path);
+    const header = folder.addMessage(
+      "Subject: external custody\r\n\r\nExternal body.\r\n"
+    );
+    const token = header.storeToken;
+    const key = header.messageKey;
+    const raw = mailTestUtils.loadMessageToString(folder, header);
+    assertMigrationForeignContext("local-store");
+    const retained = folder.msgDatabase.getMsgHdrForKey(key);
+    Assert.equal(retained.folder, folder);
+    Assert.equal(retained.storeToken, token);
+    Assert.equal(mailTestUtils.loadMessageToString(folder, retained), raw);
+    Assert.equal(folder.getTotalMessages(false), 1);
+    Assert.equal(incoming.localPath.path, external.path);
+  } finally {
+    if (account) MailServices.accounts.removeAccount(account);
+    else MailServices.accounts.removeIncomingServer(incoming, false);
+    // Only this freshly generated test directory is removed.
+    if (external.exists()) external.remove(true);
+  }
+}
+if ("nsIDatabaseCore" in Ci) {
+  add_task(async function test_migrationExternalRootLeaseMbox() {
+    await checkMigrationExternalRootRefusal("mbox");
+  });
+  add_task(async function test_migrationExternalRootLeaseMaildir() {
+    await checkMigrationExternalRootRefusal("maildir");
+  });
+}

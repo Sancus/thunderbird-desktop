@@ -3436,3 +3436,63 @@ add_task(async function test_pop3FreshForeignRootKillMbox() {
 add_task(async function test_pop3FreshForeignRootKillMaildir() {
   await checkFreshForeignRoot("maildir", true);
 });
+
+/**
+ * Refuses an actual foreign native subject without granting a live lease.
+ * Live selected-owner assertions are in the original Core native fixture.
+ *
+ * @param {string} domain - The fixed native domain whose real IO started.
+ */
+function assertMigrationForeignContext(domain) {
+  const gate = Cc["@mozilla.org/mailnews/migration-writer-lease;1"].getService(
+    Ci.nsIObserver
+  );
+  const bag = gate.QueryInterface(Ci.nsIPropertyBag2);
+  const subject = bag.getPropertyAsInterface(
+    "writer-admission-subject",
+    Ci.nsISupports
+  );
+  const before = bag.getPropertyAsUint32(`writer-history.${domain}`);
+  Assert.equal(before, 1, "The real operation irreversibly marked Started");
+  Assert.throws(
+    () => gate.observe(subject, "check-writer-never-started", domain),
+    error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+  );
+  Assert.throws(
+    () =>
+      gate.observe(Services.appinfo, "validate-selected-view", "after-await"),
+    error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+  );
+  Assert.equal(bag.getPropertyAsUint32(`writer-history.${domain}`), before);
+}
+
+/** @param {string} store - Actual mbox or maildir provider. */
+async function checkMigrationPartialRefusal(store) {
+  await withPartialStore(store, async (incoming, folder) => {
+    const header = seedPartial(incoming, folder);
+    const original = {
+      key: header.messageKey,
+      token: header.storeToken,
+      flags: header.flags,
+      raw: mailTestUtils.loadMessageToString(folder, header),
+    };
+    Assert.ok(original.flags & Ci.nsMsgMessageFlags.Partial);
+    assertMigrationForeignContext("pop3");
+    const retained = folder.msgDatabase.getMsgHdrForKey(original.key);
+    Assert.equal(retained.folder, folder);
+    Assert.equal(retained.storeToken, original.token);
+    Assert.equal(retained.flags, original.flags);
+    Assert.equal(
+      mailTestUtils.loadMessageToString(folder, retained),
+      original.raw
+    );
+    Assert.equal(folder.getTotalMessages(false), 1);
+    Assert.ok(!folder.locked);
+  });
+}
+add_task(async function test_migrationPop3SinkDrainMbox() {
+  await checkMigrationPartialRefusal("mbox");
+});
+add_task(async function test_migrationPop3SinkDrainMaildir() {
+  await checkMigrationPartialRefusal("maildir");
+});

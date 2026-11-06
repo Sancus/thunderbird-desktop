@@ -27,6 +27,7 @@ nsresult nsCreateLocalBaseMessageURI(const nsACString& baseURI,
                                      nsCString& baseMessageURI);
 
 #ifdef MOZ_PANORAMA
+#  include "LocalStoreMigrationLease.h"
 class nsIMsgDBHdr;
 class nsIMsgFolder;
 class nsIMsgPluggableStore;

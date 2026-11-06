@@ -776,3 +776,67 @@ add_task(async function test_confirmedPartialReceiptWriteFailure() {
 add_task(async function test_confirmedPartialReceiptReentrantDispatchError() {
   await checkConfirmedPartialReceipt("reentrant-reject");
 });
+
+/**
+ * Refuses an actual foreign native subject without granting a live lease.
+ * Live selected-owner assertions are in the original Core native fixture.
+ *
+ * @param {string} domain - The fixed native domain whose real IO started.
+ */
+function assertMigrationForeignContext(domain) {
+  const gate = Cc["@mozilla.org/mailnews/migration-writer-lease;1"].getService(
+    Ci.nsIObserver
+  );
+  const bag = gate.QueryInterface(Ci.nsIPropertyBag2);
+  const subject = bag.getPropertyAsInterface(
+    "writer-admission-subject",
+    Ci.nsISupports
+  );
+  const before = bag.getPropertyAsUint32(`writer-history.${domain}`);
+  Assert.equal(before, 1, "The real operation irreversibly marked Started");
+  Assert.throws(
+    () => gate.observe(subject, "check-writer-never-started", domain),
+    error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+  );
+  Assert.throws(
+    () =>
+      gate.observe(Services.appinfo, "validate-selected-view", "after-await"),
+    error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+  );
+  Assert.equal(bag.getPropertyAsUint32(`writer-history.${domain}`), before);
+}
+
+if ("nsIDatabaseCore" in Ci) {
+  add_task(async function test_migrationPop3UidlDrain() {
+    const { Pop3Client } = ChromeUtils.importESModule(
+      "resource:///modules/Pop3Client.sys.mjs"
+    );
+    const { drainPop3MigrationWriters } = ChromeUtils.importESModule(
+      "resource:///modules/Pop3IncomingServer.sys.mjs"
+    );
+    const incoming = createPop3ServerAndLocalFolders(server.port);
+    const client = new Pop3Client(incoming);
+    const path = PathUtils.join(incoming.localPath.path, "popstate.dat");
+    try {
+      await client._loadUidlState();
+      client._uidlMap.set("migration-uidl", {
+        uidl: "migration-uidl",
+        status: "k",
+        receivedAt: 100,
+      });
+      await client.markMessages(new Map([["migration-uidl", "f"]]));
+      const original = await IOUtils.readUTF8(path);
+      Assert.ok(original.includes("f migration-uidl 100"));
+      assertMigrationForeignContext("pop3");
+      Assert.throws(
+        () => drainPop3MigrationWriters(Services.appinfo),
+        error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+      );
+      Assert.equal(await IOUtils.readUTF8(path), original);
+      Assert.equal(client._uidlMap.get("migration-uidl").status, "f");
+    } finally {
+      client._sink.popServer = null;
+      MailServices.accounts.removeIncomingServer(incoming, false);
+    }
+  });
+}

@@ -12,6 +12,13 @@ import { MailServices } from "resource:///modules/MailServices.sys.mjs";
 import { MailStringUtils } from "resource:///modules/MailStringUtils.sys.mjs";
 import { Pop3Authenticator } from "resource:///modules/MailAuthenticator.sys.mjs";
 
+import {
+  checkPop3MigrationAdmission,
+  validatePop3MigrationView,
+  trackPop3MigrationClient,
+  forgetPop3MigrationClient,
+} from "resource:///modules/Pop3IncomingServer.sys.mjs";
+
 const lazy = {};
 ChromeUtils.defineLazyGetter(lazy, "localStrings", () =>
   Services.strings.createBundle(
@@ -62,6 +69,7 @@ export class Pop3Client {
    * @param {nsIPop3IncomingServer} server - The associated server instance.
    */
   constructor(server) {
+    checkPop3MigrationAdmission();
     this._server = server.QueryInterface(Ci.nsIMsgIncomingServer);
     this._server.wrappedJSObject.runningClient = this;
     this._authenticator = new Pop3Authenticator(server);
@@ -136,12 +144,168 @@ export class Pop3Client {
     }
 
     this._messagesToHandle = [];
+    this._migrationIO = new Set();
+    this._migrationErrors = [];
+    this._migrationMode = "allocated";
+    this._migrationMarks = 0;
+    this._migrationTerminal = Promise.withResolvers();
+    // Observe failure immediately; retain the same original Promise for drain.
+    this._migrationTerminal.promise.catch(() => {});
+    trackPop3MigrationClient(this);
+  }
+
+  /** @type {boolean} True only after all actual client terminals. */
+  migrationTerminalSettled = false;
+
+  /**
+   * Captures this actual client and returns its original terminal Promise.
+   *
+   * @param {nsISupports} nativeView - The native selected owner.
+   * @returns {Promise<void>} Actual IO/sink/callback completion.
+   */
+  beginMigrationDrain(nativeView) {
+    validatePop3MigrationView(nativeView);
+    if (this._migrationView && this._migrationView != nativeView) {
+      throw Components.Exception(
+        "Foreign POP client owner",
+        Cr.NS_ERROR_NOT_AVAILABLE
+      );
+    }
+    this._migrationView = nativeView;
+    this._migrationMaybeSettle();
+    return this._migrationTerminal.promise;
+  }
+
+  /** @param {nsISupports} nativeView - The same settled native owner. */
+  releaseMigrationDrain(nativeView) {
+    validatePop3MigrationView(nativeView);
+    if (this._migrationView != nativeView || !this.migrationTerminalSettled) {
+      throw Components.Exception(
+        "Unsettled POP client",
+        Cr.NS_ERROR_IN_PROGRESS
+      );
+    }
+    this._migrationView = null;
+  }
+
+  /** Validates original ownership before an already-owned IO continuation. */
+  _migrationBeforeIO() {
+    if (this.migrationTerminalSettled) {
+      checkPop3MigrationAdmission();
+      return;
+    }
+    if (this._migrationView) {
+      validatePop3MigrationView(this._migrationView);
+    } else {
+      checkPop3MigrationAdmission();
+    }
+  }
+
+  /** @param {nsresult|Error} error - An actual operation or cleanup failure. */
+  _migrationRecordError(error) {
+    const result =
+      typeof error == "number" ? error : error?.result || Cr.NS_ERROR_FAILURE;
+    if (!Components.isSuccessCode(result)) {
+      this._migrationErrors.push(
+        Components.Exception("POP writer failed", result)
+      );
+    }
+  }
+
+  /**
+   * Retains an actual IO Promise until both fulfillment and rejection settle.
+   *
+   * @param {Promise<unknown>} pending - The actual launched IO operation.
+   * @returns {Promise<unknown>} The same outcome after ownership bookkeeping.
+   */
+  _migrationTrack(pending) {
+    this._migrationIO.add(pending);
+    return pending
+      .catch(error => {
+        this._migrationRecordError(error);
+        throw error;
+      })
+      .finally(() => {
+        this._migrationIO.delete(pending);
+        this._migrationMaybeSettle();
+      });
+  }
+
+  /** Checks actual callbacks/IO; flags such as serverBusy alone prove nothing. */
+  _migrationMaybeSettle() {
+    if (
+      this.migrationTerminalSettled ||
+      this._migrationIO.size ||
+      this._migrationMarks ||
+      this._pendingIncorporation
+    ) {
+      return;
+    }
+    const standalone = this._migrationMode == "standalone";
+    const connected =
+      this._migrationMode == "connected" &&
+      this._migrationCleanupReturned &&
+      this._migrationSocketClosed;
+    const unused =
+      this._migrationMode == "refused" ||
+      (this._migrationMode == "allocated" && !!this._migrationView);
+    if (!standalone && !connected && !unused) {
+      return;
+    }
+    if (standalone) {
+      try {
+        this._sink.popServer = null;
+      } catch (error) {
+        this._migrationRecordError(error);
+      }
+    }
+    this.migrationTerminalSettled = true;
+    if (this._migrationErrors.length) {
+      const first = this._migrationErrors[0];
+      first.secondaryErrors = this._migrationErrors.slice(1);
+      this._migrationTerminal.reject(first);
+      // Retain failed actual receipts for the next selected capture.
+    } else {
+      this._migrationTerminal.resolve();
+      forgetPop3MigrationClient(this);
+    }
+  }
+
+  /**
+   * Settles a constructed client whose queued setup was refused before IO.
+   *
+   * @param {Error} error - Actual admission/setup failure.
+   */
+  abandonMigrationSetup(error) {
+    this._migrationRecordError(error);
+    if (this._socket) {
+      this._actionDone(error.result || Cr.NS_ERROR_FAILURE);
+      return;
+    }
+    this._migrationMode = "refused";
+    try {
+      this._sink.popServer = null;
+      this.onFree?.();
+    } catch (cleanup) {
+      this._migrationRecordError(cleanup);
+    }
+    this._migrationMaybeSettle();
   }
 
   /**
    * Initiate a connection to the server
    */
   connect() {
+    checkPop3MigrationAdmission();
+    if (this.migrationTerminalSettled) {
+      this.migrationTerminalSettled = false;
+      this._migrationTerminal = Promise.withResolvers();
+      this._migrationTerminal.promise.catch(() => {});
+      trackPop3MigrationClient(this);
+    }
+    this._migrationSocketClosed = false;
+    this._migrationCleanupReturned = false;
+    this._migrationMode = "connected";
     const hostname = this._server.hostname.toLowerCase();
     this._logger.debug(`Connecting to pop://${hostname}:${this._server.port}`);
     this.runningUri
@@ -237,28 +401,45 @@ export class Pop3Client {
    * @param {Map<string, UidlStatus>} uidlsToMark - A Map from uidl to status.
    */
   async markMessages(uidlsToMark) {
-    this._logger.debug("markMessages", uidlsToMark);
-    if (!this._uidlMap) {
-      this._loadUidlState();
+    checkPop3MigrationAdmission();
+    if (this.migrationTerminalSettled) {
+      this.migrationTerminalSettled = false;
+      this._migrationTerminal = Promise.withResolvers();
+      this._migrationTerminal.promise.catch(() => {});
+      trackPop3MigrationClient(this);
     }
-    // Callers of nsIPop3IncomingServer.markMessages (e.g. filters) expect it to
-    // act as a sync function, otherwise, the flags set by filters may not take
-    // effect.
-    Services.tm.spinEventLoopUntil(
-      "nsIPop3IncomingServer.markMessages is a synchronous function",
-      () => {
-        return this._uidlMap;
+    if (this._migrationMode != "connected") this._migrationMode = "standalone";
+    this._migrationMarks++;
+    try {
+      this._logger.debug("markMessages", uidlsToMark);
+      if (!this._uidlMap) {
+        this._loadUidlState();
       }
-    );
-    for (const [uidl, status] of uidlsToMark) {
-      const uidlState = this._uidlMap.get(uidl);
-      this._uidlMap.set(uidl, {
-        ...uidlState,
-        status,
-      });
-      this._uidlMapChanged = true;
+      // Callers of nsIPop3IncomingServer.markMessages (e.g. filters) expect it to
+      // act as a sync function, otherwise, the flags set by filters may not take
+      // effect.
+      Services.tm.spinEventLoopUntil(
+        "nsIPop3IncomingServer.markMessages is a synchronous function",
+        () => {
+          return this._uidlMap;
+        }
+      );
+      for (const [uidl, status] of uidlsToMark) {
+        const uidlState = this._uidlMap.get(uidl);
+        this._uidlMap.set(uidl, {
+          ...uidlState,
+          status,
+        });
+        this._uidlMapChanged = true;
+      }
+      await this._writeUidlState(true);
+    } catch (error) {
+      this._migrationRecordError(error);
+      throw error;
+    } finally {
+      this._migrationMarks--;
+      this._migrationMaybeSettle();
     }
-    await this._writeUidlState(true);
   }
 
   /**
@@ -281,7 +462,11 @@ export class Pop3Client {
    * Close the socket.
    */
   close = () => {
-    this._socket.close();
+    if (this._socket) {
+      this._socket.close();
+    } else {
+      this._migrationSocketClosed = true;
+    }
   };
 
   /**
@@ -467,24 +652,29 @@ export class Pop3Client {
    * The close event handler.
    */
   _onClose = async () => {
-    // Wait for `_onError` to finish.
-    await this._promiseErrorHandled;
-    delete this._promiseErrorHandled;
+    try {
+      // Wait for `_onError` to finish.
+      await this._promiseErrorHandled;
+      delete this._promiseErrorHandled;
 
-    this._logger.debug("Connection closed.");
-    this._server.serverBusy = false;
-    this._destroyed = true;
-    if (this._authenticating) {
-      // In some cases, socket is closed for invalid username/password.
-      this._actionAuthResponse({ success: false });
-    } else if (!this._done) {
-      this._logger.warn(
-        "The connection closed unexpectedly while a command was active."
-      );
-      this._actionDone(Cr.NS_ERROR_NET_INTERRUPT);
-    } else {
-      // Connection closed cleanly after QUIT.
-      this._actionDone();
+      this._logger.debug("Connection closed.");
+      this._server.serverBusy = false;
+      this._destroyed = true;
+      if (this._authenticating) {
+        // In some cases, socket is closed for invalid username/password.
+        this._actionAuthResponse({ success: false });
+      } else if (!this._done) {
+        this._logger.warn(
+          "The connection closed unexpectedly while a command was active."
+        );
+        this._actionDone(Cr.NS_ERROR_NET_INTERRUPT);
+      } else {
+        // Connection closed cleanly after QUIT.
+        this._actionDone();
+      }
+    } finally {
+      this._migrationSocketClosed = true;
+      this._migrationMaybeSettle();
     }
   };
 
@@ -494,37 +684,44 @@ export class Pop3Client {
    * Read popstate.dat into this._uidlMap.
    */
   async _loadUidlState() {
-    const stateFile = this._server.localPath;
-    stateFile.append("popstate.dat");
-    if (!(await IOUtils.exists(stateFile.path))) {
-      this._uidlMap = new Map();
-      return;
-    }
+    this._migrationBeforeIO();
+    return this._migrationTrack(
+      (async () => {
+        const stateFile = this._server.localPath;
+        stateFile.append("popstate.dat");
+        if (!(await IOUtils.exists(stateFile.path))) {
+          this._uidlMap = new Map();
+          return;
+        }
 
-    const content = await IOUtils.readUTF8(stateFile.path);
-    this._uidlMap = new Map();
-    let uidlLine = false;
-    for (const line of content.split(/\r?\n/)) {
-      if (!line) {
-        continue;
-      }
-      if (uidlLine) {
-        const [status, uidl, receivedAt] = line.split(" ");
-        this._uidlMap.set(uidl, {
-          status, // @type {UidlStatus}
-          uidl,
-          receivedAt,
-        });
-      }
-      if (line.startsWith("#")) {
-        // A comment line.
-        continue;
-      }
-      if (line.startsWith("*")) {
-        // The host & user line.
-        uidlLine = true;
-      }
-    }
+        this._migrationBeforeIO();
+        const content = await IOUtils.readUTF8(stateFile.path);
+        this._migrationBeforeIO();
+        this._uidlMap = new Map();
+        let uidlLine = false;
+        for (const line of content.split(/\r?\n/)) {
+          if (!line) {
+            continue;
+          }
+          if (uidlLine) {
+            const [status, uidl, receivedAt] = line.split(" ");
+            this._uidlMap.set(uidl, {
+              status, // @type {UidlStatus}
+              uidl,
+              receivedAt,
+            });
+          }
+          if (line.startsWith("#")) {
+            // A comment line.
+            continue;
+          }
+          if (line.startsWith("*")) {
+            // The host & user line.
+            uidlLine = true;
+          }
+        }
+      })()
+    );
   }
 
   /**
@@ -534,38 +731,45 @@ export class Pop3Client {
    * @throws {DOMException} for I/O errors writing to popstate.dat.
    */
   async _writeUidlState(resetFlag) {
-    if (!this._uidlMapChanged) {
-      return;
-    }
+    this._migrationBeforeIO();
+    return this._migrationTrack(
+      (async () => {
+        if (!this._uidlMapChanged) {
+          return;
+        }
 
-    const stateFile = this._server.localPath;
-    stateFile.append("popstate.dat");
-    const content = [
-      "# POP3 State File",
-      "# This is a generated file!  Do not edit.",
-      "",
-      `*${this._server.hostname} ${this._server.username}`,
-    ];
-    for (const msg of this._messagesToHandle) {
-      // _messagesToHandle is not empty means an error happened, put them back
-      // to _uidlMap to prevent loss of popstate.
-      this._uidlMap.set(msg.uidl, msg);
-    }
-    for (const { status, uidl, receivedAt } of this._uidlMap.values()) {
-      if (receivedAt) {
-        content.push(`${status} ${uidl} ${receivedAt}`);
-      }
-    }
-    this._writeUidlPromise = IOUtils.writeUTF8(
-      stateFile.path,
-      content.join(this._lineSeparator)
+        const stateFile = this._server.localPath;
+        stateFile.append("popstate.dat");
+        const content = [
+          "# POP3 State File",
+          "# This is a generated file!  Do not edit.",
+          "",
+          `*${this._server.hostname} ${this._server.username}`,
+        ];
+        for (const msg of this._messagesToHandle) {
+          // _messagesToHandle is not empty means an error happened, put them back
+          // to _uidlMap to prevent loss of popstate.
+          this._uidlMap.set(msg.uidl, msg);
+        }
+        for (const { status, uidl, receivedAt } of this._uidlMap.values()) {
+          if (receivedAt) {
+            content.push(`${status} ${uidl} ${receivedAt}`);
+          }
+        }
+        this._migrationBeforeIO();
+        this._writeUidlPromise = IOUtils.writeUTF8(
+          stateFile.path,
+          content.join(this._lineSeparator)
+        );
+        await this._writeUidlPromise;
+        this._migrationBeforeIO();
+        this._writeUidlPromise = null;
+
+        if (resetFlag) {
+          this._uidlMapChanged = false;
+        }
+      })()
     );
-    await this._writeUidlPromise;
-    this._writeUidlPromise = null;
-
-    if (resetFlag) {
-      this._uidlMapChanged = false;
-    }
   }
 
   /**
@@ -1721,6 +1925,7 @@ export class Pop3Client {
         this._sink != pending.sink
       ) {
         this._pendingIncorporation = null;
+        this._migrationMaybeSettle();
         return;
       }
       try {
@@ -1732,6 +1937,7 @@ export class Pop3Client {
         record(error.result || Cr.NS_ERROR_FAILURE);
       }
       this._pendingIncorporation = null;
+      this._migrationMaybeSettle();
       if (!Components.isSuccessCode(pending.status)) {
         if (pending.confirmed) {
           // The parser reports the filter failure; delivery is already saved.
@@ -1938,6 +2144,7 @@ export class Pop3Client {
    * @param {nsresult} status - Indicate if the last action succeeded.
    */
   _actionDone = async (status = Cr.NS_OK) => {
+    this._migrationRecordError(status);
     const pending = this._pendingIncorporation;
     if (pending?.dispatching) {
       // A publication notification may cancel reentrantly before the sink
@@ -1963,11 +2170,13 @@ export class Pop3Client {
         this._recordConfirmedPartial(this._pendingIncorporation, true);
       } catch (error) {
         this._logger.error("Reading confirmed delivery outcome failed", error);
+        this._migrationRecordError(error);
       }
       try {
         this._sink.incorporateAbort();
       } catch (error) {
         this._logger.error("Abort pending incorporation failed", error);
+        this._migrationRecordError(error);
       }
     }
     this._logger.debug(`Done with status=0x${status.toString(16)}`);
@@ -1996,7 +2205,7 @@ export class Pop3Client {
     // Normally we clean up after QUIT response.
     await this.quit(() => this._cleanUp(status));
     // If we didn't receive QUIT response after 3 seconds, clean up anyway.
-    setTimeout(() => {
+    this._quitCleanupTimer = setTimeout(() => {
       if (!this._cleanedUp) {
         this._cleanUp(status);
       }
@@ -2016,12 +2225,17 @@ export class Pop3Client {
     this._clearCommandTimeout();
 
     this._cleanedUp = true;
+    if (this._quitCleanupTimer) {
+      clearTimeout(this._quitCleanupTimer);
+      this._quitCleanupTimer = null;
+    }
     this.close();
     if (this._folderLocked) {
       try {
         this._sink.abortMailDelivery(this);
       } catch (error) {
         this._logger.error("Abort mail delivery failed", error);
+        this._migrationRecordError(error);
         if (Components.isSuccessCode(status)) {
           status = error.result || Cr.NS_ERROR_FAILURE;
         }
@@ -2038,6 +2252,14 @@ export class Pop3Client {
     this.onDone?.(status);
     this._server.wrappedJSObject.runningClient = null;
     this.onFree?.();
+    try {
+      this._sink.popServer = null;
+    } catch (error) {
+      this._migrationRecordError(error);
+    }
+    this._migrationRecordError(status);
+    this._migrationCleanupReturned = true;
+    this._migrationMaybeSettle();
   };
 
   /**

@@ -4072,3 +4072,81 @@ if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
     await checkRawMimeAttachmentNative("maildir");
   });
 }
+
+/**
+ * Refuses an actual foreign native subject without granting a live lease.
+ * Live selected-owner assertions are in the original Core native fixture.
+ *
+ * @param {string} domain - The fixed native domain whose real IO started.
+ */
+function assertMigrationForeignContext(domain) {
+  const gate = Cc["@mozilla.org/mailnews/migration-writer-lease;1"].getService(
+    Ci.nsIObserver
+  );
+  const bag = gate.QueryInterface(Ci.nsIPropertyBag2);
+  const subject = bag.getPropertyAsInterface(
+    "writer-admission-subject",
+    Ci.nsISupports
+  );
+  const before = bag.getPropertyAsUint32(`writer-history.${domain}`);
+  Assert.equal(before, 1, "The real operation irreversibly marked Started");
+  Assert.throws(
+    () => gate.observe(subject, "check-writer-never-started", domain),
+    error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+  );
+  Assert.throws(
+    () =>
+      gate.observe(Services.appinfo, "validate-selected-view", "after-await"),
+    error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+  );
+  Assert.equal(bag.getPropertyAsUint32(`writer-history.${domain}`), before);
+}
+
+/** @param {string} store - Actual mbox or maildir provider. */
+async function checkMigrationStoreRefusal(store) {
+  await withPublicationStore(store, async ({ rootFolder }) => {
+    const folder = rootFolder
+      .createLocalSubfolder("migration-store")
+      .QueryInterface(Ci.nsIMsgLocalMailFolder);
+    const original = folder.addMessage(
+      "Subject: original\r\n\r\nOriginal body.\r\n"
+    );
+    const key = original.messageKey;
+    const originalToken = original.storeToken;
+    const originalRaw = mailTestUtils.loadMessageToString(folder, original);
+    const raw = "Subject: issued stream\r\n\r\nIssued body.\r\n";
+    const output = folder.msgStore.getNewMsgOutputStream(folder);
+    let finished = false;
+    try {
+      Assert.equal(output.write(raw, raw.length), raw.length);
+      assertMigrationForeignContext("local-store");
+      Assert.equal(folder.getTotalMessages(false), 1);
+      const token = folder.msgStore.finishNewMessage(folder, output);
+      finished = true;
+      Assert.greater(token.length, 0);
+      Assert.equal(
+        readPublicationBytes(
+          folder.msgStore.getMsgInputStream(folder, token, 0)
+        ),
+        raw
+      );
+      const retained = folder.msgDatabase.getMsgHdrForKey(key);
+      Assert.equal(retained.storeToken, originalToken);
+      Assert.equal(
+        mailTestUtils.loadMessageToString(folder, retained),
+        originalRaw
+      );
+      Assert.equal(folder.getTotalMessages(false), 1);
+    } finally {
+      if (!finished) folder.msgStore.discardNewMessage(folder, output);
+    }
+  });
+}
+if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+  add_task(async function test_migrationStoreDrainMbox() {
+    await checkMigrationStoreRefusal("mbox");
+  });
+  add_task(async function test_migrationStoreDrainMaildir() {
+    await checkMigrationStoreRefusal("maildir");
+  });
+}

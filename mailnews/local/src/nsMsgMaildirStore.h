@@ -16,6 +16,10 @@
 #include "nsTStringHasher.h"  // IWYU pragma: keep, mozilla::DefaultHasher<nsCString>
 #include "mozilla/HashTable.h"
 
+#ifdef MOZ_PANORAMA
+#  include "LocalStoreMigrationLease.h"
+#endif
+
 class nsMsgMaildirStore final : public nsMsgLocalStoreUtils,
                                 nsIMsgPluggableStore
 #ifdef MOZ_PANORAMA
@@ -50,6 +54,9 @@ class nsMsgMaildirStore final : public nsMsgLocalStoreUtils,
     nsCOMPtr<nsIOutputStream> stream;
     nsresult finishStatus{NS_OK};
     bool mayHaveMoved{false};
+#ifdef MOZ_PANORAMA
+    RefPtr<mozilla::mailnews::LocalStoreMigrationWork> migration;
+#endif
   };
   mozilla::HashMap<nsCString, StreamDetails> mOngoingWrites;
 

@@ -10,6 +10,167 @@ ChromeUtils.defineESModuleGetters(lazy, {
   Pop3Client: "resource:///modules/Pop3Client.sys.mjs",
 });
 
+// These are the actual constructed clients/servers, not account enumeration.
+const migrationClients = new Set();
+const migrationServers = new Set();
+let migrationView = null;
+let migrationDrain = null;
+let migrationRelease = null;
+let migrationCapturedClients = [];
+let migrationCapturedServers = [];
+let migrationReleased = false;
+
+/**
+ * Returns the fixed native gate in Panorama builds.
+ *
+ * @returns {?nsIObserver} The process-owned gate, or null in other builds.
+ */
+function popMigrationGate() {
+  if (!("nsIDatabaseCore" in Ci)) {
+    return null;
+  }
+  return Cc["@mozilla.org/mailnews/migration-writer-lease;1"].getService(
+    Ci.nsIObserver
+  );
+}
+
+/** Checks fresh POP admission before constructing or queuing work. */
+export function checkPop3MigrationAdmission() {
+  const gate = popMigrationGate();
+  if (gate) {
+    const subject = gate
+      .QueryInterface(Ci.nsIPropertyBag2)
+      .getPropertyAsInterface("writer-admission-subject", Ci.nsISupports);
+    gate.observe(subject, "check-writer-admission", "pop3");
+  }
+}
+
+/**
+ * Validates ownership of already-captured work without granting fresh IO.
+ *
+ * @param {nsISupports} nativeView - The original native selected view.
+ */
+export function validatePop3MigrationView(nativeView) {
+  const gate = popMigrationGate();
+  if (!gate || !nativeView) {
+    throw Components.Exception(
+      "Missing selected POP owner",
+      Cr.NS_ERROR_NOT_AVAILABLE
+    );
+  }
+  gate.observe(nativeView, "validate-selected-view", "after-await");
+}
+
+/** @param {Pop3Client} client - An actual newly constructed client. */
+export function trackPop3MigrationClient(client) {
+  migrationClients.add(client);
+}
+
+/** @param {Pop3Client} client - A client whose actual terminal has returned. */
+export function forgetPop3MigrationClient(client) {
+  if (client.migrationTerminalSettled) {
+    migrationClients.delete(client);
+  }
+}
+
+/**
+ * Captures actual POP work synchronously and joins its real shared terminals.
+ * Native Core and the LS body participant join this same Promise.
+ *
+ * @param {nsISupports} nativeView - The exact native selected owner.
+ * @returns {Promise<void>} Resolves after all captured IO/callbacks settle.
+ */
+export function drainPop3MigrationWriters(nativeView) {
+  validatePop3MigrationView(nativeView);
+  if (migrationView && migrationReleased && nativeView != migrationView) {
+    // The native gate validated this new selected generation. The old release
+    // stays shared for its own view until a real new owner is admitted here.
+    migrationView = null;
+    migrationDrain = null;
+    migrationRelease = null;
+    migrationCapturedClients = [];
+    migrationCapturedServers = [];
+    migrationReleased = false;
+  }
+  if (migrationView) {
+    if (nativeView != migrationView) {
+      throw Components.Exception(
+        "Foreign POP owner",
+        Cr.NS_ERROR_NOT_AVAILABLE
+      );
+    }
+    return migrationDrain;
+  }
+  migrationView = nativeView;
+  const clients = [...migrationClients];
+  migrationCapturedClients = clients;
+  const terminals = clients.map(client =>
+    client.beginMigrationDrain(nativeView)
+  );
+  // Queued runs have no client/IO to finish. Settle their real waiting Promise;
+  // never let an onFree callback construct them after the native fence.
+  Pop3IncomingServer.rejectMigrationQueue();
+  for (const reference of migrationServers) {
+    const server = reference.deref();
+    if (!server) {
+      migrationServers.delete(reference);
+      continue;
+    }
+    migrationCapturedServers.push(server);
+    terminals.push(server.beginMigrationDrain(nativeView));
+  }
+  migrationDrain = Promise.allSettled(terminals).then(results => {
+    validatePop3MigrationView(nativeView);
+    const errors = results
+      .filter(result => result.status == "rejected")
+      .map(result => result.reason);
+    if (errors.length) {
+      const first = errors[0];
+      const error = Components.Exception(
+        "POP writer settlement failed",
+        first?.result || Cr.NS_ERROR_FAILURE
+      );
+      error.secondaryErrors = errors.slice(1);
+      throw error;
+    }
+  });
+  return migrationDrain;
+}
+
+/**
+ * Releases only captured, actually settled POP ownership after the consumer.
+ *
+ * @param {nsISupports} nativeView - The same native selected owner.
+ * @param {nsresult} settlementNsresult - The actual consumer result.
+ * @returns {Promise<void>} The shared once-only release terminal.
+ */
+export function releasePop3MigrationWriters(nativeView, settlementNsresult) {
+  validatePop3MigrationView(nativeView);
+  if (nativeView != migrationView || !migrationDrain) {
+    throw Components.Exception(
+      "Unacquired POP owner",
+      Cr.NS_ERROR_NOT_AVAILABLE
+    );
+  }
+  if (!migrationRelease) {
+    migrationRelease = migrationDrain
+      .catch(() => {})
+      .then(() => {
+        validatePop3MigrationView(nativeView);
+        for (const client of migrationCapturedClients) {
+          client.releaseMigrationDrain(nativeView);
+        }
+        for (const server of migrationCapturedServers) {
+          server.releaseMigrationDrain(nativeView, settlementNsresult);
+        }
+        // Keep the same release Promise for repeated calls from this owner.
+        // Only the native parent can admit a subsequent selected generation.
+        migrationReleased = Components.isSuccessCode(settlementNsresult);
+      });
+  }
+  return migrationRelease;
+}
+
 /**
  * @implements {nsIPop3IncomingServer}
  * @implements {nsILocalMailIncomingServer}
@@ -30,6 +191,7 @@ export class Pop3IncomingServer extends MsgIncomingServer {
   static #_connectionWaitingQueue = [];
 
   constructor() {
+    checkPop3MigrationAdmission();
     super();
 
     // nsIMsgIncomingServer attributes.
@@ -56,6 +218,9 @@ export class Pop3IncomingServer extends MsgIncomingServer {
 
     // @type {Map<string,string>} - A map from uidl to status.
     this._uidlsToMark = new Map();
+    this._migrationMarks = new Set();
+    this._migrationRuns = new Set();
+    migrationServers.add(new WeakRef(this));
   }
 
   /** @see nsIMsgIncomingServer */
@@ -242,6 +407,7 @@ export class Pop3IncomingServer extends MsgIncomingServer {
   }
 
   markMessages() {
+    checkPop3MigrationAdmission();
     if (!this._uidlsToMark.size) {
       return;
     }
@@ -249,7 +415,18 @@ export class Pop3IncomingServer extends MsgIncomingServer {
     const client = this.runningClient || new lazy.Pop3Client(this);
     // Pass a clone of this._uidlsToMark to client.markMessages, because
     // this._uidlsToMark may be changed before markMessages finishes.
-    client.markMessages(new Map(this._uidlsToMark));
+    const pending = client.markMessages(new Map(this._uidlsToMark));
+    this._migrationMarks.add(pending);
+    // Keep the actual rejection for a later selected drain. Logging does not
+    // turn a failed UIDL write into a successful/empty queue.
+    pending.then(
+      () => this._migrationMarks.delete(pending),
+      error => {
+        this._migrationMarkErrors ??= [];
+        this._migrationMarkErrors.push(error);
+        this._migrationMarks.delete(pending);
+      }
+    );
     this._uidlsToMark = new Map();
   }
 
@@ -351,12 +528,14 @@ export class Pop3IncomingServer extends MsgIncomingServer {
    * @returns {Pop3Client}
    */
   async _getNewClient() {
+    checkPop3MigrationAdmission();
     if (Pop3IncomingServer.#_busyConnections) {
       // Wait until the running client is done
-      await new Promise(resolve =>
-        Pop3IncomingServer.#_connectionWaitingQueue.push(resolve)
+      await new Promise((resolve, reject) =>
+        Pop3IncomingServer.#_connectionWaitingQueue.push({ resolve, reject })
       );
     }
+    checkPop3MigrationAdmission();
     Pop3IncomingServer.#_busyConnections = true;
     return new lazy.Pop3Client(this);
   }
@@ -375,18 +554,121 @@ export class Pop3IncomingServer extends MsgIncomingServer {
    *   the server and any handler functions needed by the client to perform
    *   the service.
    */
-  async withClient(handler) {
+  withClient(handler) {
+    checkPop3MigrationAdmission();
+    const pending = this._withMigrationClient(handler);
+    this._migrationRuns.add(pending);
+    pending.then(
+      () => this._migrationRuns.delete(pending),
+      error => {
+        this._migrationRunErrors ??= [];
+        this._migrationRunErrors.push(error);
+        this._migrationRuns.delete(pending);
+      }
+    );
+    return pending;
+  }
+
+  /**
+   * Joins actual client construction and setup after the synchronous gate.
+   *
+   * @param {function(Pop3Client): void} handler - The original setup callback.
+   * @returns {Promise<void>} Resolves after setup; client IO has its own terminal.
+   */
+  async _withMigrationClient(handler) {
     const client = await this._getNewClient();
     // This handler function is needed for all client service runs.
     client.onFree = () => {
       Pop3IncomingServer.#_busyConnections = false;
       // Resolve the promised wait for the previous client run.
-      Pop3IncomingServer.#_connectionWaitingQueue.shift()?.();
+      Pop3IncomingServer.#_connectionWaitingQueue.shift()?.resolve();
     };
-    // Specialized client handler sequence provided by the caller.
-    handler(client);
-    // Connect to pop3 server and perform the service run.
-    client.connect();
+    try {
+      checkPop3MigrationAdmission();
+      // Specialized client handler sequence provided by the caller.
+      handler(client);
+      // Connect to pop3 server and perform the service run.
+      client.connect();
+    } catch (error) {
+      client.abandonMigrationSetup(error);
+      throw error;
+    }
+  }
+
+  /** Settles queued, not-yet-constructed runs at the native admission fence. */
+  static rejectMigrationQueue() {
+    const queued = this.#_connectionWaitingQueue.splice(0);
+    for (const entry of queued) {
+      entry.reject(
+        Components.Exception("POP admission closed", Cr.NS_ERROR_NOT_AVAILABLE)
+      );
+    }
+  }
+
+  /**
+   * Joins actual independent markMessages calls made by this server.
+   *
+   * @param {nsISupports} nativeView - The exact native selected owner.
+   * @returns {Promise<void>} Actual UIDL terminals, including previous errors.
+   */
+  beginMigrationDrain(nativeView) {
+    validatePop3MigrationView(nativeView);
+    if (this._migrationView) {
+      if (this._migrationView != nativeView) {
+        throw Components.Exception(
+          "Foreign server owner",
+          Cr.NS_ERROR_NOT_AVAILABLE
+        );
+      }
+      return this._migrationDrain;
+    }
+    this._migrationView = nativeView;
+    this._migrationDrain = Promise.allSettled([
+      ...this._migrationMarks,
+      ...this._migrationRuns,
+    ]).then(results => {
+      validatePop3MigrationView(nativeView);
+      const errors = [
+        ...new Set([
+          ...(this._migrationMarkErrors || []),
+          ...(this._migrationRunErrors || []),
+          ...results
+            .filter(result => result.status == "rejected")
+            .map(result => result.reason),
+        ]),
+      ];
+      if (errors.length) {
+        const error = Components.Exception(
+          "POP server settlement failed",
+          errors[0]?.result || Cr.NS_ERROR_FAILURE
+        );
+        error.secondaryErrors = errors;
+        throw error;
+      }
+    });
+    return this._migrationDrain;
+  }
+
+  /**
+   * Releases retained server state after its joined terminal and consumer.
+   *
+   * @param {nsISupports} nativeView - The same selected native owner.
+   * @param {nsresult} settlementNsresult - The actual consumer result.
+   */
+  releaseMigrationDrain(nativeView, settlementNsresult) {
+    validatePop3MigrationView(nativeView);
+    if (this._migrationView != nativeView || !this._migrationDrain) {
+      throw Components.Exception(
+        "Unacquired server owner",
+        Cr.NS_ERROR_NOT_AVAILABLE
+      );
+    }
+    if (Components.isSuccessCode(settlementNsresult)) {
+      this._migrationView = null;
+      this._migrationDrain = null;
+      this._migrationMarkErrors = [];
+      this._migrationRunErrors = [];
+    }
   }
 }
 

@@ -608,6 +608,51 @@ export async function resumeMorkCacheImports(
 }
 
 /**
+ * Holds a profile lock so its release is observable by migration readers.
+ * A released nsIProfileLock asserts when its directory is read in debug
+ * builds, so a caller that may release the lock during an asynchronous read
+ * releases it through the returned lock instead. Its directory getters then
+ * fail with NS_ERROR_NOT_INITIALIZED, as an unlocked native lock reports,
+ * without reading the released native lock.
+ *
+ * @param {nsIProfileLock} profileLock - A currently held profile lock.
+ * @returns {nsIProfileLock} The held lock, released only through unlock().
+ */
+export function holdProfileLock(profileLock) {
+  const lock = profileLock.QueryInterface(Ci.nsIProfileLock);
+  // Reading the directory confirms the lock is held now.
+  lock.directory;
+  let held = true;
+  const requireHeld = () => {
+    if (!held) {
+      throw Components.Exception(
+        "Profile lock was released",
+        Cr.NS_ERROR_NOT_INITIALIZED
+      );
+    }
+  };
+  return {
+    QueryInterface: ChromeUtils.generateQI(["nsIProfileLock"]),
+    get directory() {
+      requireHeld();
+      return lock.directory;
+    },
+    get localDirectory() {
+      requireHeld();
+      return lock.localDirectory;
+    },
+    get replacedLockTime() {
+      return lock.replacedLockTime;
+    },
+    unlock() {
+      requireHeld();
+      held = false;
+      lock.unlock();
+    },
+  };
+}
+
+/**
  * Reads backed-up Gloda mail text and joins it to committed native imports.
  * Retains every raw record, excluded row and attribute definition. Resolves
  * physical folder/key locations before corroborating the original Message-ID.
@@ -622,7 +667,8 @@ export async function resumeMorkCacheImports(
  * @param {nsIDatabaseCore} core - Actual started Panorama database.
  * @param {function(string): (nsIMsgFolder|Promise<nsIMsgFolder>)} resolveFolder -
  *   Resolves each journal source ID to its original native folder.
- * @param {nsIProfileLock} profileLock - Caller-held selected-profile lock.
+ * @param {nsIProfileLock} profileLock - Caller-held selected-profile lock; use
+ *   holdProfileLock() if the caller may release it during the read.
  * @param {string} path - Gloda database file inside the verified complete backup.
  * @returns {Promise<object>} Schema30 snapshot, mapped and excluded records,
  *   complete native receipts, database identity and original backup location.

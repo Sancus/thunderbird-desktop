@@ -40,27 +40,7 @@ add_setup(async function setupNativeChatSearch() {
       ["gloda.show_as_list_by_default", false],
     ],
   });
-  registerCleanupFunction(async () => {
-    while (nativeChatTabmail.tabInfo.length > 1) {
-      nativeChatTabmail.closeTab(1);
-    }
-    for (const fixture of nativeChatFixtures) {
-      fixture.conversation.close();
-      closeLogWriter(fixture.conversation);
-    }
-    await closeChatSearch();
-    for (const fixture of nativeChatFixtures) {
-      for (const path of fixture.writer.paths) {
-        await gFilePromises.get(path);
-        await IOUtils.remove(path, { ignoreAbsent: true });
-      }
-    }
-    if (nativeChatAccount) {
-      nativeChatAccount.disconnect();
-      IMServices.accounts.deleteAccount(nativeChatAccount.id);
-      await Promise.resolve();
-    }
-  });
+  registerCleanupFunction(cleanupNativeChatSearch);
   nativeChatAccount = IMServices.accounts.createAccount(
     "native-search-account",
     "prpl-mochitest"
@@ -71,6 +51,46 @@ add_setup(async function setupNativeChatSearch() {
   nativeChatAccount.connect();
   nativeChatService = await getChatSearchService();
 });
+
+/**
+ * Closes owned fixtures before the shared head audit, or during failure cleanup.
+ *
+ * @returns {Promise<void>}
+ */
+async function cleanupNativeChatSearch() {
+  while (nativeChatTabmail.tabInfo.length > 1) {
+    nativeChatTabmail.closeTab(1);
+  }
+  for (const fixture of nativeChatFixtures) {
+    if (
+      IMServices.conversations
+        .getConversations()
+        .some(conversation => conversation.id == fixture.conversation.id)
+    ) {
+      fixture.conversation.close();
+    }
+    closeLogWriter(fixture.conversation);
+  }
+  await closeChatSearch();
+  for (const fixture of nativeChatFixtures) {
+    for (const path of fixture.writer.paths) {
+      await gFilePromises.get(path);
+      await IOUtils.remove(path, { ignoreAbsent: true });
+    }
+  }
+  nativeChatFixtures.length = 0;
+  if (nativeChatAccount) {
+    const account = nativeChatAccount;
+    nativeChatAccount = null;
+    if (IMServices.accounts.getAccounts().some(item => item.id == account.id)) {
+      if (account.connected || account.connecting) {
+        account.disconnect();
+      }
+      IMServices.accounts.deleteAccount(account.id);
+      await Promise.resolve();
+    }
+  }
+}
 
 /**
  * Writes a real protocol message through the logger and native service.
@@ -167,7 +187,7 @@ async function clickNativeChat(view, fixture) {
   } else {
     Assert.equal(document.getElementById("log-findbar")._findField.value, "");
     Assert.ok(
-      BrowserTestUtils.isHidden(document.getElementById("log-findbar"))
+      BrowserTestUtils.isHidden(document.getElementById("log-findbar").findbar)
     );
   }
   return browser;
@@ -448,4 +468,8 @@ add_task(async function test_nativeChatQueryAndReaderIgnoreRetiredSelection() {
     document.getElementById("searchResultConv").nativeChatLog,
     undefined
   );
+});
+
+add_task(async function test_nativeChatSearchCleanup() {
+  await cleanupNativeChatSearch();
 });

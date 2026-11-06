@@ -828,11 +828,19 @@ var chatHandler = {
     }
 
     const list = document.getElementById("contactlistbox");
-    if (list.selectedItem.getAttribute("id") != "searchResultConv") {
+    const selectedItem = list.selectedItem;
+    const searchTerm =
+      selectedItem.getAttribute("id") == "searchResultConv"
+        ? selectedItem.searchTerm
+        : undefined;
+    if (selectedItem.getAttribute("id") != "searchResultConv") {
       document.getElementById("goToConversation").hidden = false;
     }
     log.getConversation().then(aLogConv => {
-      this._showLog(aLogConv);
+      if (list.selectedItem !== selectedItem || selectedItem.nativeChatLog) {
+        return;
+      }
+      this._showLog(aLogConv, searchTerm);
     });
   },
 
@@ -1046,7 +1054,6 @@ var chatHandler = {
           ) {
             return;
           }
-          this._pendingSearchTerm = item.searchTerm || undefined;
           this._showLogList(aSimilarLogs, aLog);
         });
       });

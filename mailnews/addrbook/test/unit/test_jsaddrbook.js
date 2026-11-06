@@ -548,7 +548,7 @@ let migrationPublicationSerial = 0;
 let migrationPublicationDirectoriesRegistered = false;
 
 /**
- * Creates a genuine closed stage and holds the actual current-profile lock.
+ * Creates a genuine closed stage and native profile for an owned operation.
  *
  * @returns {Promise<object>} Owned fixture, adoption call, events and cleanup.
  */
@@ -559,7 +559,7 @@ async function migrationPublicationInput() {
   const { SQLiteDirectory } = ChromeUtils.importESModule(
     "resource:///modules/SQLiteDirectory.sys.mjs"
   );
-  const { adoptMigrationAddressBook } = ChromeUtils.importESModule(
+  const { withMigrationAddressBookPublication } = ChromeUtils.importESModule(
     "resource:///modules/AddrBookManager.sys.mjs"
   );
   // Directory-service registrations outlive each fixture's profile and lock.
@@ -581,16 +581,14 @@ async function migrationPublicationInput() {
     "manager-publication-" + serial,
     "tests"
   );
-  const lock = profile.lock({});
-  let lockReleased = false;
-  const releaseLock = () => {
-    if (!lockReleased) {
-      lock.unlock();
-      lockReleased = true;
+  let profileRemoved = false;
+  const removeProfile = () => {
+    if (!profileRemoved) {
       profile.remove(false);
+      profileRemoved = true;
     }
   };
-  registerCleanupFunction(releaseLock);
+  registerCleanupFunction(removeProfile);
   const stageFile = do_get_profile().clone();
   stageFile.append("manager-stage-" + serial + ".sqlite");
   const sourceBytes = await IOUtils.read(do_get_file("import.mab").path);
@@ -616,7 +614,6 @@ async function migrationPublicationInput() {
     lists: committed.lists,
   };
   const options = {
-    profileLock: lock,
     stageFile,
     sourceBytes,
     receipt,
@@ -654,15 +651,22 @@ async function migrationPublicationInput() {
   prefsFile.append("prefs.js");
   const input = {
     options,
-    lock,
+    profile,
     prefsFile,
-    managerServices: Cu.getGlobalForObject(adoptMigrationAddressBook).Services,
+    managerServices: Cu.getGlobalForObject(withMigrationAddressBookPublication)
+      .Services,
     target,
     pref,
     events,
     SQLiteDirectory,
     FileUtils,
-    adopt: () => adoptMigrationAddressBook(options),
+    run: callback => withMigrationAddressBookPublication(profile, callback),
+    withProfile: (selected, callback) =>
+      withMigrationAddressBookPublication(selected, callback),
+    adopt: () =>
+      withMigrationAddressBookPublication(profile, publication =>
+        publication.adopt(options)
+      ),
     async cleanup() {
       if (cleaned) {
         return;
@@ -682,7 +686,7 @@ async function migrationPublicationInput() {
       if (stageFile.exists()) {
         stageFile.remove(false);
       }
-      releaseLock();
+      removeProfile();
     },
   };
   registerCleanupFunction(() => input.cleanup());
@@ -810,6 +814,14 @@ add_task(
       const original = structuredClone(input.options.receipt);
       input.options.receipt.cards[0][1] += "-wrong";
       await Assert.rejects(input.adopt(), /scoped UID maps changed/);
+      await Assert.rejects(
+        input.run(publication => {
+          // The scope must observe a failed adoption even without this await.
+          publication.adopt(input.options);
+          return "must not report successful publication";
+        }),
+        /scoped UID maps changed/
+      );
       input.options.receipt = original;
       const source = Uint8Array.from(input.options.sourceBytes);
       input.options.sourceBytes[0] ^= 1;
@@ -898,23 +910,42 @@ add_task(
       "other-manager-book-" + migrationPublicationSerial,
       "tests"
     );
-    const otherLock = other.lock({});
-    let otherReleased = false;
+    const stageBytes = await IOUtils.read(input.options.stageFile.path);
     try {
-      input.options.profileLock = otherLock;
-      await Assert.rejects(input.adopt(), /another profile/);
-      otherLock.unlock();
-      otherReleased = true;
-      await Assert.rejects(input.adopt(), /./);
+      await Assert.rejects(
+        input.withProfile(other, publication =>
+          publication.adopt(input.options)
+        ),
+        /another profile/
+      );
+      const released = await input.run(publication => publication);
+      Assert.ok(Object.isFrozen(released));
+      Assert.deepEqual(Object.keys(released).sort(), ["adopt", "checkProfile"]);
+      Assert.throws(
+        () => released.checkProfile(),
+        /Book publication operation is closed/
+      );
+      await Assert.rejects(
+        released.adopt(input.options),
+        /Book publication operation is closed/
+      );
       Assert.ok(!input.target.exists());
       Assert.deepEqual(Services.prefs.getChildList(input.pref + "."), []);
       Assert.deepEqual(input.events, []);
-      input.options.profileLock = input.lock;
+      Assert.deepEqual(
+        await IOUtils.read(input.options.stageFile.path),
+        stageBytes,
+        "Closed capability does not mutate the genuine original stage"
+      );
+      // The operation actually unlocked before it returned its captured handle.
+      const reacquired = input.profile.lock({});
+      try {
+        Assert.ok(reacquired.directory.equals(do_get_profile()));
+      } finally {
+        reacquired.unlock();
+      }
       assertMigrationPublication(input, await input.adopt());
     } finally {
-      if (!otherReleased) {
-        otherLock.unlock();
-      }
       other.remove(false);
       await IOUtils.remove(otherRoot, { recursive: true });
       await input.cleanup();
@@ -1173,6 +1204,7 @@ async function assertMigrationPreferenceSnapshotFailure(
   let nativeFailure;
   let reached = false;
   let concurrent;
+  let activePublication;
   const baseline = input.prefsFile.clone();
   baseline.leafName += ".manager-snapshot-baseline";
   baseline.createUnique(Ci.nsIFile.NORMAL_FILE_TYPE, 0o600);
@@ -1206,7 +1238,7 @@ async function assertMigrationPreferenceSnapshotFailure(
       }
       if (!obstructBackup) {
         Services.prefs.setStringPref(conflictPref, "after");
-        concurrent = input.adopt().then(
+        concurrent = activePublication.adopt(input.options).then(
           () => ({ unexpectedlyPublished: true }),
           error => ({ error })
         );
@@ -1245,7 +1277,10 @@ async function assertMigrationPreferenceSnapshotFailure(
     );
     let failure;
     try {
-      await input.adopt();
+      await input.run(publication => {
+        activePublication = publication;
+        return publication.adopt(input.options);
+      });
     } catch (error) {
       failure = error;
     } finally {
@@ -1344,9 +1379,140 @@ async function assertMigrationPreferenceSnapshotFailure(
   }
 }
 
+/**
+ * Holds an actual backup completion while an owned callback has already ended.
+ *
+ * @param {boolean} callbackFails - Throw a real callback error before draining.
+ * @returns {Promise<void>} Pending adoption, first failure and unlock checked.
+ */
+async function assertMigrationOwnedPublicationSettlement(callbackFails) {
+  const input = await migrationPublicationInput();
+  const prefs = input.managerServices.prefs;
+  const backup = prefs.backupPrefFile;
+  const originalStage = await IOUtils.read(input.options.stageFile.path);
+  let enterBackup;
+  const backupEntered = new Promise(resolve => {
+    enterBackup = resolve;
+  });
+  let releaseBackup;
+  const backupRelease = new Promise(resolve => {
+    releaseBackup = resolve;
+  });
+  let reached = false;
+  let publication;
+  let adoption;
+  let finished;
+  let settled = false;
+  const callbackError = new Error("Actual owned publication callback failure");
+  try {
+    input.managerServices.prefs = new Proxy(
+      {},
+      {
+        get(target, name) {
+          if (name == "backupPrefFile") {
+            return file =>
+              backup.call(prefs, file).then(async value => {
+                if (!reached) {
+                  reached = true;
+                  enterBackup();
+                  await backupRelease;
+                }
+                return value;
+              });
+          }
+          const value = prefs[name];
+          return typeof value == "function" ? value.bind(prefs) : value;
+        },
+      }
+    );
+    finished = input
+      .run(active => {
+        publication = active;
+        adoption = active.adopt(input.options);
+        if (callbackFails) {
+          throw callbackError;
+        }
+        return "settled callback result";
+      })
+      .then(
+        value => {
+          settled = true;
+          return { value };
+        },
+        error => {
+          settled = true;
+          return { error };
+        }
+      );
+    // Unexpected early native failure stays an actual failure, not a timeout.
+    await Promise.race([
+      backupEntered,
+      finished.then(outcome => {
+        if (!reached) {
+          throw outcome.error ?? new Error("Native backup was not reached");
+        }
+      }),
+    ]);
+    Assert.ok(
+      reached,
+      "Actual native backup completed before the held boundary"
+    );
+    Assert.ok(!settled, "Callback completion cannot abandon an adoption");
+    Assert.throws(
+      () => publication.checkProfile(),
+      /Book publication operation is closed/
+    );
+    await Assert.rejects(
+      publication.adopt(input.options),
+      /Book publication operation is closed/
+    );
+    Assert.ok(!input.target.exists());
+    Assert.deepEqual(input.events, []);
+    releaseBackup();
+    const outcome = await finished;
+    const result = await adoption;
+    if (callbackFails) {
+      Assert.equal(
+        outcome.error,
+        callbackError,
+        "First callback error identity"
+      );
+    } else {
+      Assert.equal(outcome.value, "settled callback result");
+      Assert.ok(!Object.hasOwn(outcome, "error"));
+    }
+    assertMigrationPublication(input, result);
+    Assert.deepEqual(
+      input.events.map(([topic]) => topic),
+      ["addrbook-directory-created"]
+    );
+    Assert.deepEqual(
+      await IOUtils.read(input.options.stageFile.path),
+      originalStage
+    );
+    const reacquired = input.profile.lock({});
+    try {
+      Assert.ok(reacquired.directory.equals(do_get_profile()));
+    } finally {
+      reacquired.unlock();
+    }
+    input.events.length = 0;
+    Assert.equal((await input.adopt()).reused, true);
+    Assert.deepEqual(input.events, []);
+  } finally {
+    releaseBackup();
+    await finished;
+    await adoption?.catch(() => undefined);
+    input.managerServices.prefs = prefs;
+    await input.cleanup();
+  }
+}
+
 add_task(
   migrationPublicationOnly(),
   async function test_adoptMigrationAddressBookWithInterruptedPublication() {
+    await assertMigrationOwnedPublicationSettlement(false);
+    await assertMigrationOwnedPublicationSettlement(true);
     await assertMigrationPreferenceWriteFailure(false);
     await assertMigrationPreferenceWriteFailure(true);
     for (const atPublished of [false, true]) {
@@ -1399,13 +1565,18 @@ add_task(
     const input = await migrationPublicationInput();
     const reentered = [];
     const errors = [];
+    let activePublication;
     const observe = (subject, topic) => {
       if (
         topic == "addrbook-directory-created" &&
         subject.UID == input.options.bookUID
       ) {
         try {
-          reentered.push(input.adopt().catch(error => errors.push(error)));
+          reentered.push(
+            activePublication
+              .adopt(input.options)
+              .catch(error => errors.push(error))
+          );
         } catch (error) {
           errors.push(error);
         }
@@ -1413,7 +1584,10 @@ add_task(
     };
     Services.obs.addObserver(observe, "addrbook-directory-created");
     try {
-      const result = await input.adopt();
+      const result = await input.run(publication => {
+        activePublication = publication;
+        return publication.adopt(input.options);
+      });
       const settled = await Promise.all(reentered);
       Assert.deepEqual(errors, []);
       Assert.equal(reentered.length, 1);

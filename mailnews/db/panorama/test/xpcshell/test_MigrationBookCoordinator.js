@@ -1051,7 +1051,6 @@ add_task(unixOnly(), async function test_killedSettledImportReopensReadOnly() {
 });
 
 let publicationProfile;
-let publicationLock;
 
 /** Closes actual Manager connections before a controlled publication/restart. */
 async function reloadPublishedBooks() {
@@ -1068,11 +1067,11 @@ async function reloadPublishedBooks() {
 }
 
 /**
- * Plans genuine book bytes for the actual current, natively locked test profile.
+ * Plans genuine book bytes under a native lock, then releases that lock.
  * Other-profile staging cases above retain their original stage-only lifetime.
  *
- * @returns {Promise<object>} Actual current lock, genuine source, backup, stage,
- *   journal, original book ID and exact selected display-name map.
+ * @returns {Promise<object>} Actual current profile, genuine source, backup,
+ *   stage, journal, original book ID and selected display-name map.
  */
 async function publicationInput() {
   if (!publicationProfile) {
@@ -1081,51 +1080,68 @@ async function publicationInput() {
       "s520-current-publication",
       "tests"
     );
-    publicationLock = publicationProfile.lock({});
     registerCleanupFunction(async () => {
       await reloadPublishedBooks();
-      publicationLock?.unlock();
       publicationProfile.remove(false);
     });
   }
   await reloadPublishedBooks();
-  const id = "publication-book-" + ++serial;
-  // Journal, backup and stage use the harness's separate per-test temp tree.
-  // The actual current profile remains the read-only source admission root.
-  const root = PathUtils.join(do_get_tempdir().path, id);
-  await IOUtils.makeDirectory(root);
-  const profilePath = publicationLock.directory.path;
-  const source = PathUtils.join(profilePath, id + ".mab");
-  const bytes = await IOUtils.read(do_get_file(MAB_FILE).path);
-  await IOUtils.copy(do_get_file(MAB_FILE).path, source);
-  const { identity } = await readMorkAddressBookSource(source);
-  const stagingPath = PathUtils.join(root, "book.sqlite");
-  const path = PathUtils.join(root, "journal.json");
-  const backupPath = PathUtils.join(root, "backup");
-  const journal = await MigrationJournal.create(path, {
-    profilePath,
-    mailPaths: [],
-    backupPath,
-    sources: [],
-    books: [{ id, ...identity, stagingPath }],
-  });
-  const input = {
-    id,
-    root,
-    profilePath,
-    source,
-    bytes,
-    stagingPath,
-    path,
-    backupPath,
-    journal,
-    lock: publicationLock,
-    names: new Map([[id, "Actual imported book é"]]),
-  };
-  registerCleanupFunction(() => input.journal.close());
-  input.backup = await createMigrationBackup(profilePath, [], backupPath);
-  await input.journal.recordBackup(input.backup);
-  return input;
+  // Prepare the genuine source and backup before transferring lock ownership.
+  const preparationLock = publicationProfile.lock({});
+  try {
+    const id = "publication-book-" + ++serial;
+    const root = PathUtils.join(do_get_tempdir().path, id);
+    await IOUtils.makeDirectory(root);
+    const profilePath = preparationLock.directory.path;
+    const source = PathUtils.join(profilePath, id + ".mab");
+    const bytes = await IOUtils.read(do_get_file(MAB_FILE).path);
+    await IOUtils.copy(do_get_file(MAB_FILE).path, source);
+    const { identity } = await readMorkAddressBookSource(source);
+    const stagingPath = PathUtils.join(root, "book.sqlite");
+    const path = PathUtils.join(root, "journal.json");
+    const backupPath = PathUtils.join(root, "backup");
+    const journal = await MigrationJournal.create(path, {
+      profilePath,
+      mailPaths: [],
+      backupPath,
+      sources: [],
+      books: [{ id, ...identity, stagingPath }],
+    });
+    const input = {
+      id,
+      root,
+      profilePath,
+      source,
+      bytes,
+      stagingPath,
+      path,
+      backupPath,
+      journal,
+      profile: publicationProfile,
+      names: new Map([[id, "Actual imported book é"]]),
+    };
+    registerCleanupFunction(() => input.journal.close());
+    input.backup = await createMigrationBackup(profilePath, [], backupPath);
+    await input.journal.recordBackup(input.backup);
+    return input;
+  } finally {
+    preparationLock.unlock();
+  }
+}
+
+/**
+ * Imports a corruption/error fixture under a separate actual native lock.
+ *
+ * @param {object} input - Current-profile journal and native toolkit profile.
+ * @returns {Promise<void>} Complete original stage-only import receipt.
+ */
+async function stagePublicationInput(input) {
+  const lock = input.profile.lock({});
+  try {
+    await resumeMorkBookImports(input.journal, lock);
+  } finally {
+    lock.unlock();
+  }
 }
 
 /** @returns {{topics: string[], close: Function}} Actual creation events. */
@@ -1211,11 +1227,11 @@ add_task(
   async function test_bookPublicationAwaitsNativePreferenceCommit() {
     const input = await publicationInput();
     const events = watchBookPublication();
-    const { adoptMigrationAddressBook } = ChromeUtils.importESModule(
+    const { withMigrationAddressBookPublication } = ChromeUtils.importESModule(
       "resource:///modules/AddrBookManager.sys.mjs"
     );
     const managerServices = Cu.getGlobalForObject(
-      adoptMigrationAddressBook
+      withMigrationAddressBookPublication
     ).Services;
     const prefs = managerServices.prefs;
     const backupPrefFile = prefs.backupPrefFile;
@@ -1253,7 +1269,7 @@ add_task(
     try {
       operation = resumeMorkBookImportsAndPublish(
         input.journal,
-        input.lock,
+        input.profile,
         input.names
       );
       await Promise.race([
@@ -1303,7 +1319,7 @@ add_task(
     const events = watchBookPublication();
     const [published] = await resumeMorkBookImportsAndPublish(
       input.journal,
-      input.lock,
+      input.profile,
       input.names
     );
     assertPublishedBook(input, published);
@@ -1311,7 +1327,7 @@ add_task(
     const before = await IOUtils.read(input.path);
     const [again] = await resumeMorkBookImportsAndPublish(
       input.journal,
-      input.lock,
+      input.profile,
       input.names
     );
     Assert.equal(again.reused, true);
@@ -1329,7 +1345,8 @@ add_task(
 
 /**
  * Reads actual persisted prefs and public card/list data in a new OS process.
- * The parent releases its native profile lock only after closing real readers.
+ * The publication callback has released its native lock before this call.
+ * The parent closes real readers before the child acquires its own lock.
  *
  * @param {object} input - Published current-profile unit.
  * @param {object} published - Actual stable Manager identity.
@@ -1343,15 +1360,22 @@ async function readPublishedBookInChild(input, published) {
     "resource://testing-common/TestUtils.sys.mjs"
   );
   await reloadPublishedBooks();
-  publicationLock.unlock();
-  publicationLock = null;
+  const profileDirectories = Object.fromEntries(
+    ["DefProfRt", "DefProfLRt", "UAppData"].map(key => [
+      key,
+      Services.dirsvc.get(key, Ci.nsIFile).path,
+    ])
+  );
   const code = `
-    const { FileUtils } = ChromeUtils.importESModule("resource://gre/modules/FileUtils.sys.mjs");
-    const root = new FileUtils.File(${JSON.stringify(input.profilePath)});
-    Services.dirsvc.set("ProfD", root.clone());
-    Services.dirsvc.set("ProfLD", root.clone());
     let held;
     try {
+      const { FileUtils } = ChromeUtils.importESModule("resource://gre/modules/FileUtils.sys.mjs");
+      const root = new FileUtils.File(${JSON.stringify(input.profilePath)});
+      Services.dirsvc.set("ProfD", root.clone());
+      Services.dirsvc.set("ProfLD", root.clone());
+      for (const [key, path] of Object.entries(${JSON.stringify(profileDirectories)})) {
+        Services.dirsvc.set(key, new FileUtils.File(path));
+      }
       const service = Cc["@mozilla.org/toolkit/profile-service;1"].getService(Ci.nsIToolkitProfileService);
       const profile = service.createProfile(root, "s520-readback-child", "tests");
       held = profile.lock({});
@@ -1372,7 +1396,9 @@ async function readPublishedBookInChild(input, published) {
       held.unlock(); held = null;
       quit(0);
     } catch (error) {
-      print("BOOK-PUBLICATION-REOPEN-ERROR " + error);
+      print("BOOK-PUBLICATION-REOPEN-ERROR " + JSON.stringify({
+        message: String(error), result: error.result, stack: error.stack,
+      }));
       held?.unlock();
       quit(1);
     }
@@ -1420,14 +1446,16 @@ async function readPublishedBookInChild(input, published) {
     Assert.equal(
       terminal.exitCode,
       0,
-      "Actual Manager process-reopen exits successfully: " + output
+      "Actual Manager process-reopen exits successfully: " +
+        JSON.stringify(output)
     );
     const line = output
       .split("\n")
       .find(value => value.startsWith("BOOK-PUBLICATION-REOPEN "));
     Assert.ok(
       line,
-      "Actual process reopens the persisted public book: " + output
+      "Actual process reopens the persisted public book: " +
+        JSON.stringify(output)
     );
     return JSON.parse(line.slice("BOOK-PUBLICATION-REOPEN ".length));
   } finally {
@@ -1435,8 +1463,6 @@ async function readPublishedBookInChild(input, published) {
       await child.kill(0);
     }
     await reading;
-    publicationLock = publicationProfile.lock({});
-    input.lock = publicationLock;
   }
 }
 
@@ -1446,7 +1472,7 @@ add_task(
     const input = await publicationInput();
     const [published] = await resumeMorkBookImportsAndPublish(
       input.journal,
-      input.lock,
+      input.profile,
       input.names
     );
     const receipt = input.journal.state.books[0].receipt;
@@ -1464,7 +1490,7 @@ add_task(
     const events = watchBookPublication();
     const [again] = await resumeMorkBookImportsAndPublish(
       input.journal,
-      input.lock,
+      input.profile,
       input.names
     );
     assertPublishedBook(input, again);
@@ -1485,29 +1511,50 @@ add_task(
     await Assert.rejects(
       resumeMorkBookImportsAndPublish(
         wrong.journal,
-        wrong.lock,
+        wrong.profile,
         new Map([["original-book", "Wrong profile"]])
       ),
-      /held current profile/
+      /another profile/
     );
     Assert.deepEqual(await IOUtils.read(wrong.path), before);
     Assert.ok(!wrong.journal.state.books[0].publication);
     const input = await publicationInput();
     const previous = await IOUtils.read(input.path);
-    const released = input.lock;
-    publicationLock.unlock();
-    publicationLock = null;
-    try {
-      await Assert.rejects(
-        resumeMorkBookImportsAndPublish(input.journal, released, input.names),
-        error => error.result === Cr.NS_ERROR_NOT_INITIALIZED
-      );
-      Assert.deepEqual(await IOUtils.read(input.path), previous);
-      Assert.ok(!(await IOUtils.exists(input.stagingPath)));
-    } finally {
-      publicationLock = publicationProfile.lock({});
-      input.lock = publicationLock;
-    }
+    const { withMigrationAddressBookPublication } = ChromeUtils.importESModule(
+      "resource:///modules/AddrBookManager.sys.mjs"
+    );
+    const events = watchBookPublication();
+    let released;
+    await withMigrationAddressBookPublication(
+      input.profile,
+      async publication => {
+        released = publication;
+        Assert.equal(publication.checkProfile().path, input.profilePath);
+      }
+    );
+    // Exercise a new real native acquisition after the owned callback settles.
+    const nextLock = input.profile.lock({});
+    nextLock.unlock();
+    Assert.throws(
+      () => released.checkProfile(),
+      /Book publication operation is closed/
+    );
+    await Assert.rejects(
+      released.adopt({}),
+      /Book publication operation is closed/
+    );
+    Assert.deepEqual(await IOUtils.read(input.path), previous);
+    Assert.ok(!(await IOUtils.exists(input.stagingPath)));
+    Assert.deepEqual(events.topics, []);
+    const [published] = await resumeMorkBookImportsAndPublish(
+      input.journal,
+      input.profile,
+      input.names
+    );
+    assertPublishedBook(input, published);
+    Assert.deepEqual(events.topics, ["addrbook-directory-created"]);
+    await assertOriginals(input);
+    events.close();
   }
 );
 
@@ -1515,7 +1562,7 @@ add_task(
   unixOnly(),
   async function test_bookPublicationRejectsChangedCommittedStage() {
     const input = await publicationInput();
-    await resumeMorkBookImports(input.journal, input.lock);
+    await stagePublicationInput(input);
     const receipt = input.journal.state.books[0].receipt;
     let db = openStage(input);
     db.executeSimpleSQL(
@@ -1524,7 +1571,11 @@ add_task(
     db.close();
     const events = watchBookPublication();
     await Assert.rejects(
-      resumeMorkBookImportsAndPublish(input.journal, input.lock, input.names),
+      resumeMorkBookImportsAndPublish(
+        input.journal,
+        input.profile,
+        input.names
+      ),
       /Staged book differs: raw properties/
     );
     Assert.deepEqual(events.topics, []);
@@ -1537,7 +1588,7 @@ add_task(
     db.close();
     const [published] = await resumeMorkBookImportsAndPublish(
       input.journal,
-      input.lock,
+      input.profile,
       input.names
     );
     assertPublishedBook(input, published);
@@ -1562,7 +1613,7 @@ add_task(
     await Assert.rejects(
       resumeMorkBookImportsAndPublish(
         input.journal,
-        input.lock,
+        input.profile,
         input.names,
         controller.signal
       ),
@@ -1576,7 +1627,7 @@ add_task(
     await input.journal.setCancelled(false);
     const [again] = await resumeMorkBookImportsAndPublish(
       input.journal,
-      input.lock,
+      input.profile,
       input.names
     );
     Assert.deepEqual(input.journal.state.books[0].publication, publication);
@@ -1595,7 +1646,7 @@ add_task(
       input.id,
       input.names.get(input.id)
     );
-    await resumeMorkBookImports(input.journal, input.lock);
+    await stagePublicationInput(input);
     let db = openStage(input);
     db.executeSimpleSQL(
       "DELETE FROM migration_properties WHERE kind='card' AND name='Notes'"
@@ -1614,7 +1665,11 @@ add_task(
     };
     try {
       await Assert.rejects(
-        resumeMorkBookImportsAndPublish(input.journal, input.lock, input.names),
+        resumeMorkBookImportsAndPublish(
+          input.journal,
+          input.profile,
+          input.names
+        ),
         error =>
           error === childError &&
           /Staged book differs: raw properties/.test(error.message),
@@ -1634,7 +1689,7 @@ add_task(
     db.close();
     const [published] = await resumeMorkBookImportsAndPublish(
       input.journal,
-      input.lock,
+      input.profile,
       input.names
     );
     assertPublishedBook(input, published);

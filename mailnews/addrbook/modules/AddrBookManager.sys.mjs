@@ -249,24 +249,6 @@ function migrationBookFile(file) {
 }
 
 /**
- * Checks the actual selected lock without acquiring or releasing it.
- *
- * @param {nsIProfileLock} profileLock - Caller-held native profile lock.
- * @returns {nsIFile} Current selected profile.
- */
-function migrationBookProfile(profileLock) {
-  const selected = profileLock.QueryInterface(Ci.nsIProfileLock).directory;
-  if (!selected) {
-    throw new Error("Migration book profile lock was released");
-  }
-  const profile = migrationBookFile(Services.dirsvc.get("ProfD", Ci.nsIFile));
-  if (!profile.equals(migrationBookFile(selected))) {
-    throw new Error("Migration book lock selects another profile");
-  }
-  return profile;
-}
-
-/**
  * Hashes the three independently scoped publication identities.
  *
  * @param {string[]} identities - Original source, storage token and book UID.
@@ -419,20 +401,120 @@ function checkMigrationBookAuxiliaries(stage) {
 }
 
 /**
+ * Runs one quiesced whole-book publication under a private native profile lock.
+ *
+ * The caller must transfer at a boundary where it owns no other profile lock
+ * or writer. The capability closes when the callback settles. Every adoption
+ * started during that callback settles before the actual native unlock, even
+ * if the callback fails. No native lock escapes this operation.
+ *
+ * @param {nsIToolkitProfile} profile - Genuine native current profile.
+ * @param {function(object): *} callback - Complete import/publication
+ *   and journal checkpoint, using only checkProfile() and adopt(options).
+ * @returns {Promise<*>} Callback result after all started adoptions and unlock.
+ * @throws {Error} On wrong profile, actual native acquisition/callback/adoption
+ *   failure, or cleanup failure when no earlier failure exists. A captured
+ *   closed capability refuses with "Book publication operation is closed".
+ */
+export async function withMigrationAddressBookPublication(profile, callback) {
+  if (typeof callback != "function") {
+    throw new TypeError("Expected a whole-book publication callback");
+  }
+  const nativeProfile = profile.QueryInterface(Ci.nsIToolkitProfile);
+  const selected = migrationBookFile(nativeProfile.rootDir);
+  const current = migrationBookFile(Services.dirsvc.get("ProfD", Ci.nsIFile));
+  if (!selected.equals(current)) {
+    throw new Error("Migration book lock selects another profile");
+  }
+  const lock = nativeProfile.lock({});
+  let accepting = true;
+  let held = true;
+  let failed = false;
+  let firstError;
+  let result;
+  const settlements = [];
+  const closedError = () => new Error("Book publication operation is closed");
+  const rememberError = error => {
+    if (!failed) {
+      failed = true;
+      firstError = error;
+    }
+  };
+  const checkHeldProfile = () => {
+    if (!held) {
+      throw closedError();
+    }
+    // This getter is safe: only this closure owns or releases the native lock.
+    const actual = migrationBookFile(lock.directory);
+    const now = migrationBookFile(Services.dirsvc.get("ProfD", Ci.nsIFile));
+    if (!actual.equals(selected) || !actual.equals(now)) {
+      throw new Error("Migration book lock selects another profile");
+    }
+    return actual.clone();
+  };
+  const publication = Object.freeze({
+    checkProfile() {
+      if (!accepting) {
+        throw closedError();
+      }
+      return checkHeldProfile();
+    },
+    adopt(options) {
+      if (!accepting) {
+        return Promise.reject(closedError());
+      }
+      const operation = adoptMigrationAddressBook(options, checkHeldProfile);
+      // Observe even an adoption the callback does not await. Returning the
+      // original promise preserves its actual success or failure for callers.
+      settlements.push(operation.then(() => undefined, rememberError));
+      return operation;
+    },
+  });
+  try {
+    checkHeldProfile();
+    result = await callback(publication);
+  } catch (error) {
+    rememberError(error);
+  } finally {
+    accepting = false;
+    try {
+      // Admission is closed, so this list cannot grow during teardown.
+      await Promise.all(settlements);
+    } catch (error) {
+      rememberError(error);
+    }
+    held = false;
+    try {
+      lock.unlock();
+    } catch (error) {
+      if (failed) {
+        console.error("Could not unlock failed book publication", error);
+      } else {
+        rememberError(error);
+      }
+    }
+  }
+  if (failed) {
+    throw firstError;
+  }
+  return result;
+}
+
+/**
  * Publishes one complete, closed legacy-book stage in the current profile.
  *
- * The caller retains the native selected-profile lock through its journal
- * checkpoint. The original source, stage and backup are never removed. A
+ * The owning callback retains its private native profile lock through its
+ * journal checkpoint. The original source, stage and backup are never removed. A
  * prepared preference record owns a retry artifact but is not a live book.
  * The complete normal directory is stored before its single create event.
  *
  * @param {object} options - Settled original book publication.
- * @param {nsIProfileLock} options.profileLock - Actual caller-held profile lock.
  * @param {nsIFile} options.stageFile - Closed, unregistered schema-4 stage.
  * @param {Uint8Array} options.sourceBytes - Complete original legacy snapshot.
  * @param {object} options.receipt - Settled source/token/hash/size/cards/lists.
  * @param {string} options.bookUID - Stable book UID from the durable intent.
  * @param {string} options.dirName - Exact selected display name.
+ * @param {function(): nsIFile} checkProfile - Owning scope's held-profile check.
  * @returns {Promise<{directory: nsIAbDirectory, dirPrefId: string, uri: string,
  *   fileName: string, bookUID: string, sourceId: string, storageSourceId: string,
  *   sourceSha256: string, sourceSize: number, cards: [number, string][],
@@ -442,15 +524,11 @@ function checkMigrationBookAuxiliaries(stage) {
  *   A preference change during a pending snapshot rejects with IN_PROGRESS;
  *   the caller can retry without losing the newer preference values.
  */
-export async function adoptMigrationAddressBook({
-  profileLock,
-  stageFile,
-  sourceBytes,
-  receipt,
-  bookUID,
-  dirName,
-}) {
-  const profile = migrationBookProfile(profileLock);
+async function adoptMigrationAddressBook(
+  { stageFile, sourceBytes, receipt, bookUID, dirName },
+  checkProfile
+) {
+  const profile = checkProfile();
   const prefsFile = profile.clone();
   prefsFile.append("prefs.js");
   const stage = migrationBookFile(stageFile);
@@ -597,7 +675,7 @@ export async function adoptMigrationAddressBook({
         expected
       );
     }
-    migrationBookProfile(profileLock);
+    checkProfile();
     ensureInitialized();
     for (const directory of store.values()) {
       if (
@@ -646,7 +724,7 @@ export async function adoptMigrationAddressBook({
         };
         refuseChangedSnapshot();
         if (
-          !migrationBookProfile(profileLock).equals(profile) ||
+          !checkProfile().equals(profile) ||
           !migrationBookFile(stageFile).equals(stage) ||
           JSON.stringify(receipt) !== JSON.stringify(expected) ||
           sourceBytes.length !== bytes.length ||
@@ -745,13 +823,13 @@ export async function adoptMigrationAddressBook({
       }
     };
     if (!reused) {
-      migrationBookProfile(profileLock);
+      checkProfile();
       Services.prefs.setStringPref(
         key,
         JSON.stringify({ ...identity, state: "prepared" })
       );
       await persistPreferences("prepared");
-      migrationBookProfile(profileLock);
+      checkProfile();
       if (
         Services.prefs.getStringPref(key) !==
         JSON.stringify({ ...identity, state: "prepared" })
@@ -774,7 +852,7 @@ export async function adoptMigrationAddressBook({
       ),
       expected
     );
-    migrationBookProfile(profileLock);
+    checkProfile();
     if (!reused) {
       for (const [name, value] of Object.entries(normalPrefs)) {
         const pref = dirPrefId + "." + name;
@@ -792,7 +870,7 @@ export async function adoptMigrationAddressBook({
         await persistPreferences("published");
         // The caller's continuation also follows a promise boundary. Recheck
         // the live owner before exposing the committed book to normal callers.
-        migrationBookProfile(profileLock);
+        checkProfile();
         if (
           Services.prefs.getStringPref(key) !==
             JSON.stringify({ ...identity, state: "published" }) ||

@@ -158,6 +158,35 @@ add_task(
     Assert.equal(moved.folder.URI, archive.URI);
     Assert.notDeepEqual(physical(moved), oldLocation);
     const expected = [parent, moved, tail].map(physical);
+    // Gloda writes metadata on the same physical headers. Finish those real
+    // writes before capturing the native result used by the menu assertions.
+    ChromeUtils.importESModule("resource:///modules/gloda/GlodaPublic.sys.mjs");
+    const { GlodaMsgIndexer } = ChromeUtils.importESModule(
+      "resource:///modules/gloda/IndexMsg.sys.mjs"
+    );
+    const { waitForGlodaDBFlush } = ChromeUtils.importESModule(
+      "resource://testing-common/gloda/GlodaTestHelperFunctions.sys.mjs"
+    );
+    await Promise.all(
+      folders.map(
+        folder =>
+          new Promise((resolve, reject) => {
+            const queued = GlodaMsgIndexer.indexFolder(folder, {
+              callback(success) {
+                if (!success) {
+                  reject(new Error("Fixture Gloda indexing did not complete"));
+                  return;
+                }
+                resolve();
+              },
+            });
+            if (!queued) {
+              reject(new Error("Fixture Gloda indexing was not queued"));
+            }
+          })
+      )
+    );
+    await waitForGlodaDBFlush();
     const service = await getMailSearchService();
     let progress;
     do {

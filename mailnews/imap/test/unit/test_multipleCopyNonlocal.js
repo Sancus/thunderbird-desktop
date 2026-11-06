@@ -17,7 +17,9 @@ var gMessages = ["bugmail10", "draft1"]; // message files used as a tests
 
 var gTestArray = [
   // initial setup of IMAP environment
-  setupIMAPPump,
+  async function setup() {
+    await setupIMAPPump(undefined, { awaitInbox: true });
+  },
 
   // optionally set server parameters, here enabling debug messages
   function serverParms() {

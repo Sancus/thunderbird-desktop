@@ -3255,6 +3255,38 @@ void nsImapProtocol::ProcessSelectedStateURL() {
           [[fallthrough]];
         case nsIImapUrl::nsImapSelectFolder:
         case nsIImapUrl::nsImapSelectNoopFolder:
+#ifdef MOZ_PANORAMA
+          if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+            auto* selectedUrl = static_cast<nsImapUrl*>(m_runningUrl.get());
+            auto inputs = selectedUrl->CopyAcceptedAppendInputs();
+            nsresult association = [&]() -> nsresult {
+              // Discover every source ordinal before binding any member. A
+              // shared destination UID cannot satisfy two retained inputs.
+              for (uint32_t i = 0; i < inputs.Length(); ++i) {
+                uint32_t epoch = 0;
+                ImapUid uid = 0;
+                MOZ_TRY(ResolveNativeTransferUid(
+                    inputs[i].snapshot, inputs[i].messageId, mailboxName.get(),
+                    epoch, uid));
+                MOZ_TRY(selectedUrl->RecordAcceptedAppendObservation(i, epoch,
+                                                                     uid));
+              }
+              for (const auto& observed :
+                   selectedUrl->CopyAcceptedAppendObservations()) {
+                NS_ENSURE_TRUE(m_imapMailFolderSink, NS_ERROR_NOT_AVAILABLE);
+                MOZ_TRY(m_imapMailFolderSink->SetAppendMsgUid(observed.uid,
+                                                              m_runningUrl));
+              }
+              return NS_OK;
+            }();
+            if (NS_FAILED(association)) {
+              if (NS_SUCCEEDED(m_mailboxUpdateResult))
+                m_mailboxUpdateResult = association;
+              GetServerStateParser().SetCommandFailed(true);
+              break;
+            }
+          }
+#endif
           if (!moreHeadersToDownload) ProcessMailboxUpdate(true);
           break;
         case nsIImapUrl::nsImapMsgHeader: {

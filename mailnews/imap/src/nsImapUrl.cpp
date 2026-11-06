@@ -83,6 +83,15 @@ nsImapUrl::~nsImapUrl() {
   // hold a non-threadsafe nsWeakReference proxy that belongs to the main
   // thread, so it must be released there too.
 #ifdef MOZ_PANORAMA
+  {
+    MutexAutoLock lock(mLock);
+    for (const auto& input : mAcceptedAppendInputs) {
+      // Comparison copies only; original provider-finished custody is retained.
+      nsresult rv = input.snapshot->Remove(false);
+      NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                           "Accepted APPEND snapshot cleanup failed");
+    }
+  }
   NS_ReleaseOnMainThread("nsImapUrl::mNativeHierarchyContinuation",
                          mNativeHierarchyContinuation.forget());
   NS_ReleaseOnMainThread("nsImapUrl::mNativeHierarchyCopyState",
@@ -1035,6 +1044,46 @@ nsTArray<nsImapUrl::OnlineCopyObservation>
 nsImapUrl::CopyNativeCopyObservations() {
   MutexAutoLock lock(mLock);
   return mNativeCopyObservations.Clone();
+}
+
+nsresult nsImapUrl::PrepareAcceptedAppendDiscovery(
+    nsTArray<AcceptedAppendInput>&& inputs) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MutexAutoLock lock(mLock);
+  NS_ENSURE_TRUE(
+      mAcceptedAppendInputs.IsEmpty() && mAcceptedAppendObservations.IsEmpty(),
+      NS_ERROR_IN_PROGRESS);
+  mAcceptedAppendInputs = std::move(inputs);
+  return NS_OK;
+}
+
+nsTArray<nsImapUrl::AcceptedAppendInput> nsImapUrl::CopyAcceptedAppendInputs() {
+  MutexAutoLock lock(mLock);
+  return mAcceptedAppendInputs.Clone();
+}
+
+nsresult nsImapUrl::RecordAcceptedAppendObservation(uint32_t index,
+                                                    uint32_t epoch,
+                                                    ImapUid uid) {
+  MutexAutoLock lock(mLock);
+  NS_ENSURE_TRUE(index < mAcceptedAppendInputs.Length() && epoch && uid,
+                 NS_ERROR_NOT_AVAILABLE);
+  for (const auto& prior : mAcceptedAppendObservations) {
+    if (prior.index == index)
+      return prior.epoch == epoch && prior.uid == uid ? NS_OK
+                                                      : NS_ERROR_NOT_AVAILABLE;
+    NS_ENSURE_TRUE(prior.epoch != epoch || prior.uid != uid,
+                   NS_ERROR_NOT_AVAILABLE);
+  }
+  mAcceptedAppendObservations.AppendElement(
+      AcceptedAppendObservation{index, epoch, uid});
+  return NS_OK;
+}
+
+nsTArray<nsImapUrl::AcceptedAppendObservation>
+nsImapUrl::CopyAcceptedAppendObservations() {
+  MutexAutoLock lock(mLock);
+  return mAcceptedAppendObservations.Clone();
 }
 
 void nsImapUrl::MarkNativeOnlineCopyTargets() {

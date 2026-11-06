@@ -398,6 +398,8 @@ class nsImapMailFolder : public nsMsgDBFolder,
                                    nsIMsgWindow* msgWindow);
 
 #ifdef MOZ_PANORAMA
+  nsresult PrepareAcceptedAppendDiscovery(nsImapUrl* url);
+  nsresult AssociateAcceptedAppendObservation(nsImapUrl* url, ImapUid uid);
   nsresult PrepareNativeOnlineCopy(nsIMsgFolder* source,
                                    nsImapMailCopyState* state, nsImapUrl* url);
   nsresult PublishNativeOnlineCopies(nsIImapUrl* url);

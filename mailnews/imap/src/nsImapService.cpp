@@ -204,6 +204,14 @@ NS_IMETHODIMP nsImapService::SelectFolder(nsIMsgFolder* aImapMailFolder,
       urlSpec.Append(hierarchyDelimiter);
       urlSpec.Append(folderName);
       rv = mailNewsUrl->SetSpecInternal(urlSpec);
+#ifdef MOZ_PANORAMA
+      if (NS_SUCCEEDED(rv) &&
+          mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+        auto* folder = static_cast<nsImapMailFolder*>(aImapMailFolder);
+        rv = folder->PrepareAcceptedAppendDiscovery(
+            static_cast<nsImapUrl*>(imapUrl.get()));
+      }
+#endif
       if (NS_SUCCEEDED(rv))
         rv = GetImapConnectionAndLoadUrl(imapUrl, nullptr, aURL);
     }

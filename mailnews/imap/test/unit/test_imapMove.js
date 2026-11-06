@@ -18,8 +18,8 @@ var gFolder1;
 
 var tests = [setupCUSTOM1, startTest, doMove, testMove, teardownIMAPPump];
 
-function setupCUSTOM1() {
-  setupIMAPPump("CUSTOM1");
+async function setupCUSTOM1() {
+  await setupIMAPPump("CUSTOM1", { awaitInbox: true });
   Services.prefs.setBoolPref(
     "mail.server.default.autosync_offline_stores",
     false

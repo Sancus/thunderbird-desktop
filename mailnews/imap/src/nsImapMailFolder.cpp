@@ -7844,6 +7844,9 @@ nsImapMailFolder::SetAppendMsgUid(ImapUid uid, nsIImapUrl* url) {
     if (nativeUrl->HasNativeOnlineAppend()) {
       return PublishNativeOnlineAppend(url, uid);
     }
+    if (!nativeUrl->CopyAcceptedAppendInputs().IsEmpty()) {
+      return AssociateAcceptedAppendObservation(nativeUrl, uid);
+    }
     auto target = nativeUrl->CopyNativeQueuedAppendTarget();
     if (target) {
       using namespace mozilla::mailnews;
@@ -9237,6 +9240,117 @@ static nsresult FinishOfflineCopy(nsIMsgFolder* source, nsIMsgDBHdr* header,
   MOZ_TRY(entry.draft->SetLineCount(finished.lineCount));
   uint32_t flags;
   return entry.draft->OrFlags(nsMsgMessageFlags::Offline, &flags);
+}
+
+nsresult nsImapMailFolder::PrepareAcceptedAppendDiscovery(nsImapUrl* url) {
+  using namespace mozilla::mailnews;
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_TRY(CheckFolderPathAccess());
+  MOZ_TRY(GetDatabase());
+  RefPtr<DatabaseCore> core = DatabaseCore::GetInstanceForService();
+  NS_ENSURE_TRUE(core && mDatabase, NS_ERROR_NOT_AVAILABLE);
+  nsTArray<nsMsgKey> keys;
+  MOZ_TRY(core->MessageDB().ListOfflineOperations(mFolderId, false, keys));
+  nsTArray<nsImapUrl::AcceptedAppendInput> inputs;
+  auto cleanup = mozilla::MakeScopeExit([&] {
+    for (const auto& input : inputs) {
+      nsresult rv = input.snapshot->Remove(false);
+      NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                           "Accepted APPEND snapshot cleanup failed");
+    }
+  });
+  for (nsMsgKey key : keys) {
+    OfflineAttempt attempt;
+    nsresult rv =
+        core->MessageDB().GetCurrentOfflineAttempt(mFolderId, key, attempt);
+    if (rv == NS_ERROR_NOT_AVAILABLE) continue;
+    MOZ_TRY(rv);
+    if (!attempt.appendAccepted || attempt.state != OfflineAttemptState::Sent ||
+        attempt.confirmedUid || !attempt.appendBody)
+      continue;
+    nsTArray<nsCString> names;
+    MOZ_TRY(core->MessageDB().GetMessagePropertyNames(key, names));
+    if (names.Contains("uidOnServer"_ns)) continue;
+    MOZ_TRY(core->MessageDB().ValidateOfflineAppendAcceptedWithoutUid(attempt));
+    const auto& body = *attempt.appendBody;
+    NS_ENSURE_TRUE(body.folderId == mFolderId && body.key == key &&
+                       body.databaseSourceId == mFolderDatabaseSourceId &&
+                       attempt.destination && attempt.destination->epochKnown,
+                   NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(url->SetExpectedUidValidity(attempt.destination->epoch));
+    nsCOMPtr<nsIMsgDBHdr> header;
+    MOZ_TRY(mDatabase->GetMsgHdrForKey(key, getter_AddRefs(header)));
+    nsImapUrl::AcceptedAppendInput selected;
+    selected.attempt = attempt;
+    MOZ_TRY(header->GetMessageId(selected.messageId));
+    MOZ_TRY(GetSpecialDirectoryWithFileName(NS_OS_TEMP_DIR,
+                                            "imap-accepted-append.eml",
+                                            getter_AddRefs(selected.snapshot)));
+    MOZ_TRY(selected.snapshot->CreateUnique(nsIFile::NORMAL_FILE_TYPE, 00600));
+    inputs.AppendElement(std::move(selected));
+    auto& input = inputs.LastElement();
+    nsCOMPtr<nsIInputStream> source;
+    MOZ_TRY(GetMsgInputStream(header, getter_AddRefs(source)));
+    auto close = mozilla::MakeScopeExit([&] {
+      nsresult rv = source->Close();
+      NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                           "Accepted APPEND source cleanup failed");
+    });
+    nsCOMPtr<nsIOutputStream> output;
+    MOZ_TRY(MsgNewBufferedFileOutputStream(getter_AddRefs(output),
+                                           input.snapshot,
+                                           PR_WRONLY | PR_CREATE_FILE, 00600));
+    uint64_t bytes;
+    nsresult copied = SyncCopyStream(source, output, bytes);
+    nsresult closed = source->Close();
+    close.release();
+    nsresult saved = output->Close();
+    MOZ_TRY(copied);
+    MOZ_TRY(closed);
+    MOZ_TRY(saved);
+    NS_ENSURE_TRUE(bytes == body.offlineMessageSize, NS_ERROR_NOT_AVAILABLE);
+    MessageBodyState current;
+    MOZ_TRY(core->MessageDB().GetMessageBodyState(key, current));
+    NS_ENSURE_TRUE(SameOfflineCopyBody(body, current), NS_ERROR_NOT_AVAILABLE);
+  }
+  MOZ_TRY(url->PrepareAcceptedAppendDiscovery(std::move(inputs)));
+  cleanup.release();
+  return NS_OK;
+}
+
+nsresult nsImapMailFolder::AssociateAcceptedAppendObservation(nsImapUrl* url,
+                                                              ImapUid uid) {
+  using namespace mozilla::mailnews;
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_TRY(CheckFolderPathAccess());
+  auto inputs = url->CopyAcceptedAppendInputs();
+  auto observations = url->CopyAcceptedAppendObservations();
+  NS_ENSURE_TRUE(inputs.Length() == observations.Length(),
+                 NS_ERROR_NOT_AVAILABLE);
+  for (const auto& observed : observations) {
+    if (observed.uid != uid) continue;
+    NS_ENSURE_TRUE(observed.index < inputs.Length(), NS_ERROR_NOT_AVAILABLE);
+    const auto& attempt = inputs[observed.index].attempt;
+    NS_ENSURE_TRUE(
+        attempt.appendBody &&
+            attempt.appendBody->databaseSourceId == mFolderDatabaseSourceId &&
+            attempt.appendBody->folderId == mFolderId,
+        NS_ERROR_NOT_AVAILABLE);
+    RefPtr<DatabaseCore> core = DatabaseCore::GetInstanceForService();
+    NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
+    ServerMessageLocation mapping;
+    RefPtr<Message> live;
+    MOZ_TRY(core->MessageDB().AssociateAcceptedAppendObservation(
+        attempt, observed.epoch, uid, mapping, getter_AddRefs(live)));
+    NS_ENSURE_TRUE(live && mapping.folderId == mFolderId &&
+                       mapping.key == attempt.appendBody->key &&
+                       mapping.epoch == observed.epoch && mapping.uid == uid,
+                   NS_ERROR_NOT_AVAILABLE);
+    // This is association of an already visible retained member. Normal
+    // refresh must neither publish nor notify a second member for its UID.
+    return NS_OK;
+  }
+  return NS_ERROR_NOT_AVAILABLE;
 }
 
 nsresult nsImapMailFolder::PrepareNativeOnlineCopy(nsIMsgFolder* source,

@@ -113,6 +113,22 @@ class nsImapUrl : public nsIImapUrl,
   bool NativeFolderDeleteAcknowledged();
   void RecordNativeSourceRetired();
   bool NativeSourceRetired();
+  struct AcceptedAppendInput {
+    mozilla::mailnews::OfflineAttempt attempt;
+    nsCString messageId;
+    nsCOMPtr<nsIFile> snapshot;
+  };
+  struct AcceptedAppendObservation {
+    uint32_t index;
+    uint32_t epoch;
+    ImapUid uid;
+  };
+  nsresult PrepareAcceptedAppendDiscovery(
+      nsTArray<AcceptedAppendInput>&& inputs);
+  nsTArray<AcceptedAppendInput> CopyAcceptedAppendInputs();
+  nsresult RecordAcceptedAppendObservation(uint32_t index, uint32_t epoch,
+                                           ImapUid uid);
+  nsTArray<AcceptedAppendObservation> CopyAcceptedAppendObservations();
   struct OnlineAppendObservation {
     uint32_t epoch;
     ImapUid uid;
@@ -291,6 +307,9 @@ class nsImapUrl : public nsIImapUrl,
   bool mNativeFolderDeleteAcknowledged MOZ_GUARDED_BY(mLock) = false;
   bool mNativeSourceRetired MOZ_GUARDED_BY(mLock) = false;
   bool mNativeOnlineAppend MOZ_GUARDED_BY(mLock) = false;
+  nsTArray<AcceptedAppendInput> mAcceptedAppendInputs MOZ_GUARDED_BY(mLock);
+  nsTArray<AcceptedAppendObservation> mAcceptedAppendObservations
+      MOZ_GUARDED_BY(mLock);
   mozilla::Maybe<OnlineAppendObservation> mNativeAppendObservation
       MOZ_GUARDED_BY(mLock);
   mozilla::Maybe<NativeQueuedAppendTarget> mNativeQueuedAppend

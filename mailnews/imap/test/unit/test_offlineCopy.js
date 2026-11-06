@@ -53,6 +53,41 @@ var tests = [
     );
 
     if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+      // The base fake server ignores HEADER criteria after UNDELETED. This
+      // mailbox already contains unrelated messages when file APPEND needs
+      // current Message-ID discovery, so implement that literal SEARCH here.
+      const proto = IMAP_RFC3501_handler.prototype;
+      const search = proto.SEARCH;
+      proto.SEARCH = function (args, uid) {
+        if (
+          args.length != 4 ||
+          args[0] != "UNDELETED" ||
+          args[1].toUpperCase() != "HEADER" ||
+          args[2].toLowerCase() != "message-id"
+        ) {
+          return search.call(this, args, uid);
+        }
+        Assert.ok(uid, "Identity discovery requests actual server UIDs");
+        const needle = args[3].toLowerCase();
+        const matches = this._selectedMailbox._messages.filter(message => {
+          const headers = message.getPartHeaders("");
+          return (
+            !message.flags.includes("\\Deleted") &&
+            headers.has("message-id") &&
+            headers
+              .getRawHeader("message-id")
+              .some(value => value.toLowerCase().includes(needle))
+          );
+        });
+        return (
+          "* SEARCH" +
+          matches.map(message => " " + message.uid).join("") +
+          "\0OK SEARCH completed"
+        );
+      };
+      registerCleanupFunction(() => {
+        proto.SEARCH = search;
+      });
       Services.prefs.setCharPref(
         "mail.server.default.storeContractID",
         Services.prefs.getCharPref("mail.serverDefaultStoreContractID")

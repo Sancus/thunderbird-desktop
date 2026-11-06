@@ -144,6 +144,7 @@ add_task(async function test_recoversBackedUpTextWithActualNativeReceipts() {
     createWindowsPanoramaMigrationTarget,
     resumeMorkImports,
     readLegacyGlodaMailRecovery,
+    holdProfileLock,
   } = ChromeUtils.importESModule(
     "resource:///modules/panorama/MigrationCoordinator.sys.mjs"
   );
@@ -166,7 +167,7 @@ add_task(async function test_recoversBackedUpTextWithActualNativeReceipts() {
     "legacy-mail-recovery",
     "tests"
   );
-  let lock = nativeProfile.lock({});
+  let lock = holdProfileLock(nativeProfile.lock({}));
   registerCleanupFunction(() => {
     lock.unlock();
     nativeProfile.remove(false);
@@ -483,7 +484,7 @@ add_task(async function test_recoversBackedUpTextWithActualNativeReceipts() {
     resolve,
     unlock: () => lock.unlock(),
     relock: () => {
-      lock = nativeProfile.lock({});
+      lock = holdProfileLock(nativeProfile.lock({}));
     },
     read: callback =>
       readLegacyGlodaMailRecovery(

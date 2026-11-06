@@ -36,6 +36,9 @@ async function makeMailSearchFixture(term, count) {
   const { getMailSearchService, closeMailSearch } = ChromeUtils.importESModule(
     "resource:///modules/panorama/MailSearch.sys.mjs"
   );
+  // This fixture drains real Gloda metadata before its native index snapshot.
+  // Native startup deliberately leaves that legacy indexer uninitialized.
+  ChromeUtils.importESModule("resource:///modules/gloda/GlodaPublic.sys.mjs");
   const root =
     MailServices.accounts.localFoldersServer.rootFolder.QueryInterface(
       Ci.nsIMsgLocalMailFolder

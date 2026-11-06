@@ -60,6 +60,9 @@ add_setup(async function setupNativeFacetMessages() {
       ["mailnews.mark_message_read.auto", false],
     ],
   });
+  // This fixture drains real Gloda metadata before its native index snapshot.
+  // Native startup deliberately leaves that legacy indexer uninitialized.
+  ChromeUtils.importESModule("resource:///modules/gloda/GlodaPublic.sys.mjs");
   const root =
     MailServices.accounts.localFoldersServer.rootFolder.QueryInterface(
       Ci.nsIMsgLocalMailFolder

@@ -370,6 +370,21 @@ function copyMigrationBook(source, destination) {
 }
 
 /**
+ * Checks the caller's complete byte-snapshot type before cloning or validation.
+ *
+ * @param {Uint8Array} sourceBytes - Original legacy snapshot.
+ * @throws {TypeError} If the caller supplied another type.
+ */
+function checkMigrationBookSnapshot(sourceBytes) {
+  if (
+    !ArrayBuffer.isView(sourceBytes) ||
+    Object.prototype.toString.call(sourceBytes) != "[object Uint8Array]"
+  ) {
+    throw new TypeError("Expected a complete Uint8Array book snapshot");
+  }
+}
+
+/**
  * Publishes one complete, closed legacy-book stage in the current profile.
  *
  * The caller retains the native selected-profile lock through its journal
@@ -421,12 +436,7 @@ export async function adoptMigrationAddressBook({
   ) {
     throw new Error("Invalid migration book publication identity");
   }
-  if (
-    !ArrayBuffer.isView(sourceBytes) ||
-    Object.prototype.toString.call(sourceBytes) != "[object Uint8Array]"
-  ) {
-    throw new TypeError("Expected a complete Uint8Array book snapshot");
-  }
+  checkMigrationBookSnapshot(sourceBytes);
   // Copy caller-owned values before validation or any synchronous reentry.
   const expected = structuredClone(receipt);
   const bytes = Uint8Array.from(sourceBytes);

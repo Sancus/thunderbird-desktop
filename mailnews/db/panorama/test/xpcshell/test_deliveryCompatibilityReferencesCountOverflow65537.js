@@ -17,11 +17,13 @@ add_task(function test_numReferencesOverflow65537PreservesStorage() {
   const folder = folderDB.insertFolder(root, "Inbox");
   const tokens = Array(65536).fill("visible@invalid");
   tokens.push("last@invalid");
+  info("Reference fixture: inserting all raw references");
   const key = addMessage({
     folderId: folder,
     messageId: "self@invalid",
     references: tokens,
   });
+  info("Reference fixture: raw references inserted");
   const header = messageDB.getMessage(key);
   const file = do_get_profile().clone();
   file.append("panorama.sqlite");
@@ -34,20 +36,22 @@ add_task(function test_numReferencesOverflow65537PreservesStorage() {
     reader.close();
   });
   statement = reader.createStatement(
-    "SELECT ordinal, token FROM message_references WHERE id = :id ORDER BY ordinal"
+    "SELECT json_group_array(json_array(ordinal, token) ORDER BY ordinal), " +
+      "min(typeof(ordinal) IN ('integer', 'real') AND typeof(token) = 'text') " +
+      "FROM message_references WHERE id = :id"
   );
   statement.params.id = key;
-  const before = [];
-  let beforeTypesValid = true;
-  while (statement.executeStep()) {
-    const ordinalType = statement.getTypeOfIndex(0);
-    const tokenType = statement.getTypeOfIndex(1);
-    beforeTypesValid &&=
-      (ordinalType == Ci.mozIStorageValueArray.VALUE_TYPE_INTEGER ||
-        ordinalType == Ci.mozIStorageValueArray.VALUE_TYPE_FLOAT) &&
-      tokenType == Ci.mozIStorageValueArray.VALUE_TYPE_TEXT;
-    before.push([statement.getDouble(0), statement.getString(1)]);
-  }
+  info("Reference fixture: reading before complete raw snapshot");
+  Assert.ok(
+    statement.executeStep(),
+    "The complete reference snapshot is available"
+  );
+  const before = JSON.parse(statement.getString(0));
+  const beforeTypesValid = statement.getInt32(1) === 1;
+  Assert.ok(
+    !statement.executeStep(),
+    "The complete reference snapshot has one result"
+  );
   Assert.ok(
     beforeTypesValid,
     "The raw reference SQL column types are preserved"
@@ -72,18 +76,18 @@ add_task(function test_numReferencesOverflow65537PreservesStorage() {
     () => header.numReferences,
     error => error.result == Cr.NS_ERROR_LOSS_OF_SIGNIFICANT_DATA
   );
-  const after = [];
   statement.params.id = key;
-  let afterTypesValid = true;
-  while (statement.executeStep()) {
-    const ordinalType = statement.getTypeOfIndex(0);
-    const tokenType = statement.getTypeOfIndex(1);
-    afterTypesValid &&=
-      (ordinalType == Ci.mozIStorageValueArray.VALUE_TYPE_INTEGER ||
-        ordinalType == Ci.mozIStorageValueArray.VALUE_TYPE_FLOAT) &&
-      tokenType == Ci.mozIStorageValueArray.VALUE_TYPE_TEXT;
-    after.push([statement.getDouble(0), statement.getString(1)]);
-  }
+  info("Reference fixture: reading after complete raw snapshot");
+  Assert.ok(
+    statement.executeStep(),
+    "The complete reference snapshot is available"
+  );
+  const after = JSON.parse(statement.getString(0));
+  const afterTypesValid = statement.getInt32(1) === 1;
+  Assert.ok(
+    !statement.executeStep(),
+    "The complete reference snapshot has one result"
+  );
   Assert.ok(
     afterTypesValid,
     "The raw reference SQL column types are preserved"

@@ -46,7 +46,7 @@ add_task(function test_numReferencesOverflow65536PreservesStorage() {
   }
   statement.reset();
   Assert.equal(before.length, 65536);
-  // Compare every tuple without recursively inspecting 65k cross-realm arrays.
+  // Compare every tuple and report only the exact comparison result.
   Assert.ok(
     before.every(
       ([ordinal, token]) =>
@@ -55,8 +55,10 @@ add_task(function test_numReferencesOverflow65536PreservesStorage() {
     "Every stored reference row has a safe integer ordinal and string token"
   );
   Assert.deepEqual(
-    JSON.stringify(before),
-    JSON.stringify(tokens.map((token, ordinal) => [ordinal, token]))
+    before.every(
+      ([ordinal, token], index) => ordinal === index && token === tokens[index]
+    ),
+    true
   );
   Assert.throws(
     () => header.numReferences,
@@ -79,8 +81,12 @@ add_task(function test_numReferencesOverflow65536PreservesStorage() {
     "Every reread reference row has a safe integer ordinal and string token"
   );
   Assert.deepEqual(
-    JSON.stringify(after),
-    JSON.stringify(before),
+    after.length === before.length &&
+      after.every(
+        ([ordinal, token], index) =>
+          ordinal === before[index][0] && token === before[index][1]
+      ),
+    true,
     "Reading the count preserves every raw row"
   );
   Assert.equal(header.getStringReference(65535), "last@invalid");

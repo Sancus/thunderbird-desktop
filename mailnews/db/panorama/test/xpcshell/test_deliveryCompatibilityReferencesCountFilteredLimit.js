@@ -43,9 +43,17 @@ add_task(function test_numReferencesLimitsTheFilteredView() {
   }
   statement.reset();
   Assert.equal(before.length, 65537);
+  // Compare every tuple without recursively inspecting 65k cross-realm arrays.
+  Assert.ok(
+    before.every(
+      ([ordinal, token]) =>
+        Number.isSafeInteger(ordinal) && typeof token == "string"
+    ),
+    "Every stored reference row has a safe integer ordinal and string token"
+  );
   Assert.deepEqual(
-    before,
-    tokens.map((token, ordinal) => [ordinal, token])
+    JSON.stringify(before),
+    JSON.stringify(tokens.map((token, ordinal) => [ordinal, token]))
   );
   Assert.equal(header.numReferences, 65535);
   const after = [];
@@ -54,6 +62,17 @@ add_task(function test_numReferencesLimitsTheFilteredView() {
     after.push([statement.row.ordinal, statement.row.token]);
   }
   statement.reset();
-  Assert.deepEqual(after, before, "Reading the count preserves every raw row");
+  Assert.ok(
+    after.every(
+      ([ordinal, token]) =>
+        Number.isSafeInteger(ordinal) && typeof token == "string"
+    ),
+    "Every reread reference row has a safe integer ordinal and string token"
+  );
+  Assert.deepEqual(
+    JSON.stringify(after),
+    JSON.stringify(before),
+    "Reading the count preserves every raw row"
+  );
   Assert.equal(header.getStringReference(65534), "last@invalid");
 });

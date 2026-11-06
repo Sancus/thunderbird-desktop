@@ -837,3 +837,241 @@ add_task(async function test_sendNow_without_fcc_succeeds() {
     "No-copy send preserves every physical stored message"
   );
 });
+
+/**
+ * Sends through real SMTP and files the result through real IMAP APPEND.
+ *
+ * @param {boolean} retry - Reject the first APPEND and choose the normal retry.
+ * @returns {Promise<void>} Resolves after physical filing and event checks.
+ */
+async function checkImapFcc(retry) {
+  Assert.ok(
+    Cc["@mozilla.org/mailnews/database-core;1"].getService(Ci.nsIDatabaseCore),
+    "The installed native database serves this compose consumer"
+  );
+  Assert.ok(Services.prefs.getBoolPref("mail.panorama.enabled"));
+  const account = MailServices.accounts.createAccount();
+  let accountRemoved = false;
+  registerCleanupFunction(() => {
+    if (!accountRemoved) {
+      accountRemoved = true;
+      cleanUpAccount(account);
+    }
+  });
+  const imap = new IMAPServer({ extensions: ["RFC4315"] });
+  imap.open();
+  account.incomingServer = MailServices.accounts.createIncomingServer(
+    "user",
+    "localhost",
+    "imap"
+  );
+  const incoming = account.incomingServer.QueryInterface(
+    Ci.nsIImapIncomingServer
+  );
+  Assert.equal(incoming.msgStore.storeType, "mbox", "The declared native mbox store is selected");
+  incoming.port = imap.port;
+  incoming.password = "password";
+  incoming.maximumConnectionsNumber = 1;
+  incoming.useIdle = false;
+  incoming.downloadOnBiff = false;
+  incoming.setBoolValue("autosync_offline_stores", false);
+  const root = incoming.rootFolder;
+  const discovery = new MailPromiseTestUtils.PromiseUrlListener();
+  MailServices.imap.discoverAllFolders(root, discovery, null);
+  await discovery.promise;
+  Assert.ok(
+    root.getChildNamed("INBOX"),
+    "Real LIST discovers the native INBOX"
+  );
+  const sent = await createSubfolder(root, "ConfiguredSent");
+  const outside = await createSubfolder(root, "OtherIdentitySent");
+  const controlBody = [
+    "From: control@example.invalid",
+    "To: recipient@example.invalid",
+    "Subject: Unrelated sent copy",
+    "Message-ID: <s375-fcc-control@example.invalid>",
+    "",
+    "Keep this physical control.",
+    "",
+  ].join("\r\n");
+  await imap.addMessages(outside, [controlBody]);
+  const control = [...outside.messages].map(header => ({
+    folderURI: header.folder.URI,
+    key: header.messageKey,
+    messageId: header.messageId,
+  }));
+  Assert.equal(control.length, 1);
+  const identity = addIdentity(account, "imap-fcc@example.invalid");
+  identity.smtpServerKey = gPopAccount.defaultIdentity.smtpServerKey;
+  identity.doFcc = true;
+  identity.fccFolderURI = sent.URI;
+  const subject = retry
+    ? "IMAP FCC after rejected APPEND"
+    : "Configured IMAP FCC";
+  const body = "Exactly one SMTP delivery and one confirmed IMAP sent copy.";
+  const sentCount = gSentMessages.length;
+  let prompts = 0;
+  const originalPrompt = Services.prompt;
+  let loaded = false;
+  let cleaned = false;
+  const cleanup = async () => {
+    if (cleaned) {
+      return;
+    }
+    cleaned = true;
+    Services.prompt = originalPrompt;
+    imap.daemon.commandToFail = "";
+    for (const win of Services.wm.getEnumerator("msgcompose")) {
+      if (win.gMsgCompose.compFields.subject == subject) {
+        win.gMsgCompose.bodyModified = false;
+        win.gContentChanged = false;
+        win.close();
+      }
+    }
+    if (loaded) {
+      loaded = false;
+      await extension.unload();
+    }
+    if (!accountRemoved) {
+      accountRemoved = true;
+      cleanUpAccount(account);
+    }
+  };
+  registerCleanupFunction(cleanup);
+  if (retry) {
+    imap.daemon.commandToFail = "APPEND";
+    Services.prompt = {
+      QueryInterface: ChromeUtils.generateQI(["nsIPromptService"]),
+      confirmEx() {
+        prompts++;
+        Assert.equal(
+          prompts,
+          1,
+          "The real failed APPEND asks once for recovery"
+        );
+        Assert.equal(
+          imap.daemon.getMailbox("ConfiguredSent")._messages.length,
+          0,
+          "A rejected APPEND has not published a sent message"
+        );
+        Assert.equal(
+          gSentMessages.length,
+          sentCount + 1,
+          "SMTP has already succeeded before copy recovery"
+        );
+        imap.daemon.commandToFail = "";
+        return 0; // Retry the copy, not the already delivered SMTP message.
+      },
+    };
+  }
+  const extension = ExtensionTestUtils.loadExtension({
+    files: {
+      "background.js": async () => {
+        const [config] = await window.sendMessage("getImapFccConfig");
+        const tab = await browser.compose.beginNew({
+          identityId: config.identityId,
+          to: ["fcc-recipient@example.invalid"],
+          subject: config.subject,
+          plainTextBody: config.body,
+          isPlainText: true,
+        });
+        const events = [];
+        const after = window.waitForEvent("compose.onAfterSend");
+        const listener = (sendingTab, info) => events.push([sendingTab, info]);
+        browser.compose.onAfterSend.addListener(listener);
+        const removed = window.waitForEvent("windows.onRemoved");
+        const result = await browser.compose.sendMessage(tab.id, {
+          mode: "sendNow",
+        });
+        const [sendingTab, info] = await after;
+        await removed;
+        browser.compose.onAfterSend.removeListener(listener);
+        browser.test.assertEq(1, events.length, "Exactly one final send event");
+        browser.test.assertEq(tab.id, sendingTab.id);
+        browser.test.assertEq("sendNow", result.mode);
+        browser.test.assertEq(undefined, info.error);
+        browser.test.assertEq(result.headerMessageId, info.headerMessageId);
+        browser.test.assertEq(1, result.messages.length);
+        browser.test.assertDeepEq(result.messages, info.messages);
+        const [message] = result.messages;
+        browser.test.assertEq(config.accountId, message.folder.accountId);
+        browser.test.assertEq("/ConfiguredSent", message.folder.path);
+        browser.test.assertEq(result.headerMessageId, message.headerMessageId);
+        const stored = await browser.messages.get(message.id);
+        browser.test.assertEq(config.subject, stored.subject);
+        browser.test.assertEq(message.folder.id, stored.folder.id);
+        const raw = await browser.messages.getRaw(message.id);
+        browser.test.assertTrue(
+          raw.includes(config.body),
+          "Stored body is current"
+        );
+        await window.sendMessage("checkImapFccStored", result.headerMessageId);
+        browser.test.notifyPass("imap-fcc");
+      },
+      "utils.js": await getUtilsJS(),
+    },
+    manifest: {
+      background: { scripts: ["utils.js", "background.js"] },
+      permissions: ["compose", "compose.send", "messagesRead", "accountsRead"],
+    },
+  });
+  extension.onMessage("getImapFccConfig", () =>
+    extension.sendMessage({
+      identityId: identity.key,
+      accountId: account.key,
+      subject,
+      body,
+    })
+  );
+  extension.onMessage("checkImapFccStored", async messageId => {
+    const listener = new MailPromiseTestUtils.PromiseUrlListener();
+    sent.updateFolderWithListener(null, listener);
+    await listener.promise;
+    const messages = [...sent.messages];
+    Assert.equal(
+      messages.length,
+      1,
+      "Only one physical sent message is published"
+    );
+    Assert.equal(messages[0].folder.URI, sent.URI);
+    Assert.equal(messages[0].messageId, messageId);
+    Assert.equal(messages[0].subject, subject);
+    Assert.equal(messages[0].author, identity.email);
+    const wire = imap.daemon.getMailbox("ConfiguredSent")._messages;
+    Assert.equal(
+      wire.length,
+      1,
+      "APPEND retry has not duplicated the stored body"
+    );
+    Assert.ok(wire[0].getText().includes(body));
+    Assert.deepEqual(
+      [...outside.messages].map(header => ({
+        folderURI: header.folder.URI,
+        key: header.messageKey,
+        messageId: header.messageId,
+      })),
+      control,
+      "The other identity's physical sent message is unchanged"
+    );
+    Assert.equal(
+      imap.daemon.getMailbox("OtherIdentitySent")._messages[0].getText(),
+      controlBody
+    );
+    Assert.deepEqual(gSentMessages.slice(sentCount), [messageId]);
+    Assert.ok(gServer._daemon.post.includes(body));
+    Assert.equal(prompts, retry ? 1 : 0);
+    extension.sendMessage();
+  });
+  await extension.startup();
+  loaded = true;
+  await extension.awaitFinish("imap-fcc");
+  await cleanup();
+}
+
+add_task(async function test_sendNowFilesToConfiguredImapFolder() {
+  await checkImapFcc(false);
+});
+
+add_task(async function test_failedImapFccRetriesOnlyCopy() {
+  await checkImapFcc(true);
+});

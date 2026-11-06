@@ -7,7 +7,7 @@
  *
  * @param {mozIDOMWindowProxy} window - The window to associate with this
  *   progress display.
- * @returns {?nsITaskbarProgress}
+ * @returns {?nsITaskbarProgress} The progress display, or null when unavailable.
  */
 function getTaskbarProgress(window) {
   if (!window.docShell) {
@@ -17,7 +17,9 @@ function getTaskbarProgress(window) {
     const winTaskbar = Cc["@mozilla.org/windows-taskbar;1"].getService(
       Ci.nsIWinTaskbar
     );
-    return winTaskbar.getTaskbarProgress(window.docShell);
+    return winTaskbar.available
+      ? winTaskbar.getTaskbarProgress(window.docShell)
+      : null;
   }
   if ("@mozilla.org/widget/macdocksupport;1" in Cc) {
     return Cc["@mozilla.org/widget/macdocksupport;1"].getService(

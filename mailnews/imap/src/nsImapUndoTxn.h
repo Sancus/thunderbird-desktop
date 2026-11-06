@@ -19,7 +19,7 @@ struct NativeImapUndoEntry;
 namespace mozilla::mailnews {
 struct PendingDestination;
 struct ServerMessageLocation;
-}
+}  // namespace mozilla::mailnews
 #endif
 
 class nsImapMoveCopyMsgTxn : public nsMsgTxn, nsIUrlListener {

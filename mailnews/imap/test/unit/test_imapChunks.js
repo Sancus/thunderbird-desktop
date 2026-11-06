@@ -740,7 +740,9 @@ add_task(async function test_copyRejectsConflictingEarlyCopyUid() {
 });
 
 add_task(async function test_onlineCopyOwnsEveryLateChunkMapping() {
-  if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) return;
+  if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    return;
+  }
   const { source, originals, readBody } = gCopyChunkSource;
   const name = "online-late-chunk-mappings";
   const remote = gChunkServer.daemon.createMailbox(name, {
@@ -767,7 +769,9 @@ add_task(async function test_onlineCopyOwnsEveryLateChunkMapping() {
     );
   };
   proto.COPY = function (args, uid) {
-    if (args[1] != name) return saved.COPY.call(this, args, uid);
+    if (args[1] != name) {
+      return saved.COPY.call(this, args, uid);
+    }
     const sources = this._parseSequenceSet(args[0], uid).map(
       message => message.uid
     );
@@ -799,8 +803,9 @@ add_task(async function test_onlineCopyOwnsEveryLateChunkMapping() {
       const input = target.getMsgInputStream(header);
       try {
         let bytes = "";
-        while (input.available())
+        while (input.available()) {
           bytes += NetUtil.readInputStreamToString(input, input.available());
+        }
         // The provider owns its exact stored representation, including its
         // status headers. Compare the captured physical source bytes.
         Assert.equal(bytes, original.bytes);
@@ -856,7 +861,9 @@ add_task(async function test_onlineMoveAmbiguityRetainsUncachedSource() {
  * @returns {Promise<void>} Resolves after the real operation and custody checks.
  */
 async function checkUncachedOnlineCopy(ambiguousMove) {
-  if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) return;
+  if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    return;
+  }
   const suffix = ambiguousMove ? "ambiguous" : "unique";
   const sourceName = "uncached-source-" + suffix;
   const targetName = "uncached-target-" + suffix;
@@ -912,11 +919,13 @@ async function checkUncachedOnlineCopy(ambiguousMove) {
     return saved.CAPABILITY.apply(this, args).replace(/\bUIDPLUS\b/g, "");
   };
   proto.COPY = function (args, uid) {
-    if (args[1] != targetName) return saved.COPY.call(this, args, uid);
+    if (args[1] != targetName) {
+      return saved.COPY.call(this, args, uid);
+    }
     copies++;
     const response = saved.COPY.call(this, args, uid);
     Assert.ok(response.startsWith("OK"));
-    if (ambiguousMove)
+    if (ambiguousMove) {
       targetRemote.addMessage(
         new ImapMessage(
           "data:text/plain," + encodeURI(raw),
@@ -924,10 +933,13 @@ async function checkUncachedOnlineCopy(ambiguousMove) {
           []
         )
       );
+    }
     return response.replace(/\[COPYUID [^\]]+\]/g, "");
   };
   proto.STORE = function (args, uid) {
-    if (this._selectedMailbox == sourceRemote) destructive.push(args);
+    if (this._selectedMailbox == sourceRemote) {
+      destructive.push(args);
+    }
     return saved.STORE.call(this, args, uid);
   };
   let stops = 0;

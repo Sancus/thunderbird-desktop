@@ -172,7 +172,9 @@ async function checkOnlineAppendIdentity(mode) {
       : response;
   };
   proto.APPEND = function (args) {
-    if (args[0] != name) return saved.APPEND.call(this, args);
+    if (args[0] != name) {
+      return saved.APPEND.call(this, args);
+    }
     appends++;
     const response = saved.APPEND.call(this, args);
     Assert.equal(response, "OK APPEND complete");
@@ -195,7 +197,9 @@ async function checkOnlineAppendIdentity(mode) {
         []
       );
     }
-    if (mode == "epochChanged") mailbox.uidvalidity++;
+    if (mode == "epochChanged") {
+      mailbox.uidvalidity++;
+    }
     if (mode == "lostReply") {
       this.closing = true;
       return "";
@@ -205,14 +209,22 @@ async function checkOnlineAppendIdentity(mode) {
       : response;
   };
   proto.SEARCH = function (args) {
-    if (this._selectedMailbox != mailbox) return saved.SEARCH.call(this, args);
+    if (this._selectedMailbox != mailbox) {
+      return saved.SEARCH.call(this, args);
+    }
     searches++;
-    if (mode == "missing") return "* SEARCH\0OK SEARCH completed";
-    if (mode == "searchFailure") return "NO actual discovery refusal";
+    if (mode == "missing") {
+      return "* SEARCH\0OK SEARCH completed";
+    }
+    if (mode == "searchFailure") {
+      return "NO actual discovery refusal";
+    }
     return saved.SEARCH.call(this, args);
   };
   proto.FETCH = function (args, uid) {
-    if (this._selectedMailbox == mailbox) readbacks++;
+    if (this._selectedMailbox == mailbox) {
+      readbacks++;
+    }
     return saved.FETCH.call(this, args, uid);
   };
   const keys = [];
@@ -336,8 +348,9 @@ function readOnlineIdentityBody(folder, token) {
   const stream = folder.msgStore.getMsgInputStream(folder, token, 0);
   try {
     let bytes = "";
-    while (stream.available())
+    while (stream.available()) {
       bytes += NetUtil.readInputStreamToString(stream, stream.available());
+    }
     return bytes;
   } finally {
     stream.close();

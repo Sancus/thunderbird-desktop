@@ -29,7 +29,9 @@ function readRetainedMoveBody(header) {
     let bytes = "";
     for (;;) {
       const chunk = input.read(8192);
-      if (!chunk) return bytes;
+      if (!chunk) {
+        return bytes;
+      }
       bytes += chunk;
     }
   } finally {

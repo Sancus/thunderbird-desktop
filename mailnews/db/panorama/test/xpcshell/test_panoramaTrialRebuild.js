@@ -194,7 +194,7 @@ function receiptKey(journal, name, oldKey) {
 /**
  * Stores two physical MIME copies with the same Message-ID in different folders.
  *
- * @param {nsIMsgFolder} root - Actual Local Folders root.
+ * @param {nsIMsgLocalMailFolder} root - Actual Local Folders root.
  * @returns {{folders: nsIMsgLocalMailFolder[], headers: nsIMsgDBHdr[]}}
  *   Owned folders and independently stored headers.
  */
@@ -382,7 +382,10 @@ add_task(async function test_createRetainedNativeRebuildTrial() {
     const backup = await createMigrationBackup(profile.path, [], backupPath);
     loadExistingDB();
     Assert.equal(MailServices.accounts.accounts.length, 1);
-    const root = MailServices.accounts.localFoldersServer.rootFolder;
+    const root =
+      MailServices.accounts.localFoldersServer.rootFolder.QueryInterface(
+        Ci.nsIMsgLocalMailFolder
+      );
     const folders = new Map();
     const sources = [];
     for (const name of names) {

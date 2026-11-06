@@ -868,7 +868,11 @@ async function checkImapFcc(retry) {
   const incoming = account.incomingServer.QueryInterface(
     Ci.nsIImapIncomingServer
   );
-  Assert.equal(incoming.msgStore.storeType, "mbox", "The declared native mbox store is selected");
+  Assert.equal(
+    incoming.msgStore.storeType,
+    "mbox",
+    "The declared native mbox store is selected"
+  );
   incoming.port = imap.port;
   incoming.password = "password";
   incoming.maximumConnectionsNumber = 1;

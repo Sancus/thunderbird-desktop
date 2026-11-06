@@ -39,9 +39,15 @@ add_setup(async function () {
     createSMTPAccount("imap"));
 
   const incomingServer = smtpAccount.incomingServer;
-  Assert.ok(Cc["@mozilla.org/mailnews/database-core;1"].getService(Ci.nsIDatabaseCore));
+  Assert.ok(
+    Cc["@mozilla.org/mailnews/database-core;1"].getService(Ci.nsIDatabaseCore)
+  );
   Assert.ok(Services.prefs.getBoolPref("mail.panorama.enabled"));
-  Assert.equal(incomingServer.msgStore.storeType, "mbox", "The declared native mbox store is selected");
+  Assert.equal(
+    incomingServer.msgStore.storeType,
+    "mbox",
+    "The declared native mbox store is selected"
+  );
   let mockTaskbar;
   registerCleanupFunction(async function () {
     incomingServer.closeCachedConnections();

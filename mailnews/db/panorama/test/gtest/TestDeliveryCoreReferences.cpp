@@ -62,6 +62,10 @@
 namespace mozilla::mailnews {
 namespace {
 
+nsresult PublicationCell(mozIStorageConnection* reader, nsMsgKey key,
+                         const nsACString& sql, nsACString& value,
+                         const nsACString* name = nullptr);
+
 // Captured unversioned layout at 531bc469, without reconstructing lost tokens.
 constexpr auto kOldSchema =
     "CREATE TABLE folders(id INTEGER PRIMARY KEY, parent INTEGER REFERENCES "
@@ -3616,7 +3620,7 @@ NS_IMPL_ISUPPORTS(BodyObserver, nsISupports)
 
 nsresult PublicationCell(mozIStorageConnection* reader, nsMsgKey key,
                          const nsACString& sql, nsACString& value,
-                         const nsACString* name = nullptr) {
+                         const nsACString* name) {
   nsCOMPtr<mozIStorageStatement> stmt;
   MOZ_TRY(reader->CreateStatement(sql, getter_AddRefs(stmt)));
   auto cleanup = MakeScopeExit([&] { EXPECT_EQ(NS_OK, stmt->Finalize()); });
@@ -20359,6 +20363,133 @@ TEST_F(DeliveryCoreReferences, OnlineFinishedZeroAndUncachedPresenceReopen) {
                                        "name='messageSize'"_ns,
                                        cell));
       EXPECT_EQ("0:integer"_ns, cell);
+    }
+  }
+}
+
+TEST_F(DeliveryCoreReferences, OnlineUidRetainsCanonicalHeaderEncoding) {
+  ASSERT_EQ(NS_OK, Start());
+  for (bool finished : {true, false}) {
+    for (uint32_t uid : {1u, 16u, 0xabcdef01u, UINT32_MAX}) {
+      SCOPED_TRACE(finished);
+      SCOPED_TRACE(uid);
+      RefPtr<PerFolderDatabase> owner;
+      nsCOMPtr<nsIMsgDBHdr> draft;
+      OnlineTransferDestination expected;
+      ASSERT_EQ(NS_OK, StageOnline(owner, draft, expected, finished));
+      ServerMessageLocation mapping = OnlineSentinel();
+      RefPtr<Message> live;
+      ASSERT_EQ(NS_OK, owner->PublishHdrForOnlineTransfer(
+                           draft, expected, 521, uid, true, mapping,
+                           getter_AddRefs(live)));
+      ASSERT_TRUE(live);
+      EXPECT_EQ(expected.destination.key, mapping.key);
+      EXPECT_EQ(uid, mapping.uid);
+      uint32_t storedUid = 0;
+      ASSERT_EQ(NS_OK, live->GetUint32Property("uidOnServer", &storedUid));
+      EXPECT_EQ(uid, storedUid);
+      nsCString cell;
+      ASSERT_EQ(NS_OK, PublicationCell(mConnection, mapping.key,
+                                       "SELECT value||':'||typeof(value) FROM "
+                                       "message_properties WHERE id=:id AND "
+                                       "name='uidOnServer'"_ns,
+                                       cell));
+      nsAutoCString encoded;
+      encoded.AppendInt(uid, 16);
+      encoded.AppendLiteral(":text");
+      EXPECT_EQ(encoded, cell);
+      nsMsgKey found = nsMsgKey_None;
+      ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageKeyForServerUid(
+                           mFolderId, 521, uid, found));
+      EXPECT_EQ(mapping.key, found);
+      // Release this real binding before the next body representation reuses
+      // the same independently checked UID in the same mailbox.
+      ASSERT_EQ(NS_OK, mCore->MessageDB().RemoveMessage(mapping.key));
+    }
+  }
+}
+
+TEST_F(DeliveryCoreReferences, OnlineMalformedNumericEncodingRetainsRecovery) {
+  ASSERT_EQ(NS_OK, Start());
+  struct Fault {
+    const char* name;
+    const char* sqlValue;
+    nsresult error;
+  };
+  const Fault faults[] = {
+      {"uidOnServer", "''", NS_ERROR_FILE_CORRUPTED},
+      {"uidOnServer", "'abcdef0z'", NS_ERROR_FILE_CORRUPTED},
+      {"uidOnServer", "'1abcdef01'", NS_ERROR_FILE_CORRUPTED},
+      {"uidOnServer", "'0abcdef01'", NS_ERROR_FILE_CORRUPTED},
+      {"uidOnServer", "'00'", NS_ERROR_FILE_CORRUPTED},
+      {"uidOnServer", "'00000001'", NS_ERROR_FILE_CORRUPTED},
+      {"uidOnServer", "'ABCDEF01'", NS_ERROR_FILE_CORRUPTED},
+      {"uidOnServer", "'abcdef01 '", NS_ERROR_FILE_CORRUPTED},
+      {"uidOnServer", "'+abcdef01'", NS_ERROR_FILE_CORRUPTED},
+      {"uidOnServer", "'0xabcdef01'", NS_ERROR_FILE_CORRUPTED},
+      {"uidOnServer", "'abcdef01'||char(0)", NS_ERROR_FILE_CORRUPTED},
+      {"uidOnServer", "2882400001", NS_ERROR_FILE_CORRUPTED},
+      {"uidOnServer", "NULL", NS_ERROR_FILE_CORRUPTED},
+      {"uidOnServer", "X'6162636465663031'", NS_ERROR_FILE_CORRUPTED},
+      {"uidOnServer", "1.5", NS_ERROR_FILE_CORRUPTED},
+      {"uidOnServer", "'abcdef02'", NS_ERROR_NOT_AVAILABLE},
+      {"uidOnServer", "'0'", NS_ERROR_NOT_AVAILABLE},
+      {"messageSize", "'0'", NS_ERROR_FILE_CORRUPTED},
+      {"offlineMessageSize", "'0'", NS_ERROR_FILE_CORRUPTED},
+      {"lineCount", "'0'", NS_ERROR_FILE_CORRUPTED},
+  };
+  for (bool staged : {true, false}) {
+    for (const auto& fault : faults) {
+      SCOPED_TRACE(staged);
+      SCOPED_TRACE(fault.name);
+      SCOPED_TRACE(fault.sqlValue);
+      RefPtr<PerFolderDatabase> owner;
+      nsCOMPtr<nsIMsgDBHdr> draft;
+      OnlineTransferDestination expected;
+      ASSERT_EQ(NS_OK, StageOnline(owner, draft, expected));
+      nsCString before;
+      ASSERT_EQ(NS_OK, OnlineStageFacts(expected.destination.key, before));
+      // Mutate the real native binding, then require exact precommit readback
+      // to reject it both before and after staged children are published.
+      nsAutoCString sql(
+          "CREATE TEMP TRIGGER online_encoding AFTER INSERT ON main.");
+      sql.Append(staged ? "staged_message_properties" : "message_properties");
+      sql.AppendLiteral(" WHEN NEW.name='uidOnServer' BEGIN UPDATE ");
+      sql.Append(staged ? "staged_message_properties" : "message_properties");
+      sql.AppendLiteral(" SET value=");
+      sql.Append(fault.sqlValue);
+      sql.AppendLiteral(" WHERE id=NEW.id AND name='");
+      sql.Append(fault.name);
+      sql.AppendLiteral("'; END");
+      ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(sql));
+      auto drop = MakeScopeExit([&] {
+        EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                             "DROP TRIGGER online_encoding"_ns));
+      });
+      uint32_t calls = 0;
+      RefPtr<PublicationObserver> observer =
+          new PublicationObserver([&](Message*, bool) { ++calls; });
+      mCore->MessageDB().AddMessageListener(observer);
+      auto remove = MakeScopeExit(
+          [&] { mCore->MessageDB().RemoveMessageListener(observer); });
+      ServerMessageLocation mapping = OnlineSentinel();
+      RefPtr<Message> live;
+      EXPECT_EQ(fault.error, owner->PublishHdrForOnlineTransfer(
+                                 draft, expected, 521, 0xabcdef01u, true,
+                                 mapping, getter_AddRefs(live)));
+      EXPECT_EQ(0u, calls);
+      ExpectOnlineRecovery(expected, before, mapping, live);
+      bool active = true;
+      ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+      EXPECT_FALSE(active);
+      drop.release();
+      ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                           "DROP TRIGGER online_encoding"_ns));
+      ASSERT_EQ(NS_OK, owner->PublishHdrForOnlineTransfer(
+                           draft, expected, 521, 0xabcdef01u, true, mapping,
+                           getter_AddRefs(live)));
+      EXPECT_EQ(1u, calls);
+      ASSERT_EQ(NS_OK, mCore->MessageDB().RemoveMessage(mapping.key));
     }
   }
 }

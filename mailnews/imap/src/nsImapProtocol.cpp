@@ -3848,6 +3848,14 @@ nsresult nsImapProtocol::BeginMessageDownLoad(
     if (mNativeAppendReadbackStarted ||
         GetServerStateParser().CurrentResponseUID() !=
             mNativeAppendReadbackUid) {
+      NS_WARNING(nsPrintfCString(
+                     "Native identity readback begin: started=%d ended=%d "
+                     "uid=%u expected=%u size=%u rv=0x%08x",
+                     mNativeAppendReadbackStarted, mNativeAppendReadbackEnded,
+                     GetServerStateParser().CurrentResponseUID(),
+                     mNativeAppendReadbackUid, total_message_size,
+                     uint32_t(mNativeAppendReadbackResult))
+                     .get());
       mNativeAppendReadbackResult = NS_ERROR_NOT_AVAILABLE;
     }
     mNativeAppendReadbackStarted = true;
@@ -4409,11 +4417,17 @@ void nsImapProtocol::HandleMessageDownLoadLine(const char* line,
     uint32_t offset = 0;
     char expected[16384];
     while (offset < length) {
-      uint32_t count;
+      uint32_t count = 0;
       nsresult rv = mNativeAppendReadbackInput->Read(
           expected, std::min<uint32_t>(sizeof(expected), length - offset),
           &count);
       if (NS_FAILED(rv) || !count || memcmp(expected, line + offset, count)) {
+        NS_WARNING(nsPrintfCString(
+                       "Native identity readback bytes: uid=%u seen=%" PRIu64
+                       " line=%u offset=%u count=%u rv=0x%08x",
+                       mNativeAppendReadbackUid, mNativeAppendReadbackBytes,
+                       length, offset, count, uint32_t(rv))
+                       .get());
         mNativeAppendReadbackResult =
             NS_FAILED(rv) ? rv : NS_ERROR_NOT_AVAILABLE;
         return;
@@ -4593,6 +4607,15 @@ void nsImapProtocol::NormalMessageEndDownload() {
             mNativeAppendReadbackUid ||
         GetServerStateParser().SizeOfMostRecentMessage() !=
             mNativeAppendReadbackBytes) {
+      NS_WARNING(nsPrintfCString(
+                     "Native identity readback end: started=%d ended=%d uid=%u "
+                     "expected=%u size=%u seen=%" PRIu64,
+                     mNativeAppendReadbackStarted, mNativeAppendReadbackEnded,
+                     GetServerStateParser().CurrentResponseUID(),
+                     mNativeAppendReadbackUid,
+                     GetServerStateParser().SizeOfMostRecentMessage(),
+                     mNativeAppendReadbackBytes)
+                     .get());
       mNativeAppendReadbackResult = NS_ERROR_NOT_AVAILABLE;
     }
     mNativeAppendReadbackEnded = true;
@@ -6922,6 +6945,17 @@ nsresult nsImapProtocol::VerifyNativeAppendReadback(nsIFile* file, ImapUid uid,
   }
   nsresult closed = capture ? mNativeAppendCaptureOutput->Close()
                             : mNativeAppendReadbackInput->Close();
+  if (NS_FAILED(result) || NS_FAILED(closed)) {
+    NS_WARNING(nsPrintfCString("Native identity readback result: uid=%u "
+                               "epoch=%u started=%d ended=%d seen=%" PRIu64
+                               " accepted=%d rv=0x%08x close=0x%08x",
+                               uid, epoch, mNativeAppendReadbackStarted,
+                               mNativeAppendReadbackEnded,
+                               mNativeAppendReadbackBytes,
+                               GetServerStateParser().LastCommandSuccessful(),
+                               uint32_t(result), uint32_t(closed))
+                   .get());
+  }
   return NS_FAILED(result) ? result : closed;
 }
 

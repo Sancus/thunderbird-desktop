@@ -733,6 +733,9 @@ add_task(async function test_copyRejectsConflictingEarlyCopyUid() {
     );
   } finally {
     proto.COPY = originalCopy;
+    // The deliberately malformed receipt poisoned this connection's parser.
+    // End that case before discovery for the following independent command.
+    gChunkIncomingServer.closeCachedConnections();
   }
 });
 

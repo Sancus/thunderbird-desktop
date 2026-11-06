@@ -3435,6 +3435,26 @@ nsresult MessageDatabase::ValidateOnlineTransferDestination(
         nsCString text;
         MOZ_TRY(stmt->GetUTF8String(1, text));
         token = Some(std::move(text));
+      } else if (name.EqualsLiteral("uidOnServer")) {
+        // Message::SetUint32Property stores ordinary header properties as
+        // hexadecimal TEXT. Body sizes and line counts use native INTEGERs.
+        NS_ENSURE_TRUE(type == mozIStorageValueArray::VALUE_TYPE_TEXT,
+                       NS_ERROR_FILE_CORRUPTED);
+        nsCString text;
+        MOZ_TRY(stmt->GetUTF8String(1, text));
+        NS_ENSURE_TRUE(!text.IsEmpty() && text.Length() <= 8,
+                       NS_ERROR_FILE_CORRUPTED);
+        for (char digit : text) {
+          NS_ENSURE_TRUE(
+              (digit >= '0' && digit <= '9') || (digit >= 'a' && digit <= 'f'),
+              NS_ERROR_FILE_CORRUPTED);
+        }
+        uint32_t value =
+            static_cast<uint32_t>(MsgUnhex(text.get(), text.Length()));
+        nsAutoCString canonical;
+        canonical.AppendInt(value, 16);
+        NS_ENSURE_TRUE(text == canonical, NS_ERROR_FILE_CORRUPTED);
+        actualUid = Some(value);
       } else {
         NS_ENSURE_TRUE(type == mozIStorageValueArray::VALUE_TYPE_INTEGER,
                        NS_ERROR_FILE_CORRUPTED);
@@ -3446,7 +3466,6 @@ nsresult MessageDatabase::ValidateOnlineTransferDestination(
         if (name.EqualsLiteral("messageSize")) size = number;
         if (name.EqualsLiteral("offlineMessageSize")) offlineSize = number;
         if (name.EqualsLiteral("lineCount")) lines = number;
-        if (name.EqualsLiteral("uidOnServer")) actualUid = number;
       }
     }
   }

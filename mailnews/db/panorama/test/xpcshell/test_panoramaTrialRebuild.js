@@ -492,7 +492,8 @@ add_task(async function test_createRetainedNativeRebuildTrial() {
     const heldRoot = PathUtils.join(work, "held-original-streams");
     Assert.ok(!(await IOUtils.exists(heldRoot)));
     await IOUtils.makeDirectory(heldRoot);
-    const emptyBodySHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const emptyBodySHA256 =
+      "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
     const expected = [];
     for (const [name, folder] of folders) {
@@ -500,17 +501,14 @@ add_task(async function test_createRetainedNativeRebuildTrial() {
         const id = receiptKey(journal, name, oldKey);
         const state = messageDB.getSearchState(Number(id));
         Assert.equal(state.folderId, folder.id);
+        const recoveredKind = oldKey === 1 ? "recovered" : "recovered-empty";
         expected.push({
           id,
           folderId: folder.id,
           folderURI: folder.URI,
           messageId: messageDB.getMessage(Number(id)).messageId,
           kind:
-            name === "RecoveredInbox"
-              ? oldKey === 1
-                ? "recovered"
-                : "recovered-empty"
-              : "unavailable-imported",
+            name === "RecoveredInbox" ? recoveredKind : "unavailable-imported",
           bodyNeedle:
             name === "RecoveredInbox" && oldKey === 1 ? "recovered" : null,
           metadataNeedle: null,
@@ -529,8 +527,14 @@ add_task(async function test_createRetainedNativeRebuildTrial() {
       const placeholder = await IOUtils.stat(bodyPath);
       Assert.equal(placeholder.type, "regular");
       Assert.equal(placeholder.size, 0);
-      Assert.equal(await IOUtils.computeHexDigest(bodyPath, "sha256"), emptyBodySHA256);
-      Assert.equal(await IOUtils.computeHexDigest(heldPath, "sha256"), bodySHA256);
+      Assert.equal(
+        await IOUtils.computeHexDigest(bodyPath, "sha256"),
+        emptyBodySHA256
+      );
+      Assert.equal(
+        await IOUtils.computeHexDigest(heldPath, "sha256"),
+        bodySHA256
+      );
     }
     for (const header of copies.headers) {
       expected.push({
@@ -660,17 +664,25 @@ add_task(async function test_createRetainedNativeRebuildTrial() {
         // the real application case tests recovery, then restores these names.
         if (!complete) {
           for (const { bodyPath, heldPath, bodySHA256 } of held.reverse()) {
-            Assert.equal(await IOUtils.computeHexDigest(heldPath, "sha256"), bodySHA256);
+            Assert.equal(
+              await IOUtils.computeHexDigest(heldPath, "sha256"),
+              bodySHA256
+            );
             if (await IOUtils.exists(bodyPath)) {
               const placeholder = await IOUtils.stat(bodyPath);
               Assert.equal(placeholder.type, "regular");
               Assert.equal(placeholder.size, 0);
-              Assert.equal(await IOUtils.computeHexDigest(bodyPath, "sha256"),
-                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+              Assert.equal(
+                await IOUtils.computeHexDigest(bodyPath, "sha256"),
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+              );
               await IOUtils.remove(bodyPath, { ignoreAbsent: false });
             }
             await IOUtils.move(heldPath, bodyPath, { noOverwrite: true });
-            Assert.equal(await IOUtils.computeHexDigest(bodyPath, "sha256"), bodySHA256);
+            Assert.equal(
+              await IOUtils.computeHexDigest(bodyPath, "sha256"),
+              bodySHA256
+            );
           }
           for (const { name, hadValue, value } of savedPrefs) {
             if (hadValue) {

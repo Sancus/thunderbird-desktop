@@ -1569,7 +1569,7 @@ add_task(
     const observe = (subject, topic) => {
       if (
         topic == "addrbook-directory-created" &&
-        subject.UID == input.options.bookUID
+        subject.QueryInterface(Ci.nsIAbDirectory).UID == input.options.bookUID
       ) {
         try {
           reentered.push(

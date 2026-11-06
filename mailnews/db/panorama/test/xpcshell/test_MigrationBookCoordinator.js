@@ -1376,6 +1376,7 @@ async function readPublishedBookInChild(input, published) {
       for (const [key, path] of Object.entries(${JSON.stringify(profileDirectories)})) {
         Services.dirsvc.set(key, new FileUtils.File(path));
       }
+      Cc["@mozilla.org/xre/directory-provider;1"].getService(Ci.nsIXREDirProvider);
       const service = Cc["@mozilla.org/toolkit/profile-service;1"].getService(Ci.nsIToolkitProfileService);
       const profile = service.createProfile(root, "s520-readback-child", "tests");
       held = profile.lock({});

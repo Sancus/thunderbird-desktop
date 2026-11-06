@@ -906,16 +906,18 @@ export function createMigrationBackupAtStartup(
           output.flush();
         } catch (error) {
           flushError = error;
-          throw error;
-        } finally {
-          try {
-            output.close();
-          } catch (error) {
-            if (!flushError) {
-              throw error;
-            }
+        }
+        try {
+          output.close();
+        } catch (error) {
+          if (flushError) {
             console.error("Additional migration copy close error", error);
+          } else {
+            flushError = error;
           }
+        }
+        if (flushError) {
+          throw flushError;
         }
         temporary.lastModifiedTime = entry.lastModified;
         temporary.permissions = entry.permissions;
@@ -980,7 +982,12 @@ function startupInventory(root, profile, signal) {
     const { file, parts } = pending.pop();
     const children = [...file.directoryEntries]
       .map(child => child.QueryInterface(Ci.nsIFile))
-      .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+      .sort((a, b) => {
+        if (a.path == b.path) {
+          return 0;
+        }
+        return a.path < b.path ? -1 : 1;
+      });
     for (const child of children) {
       checkCancellation(signal);
       if (
@@ -1070,6 +1077,7 @@ function hashStartupFile(file, signal) {
   );
   input.init(file, 0x01, 0, 0);
   let firstError;
+  let digest;
   try {
     const binary = Cc["@mozilla.org/binaryinputstream;1"].createInstance(
       Ci.nsIBinaryInputStream
@@ -1092,22 +1100,25 @@ function hashStartupFile(file, signal) {
     if (file.fileSize != size || file.lastModifiedTime != modified) {
       throw new Error("Migration source changed while hashing");
     }
-    return Array.from(hash.finish(false), byte =>
+    digest = Array.from(hash.finish(false), byte =>
       byte.charCodeAt(0).toString(16).padStart(2, "0")
     ).join("");
   } catch (error) {
     firstError = error;
-    throw error;
-  } finally {
-    try {
-      input.close();
-    } catch (error) {
-      if (!firstError) {
-        throw error;
-      }
+  }
+  try {
+    input.close();
+  } catch (error) {
+    if (firstError) {
       console.error("Additional migration input close error", error);
+    } else {
+      firstError = error;
     }
   }
+  if (firstError) {
+    throw firstError;
+  }
+  return digest;
 }
 
 /**
@@ -1142,6 +1153,7 @@ function readStartupJSON(file) {
   );
   input.init(file, 0x01, 0, 0);
   let firstError;
+  let value;
   try {
     const converter = Cc[
       "@mozilla.org/intl/converter-input-stream;1"
@@ -1152,20 +1164,23 @@ function readStartupJSON(file) {
     while (converter.readString(64 * 1024, part)) {
       text += part.value;
     }
-    return JSON.parse(text);
+    value = JSON.parse(text);
   } catch (error) {
     firstError = error;
-    throw error;
-  } finally {
-    try {
-      input.close();
-    } catch (error) {
-      if (!firstError) {
-        throw error;
-      }
+  }
+  try {
+    input.close();
+  } catch (error) {
+    if (firstError) {
       console.error("Additional migration manifest close error", error);
+    } else {
+      firstError = error;
     }
   }
+  if (firstError) {
+    throw firstError;
+  }
+  return value;
 }
 
 /**

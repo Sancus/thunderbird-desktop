@@ -471,13 +471,32 @@ add_task(async function testCrossServerArchiveFailureAndRetry() {
       date: new Date(year, 0, 1),
       to: [["Archive source", identity.email]],
       body: {
-        body: `<body bgcolor="#ffffff">${"line%25? #ffffff ".repeat(1400)}</body>\r\n`,
+        charset: "ISO-8859-1",
+        encoding: "8bit",
+        body: `<body bgcolor="#ffffff">caf\u00e9 \u00a3 ${"line%25? #ffffff ".repeat(1400)}</body>\r\n`,
       },
     })
   );
   await source.server.addMessages(source.folder, messages, true);
   const headers = [...source.folder.messages];
   Assert.equal(headers.length, 2, "Two actual source headers exist");
+  for (const message of messages) {
+    const raw = message.toMessageString();
+    Assert.ok(raw.includes("Content-Transfer-Encoding: 8bit"));
+    Assert.ok(
+      raw.includes("caf\u00e9 \u00a3"),
+      "The literal includes real high-bit bytes"
+    );
+    Assert.greater(
+      raw.length,
+      16 * 1024,
+      "The literal spans a native stream chunk"
+    );
+    Assert.ok(
+      raw.endsWith("\r\n"),
+      "The final CRLF is part of the exact bytes"
+    );
+  }
   for (const [index, command] of ["APPEND", "CREATE"].entries()) {
     const header = headers[index];
     const key = header.messageKey;

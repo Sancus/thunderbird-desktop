@@ -1151,6 +1151,9 @@ add_task(async function test_exclusionDropsCanonicalText() {
   await index.close();
 
   connection = Services.storage.openUnsharedDatabase(fixture.file);
+  Cc["@mozilla.org/messenger/fts3tokenizer;1"]
+    .getService(Ci.nsIFts3Tokenizer)
+    .registerTokenizer(connection);
   statement = connection.createStatement(
     "SELECT " +
       "(SELECT COUNT(*) FROM documents), " +

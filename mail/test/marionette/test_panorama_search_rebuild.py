@@ -404,7 +404,53 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
             script_timeout=120000,
         )
         self.assertNotIn("error", result, json.dumps(result, ensure_ascii=True))
+        if phase == "update":
+            self.settle_startup_search()
         return result["value"]
+
+    def settle_startup_search(self):
+        """Finish the separate normal startup writer before sealing a checkpoint."""
+        result = self.marionette.execute_async_script(
+            """
+            const [f] = arguments;
+            const done = arguments[arguments.length - 1];
+            (async () => {
+                const { MailGlue } = ChromeUtils.importESModule('resource:///modules/MailGlue.sys.mjs');
+                const { getMailSearchService } = ChromeUtils.importESModule('resource:///modules/panorama/MailSearch.sys.mjs');
+                await MailGlue.afterStartUp;
+                const core = Cc['@mozilla.org/mailnews/database-core;1'].getService(Ci.nsIDatabaseCore);
+                if (core.sourceId !== f.sourceId) {
+                    throw new Error('Startup writer selected another native incarnation');
+                }
+                const snapshot = () => f.mail.map(row => {
+                    const state = core.messageDB.getSearchState(Number(row.id));
+                    return {id: row.id, generation: state.generation,
+                        contentRevision: state.contentRevision, policyRevision: state.policyRevision};
+                });
+                const before = snapshot();
+                const service = await getMailSearchService();
+                const history = [];
+                for (let batch = 0; batch < 200; batch++) {
+                    const progress = await service.update({limit: 500});
+                    history.push(progress);
+                    if (!progress.moreWork && !progress.pending &&
+                        progress.acceptedThrough === progress.sourceWatermark) {
+                        return {before, after: snapshot(), history};
+                    }
+                }
+                throw new Error('Startup writer exceeded the fixed200 bound');
+            })().then(value => done({value}), error => done({error: {
+                name: error.name, message: error.message, result: error.result,
+                stack: error.stack
+            }}));
+            """,
+            script_args=[self.fixture],
+            script_timeout=120000,
+        )
+        self.assertNotIn("error", result, json.dumps(result, ensure_ascii=True))
+        step = getattr(self, "_startup_settle_step", 0)
+        self.record(f"s401-startup-settle-{step:03d}", result["value"])
+        self._startup_settle_step = step + 1
 
     def stop(self):
         """Require normal process termination, not a service-only reopen."""
@@ -740,13 +786,63 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
                 if (phase === 'inputs') {
                     require(!state, 'one owned conversation phase');
                     state = {owner: f.work, tabs: [...tabmail.tabInfo], flags: [],
-                        members: f.s401.members.map(row => ({...row})), selected: {...f.s401.selected}, moved: false};
+                        members: [], selected: null, moved: false};
                     root.__s401ImportedConversation = state;
                     for (const item of f.s401.folders) {
                         const folder = MailServices.folderLookup.getFolderForURL(item.folderURI);
                         require(folder && folder.id === item.folderId, 'retained imported folder identity');
                         require(folder.flags & Ci.nsMsgFolderFlags.Junk, 'original trial exclusion');
+                        require(folder.getTotalMessages(false) === 0, 'S401 native rows were deferred through both earlier trials');
                         state.flags.push({folder, flags: folder.flags});
+                    }
+                    const { MigrationJournal } = ChromeUtils.importESModule(
+                        'resource:///modules/panorama/MigrationJournal.sys.mjs'
+                    );
+                    const { readMorkFolderImport } = ChromeUtils.importESModule(
+                        'resource:///modules/panorama/MorkFolderImport.sys.mjs'
+                    );
+                    const { convertMorkFolderSnapshot, validateMorkFolderReceipt } = ChromeUtils.importESModule(
+                        'resource:///modules/panorama/MorkSnapshotAdapter.sys.mjs'
+                    );
+                    const journal = await MigrationJournal.open(f.s401.journalPath, f.profile);
+                    try {
+                        require(journal.state.sources.length === 3, 'complete original three-folder source plan');
+                        for (const planned of journal.state.sources) {
+                            require(planned.state === 'pending' && planned.receipt === null,
+                                'fresh source has no invented or pre-applied receipt');
+                            const item = f.s401.folders.find(row => row.name === planned.id);
+                            require(item && planned.databaseSourceId === core.sourceId &&
+                                planned.destinationFolderId === item.folderId, 'persisted original source and destination');
+                            const folder = MailServices.folderLookup.getFolderForURL(item.folderURI);
+                            require(folder && folder.id === item.folderId, 'exact original imported destination');
+                            const token = await journal.beginImport(planned.id);
+                            const source = journal.state.sources.find(row => row.id === planned.id);
+                            const request = convertMorkFolderSnapshot(await readMorkFolderImport(folder, token),
+                                source, core.sourceId, core.folderDB.getFolderFlags(folder.id));
+                            require(core.getFolderImportReceipt(folder, request) === null,
+                                'native receipt is absent before this actual complete import');
+                            const receipt = validateMorkFolderReceipt(request, await core.importFolderSnapshot(folder, request));
+                            const durable = validateMorkFolderReceipt(request, core.getFolderImportReceipt(folder, request));
+                            require(JSON.stringify(receipt) === JSON.stringify(durable), 'same real committed native receipt');
+                            await journal.recordImport(source.id, durable);
+                            require(journal.state.sources.find(row => row.id === source.id).state === 'imported',
+                                'complete receipt checkpoint follows native commit');
+                            for (const [oldKey, key] of durable.keys) {
+                                require([1, 3].includes(oldKey) && Number.isSafeInteger(key) && key > 0,
+                                    'complete old-key to actual global-key mapping');
+                                const header = folder.GetMessageHeader(key);
+                                const messageId = oldKey === 1 ? 's40101@invalid' : 's40103@invalid';
+                                require(header.messageId === messageId && core.messageDB.getSearchState(key).folderId === folder.id,
+                                    'actual imported header and original physical destination');
+                                state.members.push({sourceFolderId: source.id, role: item.role, oldKey, key,
+                                    folderId: folder.id, folderURI: folder.URI, messageId});
+                            }
+                        }
+                    } finally {
+                        await journal.close();
+                    }
+                    state.selected = state.members.find(row => row.role === 'Sent' && row.oldKey === 1);
+                    for (const {folder} of state.flags) {
                         folder.clearFlag(Ci.nsMsgFolderFlags.Junk);
                     }
                 }
@@ -830,7 +926,8 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
                             require(header.getStringReference(0) === 's40101@invalid', 'actual imported parent reference');
                         }
                     }
-                    require(state.selected.messageId === f.s401.peer.messageId && state.selected.key !== f.s401.peer.key,
+                    const peer = state.members.find(row => row.role === 'Inbox' && row.oldKey === 1);
+                    require(state.selected.messageId === peer.messageId && state.selected.key !== peer.key,
                         'duplicate Message-ID peer is physically distinct');
                     const history = [];
                     for (let batch = 0; batch < 200; batch++) {
@@ -909,44 +1006,70 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
         c = self.fixture["s401"]
         self.assertEqual(c["version"], 1)
         self.assertEqual(c["sourceId"], self.fixture["sourceId"])
-        journal = json.loads(Path(c["journalPath"]).read_text(encoding="utf-8"))
-        journal_hash = self.digest(Path(c["journalPath"]))
-        self.assertEqual(len(c["sourceHashes"]), 9)
-        for row in c["sourceHashes"]:
-            self.assertEqual(self.digest(Path(row["path"])), row["sha256"])
-        self.assertEqual(Path(journal["profilePath"]).resolve(), self.profile)
-        self.assertEqual(len(journal["sources"]), 3)
-        mapped = []
-        for source in journal["sources"]:
-            self.assertEqual(source["state"], "imported")
-            self.assertEqual(source["databaseSourceId"], c["sourceId"])
-            self.assertEqual(set(dict(source["receipt"]["keys"])), {1, 3})
-            self.assertIn(source["receipt"], c["receipts"])
-            for old_key, current_key in source["receipt"]["keys"]:
-                row = next(
-                    row
-                    for row in c["members"]
-                    if row["sourceFolderId"] == source["id"] and row["oldKey"] == old_key
-                )
-                self.assertEqual(current_key, row["key"])
-                self.assertEqual(row["folderId"], source["receipt"]["folderId"])
-                mapped.append(current_key)
-        self.assertEqual(set(mapped), {row["key"] for row in c["members"]})
-        self.assertEqual(len(mapped), 6)
-        self.assertEqual(c["selected"]["role"], "Sent")
-        self.assertEqual(
-            c["selected"],
-            next(row for row in c["members"] if row["role"] == "Sent" and row["oldKey"] == 1),
-        )
-        self.assertEqual(
-            c["peer"],
-            next(row for row in c["members"] if row["role"] == "Inbox" and row["oldKey"] == 1),
-        )
-        self.assertEqual(c["selected"]["messageId"], c["peer"]["messageId"])
-        self.assertNotEqual(c["selected"]["key"], c["peer"]["key"])
         failure = None
         try:
             inputs = self.s401_operation("inputs")
+            # Expected physical keys come independently from the durable journal,
+            # paired with the fixed old keys/IDs and original destination plan.
+            committed = json.loads(Path(c["journalPath"]).read_text(encoding="utf-8"))
+            expected_members = []
+            for source in committed["sources"]:
+                folder = next(row for row in c["folders"] if row["name"] == source["id"])
+                for old_key, key in source["receipt"]["keys"]:
+                    expected_members.append(
+                        {
+                            "sourceFolderId": source["id"],
+                            "role": folder["role"],
+                            "oldKey": old_key,
+                            "key": key,
+                            "folderId": folder["folderId"],
+                            "folderURI": folder["folderURI"],
+                            "messageId": "s40101@invalid" if old_key == 1 else "s40103@invalid",
+                        }
+                    )
+            c["members"] = expected_members
+            c["selected"] = next(
+                row for row in expected_members if row["role"] == "Sent" and row["oldKey"] == 1
+            )
+            c["peer"] = next(
+                row for row in expected_members if row["role"] == "Inbox" and row["oldKey"] == 1
+            )
+            c["receipts"] = [source["receipt"] for source in committed["sources"]]
+            journal = json.loads(Path(c["journalPath"]).read_text(encoding="utf-8"))
+            journal_hash = self.digest(Path(c["journalPath"]))
+            self.assertEqual(len(c["sourceHashes"]), 9)
+            for row in c["sourceHashes"]:
+                self.assertEqual(self.digest(Path(row["path"])), row["sha256"])
+            self.assertEqual(Path(journal["profilePath"]).resolve(), self.profile)
+            self.assertEqual(len(journal["sources"]), 3)
+            mapped = []
+            for source in journal["sources"]:
+                self.assertEqual(source["state"], "imported")
+                self.assertEqual(source["databaseSourceId"], c["sourceId"])
+                self.assertEqual(set(dict(source["receipt"]["keys"])), {1, 3})
+                self.assertIn(source["receipt"], c["receipts"])
+                for old_key, current_key in source["receipt"]["keys"]:
+                    row = next(
+                        row
+                        for row in c["members"]
+                        if row["sourceFolderId"] == source["id"] and row["oldKey"] == old_key
+                    )
+                    self.assertEqual(current_key, row["key"])
+                    self.assertEqual(row["folderId"], source["receipt"]["folderId"])
+                    mapped.append(current_key)
+            self.assertEqual(set(mapped), {row["key"] for row in c["members"]})
+            self.assertEqual(len(mapped), 6)
+            self.assertEqual(c["selected"]["role"], "Sent")
+            self.assertEqual(
+                c["selected"],
+                next(row for row in c["members"] if row["role"] == "Sent" and row["oldKey"] == 1),
+            )
+            self.assertEqual(
+                c["peer"],
+                next(row for row in c["members"] if row["role"] == "Inbox" and row["oldKey"] == 1),
+            )
+            self.assertEqual(c["selected"]["messageId"], c["peer"]["messageId"])
+            self.assertNotEqual(c["selected"]["key"], c["peer"]["key"])
             self.record("s401-imported-inputs", inputs)
             self.assertEqual(inputs["members"], c["members"])
             self.assertEqual(inputs["selected"], c["selected"])

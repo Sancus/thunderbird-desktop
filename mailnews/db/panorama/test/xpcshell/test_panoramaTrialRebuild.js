@@ -401,7 +401,10 @@ async function prepareImportedConversationSource(summaryPath, bodyPath) {
     for (const [oldId, newId] of replacements) {
       Assert.equal(oldId.length, newId.length);
       const header = legacy.getMsgHdrForMessageID(oldId);
-      Assert.ok(header, "The real retained source supplies this physical header");
+      Assert.ok(
+        header,
+        "The real retained source supplies this physical header"
+      );
       header.messageId = newId;
       if (newId === "s40103@invalid") {
         header.setReferences("<s40101@invalid>");
@@ -412,14 +415,20 @@ async function prepareImportedConversationSource(summaryPath, bodyPath) {
   } finally {
     legacy.forceClosed();
   }
-  Assert.equal(new TextEncoder().encode(body).length, new TextEncoder().encode(original).length);
-  await IOUtils.writeUTF8(bodyPath, body);
-  const reopened = Cc["@mozilla.org/nsMsgDatabase/msgDB-mailbox"].createInstance(
-    Ci.nsIMsgDatabase
+  Assert.equal(
+    new TextEncoder().encode(body).length,
+    new TextEncoder().encode(original).length
   );
+  await IOUtils.writeUTF8(bodyPath, body);
+  const reopened = Cc[
+    "@mozilla.org/nsMsgDatabase/msgDB-mailbox"
+  ].createInstance(Ci.nsIMsgDatabase);
   try {
     reopened.openFromFile(new FileUtils.File(summaryPath));
-    Assert.equal(reopened.getMsgHdrForMessageID("s40101@invalid").messageKey, 1);
+    Assert.equal(
+      reopened.getMsgHdrForMessageID("s40101@invalid").messageKey,
+      1
+    );
     const reply = reopened.getMsgHdrForMessageID("s40103@invalid");
     Assert.equal(reply.messageKey, 3);
     Assert.equal(reply.numReferences, 1);
@@ -430,88 +439,102 @@ async function prepareImportedConversationSource(summaryPath, bodyPath) {
 }
 
 /**
- * Imports the three retained summaries through a separate committed journal.
- * Junk exclusion keeps these six rows outside the unchanged S716/S717 cohort.
+ * Plans three closed Mork sources without adding rows to the earlier trial.
+ * The final S401 application phase performs the actual native receipt import.
  *
  * @param {{name: string, role: string, summaryFilePath: string,
  *   mailFilePath: string}[]} inputs - Closed genuine legacy source copies.
  * @param {nsIMsgFolder} root - Original selected Local Folders root.
  * @param {string} backupRoot - External journal parent beside the profile.
  * @param {string} backupPath - Existing immutable backup destination.
- * @param {{path: string, sha256: string}} backup - Genuine completed backup receipt.
- * @param {nsIProfileLock} lock - Held lock for the original retained profile.
+ * @param {{path: string, sha256: string}} backup - Genuine backup receipt.
+ * @param {nsIProfileLock} lock - Held lock for the retained profile.
  * @returns {Promise<{version: number, sourceId: string, journalPath: string,
- *   sourceHashes: {path: string, sha256: string}[], members: S401ImportedMember[],
- *   selected: S401ImportedMember, peer: S401ImportedMember, bodyNeedle: string,
+ *   sourceHashes: {path: string, sha256: string}[], bodyNeedle: string,
  *   folders: {name: string, role: string, folderId: number, folderURI: string,
- *   summaryPath: string, bodyPath: string}[], receipts: {token: string,
- *   sourceSha256: string, folderId: number, keys: number[][]}[]}>}
- *   Closed journal, receipt keys and exact membership.
+ *   summaryPath: string, bodyPath: string}[]}>} Pending closed-source plan.
  */
-async function importRetainedConversation(inputs, root, backupRoot, backupPath, backup, lock) {
+async function planRetainedConversation(
+  inputs,
+  root,
+  backupRoot,
+  backupPath,
+  backup,
+  lock
+) {
   const folders = new Map();
   const sources = [];
   for (const input of inputs) {
     const folder = root.getChildNamed(input.name);
-    const flag = { Inbox: Ci.nsMsgFolderFlags.Inbox,
-      Sent: Ci.nsMsgFolderFlags.SentMail, Archive: Ci.nsMsgFolderFlags.Archive }[input.role];
+    const flag = {
+      Inbox: Ci.nsMsgFolderFlags.Inbox,
+      Sent: Ci.nsMsgFolderFlags.SentMail,
+      Archive: Ci.nsMsgFolderFlags.Archive,
+    }[input.role];
     folder.setFlag(Ci.nsMsgFolderFlags.Mail | flag | Ci.nsMsgFolderFlags.Junk);
     Assert.ok(folderDB.getFolderFlags(folder.id) & Ci.nsMsgFolderFlags.Junk);
     const plan = await readMorkFolderImport(folder, "s401-planning-only");
     Assert.deepEqual(plan.source.messageKeys.toSorted(), [1, 3]);
+    Assert.equal(
+      folder.getTotalMessages(false),
+      0,
+      "New native rows wait for the final application phase"
+    );
     folders.set(input.name, folder);
-    sources.push({ id: input.name, databaseSourceId: database.sourceId,
-      ...plan.source, destinationFolderId: folder.id });
+    sources.push({
+      id: input.name,
+      databaseSourceId: database.sourceId,
+      ...plan.source,
+      destinationFolderId: folder.id,
+    });
   }
   const journalPath = PathUtils.join(backupRoot, "s401-journal.json");
   const journal = await MigrationJournal.create(journalPath, {
-    profilePath: lock.directory.path, mailPaths: [], backupPath, sources,
+    profilePath: lock.directory.path,
+    mailPaths: [],
+    backupPath,
+    sources,
   });
   try {
     await journal.recordBackup(backup);
-    await resumeMorkImports(journal, createPanoramaMigrationTarget(
-      journal, database, id => folders.get(id), lock
-    ));
-    const members = [];
-    for (const input of inputs) {
-      const folder = folders.get(input.name);
-      const source = journal.state.sources.find(row => row.id === input.name);
-      Assert.equal(source.state, "imported");
-      for (const oldKey of [1, 3]) {
-        const key = Number(receiptKey(journal, input.name, oldKey));
-        const header = folder.GetMessageHeader(key);
-        Assert.equal(header.messageId, oldKey === 1 ? "s40101@invalid" : "s40103@invalid");
-        Assert.equal(header.numReferences, oldKey === 1 ? 0 : 1);
-        if (oldKey === 3) {
-          Assert.equal(header.getStringReference(0), "s40101@invalid");
-        }
-        Assert.equal(messageDB.getSearchState(key).folderId, folder.id);
-        members.push({ sourceFolderId: input.name, role: input.role,
-          oldKey, key, folderId: folder.id, folderURI: folder.URI,
-          messageId: header.messageId });
-      }
+    Assert.equal(journal.state.stage, "import");
+    for (const source of journal.state.sources) {
+      Assert.equal(source.state, "pending");
+      Assert.equal(source.receipt, null);
     }
-    Assert.equal(members.length, 6);
-    Assert.equal(new Set(members.map(row => row.key)).size, 6);
-    const selected = members.find(row => row.role === "Sent" && row.oldKey === 1);
-    const peer = members.find(row => row.role === "Inbox" && row.oldKey === 1);
-    Assert.equal(selected.messageId, peer.messageId);
-    Assert.notEqual(selected.key, peer.key);
     const sourceHashes = [];
     for (const input of inputs) {
-      const relative = PathUtils.split(input.summaryFilePath).slice(PathUtils.split(lock.directory.path).length);
+      const relative = PathUtils.split(input.summaryFilePath).slice(
+        PathUtils.split(lock.directory.path).length
+      );
       const backedUpSummary = PathUtils.join(backupPath, "root-0", ...relative);
       const backedUpBody = backedUpSummary.replace(/\.msf$/, "");
-      for (const path of [input.summaryFilePath, backedUpSummary, backedUpBody]) {
-        sourceHashes.push({ path, sha256: await IOUtils.computeHexDigest(path, "sha256") });
+      for (const path of [
+        input.summaryFilePath,
+        backedUpSummary,
+        backedUpBody,
+      ]) {
+        sourceHashes.push({
+          path,
+          sha256: await IOUtils.computeHexDigest(path, "sha256"),
+        });
       }
     }
-    return { version: 1, sourceId: database.sourceId, journalPath, sourceHashes,
-      members, selected, peer, bodyNeedle: "eos quos omnis dolorem dicta.",
-      folders: inputs.map(input => ({ name: input.name, role: input.role,
-        folderId: folders.get(input.name).id, folderURI: folders.get(input.name).URI,
-        summaryPath: input.summaryFilePath, bodyPath: input.mailFilePath })),
-      receipts: sources.map(source => journal.state.sources.find(row => row.id === source.id).receipt) };
+    return {
+      version: 1,
+      sourceId: database.sourceId,
+      journalPath,
+      sourceHashes,
+      bodyNeedle: "eos quos omnis dolorem dicta.",
+      folders: inputs.map(input => ({
+        name: input.name,
+        role: input.role,
+        folderId: folders.get(input.name).id,
+        folderURI: folders.get(input.name).URI,
+        summaryPath: input.summaryFilePath,
+        bodyPath: input.mailFilePath,
+      })),
+    };
   } finally {
     await journal.close();
   }
@@ -578,10 +601,20 @@ add_task(async function test_createRetainedNativeRebuildTrial() {
     const conversationInputs = [];
     for (const role of ["Inbox", "Sent", "Archive"]) {
       const name = "S401" + role;
-      const files = await server.rootFolder.addMailFolder(name, { summary, mbox: body });
-      await prepareImportedConversationSource(files.summaryFilePath, files.mailFilePath);
-      conversationInputs.push({ name, role, summaryFilePath: files.summaryFilePath,
-        mailFilePath: files.mailFilePath });
+      const files = await server.rootFolder.addMailFolder(name, {
+        summary,
+        mbox: body,
+      });
+      await prepareImportedConversationSource(
+        files.summaryFilePath,
+        files.mailFilePath
+      );
+      conversationInputs.push({
+        name,
+        role,
+        summaryFilePath: files.summaryFilePath,
+        mailFilePath: files.mailFilePath,
+      });
     }
     const originalGloda = createMailInput(
       "s716",
@@ -658,8 +691,13 @@ add_task(async function test_createRetainedNativeRebuildTrial() {
       "",
       Ci.nsMsgPriority.notSet
     );
-    const importedConversation = await importRetainedConversation(
-      conversationInputs, root, backupRoot, backupPath, backup, lock
+    const importedConversation = await planRetainedConversation(
+      conversationInputs,
+      root,
+      backupRoot,
+      backupPath,
+      backup,
+      lock
     );
     // The normal app factory opens this separate sidecar on first startup.
     // Prepare its real preference fingerprint before capturing recovery so that

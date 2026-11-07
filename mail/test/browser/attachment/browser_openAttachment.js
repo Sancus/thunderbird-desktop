@@ -1607,6 +1607,12 @@ add_task(async function test_pdfTabUsesSelectedBytesAcrossImapUidReuse() {
         await SpecialPowers.spawn(tab.browser, [], async () => {
           await content.wrappedJSObject.PDFViewerApplication.testingClose();
         });
+        // Release the loaded file document before destroying its tab and file.
+        const blank = BrowserTestUtils.browserLoaded(tab.browser, {
+          wantLoad: "about:blank",
+        });
+        BrowserTestUtils.startLoadingURIString(tab.browser, "about:blank");
+        await blank;
       } finally {
         tabmail.closeTab(tab);
       }

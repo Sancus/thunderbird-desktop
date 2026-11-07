@@ -550,6 +550,7 @@ done:
 NS_IMETHODIMP
 nsMsgCopyService::NotifyCompletion(nsISupports* aSupport,
                                    nsIMsgFolder* dstFolder, nsresult result) {
+  if (NS_FAILED(result)) NS_WARNING("CI051 diagnostic copy service failed completion");
   if (MOZ_LOG_TEST(gCopyServiceLog, mozilla::LogLevel::Info))
     LogCopyCompletion(aSupport, dstFolder);
   nsCopyRequest* copyRequest = nullptr;

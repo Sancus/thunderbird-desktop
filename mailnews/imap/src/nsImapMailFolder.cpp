@@ -10856,15 +10856,18 @@ nsImapFolderCopyState::nsImapFolderCopyState(nsIMsgFolder* destParent,
 }
 
 nsresult nsImapFolderCopyState::Finish(nsresult aStatus) {
+  if (NS_FAILED(aStatus)) NS_WARNING("CI051 diagnostic Finish called with failure");
   if (m_completed) return m_status;
   RefPtr<nsImapFolderCopyState> kungFuDeathGrip(this);
   nsCOMPtr<nsIMsgFolder> completionFolder = m_origDestParent;
   if (NS_SUCCEEDED(aStatus)) {
     nsCOMPtr<nsIMsgFolder> parent;
+    if (!m_newDestFolder) NS_WARNING("CI051 diagnostic Finish: no new destination folder");
     aStatus = m_newDestFolder
                   ? m_newDestFolder->GetParent(getter_AddRefs(parent))
                   : NS_ERROR_NOT_AVAILABLE;
     if (NS_SUCCEEDED(aStatus) && parent != m_origDestParent) {
+      NS_WARNING("CI051 diagnostic Finish: new destination parent differs");
       aStatus = NS_ERROR_NOT_AVAILABLE;
     }
     if (NS_SUCCEEDED(aStatus)) completionFolder = m_newDestFolder;

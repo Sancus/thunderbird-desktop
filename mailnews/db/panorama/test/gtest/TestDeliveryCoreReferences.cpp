@@ -4780,6 +4780,19 @@ class DeliveryCoreReferences : public testing::Test {
     ASSERT_EQ(NS_OK, StartupDocument(cx, bytes, &parsed));
     state = &parsed.toObject();
     ASSERT_EQ(NS_OK, object(state, "startup", &startup));
+    nsCOMPtr<nsIFile> selector;
+    ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(selector)));
+    ASSERT_EQ(NS_OK, selector->AppendNative("panorama-profile.json"_ns));
+    ASSERT_EQ(NS_OK, JSONCacheReadFile(selector, bytes));
+    ASSERT_EQ(NS_OK, StartupDocument(cx, bytes, &parsed));
+    JS::Rooted<JSObject*> selected(cx, &parsed.toObject()), identity(cx),
+        declared(cx, JS_NewPlainObject(cx)),
+        imports(cx, JS::NewArrayObject(cx, 1));
+    ASSERT_TRUE(declared && imports);
+    ASSERT_EQ(NS_OK, object(selected, "identity", &identity));
+    // The ordinary journal records this verified backup before import. Retain
+    // the same original identity from the prepared selector for final readback.
+    ASSERT_EQ(NS_OK, copy(identity, state, "backup", "backup"));
     ASSERT_EQ(NS_OK,
               copy(input, startup, "databaseSourceId", "databaseSourceId"));
     value.setBoolean(true);
@@ -4800,16 +4813,6 @@ class DeliveryCoreReferences : public testing::Test {
     for (const char* name : {"sources", "protocolUnits", "books"})
       ASSERT_TRUE(JS_SetProperty(cx, state, name, value));
     ASSERT_EQ(NS_OK, write(journal, state));
-    nsCOMPtr<nsIFile> selector;
-    ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(selector)));
-    ASSERT_EQ(NS_OK, selector->AppendNative("panorama-profile.json"_ns));
-    ASSERT_EQ(NS_OK, JSONCacheReadFile(selector, bytes));
-    ASSERT_EQ(NS_OK, StartupDocument(cx, bytes, &parsed));
-    JS::Rooted<JSObject*> selected(cx, &parsed.toObject()), identity(cx),
-        declared(cx, JS_NewPlainObject(cx)),
-        imports(cx, JS::NewArrayObject(cx, 1));
-    ASSERT_TRUE(declared && imports);
-    ASSERT_EQ(NS_OK, object(selected, "identity", &identity));
     ASSERT_EQ(NS_OK,
               copy(input, identity, "databaseSourceId", "databaseSourceId"));
     int32_t schema;

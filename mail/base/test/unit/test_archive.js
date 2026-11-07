@@ -477,6 +477,9 @@ add_task(async function testCrossServerArchiveFailureAndRetry() {
       },
     })
   );
+  for (const message of messages) {
+    message.headers["Content-Transfer-Encoding"] = "8bit";
+  }
   await source.server.addMessages(source.folder, messages, true);
   const headers = [...source.folder.messages];
   Assert.equal(headers.length, 2, "Two actual source headers exist");

@@ -1161,12 +1161,17 @@ async function checkImapFcc(retry) {
     Assert.deepEqual(gSentMessages.slice(sentCount), [messageId]);
     Assert.ok(gServer._daemon.post.includes(body));
     Assert.equal(prompts, retry ? 1 : 0);
-    Assert.equal(protocolAlerts, retry ? 1 : 0);
     extension.sendMessage();
   });
   await extension.startup();
   loaded = true;
   await Promise.all([extension.awaitFinish("imap-fcc"), recovery]);
+  // The protocol alert can arrive after the copy retry has completed.
+  Assert.equal(
+    protocolAlerts,
+    retry ? 1 : 0,
+    "The rejected APPEND reports exactly one command error"
+  );
   await cleanup();
 }
 

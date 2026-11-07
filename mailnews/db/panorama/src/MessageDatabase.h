@@ -1044,6 +1044,12 @@ class MessageDatabase : public nsIMessageDatabase {
   struct QueuedMessageBatch;
   nsresult PrepareMessageBatch(UniquePtr<QueuedMessageBatch>& output);
   nsresult CaptureThreadViewsBeforeInsert(QueuedMessageBatch& batch);
+  friend class LiveView;
+  nsresult CaptureOrdinaryThreadPeers(nsMsgKey threadId,
+                                      QueuedMessageBatch& notification,
+                                      MessageThreadBatch& captured);
+  nsresult PrepareOrdinaryPublication(QueuedMessageBatch& notification,
+                                       MessageThreadBatch& captured);
   // Consume a staged action only after the final published thread is known,
   // before any prepared delivery can observe its thread state.
   nsresult ConsumeProtoThreadFlagsInTransaction(nsMsgKey key, uint64_t folderId,

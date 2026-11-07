@@ -79,11 +79,32 @@ add_task(async function testColumnContents() {
   }
 });
 
+// Only opted-in flat adds change their event contract. Shared sparse/grouped
+// ListenerTree behavior, exact row assertions and ordinary removals stay strict.
+class FlatPublicationTree extends ListenerTree {
+  resets = 0;
+  reset() {
+    Assert.strictEqual(
+      this._index,
+      undefined,
+      "No intermediate row-count event"
+    );
+    Assert.strictEqual(this._start, undefined, "No intermediate invalidation");
+    this.resets++;
+  }
+  assertSettledPublication() {
+    Assert.equal(this.resets, 1, "Exactly one settled native publication");
+    Assert.strictEqual(this._index, undefined);
+    Assert.strictEqual(this._start, undefined);
+    this.resets = 0;
+  }
+}
+
 async function setUpAdapter(sortColumn, sortDirection) {
   const liveView = new LiveView();
   const adapter = new LiveViewDataAdapter(liveView);
   adapter.sortBy(sortColumn, sortDirection);
-  const tree = new ListenerTree();
+  const tree = new FlatPublicationTree();
   adapter.setTree(tree);
   await tree.promiseInvalidated(0, 9);
   return { adapter, tree };
@@ -110,7 +131,7 @@ async function subtestAddRemove(
 
     const addedBefore = addMessage(messagesToAdd[0]);
     Assert.deepEqual(listMessages(adapter), [addedBefore, ...idsInOrder]);
-    tree.assertRowCountChanged(0, 1);
+    tree.assertSettledPublication();
 
     const addedBetween = addMessage(messagesToAdd[1]);
     const countBefore = sortDirection == "descending" ? 6 : 4;
@@ -120,7 +141,7 @@ async function subtestAddRemove(
       addedBetween,
       ...idsInOrder.slice(countBefore, 10),
     ]);
-    tree.assertRowCountChanged(countBefore + 1, 1);
+    tree.assertSettledPublication();
 
     const addedAfter = addMessage(messagesToAdd[2]);
     Assert.deepEqual(listMessages(adapter), [
@@ -130,7 +151,7 @@ async function subtestAddRemove(
       ...idsInOrder.slice(countBefore, 10),
       addedAfter,
     ]);
-    tree.assertRowCountChanged(12, 1);
+    tree.assertSettledPublication();
 
     messageDB.removeMessage(addedBefore);
     Assert.deepEqual(listMessages(adapter), [
@@ -2239,5 +2260,491 @@ add_task(async function test_publicNewFlatUsesDisplayedState() {
     );
   } finally {
     adapter.setTree(null);
+  }
+});
+
+/**
+ * Creates isolated real physical folders for an ordinary graph-off operation.
+ *
+ * @param {string} name - The unique operation name.
+ * @returns {number[]} Two genuine native folder identifiers.
+ */
+function ordinaryBatchFolders(name) {
+  const root = folderDB.insertRoot(`ordinary-batch-${name}`);
+  return [folderDB.insertFolder(root, "A"), folderDB.insertFolder(root, "B")];
+}
+
+/**
+ * Queries a real native flat view and records its actual producer payloads.
+ *
+ * @param {number[]} folders - The physical view scope.
+ * @param {Function} [initialize] - An additional native view restriction.
+ * @returns {Promise<object>} The adapter, view, selection, payloads and tree.
+ */
+async function ordinaryBatchAdapter(folders, initialize) {
+  const view = new LiveView();
+  view.initWithFolders(folders);
+  initialize?.(view);
+  const adapter = new LiveViewDataAdapter(view);
+  const events = [],
+    payloads = [];
+  const tree = {
+    reset() {
+      events.push(["reset"]);
+    },
+    rowCountChanged(index, delta) {
+      events.push(["count", index, delta]);
+    },
+    invalidateRow(index) {
+      events.push(["row", index]);
+    },
+    invalidateRange(start, end) {
+      events.push(["range", start, end]);
+    },
+  };
+  adapter.setTree(tree);
+  adapter.selection = new TreeSelection(null);
+  adapter.selection._view = adapter;
+  registerCleanupFunction(() => adapter.setTree(null));
+  const receive = adapter.onMessageAdded.bind(adapter);
+  adapter.onMessageAdded = value => {
+    payloads.push(value);
+    receive(value);
+  };
+  await adapter.sortBy("date", "ascending");
+  events.length = 0;
+  Assert.equal(
+    adapter.panoramaThreadBatchVersion,
+    1,
+    "Real completed flat query"
+  );
+  return {
+    view,
+    adapter,
+    selection: adapter.selection,
+    tree,
+    events,
+    payloads,
+  };
+}
+
+/**
+ * Lists loaded physical identities without Message-ID or positional guessing.
+ *
+ * @param {LiveViewDataAdapter} adapter - The queried consumer.
+ * @returns {number[][]} Exact folder/key pairs.
+ */
+function ordinaryBatchPairs(adapter) {
+  return adapter._rowMap.map(row => [row.message.folderId, row.message.id]);
+}
+
+add_task(async function test_nativeOrdinaryFlatBatchPhysicalIdentity() {
+  const folders = ordinaryBatchFolders("identity");
+  const first = addMessage({
+    folderId: folders[0],
+    messageId: "physical-copy",
+  });
+  const copy = addMessage({ folderId: folders[1], messageId: "physical-copy" });
+  const f = await ordinaryBatchAdapter(folders);
+  try {
+    const old = [...f.adapter._rowMap];
+    f.selection.select(1);
+    const selected = old[1].message.id;
+    const added = addMessage({
+      folderId: folders[1],
+      messageId: "physical-new",
+    });
+    Assert.deepEqual(f.events, [["reset"]]);
+    Assert.equal(f.payloads.length, 1);
+    Assert.equal(f.payloads[0].kind, "panorama-thread-batch");
+    Assert.deepEqual(f.payloads[0].publication, {
+      folderId: folders[1],
+      id: added,
+    });
+    Assert.deepEqual(ordinaryBatchPairs(f.adapter), [
+      [folders[0], first],
+      [folders[1], copy],
+      [folders[1], added],
+    ]);
+    Assert.strictEqual(f.adapter.rowAt(0), old[0]);
+    Assert.strictEqual(f.adapter.rowAt(1), old[1]);
+    Assert.equal(
+      f.adapter.rowAt(f.selection.currentIndex).message.id,
+      selected
+    );
+    Assert.ok(f.selection.isSelected(1));
+    Assert.equal(f.selection.shiftSelectPivot, 1);
+  } finally {
+    f.adapter.setTree(null);
+  }
+});
+
+add_task(async function test_nativeOrdinaryFlatBatchCompleteUnchangedPeers() {
+  const folders = ordinaryBatchFolders("peers");
+  const root = addMessage({ folderId: folders[0], messageId: "peer-root" });
+  const peer = addMessage({
+    folderId: folders[1],
+    messageId: "peer-copy",
+    references: ["peer-root"],
+  });
+  const f = await ordinaryBatchAdapter([folders[0]]);
+  try {
+    const before = [root, peer].map(key => {
+      const message = messageDB.getMessage(key);
+      return [key, message.threadId, message.threadParent];
+    });
+    const added = addMessage({
+      folderId: folders[0],
+      messageId: "peer-new",
+      references: ["peer-root"],
+    });
+    const batch = f.payloads[0];
+    Assert.deepEqual(batch.componentThreadIds, {
+      before: [root],
+      after: [root],
+    });
+    Assert.deepEqual(batch.groups, { before: [], after: [] });
+    Assert.deepEqual(
+      batch.rows.map(row => row.after.id),
+      [root, peer, added]
+    );
+    Assert.deepEqual(
+      batch.rows.slice(0, 2).map(row => row.before),
+      batch.rows.slice(0, 2).map(row => row.after)
+    );
+    Assert.equal(
+      batch.rows[1].matchesBefore,
+      false,
+      "Filtered peer remains captured"
+    );
+    Assert.equal(batch.rows[1].matchesAfter, false);
+    Assert.deepEqual(
+      before,
+      [root, peer].map(key => {
+        const message = messageDB.getMessage(key);
+        return [key, message.threadId, message.threadParent];
+      }),
+      "No ordinary graph rewrite"
+    );
+    Assert.deepEqual(f.events, [["reset"]]);
+    f.events.length = 0;
+    addMessage({
+      folderId: folders[1],
+      messageId: "outside-peer",
+      references: ["peer-root"],
+    });
+    Assert.deepEqual(
+      f.events,
+      [],
+      "Matching old peers do not fabricate a publication"
+    );
+    Assert.equal(f.payloads.length, 1);
+  } finally {
+    f.adapter.setTree(null);
+  }
+});
+
+add_task(async function test_nativeOrdinaryFlatBatchCountSortAndTieOrder() {
+  const folders = ordinaryBatchFolders("count-sort");
+  const first = addMessage({
+    folderId: folders[0],
+    messageId: "tie-a",
+    subject: "equal",
+  });
+  const second = addMessage({
+    folderId: folders[1],
+    messageId: "tie-b",
+    subject: "equal",
+  });
+  const f = await ordinaryBatchAdapter(folders);
+  try {
+    f.selection.rangedSelect(0, 1, false);
+    const old = [...f.adapter._rowMap];
+    const sorting = f.adapter.sortBy("subject", "descending");
+    Assert.equal(
+      f.adapter.panoramaThreadBatchVersion,
+      1,
+      "Old dense map retained during count"
+    );
+    const added = addMessage({
+      folderId: folders[0],
+      messageId: "tie-c",
+      subject: "equal",
+    });
+    await sorting;
+    Assert.deepEqual(
+      f.events,
+      [["reset"]],
+      "Stale count/chunks cannot overwrite install"
+    );
+    Assert.deepEqual(
+      ordinaryBatchPairs(f.adapter).map(pair => pair[1]),
+      [first, second, added]
+    );
+    Assert.strictEqual(f.adapter.rowAt(0), old[0]);
+    Assert.strictEqual(f.adapter.rowAt(1), old[1]);
+    Assert.ok(f.selection.isSelected(0));
+    Assert.ok(f.selection.isSelected(1));
+    Assert.equal(f.selection.currentIndex, 1);
+    Assert.equal(f.selection.shiftSelectPivot, 0);
+    f.events.length = 0;
+    const next = addMessage({
+      folderId: folders[1],
+      messageId: "tie-d",
+      subject: "equal",
+    });
+    Assert.deepEqual(
+      ordinaryBatchPairs(f.adapter).map(pair => pair[1]),
+      [first, second, added, next]
+    );
+    Assert.deepEqual(f.events, [["reset"]]);
+  } finally {
+    f.adapter.setTree(null);
+  }
+});
+
+add_task(
+  async function test_nativeOrdinaryFlatBatchReadinessAndSparseFallback() {
+    const folders = ordinaryBatchFolders("readiness");
+    const view = new LiveView();
+    view.initWithFolders(folders);
+    const adapter = new LiveViewDataAdapter(view);
+    const payloads = [];
+    const receive = adapter.onMessageAdded.bind(adapter);
+    adapter.onMessageAdded = value => {
+      payloads.push(value);
+      receive(value);
+    };
+    try {
+      Assert.equal(adapter.panoramaThreadBatchVersion, 0);
+      const initial = addMessage({
+        folderId: folders[0],
+        messageId: "unready",
+      });
+      Assert.equal(payloads[0].id, initial);
+      Assert.equal(
+        payloads[0].kind,
+        undefined,
+        "Unready recipient uses ordinary delivery"
+      );
+      await adapter.sortBy("date", "ascending");
+      Assert.equal(adapter.panoramaThreadBatchVersion, 1);
+      const versions = [];
+      const chunk = adapter.onSelectedChunk.bind(adapter);
+      adapter.onSelectedChunk = (...args) => {
+        versions.push(adapter._queryListener.panoramaThreadBatchVersion);
+        chunk(...args);
+      };
+      await adapter.sortBy("date", "descending");
+      Assert.deepEqual(
+        versions,
+        [0],
+        "Actual sparse replacement withdraws enrollment"
+      );
+      Assert.equal(
+        adapter.panoramaThreadBatchVersion,
+        1,
+        "Real chunk restores eligibility"
+      );
+      addMessage({ folderId: folders[1], messageId: "ready" });
+      Assert.equal(payloads.at(-1).kind, "panorama-thread-batch");
+    } finally {
+      adapter.setTree(null);
+    }
+    let getters = 0;
+    const unaware = {
+      onMessageAdded(value) {
+        Assert.equal(value.kind, undefined);
+      },
+    };
+    Object.defineProperty(unaware, "panoramaThreadBatchVersion", {
+      get() {
+        getters++;
+        return 1;
+      },
+    });
+    view.setListener(unaware);
+    try {
+      addMessage({ folderId: folders[0], messageId: "unaware" });
+    } finally {
+      view.clearListener();
+    }
+    Assert.equal(
+      getters,
+      0,
+      "Native admission never executes a capability getter"
+    );
+  }
+);
+
+add_task(
+  async function test_nativeOrdinaryFlatBatchReentrantHistoryAndRegistration() {
+    const folders = ordinaryBatchFolders("reentry");
+    const early = new LiveView();
+    early.initWithFolders(folders);
+    let nested = false;
+    early.setListener({
+      onMessageAdded(message) {
+        if (nested) return;
+        nested = true;
+        messageDB.getMessage(message.id).orFlags(Ci.nsMsgMessageFlags.Marked);
+        addMessage({ folderId: folders[1], messageId: "queued-next" });
+      },
+    });
+    const f = await ordinaryBatchAdapter(folders);
+    try {
+      const added = addMessage({
+        folderId: folders[0],
+        messageId: "captured-first",
+        flags: 0,
+        tags: "opaque",
+      });
+      Assert.equal(
+        f.payloads.length,
+        2,
+        "Each committed publication delivered once"
+      );
+      Assert.equal(f.payloads[0].rows.at(-1).after.id, added);
+      Assert.equal(
+        f.payloads[0].rows.at(-1).after.flags,
+        0,
+        "First facts precede reentry"
+      );
+      Assert.equal(f.payloads[0].rows.at(-1).after.tags, "opaque");
+      Assert.equal(
+        f.adapter._rowMap.find(row => row.message.id == added).message.flags,
+        Ci.nsMsgMessageFlags.Marked
+      );
+      Assert.ok(BigInt(f.payloads[1].batchId) > BigInt(f.payloads[0].batchId));
+      Assert.equal(f.events.filter(event => event[0] == "reset").length, 2);
+      const count = f.payloads.length;
+      f.view.clearListener();
+      addMessage({ folderId: folders[0], messageId: "detached" });
+      Assert.equal(
+        f.payloads.length,
+        count,
+        "Removed registration cannot receive a queued form"
+      );
+    } finally {
+      early.clearListener();
+      f.adapter.setTree(null);
+    }
+  }
+);
+
+add_task(async function test_nativeOrdinaryFlatBatchSourceErrorAndRetry() {
+  const folders = ordinaryBatchFolders("source-error");
+  const f = await ordinaryBatchAdapter(folders);
+  const connection = database.connectionForTests;
+  connection.executeSimpleSQL(
+    "CREATE TEMP TRIGGER ordinary_batch_abort BEFORE INSERT ON messages WHEN NEW.messageId = 'source-failure' BEGIN SELECT RAISE(ABORT, 'ordinary batch source failure'); END"
+  );
+  try {
+    Assert.throws(
+      () => addMessage({ folderId: folders[0], messageId: "source-failure" }),
+      error => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT
+    );
+    Assert.equal(await f.view.countMessages(), 0);
+    Assert.equal(f.payloads.length, 0);
+    Assert.deepEqual(f.events, []);
+  } finally {
+    connection.executeSimpleSQL("DROP TRIGGER ordinary_batch_abort");
+  }
+  try {
+    const added = addMessage({
+      folderId: folders[0],
+      messageId: "source-failure",
+    });
+    Assert.deepEqual(ordinaryBatchPairs(f.adapter), [[folders[0], added]]);
+    Assert.deepEqual(f.events, [["reset"]]);
+    Assert.equal(
+      f.payloads.length,
+      1,
+      "Retry publishes once with no failed-attempt event"
+    );
+    // A genuine native descriptor-domain failure must also roll back, not fall
+    // back to the ordinary callback after an opted-in recipient's preparation.
+    Assert.throws(
+      () =>
+        messageDB.addMessage(
+          folders[1],
+          "invalid-time",
+          [],
+          9e18,
+          "sender",
+          "recipient",
+          "",
+          "",
+          "subject",
+          0,
+          "",
+          Ci.nsMsgPriority.notSet
+        ),
+      /NS_ERROR_/
+    );
+    Assert.equal(await f.view.countMessages(), 1);
+    Assert.equal(f.payloads.length, 1);
+  } finally {
+    f.adapter.setTree(null);
+  }
+});
+
+add_task(async function test_nativeOrdinaryFlatBatchConsumerFailure() {
+  const folders = ordinaryBatchFolders("consumer-error");
+  const f = await ordinaryBatchAdapter(folders);
+  let invalidations = 0;
+  const invalidate = f.adapter.panoramaThreadBatchInvalidated;
+  f.adapter.panoramaThreadBatchInvalidated = () => {
+    invalidations++;
+    invalidate();
+  };
+  f.adapter._queryListener.panoramaThreadBatchInvalidated =
+    f.adapter.panoramaThreadBatchInvalidated;
+  f.view.setListener(f.adapter._queryListener);
+  f.tree.reset = () => {
+    throw new Error("intentional committed consumer failure");
+  };
+  const added = addMessage({
+    folderId: folders[0],
+    messageId: "committed-consumer-error",
+  });
+  Assert.equal(
+    messageDB.getMessage(added).messageId,
+    "committed-consumer-error"
+  );
+  Assert.equal(f.payloads.length, 1);
+  Assert.equal(invalidations, 1);
+  Assert.equal(f.adapter._liveView, null);
+  addMessage({ folderId: folders[1], messageId: "after-detach" });
+  Assert.equal(
+    f.payloads.length,
+    1,
+    "No resend or delivery after invalidation"
+  );
+});
+
+add_task(async function test_nativeOrdinaryFlatBatchPublicNewProjection() {
+  const folders = ordinaryBatchFolders("new-word");
+  const root = addMessage({
+    folderId: folders[0],
+    messageId: "new-root",
+    flags: Ci.nsMsgMessageFlags.New,
+  });
+  const f = await ordinaryBatchAdapter(folders);
+  try {
+    addMessage({
+      folderId: folders[1],
+      messageId: "new-child",
+      references: ["new-root"],
+      flags: 0,
+    });
+    Assert.equal(f.payloads[0].rows[0].before.flags, Ci.nsMsgMessageFlags.New);
+    Assert.equal(
+      f.adapter._rowMap.find(row => row.message.id == root).message.flags,
+      Ci.nsMsgMessageFlags.New
+    );
+    Assert.deepEqual(f.events, [["reset"]]);
+  } finally {
+    f.adapter.setTree(null);
   }
 });

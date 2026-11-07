@@ -74,6 +74,7 @@ class LiveViewBatchCapability final {
   JS::PersistentRooted<JSObject*> owner;
   JS::PersistentRooted<JS::Value> invalidator;
   const uint64_t generation;
+  bool enabled = true;
 
  private:
   ~LiveViewBatchCapability() = default;
@@ -153,6 +154,12 @@ struct LiveViewPublicStatus {
   nsTHashMap<nsMsgKey, Row> rows;
   nsTArray<RefPtr<LiveViewFolderStatusListener>> listeners;
   nsCString sourceId;
+  void Project(CapturedMessage& message) const {
+    auto row = rows.Lookup(message.id);
+    if (row && row.Data().raw.folderId == message.folderId) {
+      message.flags |= row.Data().flags & nsMsgMessageFlags::New;
+    }
+  }
   ~LiveViewPublicStatus() {
     for (const auto& listener : listeners) listener->Detach();
   }
@@ -424,7 +431,8 @@ static nsresult ReadBatchCapability(nsILiveViewListener* listener,
   }
   if (!version.get() || !version.get()->isDataDescriptor() ||
       !version.get()->value().isNumber() ||
-      version.get()->value().toNumber() != 1 || !generation.get() ||
+      (version.get()->value().toNumber() != 1 &&
+       version.get()->value().toNumber() != 0) || !generation.get() ||
       !generation.get()->isDataDescriptor() ||
       !generation.get()->value().isNumber() || !owner.get() ||
       !owner.get()->isDataDescriptor() || !owner.get()->value().isObject() ||
@@ -444,7 +452,9 @@ static nsresult ReadBatchCapability(nsILiveViewListener* listener,
   if (!ownerObject || js::IsProxy(ownerObject)) return NS_OK;
   output = new (fallible) LiveViewBatchCapability(cx, object, ownerObject,
                                                   callback, uint64_t(value));
-  return output ? NS_OK : NS_ERROR_OUT_OF_MEMORY;
+  if (!output) return NS_ERROR_OUT_OF_MEMORY;
+  output->enabled = version.get()->value().toNumber() == 1;
+  return NS_OK;
 }
 
 static bool BatchString(JSContext* cx, JS::Handle<JSObject*> object,
@@ -920,7 +930,8 @@ nsresult LiveView::CaptureQueryView(const CapturedLiveView* context,
   RefPtr<CapturedLiveView> captured = new (fallible) CapturedLiveView();
   NS_ENSURE_TRUE(captured, NS_ERROR_OUT_OF_MEMORY);
   captured->listener = mListener;
-  captured->capability = mBatchCapability;
+  captured->capability =
+      mBatchCapability && mBatchCapability->enabled ? mBatchCapability : nullptr;
   captured->attachment = mAttachmentGeneration;
   captured->query = mQueryGeneration;
   captured->configuration = mConfigurationGeneration;
@@ -936,7 +947,7 @@ nsresult LiveView::CaptureQueryView(const CapturedLiveView* context,
                            ? nsCString()
                            : SelectGroupSQL();
   captured->params = context ? context->params.Clone() : mParams.Clone();
-  if (mListener && mBatchCapability) {
+  if (mListener && mBatchCapability && mBatchCapability->enabled) {
     nsCOMPtr<mozIStorageStatement> roots, members;
     MOZ_TRY(Connection()->CreateStatement(captured->selectSQL,
                                           getter_AddRefs(roots)));
@@ -954,6 +965,7 @@ nsresult LiveView::CaptureQueryView(const CapturedLiveView* context,
       MOZ_TRY(roots->GetInt64(0, &key));
       NS_ENSURE_TRUE(key > 0 && key < nsMsgKey_None, NS_ERROR_FILE_CORRUPTED);
       MOZ_TRY(MessageDB().CaptureMessage(nsMsgKey(key), root.message));
+      if (mPublicStatus) mPublicStatus->Project(root.message);
       if (members) {
         mozStorageStatementScoper scoper(members);
         for (size_t i = 0; i < captured->params.Length(); ++i)
@@ -1022,9 +1034,15 @@ nsresult LiveView::CaptureQueryView(const CapturedLiveView* context,
 
 nsresult LiveView::CaptureThreadViewBeforeInsert(
     nsCOMPtr<nsISupports>& output) {
+  output = nullptr;
+  if (!MessageDB().mConversationGroupingEnabled &&
+      (!mListener || !mBatchCapability || !mBatchCapability->enabled ||
+       mGrouping != nsILiveView::UNTHREADED)) {
+    return NS_OK;
+  }
   RefPtr<CapturedLiveView> captured;
   MOZ_TRY(CaptureQueryView(nullptr, captured));
-  if (mMappedQuery && mBatchCapability) {
+  if (mMappedQuery && mBatchCapability && mBatchCapability->enabled) {
     MOZ_TRY(CaptureQueryView(mMappedQuery, captured->display));
     captured->display->original = mMappedQuery;
   }
@@ -1116,16 +1134,29 @@ nsresult LiveView::PrepareThreadBatch(const MessageThreadBatch& batch,
                  before->query != mQueryGeneration ||
                  before->configuration != mConfigurationGeneration))
     return NS_ERROR_NOT_AVAILABLE;
-  if (mListener && mBatchCapability && !before) return NS_ERROR_NOT_AVAILABLE;
+  if (mListener && mBatchCapability && mBatchCapability->enabled && !before)
+    return NS_ERROR_NOT_AVAILABLE;
   PreparedThreadBatch prepared;
   MOZ_TRY(MessageListener::PrepareThreadBatch(batch, prepared));
   if (!mListener) {
     output = std::move(prepared);
     return NS_OK;
   }
+  if (!MessageDB().mConversationGroupingEnabled && mPublicStatus) {
+    for (auto& row : prepared.captured.before) mPublicStatus->Project(row);
+    for (auto& row : prepared.captured.after) mPublicStatus->Project(row);
+  }
   LiveViewThreadBatchBuilder builder(*this, prepared, before);
   MOZ_TRY(builder.Prepare());
-  if (mListener && builder.changedMatching && !mBatchCapability)
+  if (!MessageDB().mConversationGroupingEnabled) {
+    // Unchanged peers are a completeness envelope, not publication events.
+    builder.matching = false;
+    for (const auto& row : builder.rows) {
+      if (!row.before) builder.matching = row.matchesAfter;
+    }
+  }
+  if (mListener && builder.changedMatching &&
+      (!mBatchCapability || !mBatchCapability->enabled))
     return NS_ERROR_NOT_AVAILABLE;
   AutoJSAPI jsapi;
   if (!jsapi.Init(PrivilegedJunkScope())) return NS_ERROR_FAILURE;
@@ -1142,7 +1173,7 @@ nsresult LiveView::PrepareThreadBatch(const MessageThreadBatch& batch,
   data->before = before;
   if (mListener && builder.matching) {
     Rooted<JSObject*> object(cx);
-    if (mBatchCapability) {
+    if (mBatchCapability && mBatchCapability->enabled) {
       Rooted<JSObject*> mapping(cx);
       if (!builder.Serialize(cx, mBatchCapability->generation, &object) ||
           !SerializeCapturedView(cx, *before, &mapping) ||
@@ -1476,7 +1507,8 @@ class CountMessagesListener final : public mozIStorageStatementCallback {
 NS_IMPL_ISUPPORTS(CountMessagesListener, mozIStorageStatementCallback)
 
 NS_IMETHODIMP LiveView::CountMessages(JSContext* cx, Promise** promise) {
-  if (mBatchCapability) MOZ_TRY(CaptureQueryView(nullptr, mCountQuery));
+  if (mBatchCapability && mBatchCapability->enabled)
+    MOZ_TRY(CaptureQueryView(nullptr, mCountQuery));
   if (!mCountStmt) {
     nsAutoCString sql("SELECT COUNT(");
     if (mGrouping == nsILiveView::THREADED) {
@@ -1931,7 +1963,8 @@ NS_IMETHODIMP LiveView::SelectMessages(JSContext* cx, Promise** promise) {
   AUTO_PROFILER_LABEL("LiveView::SelectMessages", MAILNEWS);
   ++mQueryGeneration;
   MOZ_TRY(RefreshPublicStatus());
-  if (mBatchCapability) MOZ_TRY(CaptureQueryView(nullptr, mMappedQuery));
+  if (mBatchCapability && mBatchCapability->enabled)
+    MOZ_TRY(CaptureQueryView(nullptr, mMappedQuery));
   if (mPendingStmt) {
     mPendingStmt->Cancel();
   }
@@ -2270,6 +2303,22 @@ void LiveView::OnMessageTagsChanged(nsIMsgDBHdr* oldMessage,
 NS_IMETHODIMP LiveView::SetListener(nsILiveViewListener* aListener) {
   RefPtr<LiveViewBatchCapability> capability;
   if (aListener) MOZ_TRY(ReadBatchCapability(aListener, capability));
+  if (aListener == mListener && capability && mBatchCapability &&
+      capability->object.get() == mBatchCapability->object.get() &&
+      capability->owner.get() == mBatchCapability->owner.get() &&
+      capability->generation == mBatchCapability->generation &&
+      &capability->invalidator.get().toObject() ==
+          &mBatchCapability->invalidator.get().toObject()) {
+    // Only enrollment changed on this exact listener. Preserve outstanding
+    // query/display snapshots and public-status attachments across real chunks.
+    mBatchCapability->enabled = capability->enabled;
+    if (mCountQuery &&
+        mCountQuery->viewGeneration == capability->generation &&
+        mCountQuery->configuration == mConfigurationGeneration) {
+      mMappedQuery = mCountQuery;
+    }
+    return NS_OK;
+  }
   bool sameOwner = capability && mBatchCapability &&
                    capability->owner.get() == mBatchCapability->owner.get();
   if (!sameOwner) {

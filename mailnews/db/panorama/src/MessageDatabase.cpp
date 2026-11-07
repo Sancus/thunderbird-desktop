@@ -84,6 +84,7 @@ struct MessageDatabase::QueuedMessageBatch {
     RefPtr<MessageListener> listener;
     nsCOMPtr<nsISupports> beforeViewData;
     PreparedThreadBatch prepared;
+    bool preparedPublication = false;
   };
   struct Flags {
     CapturedMessage before, after;
@@ -287,8 +288,12 @@ void MessageDatabase::DrainMessageBatches() {
           listener->DeliverThreadBatch(delivery.prepared);
           break;
         case QueuedMessageBatch::Kind::Publication:
-          listener->OnMessagePublishedCaptured(batch->after, batch->live,
-                                               batch->notifyLegacy);
+          if (delivery.preparedPublication) {
+            listener->DeliverThreadBatch(delivery.prepared);
+          } else {
+            listener->OnMessagePublishedCaptured(batch->after, batch->live,
+                                                 batch->notifyLegacy);
+          }
           break;
         case QueuedMessageBatch::Kind::Removed:
           listener->OnMessageRemovedCaptured(batch->before, batch->live);
@@ -2576,7 +2581,7 @@ nsresult MessageDatabase::InsertMessage(
   }
   MOZ_TRY(connection->BeginTransaction());
   nsresult rv = [&]() -> nsresult {
-    if (!staged && mConversationGroupingEnabled) {
+    if (!staged) {
       MOZ_TRY(CaptureThreadViewsBeforeInsert(*notification));
     }
     if (staged || restoring) {
@@ -2615,6 +2620,10 @@ nsresult MessageDatabase::InsertMessage(
     }
     nsMsgKey allocated;
     MOZ_TRY(DatabaseCore::GetNextMessageKey(allocated));
+    if (!staged && !mConversationGroupingEnabled) {
+      MOZ_TRY(CaptureOrdinaryThreadPeers(threadId ? threadId : allocated,
+                                         *notification, captured));
+    }
     if (newsLiveHeader) {
       message = new (fallible) Message(allocated);
       NS_ENSURE_TRUE(message, NS_ERROR_OUT_OF_MEMORY);
@@ -2900,6 +2909,7 @@ nsresult MessageDatabase::InsertMessage(
         }
       } else {
         MOZ_TRY(CaptureMessage(cached.key, notification->after));
+        MOZ_TRY(PrepareOrdinaryPublication(*notification, captured));
       }
     }
     if (news) {
@@ -2920,8 +2930,9 @@ nsresult MessageDatabase::InsertMessage(
     }
     if (notification) {
       notification->live = message;
-      if (notification->kind == QueuedMessageBatch::Kind::Thread) {
-        for (auto& delivery : notification->deliveries) {
+      for (auto& delivery : notification->deliveries) {
+        if (notification->kind == QueuedMessageBatch::Kind::Thread ||
+            delivery.preparedPublication) {
           delivery.prepared.publicationLive = message;
         }
       }
@@ -3552,9 +3563,7 @@ nsresult MessageDatabase::PublishMessageInternal(
           ValidateOnlineTransferDestination(*online, epoch, Some(uid), true));
     }
     MOZ_TRY(FetchMsg(key, cached));
-    if (mConversationGroupingEnabled) {
-      MOZ_TRY(CaptureThreadViewsBeforeInsert(*notification));
-    }
+    MOZ_TRY(CaptureThreadViewsBeforeInsert(*notification));
     cached.threadId = key;
     cached.threadParent = 0;
     if (!mConversationGroupingEnabled) {
@@ -3568,6 +3577,10 @@ nsresult MessageDatabase::PublishMessageInternal(
         cached.threadParent =
             MOZ_TRY(FindByMessageId(references.LastElement()));
       }
+    }
+    if (!mConversationGroupingEnabled) {
+      MOZ_TRY(CaptureOrdinaryThreadPeers(cached.threadId, *notification,
+                                         captured));
     }
     {
       nsCOMPtr<mozIStorageStatement> stmt;
@@ -3626,6 +3639,7 @@ nsresult MessageDatabase::PublishMessageInternal(
       MOZ_TRY(ConsumeProtoThreadFlagsInTransaction(key, cached.folderId,
                                                    cached.threadId));
       MOZ_TRY(CaptureMessage(key, notification->after));
+      MOZ_TRY(PrepareOrdinaryPublication(*notification, captured));
     }
     if (!mMsgCache.reserve(mMsgCache.count() + 1)) {
       return NS_ERROR_OUT_OF_MEMORY;
@@ -3633,8 +3647,9 @@ nsresult MessageDatabase::PublishMessageInternal(
     message = new (fallible) Message(key);
     NS_ENSURE_TRUE(message, NS_ERROR_OUT_OF_MEMORY);
     notification->live = message;
-    if (notification->kind == QueuedMessageBatch::Kind::Thread) {
-      for (auto& delivery : notification->deliveries) {
+    for (auto& delivery : notification->deliveries) {
+      if (notification->kind == QueuedMessageBatch::Kind::Thread ||
+          delivery.preparedPublication) {
         delivery.prepared.publicationLive = message;
       }
     }
@@ -10111,6 +10126,61 @@ nsresult MessageDatabase::ApplyThreadWordRemap(
       MOZ_TRY(stmt->BindInt64ByName("thread"_ns, oldThread));
       MOZ_TRY(stmt->Execute());
     }
+  }
+  return NS_OK;
+}
+
+// Ordinary publication retains the existing thread edges. Capture every physical
+// peer before the visible INSERT, even if a recipient filters that peer out.
+nsresult MessageDatabase::CaptureOrdinaryThreadPeers(
+    nsMsgKey threadId, QueuedMessageBatch& notification,
+    MessageThreadBatch& captured) {
+  bool enrolled = false;
+  for (const auto& delivery : notification.deliveries) {
+    enrolled |= bool(delivery.beforeViewData);
+  }
+  if (!enrolled) return NS_OK;
+  nsCOMPtr<mozIStorageStatement> statement;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "CaptureOrdinaryThreadPeers"_ns,
+      "SELECT id FROM messages WHERE threadId = :thread ORDER BY id"_ns,
+      getter_AddRefs(statement)));
+  mozStorageStatementScoper scope(statement);
+  MOZ_TRY(statement->BindInt64ByName("thread"_ns, threadId));
+  bool more;
+  nsresult rv;
+  while (NS_SUCCEEDED(rv = statement->ExecuteStep(&more)) && more) {
+    int64_t key;
+    MOZ_TRY(statement->GetInt64(0, &key));
+    NS_ENSURE_TRUE(key > 0 && key < nsMsgKey_None, NS_ERROR_FILE_CORRUPTED);
+    CapturedMessage row;
+    MOZ_TRY(CaptureMessage(nsMsgKey(key), row));
+    NS_ENSURE_TRUE(captured.before.AppendElement(std::move(row), fallible),
+                   NS_ERROR_OUT_OF_MEMORY);
+  }
+  return rv;
+}
+
+nsresult MessageDatabase::PrepareOrdinaryPublication(
+    QueuedMessageBatch& notification, MessageThreadBatch& captured) {
+  bool enrolled = false;
+  for (const auto& delivery : notification.deliveries) {
+    enrolled |= bool(delivery.beforeViewData);
+  }
+  if (!enrolled) return NS_OK;
+  captured.batchId = notification.id;
+  captured.publicationKey = notification.after.id;
+  captured.notifyLegacy = notification.notifyLegacy;
+  MOZ_TRY(CopyThreadCaptures(captured.before, captured.after));
+  CapturedMessage publication;
+  MOZ_TRY(CaptureMessage(notification.after.id, publication));
+  NS_ENSURE_TRUE(captured.after.AppendElement(std::move(publication), fallible),
+                 NS_ERROR_OUT_OF_MEMORY);
+  for (auto& delivery : notification.deliveries) {
+    if (!delivery.beforeViewData) continue;
+    MOZ_TRY(delivery.listener->PrepareThreadBatch(
+        captured, delivery.beforeViewData, delivery.prepared));
+    delivery.preparedPublication = true;
   }
   return NS_OK;
 }

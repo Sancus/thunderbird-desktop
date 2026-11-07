@@ -264,7 +264,8 @@ export class LiveViewDataAdapter extends TreeDataAdapter {
   _viewGeneration = 0;
   _queryGeneration = 0;
   // Native LiveView reads these own data properties only at attachment.
-  panoramaThreadBatchVersion = 1;
+  panoramaThreadBatchVersion = 0;
+  _flatQueryKnown = false;
   panoramaThreadBatchGeneration = 0;
   panoramaThreadBatchOwner = this;
   panoramaThreadBatchInvalidated = () => this._invalidateThreadBatch();
@@ -280,6 +281,8 @@ export class LiveViewDataAdapter extends TreeDataAdapter {
   constructor(liveView, grouping = Ci.nsILiveView.UNTHREADED) {
     super();
     this._threadBatchGrouping = grouping;
+    this.panoramaThreadBatchVersion =
+      grouping == Ci.nsILiveView.UNTHREADED ? 0 : 1;
     liveView.grouping = grouping;
     liveView.setListener(this);
     this._liveView = liveView;
@@ -338,6 +341,8 @@ export class LiveViewDataAdapter extends TreeDataAdapter {
       this._rowMap.length = 0;
       this._rowMap.length = count;
       this._clearFlatRowCache();
+      this._flatQueryKnown = true;
+      this._updateThreadBatchEnrollment();
       if (this._threadBatchGrouping != Ci.nsILiveView.UNTHREADED) {
         this._setBatchGroupMap(new Map());
       }
@@ -362,7 +367,7 @@ export class LiveViewDataAdapter extends TreeDataAdapter {
     const adapter = this;
     return {
       QueryInterface: ChromeUtils.generateQI(["nsILiveViewListener"]),
-      panoramaThreadBatchVersion: 1,
+      panoramaThreadBatchVersion: adapter.panoramaThreadBatchVersion,
       panoramaThreadBatchGeneration: adapter._viewGeneration,
       panoramaThreadBatchOwner: adapter,
       panoramaThreadBatchInvalidated: adapter.panoramaThreadBatchInvalidated,
@@ -380,6 +385,28 @@ export class LiveViewDataAdapter extends TreeDataAdapter {
         }
       },
     };
+  }
+
+  /**
+   * Advertises the existing batch capability only for a fully mapped flat query.
+   * An old dense map remains eligible while a replacement count is pending.
+   */
+  _updateThreadBatchEnrollment() {
+    if (this._threadBatchGrouping != Ci.nsILiveView.UNTHREADED) {
+      return;
+    }
+    const version = Number(
+      this._flatQueryKnown &&
+        Array.from(this._rowMap).every(row => Boolean(row?.message))
+    );
+    if (version == this.panoramaThreadBatchVersion) {
+      return;
+    }
+    this.panoramaThreadBatchVersion = version;
+    if (this._queryListener) {
+      this._queryListener.panoramaThreadBatchVersion = version;
+      this._liveView?.setListener(this._queryListener);
+    }
   }
 
   /**
@@ -2084,6 +2111,7 @@ export class LiveViewDataAdapter extends TreeDataAdapter {
     // We can get away with this because all rows are top level rows.
     // If we open one, _flatRowCache gets replaced.
     this._flatRowCache = this._rowMap;
+    this._updateThreadBatchEnrollment();
     this._tree?.invalidateRange(startIndex, endIndex);
   }
 }

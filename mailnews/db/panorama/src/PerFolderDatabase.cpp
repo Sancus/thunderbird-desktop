@@ -1627,7 +1627,7 @@ nsresult ParsedServerHdr::Check(bool writing) {
   if (mState == State::Publishing || (writing && mWriting))
     return NS_ERROR_IN_PROGRESS;
   if (NS_FAILED(mError)) return mError;
-  if (mState == State::Aborted) return NS_ERROR_NOT_AVAILABLE;
+  if (mState == State::Aborted) { NS_WARNING("CI051 diagnostic NOT_AVAILABLE"); return NS_ERROR_NOT_AVAILABLE; }
   MOZ_TRY(mOwner->ValidateParsedServerHdr(*this));
   if (writing) {
     MOZ_TRY(mOwner->CheckParsedServerWriteTransaction());
@@ -3675,6 +3675,7 @@ nsresult PerFolderDatabase::AppendPendingAttribute(
       attribute.name.EqualsLiteral("offlineMsgSize") ||
       attribute.name.EqualsLiteral("offlineMessageSize") ||
       attribute.name.EqualsLiteral("lineCount")) {
+    NS_WARNING("CI051 diagnostic NOT_AVAILABLE");
     return NS_ERROR_NOT_AVAILABLE;
   }
   if (attribute.name.EqualsLiteral("flags")) {

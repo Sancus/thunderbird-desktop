@@ -1730,6 +1730,7 @@ nsresult MessageDatabase::ReadMessageBodyState(nsMsgKey key,
     bool exists;
     MOZ_TRY(MessageExists(key, exists));
     NS_ENSURE_TRUE(!exists, NS_ERROR_FILE_CORRUPTED);
+    NS_WARNING("CI051 diagnostic NOT_AVAILABLE");
     return NS_ERROR_NOT_AVAILABLE;
   }
   int64_t folder, content, location;
@@ -3040,6 +3041,7 @@ nsresult MessageDatabase::SetStagedHeaderAttributes(
                      NS_ERROR_INVALID_ARG);
       if (attribute.name.EqualsLiteral("uidOnServer")) {
         // Only checked server confirmation may establish this binding.
+        NS_WARNING("CI051 diagnostic NOT_AVAILABLE");
         return NS_ERROR_NOT_AVAILABLE;
       }
       if (attribute.name.EqualsLiteral("storeToken")) {
@@ -7605,6 +7607,7 @@ nsresult MessageDatabase::GetMessageReferences(
   bool isNull;
   MOZ_TRY(stmt->GetIsNull(0, &isNull));
   if (isNull) {
+    NS_WARNING("CI051 diagnostic NOT_AVAILABLE");
     return NS_ERROR_NOT_AVAILABLE;
   }
   nsTArray<nsCString> result;
@@ -8995,6 +8998,7 @@ nsresult MessageDatabase::GetMessageKeyForServerUid(uint64_t folderId,
   MOZ_TRY(DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(folderId,
                                                                    current));
   if (current != epoch) {
+    NS_WARNING("CI051 diagnostic NOT_AVAILABLE");
     return NS_ERROR_NOT_AVAILABLE;
   }
   nsCOMPtr<mozIStorageStatement> stmt;
@@ -9028,6 +9032,7 @@ nsresult MessageDatabase::GetMessageKeyForServerUid(uint64_t folderId,
     found = static_cast<nsMsgKey>(storedKey);
   }
   if (found == nsMsgKey_None) {
+    NS_WARNING("CI051 diagnostic NOT_AVAILABLE");
     return NS_ERROR_NOT_AVAILABLE;
   }
   key = found;
@@ -9038,6 +9043,7 @@ nsresult MessageDatabase::BindMessageToServerUid(nsMsgKey key,
                                                  uint64_t folderId,
                                                  uint32_t epoch, uint32_t uid) {
   if (!key || key == nsMsgKey_None || !folderId || folderId > INT64_MAX) {
+    NS_WARNING("CI051 diagnostic NOT_AVAILABLE");
     return NS_ERROR_NOT_AVAILABLE;
   }
   NS_ENSURE_TRUE(DatabaseCore::sInstance, NS_ERROR_NOT_AVAILABLE);
@@ -9078,6 +9084,7 @@ nsresult MessageDatabase::BindMessageToServerUidInTransaction(
   MOZ_TRY(DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(folderId,
                                                                    current));
   if (current != epoch) {
+    NS_WARNING("CI051 diagnostic NOT_AVAILABLE");
     return NS_ERROR_NOT_AVAILABLE;
   }
   {
@@ -9095,6 +9102,7 @@ nsresult MessageDatabase::BindMessageToServerUidInTransaction(
     bool more;
     MOZ_TRY(stmt->ExecuteStep(&more));
     if (!more) {
+      NS_WARNING("CI051 diagnostic NOT_AVAILABLE");
       return NS_ERROR_NOT_AVAILABLE;
     }
   }

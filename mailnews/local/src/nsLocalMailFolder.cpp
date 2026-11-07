@@ -3056,6 +3056,7 @@ nsresult nsMsgLocalMailFolder::CompleteCopyMessage(nsIMsgDBHdr** liveHdr) {
                             (mCopyState->m_flags & carryOver)));
   }
   if (draft && !mCopyState->m_destDB) {
+    NS_WARNING("CI051 diagnostic NOT_AVAILABLE");
     return NS_ERROR_NOT_AVAILABLE;
   }
   mCopyState->m_sourceKey = nsMsgKey_None;

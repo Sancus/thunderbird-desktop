@@ -4766,6 +4766,7 @@ NS_IMETHODIMP nsImapMailFolder::ApplyFilterHit(nsIMsgFilter* filter,
           actionType != nsMsgFilterAction::Custom) {
         m_filterIdentityRefused = true;
         *applyMore = false;
+        NS_WARNING("CI051 diagnostic NOT_AVAILABLE");
         return NS_ERROR_NOT_AVAILABLE;
       }
 #endif
@@ -5864,7 +5865,7 @@ nsresult nsImapMailFolder::TweakHeaderFlags(nsIImapProtocol* protocol,
   NS_ENSURE_STATE(state);
   bool found;
   MOZ_TRY(state->HasMessage(m_curMsgUid, &found));
-  if (!found) return NS_ERROR_NOT_AVAILABLE;
+  if (!found) { NS_WARNING("CI051 diagnostic NOT_AVAILABLE"); return NS_ERROR_NOT_AVAILABLE; }
   imapMessageFlagsType serverFlags;
   MOZ_TRY(state->GetMessageFlagsByUid(m_curMsgUid, &serverFlags));
   uint32_t flags;
@@ -8946,7 +8947,7 @@ nsresult nsImapMailFolder::ValidateStreamSource(nsImapMailCopyState* state,
 
 nsresult nsImapMailFolder::ContinueStreamCopy(nsImapMailCopyState* state,
                                               nsresult status) {
-  if (m_copyState != state) return NS_ERROR_NOT_AVAILABLE;
+  if (m_copyState != state) { NS_WARNING("CI051 diagnostic NOT_AVAILABLE"); return NS_ERROR_NOT_AVAILABLE; }
   if (NS_SUCCEEDED(status) && state->m_curIndex < state->m_messages.Length()) {
     RefPtr<nsIMsgDBHdr> message = state->m_messages[state->m_curIndex];
     bool isRead;
@@ -9373,6 +9374,7 @@ nsresult nsImapMailFolder::AssociateAcceptedAppendObservation(nsImapUrl* url,
     MOZ_TRY(live->SetUint32Property("pseudoHdr", 0));
     return NS_OK;
   }
+  NS_WARNING("CI051 diagnostic NOT_AVAILABLE");
   return NS_ERROR_NOT_AVAILABLE;
 }
 
@@ -10943,14 +10945,14 @@ nsImapFolderCopyState::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
     rv = child->GetName(name);
     if (NS_FAILED(rv)) return Finish(rv);
     if (!name.Equals(m_curFolderName)) continue;
-    if (newMsgFolder) return Finish(NS_ERROR_NOT_AVAILABLE);
+    if (newMsgFolder) { NS_WARNING("CI051 diagnostic NOT_AVAILABLE"); return Finish(NS_ERROR_NOT_AVAILABLE); }
     newMsgFolder = child;
   }
-  if (!newMsgFolder) return Finish(NS_ERROR_NOT_AVAILABLE);
+  if (!newMsgFolder) { NS_WARNING("CI051 diagnostic NOT_AVAILABLE"); return Finish(NS_ERROR_NOT_AVAILABLE); }
   nsCOMPtr<nsIMsgFolder> parent;
   rv = newMsgFolder->GetParent(getter_AddRefs(parent));
   if (NS_FAILED(rv)) return Finish(rv);
-  if (parent != m_curDestParent) return Finish(NS_ERROR_NOT_AVAILABLE);
+  if (parent != m_curDestParent) { NS_WARNING("CI051 diagnostic NOT_AVAILABLE"); return Finish(NS_ERROR_NOT_AVAILABLE); }
   if (!m_newDestFolder) m_newDestFolder = newMsgFolder;
 
   nsTArray<RefPtr<nsIMsgFolder>> subFolders;
@@ -10966,7 +10968,7 @@ nsImapFolderCopyState::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
   nsCOMPtr<nsIMsgEnumerator> enumerator;
   rv = m_curSrcFolder->GetMessages(getter_AddRefs(enumerator));
   if (NS_FAILED(rv)) return Finish(rv);
-  if (!enumerator) return Finish(NS_ERROR_NOT_AVAILABLE);
+  if (!enumerator) { NS_WARNING("CI051 diagnostic NOT_AVAILABLE"); return Finish(NS_ERROR_NOT_AVAILABLE); }
   nsTArray<RefPtr<nsIMsgDBHdr>> messages;
   bool hasMore;
   rv = enumerator->HasMoreElements(&hasMore);
@@ -10975,7 +10977,7 @@ nsImapFolderCopyState::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
     nsCOMPtr<nsIMsgDBHdr> header;
     rv = enumerator->GetNext(getter_AddRefs(header));
     if (NS_FAILED(rv)) return Finish(rv);
-    if (!header) return Finish(NS_ERROR_NOT_AVAILABLE);
+    if (!header) { NS_WARNING("CI051 diagnostic NOT_AVAILABLE"); return Finish(NS_ERROR_NOT_AVAILABLE); }
     messages.AppendElement(header);
     rv = enumerator->HasMoreElements(&hasMore);
     if (NS_FAILED(rv)) return Finish(rv);
@@ -10994,6 +10996,7 @@ nsImapFolderCopyState::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
     if (m_completed) return m_status;
     if (!database || m_messageDestination || phase != m_messagePhase ||
         phaseSource != m_curSrcFolder || parent != m_curDestParent)
+      NS_WARNING("CI051 diagnostic NOT_AVAILABLE");
       return Finish(NS_ERROR_NOT_AVAILABLE);
     m_messageSource = phaseSource;
     m_messageDestination = newMsgFolder;

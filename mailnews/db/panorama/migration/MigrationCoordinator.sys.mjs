@@ -2626,6 +2626,7 @@ async function finishPanoramaProfileStartup(
   let operation;
   let journal;
   let createdSelection = false;
+  let target;
   try {
     operation = await pending;
     if (captureError) {
@@ -2648,7 +2649,6 @@ async function finishPanoramaProfileStartup(
       );
     }
     let origin;
-    let target;
     if (selected.mode === "migrate") {
       if (!captured.backup) {
         throw new Error(
@@ -2730,6 +2730,9 @@ async function finishPanoramaProfileStartup(
       );
       createdSelection = true;
       journal = await MigrationJournal.open(journalPath, selected.profilePath);
+      if (signal?.aborted) {
+        throw new DOMException("Migration cancelled", "AbortError");
+      }
       target = database.openProfileStartupTarget(operation, {
         mode: "migrate",
         profilePath: selected.profilePath,
@@ -2879,7 +2882,19 @@ async function finishPanoramaProfileStartup(
     }
     if (createdSelection) {
       try {
-        await requireStartupProfileRecovery(captured.profilePath);
+        const databaseFile = new FileUtils.File(
+          PathUtils.join(captured.profilePath, "panorama.sqlite")
+        );
+        if (!target && !startupEntryExists(databaseFile)) {
+          // This operation alone created the prepared selector. No target was
+          // created, so legacy can still use the untouched original profile.
+          // Retained work continues to require explicit recovery on opt-in.
+          await IOUtils.remove(
+            PathUtils.join(captured.profilePath, "panorama-profile.json")
+          );
+        } else {
+          await requireStartupProfileRecovery(captured.profilePath);
+        }
       } catch (secondary) {
         console.error(
           "Could not persist startup recovery selection",

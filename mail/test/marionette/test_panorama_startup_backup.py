@@ -521,6 +521,28 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.assertEqual(before[Path(source["summary"])],
                          (backup.parent / "root-0" / Path(source["summary"]).relative_to(self.profile)).read_bytes())
 
+        # Normal reuse consumes native data and durable identities, not the archive.
+        self.stop_application()
+        manifest_bytes = backup.read_bytes()
+        backup.write_bytes(b"A damaged archive must not block active native reuse\n")
+        self.start_same_profile(True)
+        self.assertEqual(selected["sourceId"], self.selection()["sourceId"])
+        self.assertEqual(headers, self.assert_message_after_activation(source))
+        self.assertEqual(selector, (self.profile / "panorama-profile.json").read_bytes())
+        self.assertEqual(journal, journal_path.read_bytes())
+        self.stop_application()
+        backup.write_bytes(manifest_bytes)
+        moved_archive = backup.parent.with_name("retained-archive")
+        backup.parent.replace(moved_archive)
+        self.assertFalse(backup.parent.exists())
+        self.start_same_profile(True)
+        self.assertEqual(selected["sourceId"], self.selection()["sourceId"])
+        self.assertEqual(headers, self.assert_message_after_activation(source))
+        self.assertEqual(selector, (self.profile / "panorama-profile.json").read_bytes())
+        self.assertEqual(journal, journal_path.read_bytes())
+        self.assertFalse(backup.parent.exists(), "Reuse must not recreate the archive")
+        self.assertEqual(manifest_bytes, (moved_archive / "manifest.json").read_bytes())
+
     def register_selected_profile(self):
         """Register the actual current path; XRE resolves it on the next startup."""
         name = "s526-" + uuid.uuid4().hex

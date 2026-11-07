@@ -149,9 +149,10 @@ export async function getMigrationProfileState(profilePath) {
 }
 
 /**
- * Validates the durable journal and archive of an active startup migration.
+ * Validates the durable journal and identities of an active startup migration.
  * Reads no original Mork files and does not resume or rewrite migration work.
  * Core separately checks the retained native receipts before startup completes.
+ * Recovery and restore verify the archive when they use its contents.
  *
  * @param {StartupMigrationProfileRecord} record - Validated active selector.
  * @returns {Promise<void>} Resolves when the durable recovery state matches.
@@ -203,15 +204,6 @@ async function validateStartupRecoveryRecord(record) {
     if (JSON.stringify(units) !== JSON.stringify(identity[name])) {
       throw new Error("Startup recovery journal changed committed units");
     }
-  }
-  const backup = await verifyMigrationBackup(
-    PathUtils.parent(identity.backup.path)
-  );
-  if (
-    backup.path !== identity.backup.path ||
-    backup.sha256 !== identity.backup.sha256
-  ) {
-    throw new Error("Startup recovery archive identity changed");
   }
 }
 

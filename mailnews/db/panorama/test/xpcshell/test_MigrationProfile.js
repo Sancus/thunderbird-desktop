@@ -848,7 +848,7 @@ add_task(async function test_getMigrationProfileStateRequiresDurableRecovery() {
         sources: [],
         books: [],
         caches: [],
-        backup: record.identity.backup,
+        backup: { ...record.identity.backup, sha256: "b".repeat(64) },
       }),
     ]) {
       await IOUtils.writeUTF8(journalPath, value);
@@ -856,10 +856,253 @@ add_task(async function test_getMigrationProfileStateRequiresDurableRecovery() {
       await Assert.rejects(
         getMigrationProfileState(input.profilePath),
         /JSON|recovery|exist|found/i,
-        "Corrupt, incomplete, cancelled or missing-archive progress refuses"
+        "Corrupt, incomplete, cancelled or changed-identity progress refuses"
       );
       Assert.deepEqual(await IOUtils.read(journalPath), journal);
       Assert.deepEqual(await IOUtils.read(input.path), selector);
     }
   });
 });
+
+add_task(async function test_getMigrationProfileStateDoesNotReadArchive() {
+  // Reader-only identities; ordinary startup tests cover actual native reuse.
+  const input = await startupSelector("migrated");
+  const journalPath = PathUtils.join(input.profilePath, "journal.json");
+  const backupPath = PathUtils.join(input.profilePath, "manifest.json");
+  input.record.identity.journalPath = journalPath;
+  input.record.identity.backup = { path: backupPath, sha256: "a".repeat(64) };
+  await IOUtils.writeJSON(input.path, input.record);
+  const state = {
+    version: 7,
+    stage: "complete",
+    cancelled: false,
+    profilePath: input.profilePath,
+    startup: {
+      bound: true,
+      databaseSourceId: input.record.identity.databaseSourceId,
+    },
+    sources: [],
+    books: [],
+    caches: [],
+    backup: input.record.identity.backup,
+  };
+  await IOUtils.writeJSON(journalPath, state);
+  const selector = await IOUtils.read(input.path);
+  const journal = await IOUtils.read(journalPath);
+  await withApplication(activatingApplication, async () => {
+    Assert.ok(!(await IOUtils.exists(backupPath)));
+    Assert.equal(
+      (await getMigrationProfileState(input.profilePath)).state,
+      "active"
+    );
+    await IOUtils.writeUTF8(
+      backupPath,
+      "Archive contents are not startup inputs"
+    );
+    const archive = await IOUtils.read(backupPath);
+    Assert.equal(
+      (await getMigrationProfileState(input.profilePath)).state,
+      "active"
+    );
+    Assert.deepEqual(await IOUtils.read(backupPath), archive);
+    Assert.deepEqual(await IOUtils.read(input.path), selector);
+    Assert.deepEqual(await IOUtils.read(journalPath), journal);
+    const changed = structuredClone(state);
+    changed.backup.sha256 = "b".repeat(64);
+    await IOUtils.writeJSON(journalPath, changed);
+    await Assert.rejects(
+      getMigrationProfileState(input.profilePath),
+      /incomplete or changed/,
+      "The durable backup identity remains mandatory without reading its archive"
+    );
+  });
+});
+
+/**
+ * Runs the public coordinator with a fault at the native target-open boundary.
+ * The real source copy, pending journal and prepared selector are persisted.
+ * Restores the component and temporary profile inputs before the next case.
+ *
+ * @param {"refused"|"cancelled"|"partial"} failure - Native open outcome.
+ * @returns {Promise<void>} Resolves after checking selector and retry behavior.
+ */
+async function checkStartupTargetFailure(failure) {
+  const { MockRegistrar } = ChromeUtils.importESModule(
+    "resource://testing-common/MockRegistrar.sys.mjs"
+  );
+  const { startPanoramaProfileAtStartup } = ChromeUtils.importESModule(
+    "resource:///modules/panorama/MigrationCoordinator.sys.mjs"
+  );
+  const profile = do_get_profile();
+  const profilePath = profile.path;
+  const directory = PathUtils.join(profilePath, "startup-open-failure");
+  const work = PathUtils.join(
+    profile.parent.path,
+    "panorama-migration-" + profile.leafName
+  );
+  const selector = PathUtils.join(profilePath, "panorama-profile.json");
+  const databasePath = PathUtils.join(profilePath, "panorama.sqlite");
+  const journalPath = PathUtils.join(work, "journal.json");
+  const branch = "mail.server.startupOpenFailure.";
+  const hadEnabled = Services.prefs.prefHasUserValue("mail.panorama.enabled");
+  const enabled = Services.prefs.getBoolPref("mail.panorama.enabled", false);
+  Assert.ok(!(await IOUtils.exists(work)));
+  Assert.ok(!(await IOUtils.exists(selector)));
+  Assert.ok(!(await IOUtils.exists(databasePath)));
+  await IOUtils.makeDirectory(directory);
+  const summary = PathUtils.join(directory, "Inbox.msf");
+  const body = PathUtils.join(directory, "Inbox");
+  await IOUtils.copy(do_get_file("data/migration.msf").path, summary);
+  await IOUtils.copy(do_get_file("data/migration").path, body);
+  const originalSummary = await IOUtils.read(summary);
+  const originalBody = await IOUtils.read(body);
+  const controller = new AbortController();
+  let opened = 0;
+  let settled = 0;
+  const operation = {
+    QueryInterface: ChromeUtils.generateQI(["nsISupports"]),
+  };
+  const fault =
+    failure === "cancelled"
+      ? new DOMException("Migration cancelled", "AbortError")
+      : Components.Exception(
+          "Native target admission refused",
+          Cr.NS_ERROR_NOT_AVAILABLE
+        );
+  const core = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDatabaseCore"]),
+    beginProfileStartup() {
+      return Promise.resolve(operation);
+    },
+    validateProfileStartup(actual) {
+      Assert.strictEqual(actual, operation);
+      return { profilePath, mode: "migrate" };
+    },
+    openProfileStartupTarget(actual) {
+      Assert.strictEqual(actual, operation);
+      Assert.ok(
+        new FileUtils.File(selector).exists(),
+        "Fault follows preparation"
+      );
+      Assert.ok(
+        new FileUtils.File(journalPath).exists(),
+        "Pending journal exists"
+      );
+      opened++;
+      if (failure === "partial") {
+        // A native open can create the target and then throw before returning it.
+        new FileUtils.File(databasePath).create(
+          Ci.nsIFile.NORMAL_FILE_TYPE,
+          0o600
+        );
+      } else if (failure === "cancelled") {
+        controller.abort();
+      }
+      throw fault;
+    },
+    async failProfileStartup(actual) {
+      Assert.strictEqual(actual, operation);
+      settled++;
+    },
+  };
+  const cid = MockRegistrar.registerEx(
+    "@mozilla.org/mailnews/database-core;1",
+    { shouldCreateInstance: false },
+    core
+  );
+  const originalOpen = MigrationJournal.open;
+  MigrationJournal.open = async function (...args) {
+    const journal = await originalOpen.apply(this, args);
+    if (failure === "cancelled" && new FileUtils.File(selector).exists()) {
+      controller.abort();
+    }
+    return journal;
+  };
+  try {
+    Services.prefs.setBoolPref("mail.panorama.enabled", true);
+    Services.prefs.setComplexValue(
+      branch + "directory",
+      Ci.nsIFile,
+      new FileUtils.File(directory)
+    );
+    Services.prefs.setCharPref(branch + "type", "none");
+    await Assert.rejects(
+      startPanoramaProfileAtStartup(controller.signal),
+      error =>
+        failure === "cancelled"
+          ? error.name === "AbortError"
+          : error.result === Cr.NS_ERROR_NOT_AVAILABLE,
+      "The original native refusal or cancellation is propagated"
+    );
+    const expectedOpens = failure === "cancelled" ? 0 : 1;
+    Assert.equal(opened, expectedOpens);
+    Assert.equal(settled, 1);
+    Assert.deepEqual(await IOUtils.read(summary), originalSummary);
+    Assert.deepEqual(await IOUtils.read(body), originalBody);
+    const journal = await IOUtils.read(journalPath);
+    Assert.equal((await IOUtils.readJSON(journalPath)).stage, "backup");
+    Assert.ok((await IOUtils.readJSON(journalPath)).lastError);
+    if (failure === "partial") {
+      Assert.ok(await IOUtils.exists(databasePath));
+      Assert.equal(
+        (await getMigrationProfileState(profilePath)).state,
+        "restore-required",
+        "A created target always requires recovery"
+      );
+    } else {
+      Assert.ok(!(await IOUtils.exists(databasePath)));
+      Assert.ok(!(await IOUtils.exists(selector)));
+      Services.prefs.setBoolPref("mail.panorama.enabled", false);
+      Assert.equal(
+        (await getMigrationProfileState(profilePath)).state,
+        "legacy",
+        "Untouched original data can start through the default legacy gate"
+      );
+    }
+    Services.prefs.setBoolPref("mail.panorama.enabled", true);
+    await Assert.rejects(
+      startPanoramaProfileAtStartup(),
+      /requires explicit recovery/,
+      "Retained migration work still forbids a silent opt-in retry"
+    );
+    Assert.equal(opened, expectedOpens, "A retry never opens another target");
+    Assert.deepEqual(await IOUtils.read(journalPath), journal);
+    Assert.deepEqual(await IOUtils.read(summary), originalSummary);
+    Assert.deepEqual(await IOUtils.read(body), originalBody);
+  } finally {
+    // These process-wide test replacements must be restored before another case.
+    MigrationJournal.open = originalOpen;
+    MockRegistrar.unregister(cid);
+    Services.prefs.deleteBranch(branch);
+    if (hadEnabled) {
+      Services.prefs.setBoolPref("mail.panorama.enabled", enabled);
+    } else {
+      Services.prefs.clearUserPref("mail.panorama.enabled");
+    }
+    await IOUtils.remove(work, { recursive: true, ignoreAbsent: true });
+    await IOUtils.remove(directory, { recursive: true, ignoreAbsent: true });
+    await IOUtils.remove(selector, { ignoreAbsent: true });
+    await IOUtils.remove(databasePath, { ignoreAbsent: true });
+  }
+}
+
+add_task(
+  { skip_if: () => AppConstants.platform === "win" },
+  async function test_startPanoramaProfileAtStartupWithPreTargetRefusal() {
+    await checkStartupTargetFailure("refused");
+  }
+);
+
+add_task(
+  { skip_if: () => AppConstants.platform === "win" },
+  async function test_startPanoramaProfileAtStartupWithPreTargetCancellation() {
+    await checkStartupTargetFailure("cancelled");
+  }
+);
+
+add_task(
+  { skip_if: () => AppConstants.platform === "win" },
+  async function test_startPanoramaProfileAtStartupWithPartialTarget() {
+    await checkStartupTargetFailure("partial");
+  }
+);

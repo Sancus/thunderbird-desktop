@@ -9604,6 +9604,16 @@ nsresult StartupServerSummaryInput(JSContext* cx, JS::Handle<JSObject*> source,
   NS_ENSURE_TRUE(inside && literal == output.path &&
                      output.id.Equals("server-summary:"_ns + relative),
                  NS_ERROR_FILE_ACCESS_DENIED);
+  if (historical) {
+    // The unchanged selected/journal bindings and native root identity are
+    // checked by CheckProfileActivation. This old metadata no longer imports
+    // anything; do not reopen its archived Mork document on ordinary reuse.
+    NS_ENSURE_TRUE(output.hash.Length() == 64, NS_ERROR_NOT_AVAILABLE);
+    for (char c : output.hash.View())
+      NS_ENSURE_TRUE((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'),
+                     NS_ERROR_NOT_AVAILABLE);
+    return NS_OK;
+  }
   if (!historical) {
     uint32_t matches = 0;
     for (const auto& server : operation.servers) {
@@ -11492,7 +11502,24 @@ nsresult DatabaseCore::CheckProfileActivation(
   JS::Rooted<JS::Value> expected(cx), actual(cx, JS::ObjectValue(*backup));
   MOZ_TRY(ImportMember(cx, identity, "backup", &expected));
   MOZ_TRY(StartupEqual(cx, expected, actual));
-  MOZ_TRY(StartupBackup(cx, operation, backup));
+  if (reusing) {
+    // The committed selector and durable complete journal already bind this
+    // backup identity. Ordinary reuse consumes native receipts, not the
+    // archive.
+    nsCString path, hash;
+    MOZ_TRY(StartupText(cx, backup, "path", path));
+    MOZ_TRY(StartupText(cx, backup, "sha256", hash));
+    NS_ENSURE_TRUE(!path.IsEmpty() && hash.Length() == 64,
+                   NS_ERROR_INVALID_ARG);
+    nsCOMPtr<nsIFile> named;
+    MOZ_TRY(NS_NewNativeLocalFile(path, getter_AddRefs(named)));
+    for (char c : hash.View())
+      NS_ENSURE_TRUE((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'),
+                     NS_ERROR_INVALID_ARG);
+  } else {
+    // First migration activation still consumes and verifies the full backup.
+    MOZ_TRY(StartupBackup(cx, operation, backup));
+  }
   JS::Rooted<JSObject*> originalInventory(cx);
   MOZ_TRY(StartupObject(cx, startup, "inventory", &originalInventory));
   JS::Rooted<JS::Value> retainedInventory(cx);
@@ -11603,9 +11630,8 @@ nsresult DatabaseCore::CheckProfileActivation(
                  retained.hash == native.sourceSha256;
     }
     if (reusing) {
-      auto archived = operation.backupFiles.Lookup(path);
-      NS_ENSURE_TRUE(archived && archived.Data() == native.sourceSha256,
-                     NS_ERROR_NOT_AVAILABLE);
+      // The retained inventory must match the committed native receipt below;
+      // an archived copy is neither readback authority nor a reuse dependency.
       JS::Rooted<JSObject*> retained(cx);
       uint32_t length;
       MOZ_TRY(ImportArray(cx, retainedInventory, &retained, length));
@@ -11957,15 +11983,13 @@ nsresult DatabaseCore::CheckProfileActivation(
       declaredPaths.Insert(path);
       NS_ENSURE_TRUE(state == "imported"_ns, NS_ERROR_NOT_AVAILABLE);
       nsCOMPtr<nsIFile> original;
-      if (reusing) {
-        auto archived = operation.backupFiles.Lookup(path);
-        NS_ENSURE_TRUE(archived && archived.Data() == hash,
-                       NS_ERROR_NOT_AVAILABLE);
-      } else {
+      if (!reusing) {
         MOZ_TRY(StartupContained(operation.profile, path,
                                  getter_AddRefs(original)));
         MOZ_TRY(StartupCheckHash(original, hash, size));
       }
+      // Reuse verifies the committed book/cache receipt below, not backup
+      // bytes.
       MOZ_TRY(StartupObject(cx, unit, "receipt", &saved));
       if (!strcmp(name, "books")) {
         JS::Rooted<JSObject*> publication(cx), published(cx);

@@ -4793,6 +4793,15 @@ class DeliveryCoreReferences : public testing::Test {
     // The ordinary journal records this verified backup before import. Retain
     // the same original identity from the prepared selector for final readback.
     ASSERT_EQ(NS_OK, copy(identity, state, "backup", "backup"));
+    JS::Rooted<JS::Value> nativeTarget(cx);
+    ASSERT_EQ(NS_OK, mCore->DescribeProfileStartup(cx, &nativeTarget));
+    ASSERT_TRUE(nativeTarget.isObject());
+    JS::Rooted<JSObject*> target(cx, &nativeTarget.toObject());
+    // Retain actual native root-summary bindings when this fixture has one.
+    ASSERT_EQ(NS_OK,
+              copy(target, startup, "serverSummaries", "serverSummaries"));
+    ASSERT_EQ(NS_OK,
+              copy(target, identity, "serverSummaries", "serverSummaries"));
     ASSERT_EQ(NS_OK,
               copy(input, startup, "databaseSourceId", "databaseSourceId"));
     value.setBoolean(true);
@@ -5180,6 +5189,172 @@ class DeliveryCoreReferences : public testing::Test {
     }
     if (completeCache) CompleteStartupRootCache(root, journal, raw);
     action(manager, server, message, prefs, accountKey);
+  }
+
+  void FaultStartupArchive(uint32_t mode) {
+    ASSERT_LE(mode, 2u);
+    ASSERT_TRUE(mStartupFixtureWork);
+    nsCOMPtr<nsIFile> archive, manifest;
+    ASSERT_EQ(NS_OK, mStartupFixtureWork->Clone(getter_AddRefs(archive)));
+    ASSERT_EQ(NS_OK, archive->AppendNative("root-0"_ns));
+    ASSERT_EQ(NS_OK, mStartupFixtureWork->Clone(getter_AddRefs(manifest)));
+    ASSERT_EQ(NS_OK, manifest->AppendNative("manifest.json"_ns));
+    if (mode == 0) {
+      ASSERT_EQ(NS_OK, archive->MoveToNative(mStartupFixtureWork,
+                                             "relocated-root-0"_ns));
+      ASSERT_EQ(NS_OK, manifest->MoveToNative(mStartupFixtureWork,
+                                              "relocated-manifest.json"_ns));
+    } else if (mode == 1) {
+      // These are only this test's newly created backup copies, not sources.
+      ASSERT_EQ(NS_OK, archive->Remove(true));
+      ASSERT_EQ(NS_OK, manifest->Remove(false));
+    } else {
+      nsCOMPtr<nsIFile> child;
+      ASSERT_EQ(NS_OK, archive->Clone(getter_AddRefs(child)));
+      ASSERT_EQ(NS_OK, child->AppendNative("corrupt-archive"_ns));
+      ASSERT_EQ(NS_OK, StartupWriteControl(child, "not an archived input"_ns));
+      ASSERT_EQ(NS_OK, StartupWriteControl(manifest, "{corrupt archive"_ns));
+    }
+  }
+
+  void CheckStartupReuseWithoutArchive(uint32_t mode) {
+    ASSERT_EQ(NS_OK, Start());
+    FolderImportSnapshot input;
+    nsCOMPtr<nsIFile> source;
+    ASSERT_EQ(NS_OK, PrepareNativeImport(input, getter_AddRefs(source)));
+    FolderImportReceipt receipt;
+    ASSERT_EQ(NS_OK, ImportNativeFile(source, input, receipt));
+    ASSERT_EQ(NS_OK, mCore->FolderDB().UpdateName(input.identity.folderId,
+                                                  "After import"_ns));
+    nsCOMPtr<nsIFile> journal, manifest;
+    nsCString path, valid, original, manifestBytes, backupHash;
+    ASSERT_EQ(NS_OK,
+              StartupReceiptControl(input, receipt, source,
+                                    getter_AddRefs(journal), path, valid));
+    ASSERT_EQ(NS_OK, JSONCacheReadFile(source, original));
+    ASSERT_EQ(NS_OK, mStartupFixtureWork->Clone(getter_AddRefs(manifest)));
+    ASSERT_EQ(NS_OK, manifest->AppendNative("manifest.json"_ns));
+    ASSERT_EQ(NS_OK, JSONCacheReadFile(manifest, manifestBytes));
+    ASSERT_EQ(NS_OK, StartupHashControl(manifestBytes, backupHash));
+    Stop();
+    FaultStartupArchive(mode);
+    ASSERT_FALSE(HasFatalFailure());
+    ASSERT_EQ(NS_OK, ArmSelectedStartup());
+    nsCString selected;
+    ASSERT_EQ(NS_OK, DescribeStartup(selected));
+    ASSERT_EQ(NS_OK, OpenStartup("reuse"));
+    ASSERT_EQ(NS_OK, CheckStartupActivation(false, &path));
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DatabaseCore::CheckAccountStartup());
+    for (uint32_t damagedMode = 0; damagedMode < 4; ++damagedMode) {
+      SCOPED_TRACE(damagedMode);
+      nsCString damaged(valid);
+      if (damagedMode == 0)
+        damaged.ReplaceSubstring("\"stage\":\"complete\"",
+                                 "\"stage\":\"validate\"");
+      if (damagedMode == 1)
+        damaged.ReplaceSubstring("\"cancelled\":false", "\"cancelled\":true");
+      if (damagedMode == 2)
+        damaged.ReplaceSubstring("\"bound\":true", "\"bound\":false");
+      if (damagedMode == 3) {
+        nsCString changedHash;
+        const nsCString changedManifest(manifestBytes + " "_ns);
+        ASSERT_EQ(NS_OK, StartupHashControl(changedManifest, changedHash));
+        ASSERT_NE(backupHash, changedHash);
+        damaged.ReplaceSubstring(backupHash.get(), changedHash.get());
+      }
+      ASSERT_NE(valid, damaged);
+      ASSERT_EQ(NS_OK, StartupWriteControl(journal, damaged));
+      EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, CheckStartupActivation(false, &path));
+      EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DatabaseCore::CheckAccountStartup());
+    }
+    ASSERT_EQ(NS_OK, StartupWriteControl(journal, "{"_ns));
+    EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, CheckStartupActivation(false, &path));
+    ASSERT_EQ(NS_OK, journal->Remove(false));
+    EXPECT_EQ(NS_ERROR_FILE_NOT_FOUND, CheckStartupActivation(false, &path));
+    ASSERT_EQ(NS_OK, StartupWriteControl(journal, valid));
+    ASSERT_FALSE(receipt.keys.IsEmpty());
+    const auto pair = receipt.keys[0];
+    nsCOMPtr<mozIStorageStatement> fault;
+    ASSERT_EQ(
+        NS_OK,
+        mConnection->CreateStatement(
+            "DELETE FROM folder_import_keys WHERE token=:token AND sourceKey=:key"_ns,
+            getter_AddRefs(fault)));
+    ASSERT_EQ(NS_OK,
+              fault->BindUTF8StringByName("token"_ns, input.identity.token));
+    ASSERT_EQ(NS_OK, fault->BindInt64ByName("key"_ns, pair.source));
+    ASSERT_EQ(NS_OK, fault->Execute());
+    fault = nullptr;
+    EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, CheckStartupActivation(false, &path));
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DatabaseCore::CheckAccountStartup());
+    ASSERT_EQ(
+        NS_OK,
+        mConnection->CreateStatement(
+            "INSERT INTO folder_import_keys(token,sourceKey,destinationKey) "
+            "VALUES(:token,:key,:destination)"_ns,
+            getter_AddRefs(fault)));
+    ASSERT_EQ(NS_OK,
+              fault->BindUTF8StringByName("token"_ns, input.identity.token));
+    ASSERT_EQ(NS_OK, fault->BindInt64ByName("key"_ns, pair.source));
+    ASSERT_EQ(NS_OK,
+              fault->BindInt64ByName("destination"_ns, pair.destination));
+    ASSERT_EQ(NS_OK, fault->Execute());
+    fault = nullptr;
+    ASSERT_EQ(NS_OK, CheckStartupActivation(true, &path));
+    EXPECT_EQ(NS_OK, DatabaseCore::CheckAccountStartup());
+    auto name = mCore->FolderDB().GetFolderName(input.identity.folderId);
+    ASSERT_TRUE(name.isOk());
+    EXPECT_EQ("After import"_ns, name.unwrap());
+    nsCString retained;
+    ASSERT_EQ(NS_OK, JSONCacheReadFile(source, retained));
+    EXPECT_EQ(original, retained);
+    ASSERT_EQ(NS_OK, mCore->GetSourceId(retained));
+    EXPECT_EQ(input.identity.databaseSourceId, retained);
+  }
+
+  void CheckStartupRootCacheReuseWithoutArchive() {
+    const auto original = EmptyImapRootSummary();
+    WithPreReadyStartupAccount(
+        [&](nsIMsgAccountManager* manager, auto*, auto*, auto*, const auto&) {
+          nsCOMPtr<nsIFile> journal;
+          ASSERT_EQ(NS_OK, mStartupFixtureWork->Clone(getter_AddRefs(journal)));
+          ASSERT_EQ(NS_OK, journal->AppendNative("journal.json"_ns));
+          nsCOMPtr<nsIFile> cache;
+          ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(cache)));
+          ASSERT_EQ(NS_OK, cache->AppendNative("folderCache.json"_ns));
+          nsCString path, sourceId, originalCache;
+          ASSERT_EQ(NS_OK, JSONCacheReadFile(cache, originalCache));
+          ASSERT_EQ(NS_OK, journal->GetNativePath(path));
+          ASSERT_EQ(NS_OK, mCore->GetSourceId(sourceId));
+          ASSERT_EQ(NS_OK, manager->UnloadAccounts());
+          Stop();
+          FaultStartupArchive(2);
+          ASSERT_FALSE(HasFatalFailure());
+          ASSERT_EQ(NS_OK, ArmSelectedStartup());
+          nsCString selected;
+          ASSERT_EQ(NS_OK, DescribeStartup(selected));
+          ASSERT_EQ(NS_OK, OpenStartup("reuse"));
+          ASSERT_EQ(NS_OK, CheckStartupActivation(false, &path));
+          EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+                    DatabaseCore::CheckAccountStartup());
+          ASSERT_EQ(NS_OK, CheckStartupActivation(true, &path));
+          EXPECT_EQ(NS_OK, DatabaseCore::CheckAccountStartup());
+          nsCString retained;
+          ASSERT_EQ(NS_OK, mCore->GetSourceId(retained));
+          EXPECT_EQ(sourceId, retained);
+          nsCOMPtr<nsIFile> summary;
+          ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(summary)));
+          ASSERT_EQ(NS_OK,
+                    summary->AppendNative("startup-account-store.msf"_ns));
+          ASSERT_EQ(NS_OK, JSONCacheReadFile(summary, retained));
+          EXPECT_EQ(original, retained);
+          ASSERT_EQ(NS_OK, JSONCacheReadFile(cache, retained));
+          EXPECT_EQ(originalCache, retained);
+          int64_t imports;
+          ASSERT_EQ(NS_OK, JSONCacheImportCount(imports));
+          EXPECT_EQ(1, imports);
+        },
+        &original, NS_OK, nullptr, false, true);
   }
 
   // Real native import/receipt/backup and factory controls. Raw Mork/body
@@ -24395,6 +24570,22 @@ TEST_F(DeliveryCoreReferences,
   int64_t size;
   ASSERT_EQ(NS_OK, source->GetFileSize(&size));
   EXPECT_EQ(int64_t(sizeof("obsolete Mork has changed") - 1), size);
+}
+
+TEST_F(DeliveryCoreReferences, StartupMigratedReuseWithoutMovedArchive) {
+  CheckStartupReuseWithoutArchive(0);
+}
+
+TEST_F(DeliveryCoreReferences, StartupMigratedReuseWithoutMissingArchive) {
+  CheckStartupReuseWithoutArchive(1);
+}
+
+TEST_F(DeliveryCoreReferences, StartupMigratedReuseWithoutCorruptArchive) {
+  CheckStartupReuseWithoutArchive(2);
+}
+
+TEST_F(DeliveryCoreReferences, StartupRootSummaryCacheReuseWithoutArchive) {
+  CheckStartupRootCacheReuseWithoutArchive();
 }
 
 TEST_F(DeliveryCoreReferences,

@@ -8,6 +8,7 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 
+from marionette_driver import Wait
 from marionette_harness import MarionetteTestCase
 from mozprofile import Profile
 
@@ -699,6 +700,305 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
         self.assert_source_hashes()
         self.assert_receipt_keys()
         self.run_s717_policy_rebuild()
+        self.run_s401_imported_conversation()
+
+    def s401_operation(self, phase):
+        """Use receipt-bound headers, public conversation opening and a real move."""
+        result = self.marionette.execute_async_script(
+            r"""
+            const [f, phase] = arguments;
+            const done = arguments[arguments.length - 1];
+            (async () => {
+                const { MailServices } = ChromeUtils.importESModule('resource:///modules/MailServices.sys.mjs');
+                const { getMailSearchService, closeMailSearch } = ChromeUtils.importESModule(
+                    'resource:///modules/panorama/MailSearch.sys.mjs'
+                );
+                const { ConversationOpener } = ChromeUtils.importESModule(
+                    'resource:///modules/ConversationOpener.sys.mjs'
+                );
+                const root = Services.wm.getMostRecentWindow('mail:3pane');
+                const tabmail = root.document.getElementById('tabmail');
+                const core = Cc['@mozilla.org/mailnews/database-core;1'].getService(Ci.nsIDatabaseCore);
+                const require = (condition, message) => {
+                    if (!condition) { throw new Error('S401: ' + message); }
+                };
+                const physical = header => ({key: header.messageKey, folderId: header.folder.id,
+                    folderURI: header.folder.URI, messageId: header.messageId});
+                const locate = row => {
+                    const folder = MailServices.folderLookup.getFolderForURL(row.folderURI);
+                    require(folder && folder.id === row.folderId, 'original physical folder');
+                    const header = folder.GetMessageHeader(row.key);
+                    require(header && header.messageId === row.messageId, 'receipt key, never Message-ID lookup');
+                    require(core.messageDB.getSearchState(row.key).folderId === row.folderId,
+                        'current native folder/key membership');
+                    return header;
+                };
+                require(core.sourceId === f.sourceId && f.s401.sourceId === f.sourceId, 'original native incarnation');
+                require(Services.dirsvc.get('ProfD', Ci.nsIFile).path === f.profile, 'original retained profile');
+                let state = root.__s401ImportedConversation;
+                if (phase === 'cleanup' && !state) { return {ownedStateAbsent: true}; }
+                if (phase === 'inputs') {
+                    require(!state, 'one owned conversation phase');
+                    state = {owner: f.work, tabs: [...tabmail.tabInfo], flags: [],
+                        members: f.s401.members.map(row => ({...row})), selected: {...f.s401.selected}, moved: false};
+                    root.__s401ImportedConversation = state;
+                    for (const item of f.s401.folders) {
+                        const folder = MailServices.folderLookup.getFolderForURL(item.folderURI);
+                        require(folder && folder.id === item.folderId, 'retained imported folder identity');
+                        require(folder.flags & Ci.nsMsgFolderFlags.Junk, 'original trial exclusion');
+                        state.flags.push({folder, flags: folder.flags});
+                        folder.clearFlag(Ci.nsMsgFolderFlags.Junk);
+                    }
+                }
+                require(state && state.owner === f.work, 'owned state custody');
+                /**
+                 * Move exactly one captured physical header and measure its new key.
+                 * @param {nsIMsgDBHdr} header - Current owned imported selection.
+                 * @param {nsIMsgFolder} destination - Owned target folder.
+                 * @returns {Promise<{key: number, folderId: number,
+                 *   folderURI: string, messageId: string}>} Measured destination.
+                 */
+                async function move(header, destination) {
+                    const source = physical(header);
+                    const events = [];
+                    const observer = {
+                        msgsMoveCopyCompleted(isMove, sources, target, messages) {
+                            if (target.URI === destination.URI) {
+                                events.push({isMove, sources: sources.map(physical), keys: messages.map(item => item.messageKey)});
+                            }
+                        },
+                    };
+                    const completion = Promise.withResolvers();
+                    const listener = {
+                        QueryInterface: ChromeUtils.generateQI(['nsIMsgCopyServiceListener']),
+                        onStartCopy() {}, onProgress() {}, setMessageKey() {}, getMessageId() { return null; },
+                        onStopCopy(status) {
+                            if (Components.isSuccessCode(status)) { completion.resolve(); }
+                            else { completion.reject(Components.Exception('S401 physical move failed', status)); }
+                        },
+                    };
+                    MailServices.mfn.addListener(observer, MailServices.mfn.msgsMoveCopyCompleted);
+                    try {
+                        MailServices.copy.copyMessages(header.folder, [header], destination, true, listener, null, false);
+                        await completion.promise;
+                    } finally {
+                        MailServices.mfn.removeListener(observer);
+                    }
+                    require(events.length === 1 && events[0].isMove && events[0].keys.length === 1,
+                        'one actual physical move callback');
+                    require(JSON.stringify(events[0].sources) === JSON.stringify([source]), 'exact moved source copy');
+                    const current = physical(destination.GetMessageHeader(events[0].keys[0]));
+                    require(current.folderId === destination.id && current.messageId === source.messageId,
+                        'measured native destination header');
+                    require(current.folderURI !== source.folderURI, 'move changes physical location');
+                    return {...current, source, events};
+                }
+                if (phase === 'cleanup') {
+                    const errors = [];
+                    try {
+                        for (const tab of [...tabmail.tabInfo]) {
+                            if (!state.tabs.includes(tab)) { tabmail.closeTab(tab); }
+                        }
+                        if (state.moved) {
+                            const original = f.s401.selected;
+                            const folder = MailServices.folderLookup.getFolderForURL(original.folderURI);
+                            const restored = await move(locate(state.selected), folder);
+                            require(restored.folderURI === original.folderURI && restored.messageId === original.messageId,
+                                'owned moved message returned to original source folder');
+                            state.moved = false;
+                        }
+                    } catch (error) { errors.push(error); }
+                    try {
+                        for (const {folder, flags} of state.flags) {
+                            folder.flags = flags;
+                            require(folder.flags === flags, 'owned folder policy restored');
+                        }
+                    } catch (error) { errors.push(error); }
+                    try { await closeMailSearch(); } catch (error) { errors.push(error); }
+                    if (errors.length) { throw new AggregateError(errors, 'S401 cleanup failed'); }
+                    delete root.__s401ImportedConversation;
+                    return {closedTabs: true, flagsRestored: true, moveRestored: !state.moved};
+                }
+                const service = await getMailSearchService();
+                if (phase === 'inputs') {
+                    require(state.members.length === 6 && new Set(state.members.map(row => row.key)).size === 6,
+                        'complete distinct imported physical set');
+                    for (const row of state.members) {
+                        const header = locate(row);
+                        require(header.numReferences === (row.oldKey === 1 ? 0 : 1), 'actual persisted imported References');
+                        if (row.oldKey === 3) {
+                            require(header.getStringReference(0) === 's40101@invalid', 'actual imported parent reference');
+                        }
+                    }
+                    require(state.selected.messageId === f.s401.peer.messageId && state.selected.key !== f.s401.peer.key,
+                        'duplicate Message-ID peer is physically distinct');
+                    const history = [];
+                    for (let batch = 0; batch < 200; batch++) {
+                        const progress = await service.update({limit: 500});
+                        history.push(progress);
+                        if (!progress.moreWork) { break; }
+                    }
+                    require(history.length && !history.at(-1).moreWork && !history.at(-1).pending,
+                        'bounded imported current indexing settled');
+                    return {members: state.members, selected: state.selected, history,
+                        profile: f.profile, sourceId: core.sourceId, pid: Services.appinfo.processID};
+                }
+                if (phase === 'move') {
+                    if (state.tab && tabmail.tabInfo.includes(state.tab)) { tabmail.closeTab(state.tab); }
+                    const archive = f.s401.folders.find(row => row.role === 'Archive');
+                    const destination = MailServices.folderLookup.getFolderForURL(archive.folderURI);
+                    const before = {...state.selected};
+                    const measured = await move(locate(before), destination);
+                    state.selected = {...before, ...measured};
+                    state.members = state.members.map(row => row.key === before.key ? {...row, ...measured} : row);
+                    state.moved = true;
+                    require(state.members.filter(row => row.messageId === before.messageId).length === 3,
+                        'all repeated-ID peers retained after move');
+                    return {before, after: state.selected, members: state.members, events: measured.events};
+                }
+                if (phase === 'open') {
+                    const header = locate(state.selected);
+                    const snapshot = await service.getConversationForHeader(header);
+                    require(snapshot.status === 'ready' && snapshot.sourceId === f.sourceId &&
+                        snapshot.selectedId === String(state.selected.key), 'receipt-bound conversation snapshot');
+                    require(snapshot.excludedCount === 0, 'no hidden imported member');
+                    require(JSON.stringify(snapshot.items.map(row => Number(row.id)).sort((a,b) => a-b)) ===
+                        JSON.stringify(state.members.map(row => row.key).sort((a,b) => a-b)), 'complete six-member conversation');
+                    require(physical(snapshot.selectedMessage).folderId === state.selected.folderId,
+                        'snapshot selected exact physical folder');
+                    state.tab = await new ConversationOpener(root).openConversationForMessages([header]);
+                    require(state.tab && tabmail.tabInfo.includes(state.tab), 'public opener created real conversation tab');
+                    return {selected: state.selected, members: state.members,
+                        ids: snapshot.items.map(row => row.id), mode: state.tab.mode.name};
+                }
+                throw new Error('Unknown S401 phase: ' + phase);
+            })().then(value => done({value}), error => done({error: {
+                name: error.name, message: error.message, result: error.result, stack: error.stack,
+                errors: error.errors?.map(item => String(item)),
+            }}));
+            """,
+            script_args=[self.fixture, phase],
+            script_timeout=120000,
+        )
+        self.assertNotIn("error", result, json.dumps(result, ensure_ascii=True))
+        return result["value"]
+
+    def s401_reader(self):
+        """Read the actual synthetic view and MIME reader after public opening."""
+        return self.marionette.execute_script(
+            r"""
+            const root = Services.wm.getMostRecentWindow('mail:3pane');
+            const state = root.__s401ImportedConversation;
+            const pane = state.tab.chromeBrowser.contentWindow;
+            const selected = pane.gDBView?.hdrForFirstSelectedMessage;
+            const reader = pane.messageBrowser?.contentWindow;
+            const body = reader?.getMessagePaneBrowser()?.contentDocument?.body?.textContent;
+            if (!pane.dbViewWrapperListener.allMessagesLoaded || pane.gDBView.numSelected !== 1 ||
+                !selected || !reader.gMessage || !body?.includes(arguments[0])) { return null; }
+            const physical = header => ({key: header.messageKey, folderId: header.folder.id,
+                folderURI: header.folder.URI, messageId: header.messageId});
+            return {rows: Array.from({length: pane.gDBView.rowCount}, (_, i) => physical(pane.gDBView.getMsgHdrAt(i))),
+                selected: physical(selected), reader: physical(reader.gMessage), body,
+                synthetic: pane.gViewWrapper.isSynthetic};
+            """,
+            script_args=[self.fixture["s401"]["bodyNeedle"]],
+        )
+
+    def run_s401_imported_conversation(self):
+        """Verify six genuine imported members and their exact selected copy after move."""
+        c = self.fixture["s401"]
+        self.assertEqual(c["version"], 1)
+        self.assertEqual(c["sourceId"], self.fixture["sourceId"])
+        journal = json.loads(Path(c["journalPath"]).read_text(encoding="utf-8"))
+        journal_hash = self.digest(Path(c["journalPath"]))
+        self.assertEqual(len(c["sourceHashes"]), 9)
+        for row in c["sourceHashes"]:
+            self.assertEqual(self.digest(Path(row["path"])), row["sha256"])
+        self.assertEqual(Path(journal["profilePath"]).resolve(), self.profile)
+        self.assertEqual(len(journal["sources"]), 3)
+        mapped = []
+        for source in journal["sources"]:
+            self.assertEqual(source["state"], "imported")
+            self.assertEqual(source["databaseSourceId"], c["sourceId"])
+            self.assertEqual(set(dict(source["receipt"]["keys"])), {1, 3})
+            self.assertIn(source["receipt"], c["receipts"])
+            for old_key, current_key in source["receipt"]["keys"]:
+                row = next(
+                    row
+                    for row in c["members"]
+                    if row["sourceFolderId"] == source["id"] and row["oldKey"] == old_key
+                )
+                self.assertEqual(current_key, row["key"])
+                self.assertEqual(row["folderId"], source["receipt"]["folderId"])
+                mapped.append(current_key)
+        self.assertEqual(set(mapped), {row["key"] for row in c["members"]})
+        self.assertEqual(len(mapped), 6)
+        self.assertEqual(c["selected"]["role"], "Sent")
+        self.assertEqual(
+            c["selected"],
+            next(row for row in c["members"] if row["role"] == "Sent" and row["oldKey"] == 1),
+        )
+        self.assertEqual(
+            c["peer"],
+            next(row for row in c["members"] if row["role"] == "Inbox" and row["oldKey"] == 1),
+        )
+        self.assertEqual(c["selected"]["messageId"], c["peer"]["messageId"])
+        self.assertNotEqual(c["selected"]["key"], c["peer"]["key"])
+        failure = None
+        try:
+            inputs = self.s401_operation("inputs")
+            self.record("s401-imported-inputs", inputs)
+            self.assertEqual(inputs["members"], c["members"])
+            self.assertEqual(inputs["selected"], c["selected"])
+            for phase in ("imported", "moved"):
+                if phase == "moved":
+                    move = self.s401_operation("move")
+                    self.record("s401-physical-move", move)
+                    self.assertEqual(move["before"], c["selected"])
+                    self.assertNotEqual(move["before"]["folderURI"], move["after"]["folderURI"])
+                    self.assertEqual(move["after"]["messageId"], c["selected"]["messageId"])
+                opened = self.s401_operation("open")
+                reader = Wait(self.marionette, timeout=60).until(lambda driver: self.s401_reader())
+                expected = [
+                    {key: row[key] for key in ("key", "folderId", "folderURI", "messageId")}
+                    for row in opened["members"]
+                ]
+                selected = {
+                    key: opened["selected"][key]
+                    for key in ("key", "folderId", "folderURI", "messageId")
+                }
+                self.assertIs(reader["synthetic"], True)
+                self.assertEqual(
+                    sorted(reader["rows"], key=lambda row: row["key"]),
+                    sorted(expected, key=lambda row: row["key"]),
+                )
+                self.assertEqual(reader["selected"], selected)
+                self.assertEqual(reader["reader"], selected)
+                self.assertEqual(len(reader["rows"]), 6)
+                self.assertNotEqual(reader["selected"]["key"], c["peer"]["key"])
+                self.assertIn(c["bodyNeedle"], reader["body"])
+                self.assertEqual(
+                    {row["folderURI"] for row in reader["rows"]},
+                    {row["folderURI"] for row in c["folders"]},
+                )
+                self.record(
+                    "s401-" + phase + "-conversation-reader", {"opened": opened, "reader": reader}
+                )
+                self.assertEqual(self.digest(Path(c["journalPath"])), journal_hash)
+                for row in c["sourceHashes"]:
+                    self.assertEqual(self.digest(Path(row["path"])), row["sha256"])
+            self.assert_source_hashes()
+            self.assert_receipt_keys()
+        except BaseException as error:
+            failure = error
+            raise
+        finally:
+            try:
+                self.record("s401-cleanup", self.s401_operation("cleanup"))
+            except BaseException as cleanup_error:
+                if failure is not None:
+                    raise cleanup_error from failure
+                raise
 
     def s717_operation(self, phase):
         """Use actual native services/readers and preserve operation and close errors."""

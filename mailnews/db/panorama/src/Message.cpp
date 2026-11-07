@@ -18,6 +18,7 @@
 #include "nsIMsgAccountManager.h"
 #include "nsIMsgFolder.h"
 #include "nsIMsgNewsFolder.h"
+#include "nsMsgFolderFlags.h"
 #include "nsMsgMessageFlags.h"
 #include "nsMsgUtils.h"
 #include "nsString.h"
@@ -144,7 +145,29 @@ NS_IMETHODIMP Message::GetIsKilled(bool* isKilled) {
 }
 
 NS_IMETHODIMP Message::MarkRead(bool read) {
-  return MessageDB().SetMessageFlag(mKey, nsMsgMessageFlags::Read, read);
+  RefPtr<DatabaseCore> core = DatabaseCore::sInstance;
+  NS_ENSURE_TRUE(core && DatabaseCore::sConnection && core->mMessageDatabase,
+                 NS_ERROR_NOT_AVAILABLE);
+  RefPtr<MessageDatabase> messages = core->mMessageDatabase;
+  uint32_t flags;
+  MOZ_TRY(messages->GetMessageFlags(mKey, flags));
+  uint32_t nextFlags =
+      read ? flags | nsMsgMessageFlags::Read : flags & ~nsMsgMessageFlags::Read;
+  if ((flags ^ nextFlags) & nsMsgMessageFlags::Read) {
+    uint64_t folderId;
+    MOZ_TRY(messages->GetMessageFolderId(mKey, folderId));
+    if (folderId) {
+      uint32_t folderFlags = MOZ_TRY(core->FolderDB().GetFolderFlags(folderId));
+      if (folderFlags & nsMsgFolderFlags::Newsgroup) {
+        // Ordinary news folder reads arrive through this header API. Clear its
+        // stored New bit in the same transaction as Read and the news read set.
+        nextFlags &= ~nsMsgMessageFlags::New;
+      }
+    }
+  }
+  // Generic header setters retain their raw New bit; folder MarkRead below
+  // owns the separate facade operation. Do not open or revive a folder wrapper.
+  return messages->SetMessageFlags(mKey, nextFlags);
 }
 
 NS_IMETHODIMP Message::MarkFlagged(bool flagged) {

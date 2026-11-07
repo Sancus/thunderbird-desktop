@@ -619,7 +619,11 @@ add_task(async function test_savedSearchCachedHitsDoNotHideInvalidTerms() {
     false
   );
   first.msgDatabase.refreshCache(saved.virtualFolder.URI, [message.messageKey]);
-  saved.searchString = "AND (subject,unsupported-operation,scope)";
+  // Model invalid persisted input without weakening the ordinary wrapper setter.
+  saved.virtualFolder.msgDatabase.dBFolderInfo.setCharProperty(
+    "searchStr",
+    "AND (subject,unsupported-operation,scope)"
+  );
   Assert.throws(() => getMessagesInFolder(saved.virtualFolder), /NS_ERROR/);
   saved.searchString = "ALL";
   assertSavedSearchMembers(saved.virtualFolder, [message]);

@@ -1040,6 +1040,32 @@ async function s376MenuAttachment(name, body) {
   return { selectedFolder, header, attachment };
 }
 
+/**
+ * Create a detach target and clean only downloads and files owned by this case.
+ *
+ * @returns {Promise<string>} The owned target directory.
+ */
+async function s376MenuDirectory() {
+  const directory = await IOUtils.createUniqueDirectory(
+    PathUtils.tempDir,
+    "s376-detach"
+  );
+  registerCleanupFunction(async () => {
+    const { Downloads } = ChromeUtils.importESModule(
+      "resource://gre/modules/Downloads.sys.mjs"
+    );
+    const list = await Downloads.getList(Downloads.ALL);
+    for (const download of await list.getAll()) {
+      if (PathUtils.parent(download.target.path) == directory) {
+        await list.remove(download);
+        await download.finalize(true);
+      }
+    }
+    await IOUtils.remove(directory, { recursive: true });
+  });
+  return directory;
+}
+
 add_task(async function test_nativeDetachKeepsSelectedPhysicalMessage() {
   const first = await s376MenuAttachment(
     "S376DetachSelected",
@@ -1053,11 +1079,7 @@ add_task(async function test_nativeDetachKeepsSelectedPhysicalMessage() {
   const { AttachmentInfo } = ChromeUtils.importESModule(
     "resource:///modules/AttachmentInfo.sys.mjs"
   );
-  const directory = await IOUtils.createUniqueDirectory(
-    PathUtils.tempDir,
-    "s376-detach"
-  );
-  registerCleanupFunction(() => IOUtils.remove(directory, { recursive: true }));
+  const directory = await s376MenuDirectory();
   await be_in_folder(first.selectedFolder);
   await select_click_row(0);
   await AttachmentInfo.detachAttachments(
@@ -1133,5 +1155,231 @@ add_task(async function test_attachmentPermissionsAndEncryptionGatesRemain() {
   Assert.equal(
     new TextDecoder().decode(await attachment.fetchAttachment()),
     "unchanged guarded attachment"
+  );
+});
+
+add_task(async function test_modifyRejectsAnotherPhysicalParent() {
+  const first = await s376MenuAttachment(
+    "S376MismatchFirst",
+    "first exact physical part"
+  );
+  const other = await s376MenuAttachment(
+    "S376MismatchOther",
+    "other exact physical part"
+  );
+  const { AttachmentInfo } = ChromeUtils.importESModule(
+    "resource:///modules/AttachmentInfo.sys.mjs"
+  );
+  const directory = await s376MenuDirectory();
+  await Assert.rejects(
+    AttachmentInfo.deleteAttachments(other.header, [first.attachment]),
+    error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+  );
+  await Assert.rejects(
+    AttachmentInfo.detachAttachments(
+      other.header,
+      [first.attachment],
+      directory
+    ),
+    error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+  );
+  Assert.deepEqual(await IOUtils.getChildren(directory), []);
+  Assert.ok(
+    first.selectedFolder.msgDatabase.containsKey(first.header.messageKey)
+  );
+  Assert.ok(
+    other.selectedFolder.msgDatabase.containsKey(other.header.messageKey)
+  );
+  Assert.equal(first.selectedFolder.getTotalMessages(false), 1);
+  Assert.equal(other.selectedFolder.getTotalMessages(false), 1);
+  Assert.equal(
+    new TextDecoder().decode(await first.attachment.fetchAttachment()),
+    "first exact physical part"
+  );
+  Assert.equal(
+    new TextDecoder().decode(await other.attachment.fetchAttachment()),
+    "other exact physical part"
+  );
+});
+
+add_task(
+  async function test_confirmationCannotRetargetAttachmentModification() {
+    const { selectedFolder, header, attachment } = await s376MenuAttachment(
+      "S376ConfirmationLifetime",
+      "retain across confirmation"
+    );
+    const { AttachmentInfo } = ChromeUtils.importESModule(
+      "resource:///modules/AttachmentInfo.sys.mjs"
+    );
+    const part = attachment.partID;
+    const confirmed = BrowserTestUtils.promiseAlertDialogOpen(
+      "",
+      "chrome://global/content/commonDialog.xhtml",
+      {
+        callback(win) {
+          attachment.partID = "1.3";
+          win.document.querySelector("dialog").acceptDialog();
+        },
+      }
+    );
+    try {
+      await Assert.rejects(
+        AttachmentInfo.deleteAttachments(header, [attachment], false),
+        error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+      );
+      await confirmed;
+    } finally {
+      attachment.partID = part;
+    }
+    Assert.ok(selectedFolder.msgDatabase.containsKey(header.messageKey));
+    Assert.equal(selectedFolder.getTotalMessages(false), 1);
+    Assert.equal(
+      new TextDecoder().decode(await attachment.fetchAttachment()),
+      "retain across confirmation"
+    );
+  }
+);
+
+add_task(async function test_detachFailureKeepsOriginalAndCleansStaging() {
+  const { selectedFolder, header, attachment } = await s376MenuAttachment(
+    "S376DetachFault",
+    "retain original after strip or copy failure"
+  );
+  const { AttachmentInfo } = ChromeUtils.importESModule(
+    "resource:///modules/AttachmentInfo.sys.mjs"
+  );
+  const { MailServices } = ChromeUtils.importESModule(
+    "resource:///modules/MailServices.sys.mjs"
+  );
+  const directory = await s376MenuDirectory();
+  const originalService = MailServices.messageServiceFromURI;
+  const originalCopy = MailServices.copy.copyFileMessage;
+  const uri = selectedFolder.getUriForMsg(header);
+  const failure = Cr.NS_ERROR_FILE_ACCESS_DENIED;
+  let stripCalls = 0;
+  let copyCalls = 0;
+  let stagingPath;
+  MailServices.messageServiceFromURI = function (messageURI) {
+    const service = originalService.call(this, messageURI);
+    if (messageURI != uri) {
+      return service;
+    }
+    return {
+      getUrlForUri: (...args) => service.getUrlForUri(...args),
+      streamMessage(_uri, listener) {
+        stripCalls++;
+        listener.onStartRequest(null);
+        listener.onStopRequest(null, failure);
+      },
+    };
+  };
+  MailServices.copy.copyFileMessage = (
+    _file,
+    _folder,
+    _header,
+    _draft,
+    _flags,
+    _keywords,
+    listener
+  ) => {
+    copyCalls++;
+    listener.onStopCopy(failure);
+  };
+  try {
+    await Assert.rejects(
+      AttachmentInfo.detachAttachments(header, [attachment], directory),
+      error => error.result == failure
+    );
+    Assert.equal(
+      stripCalls,
+      1,
+      "The existing strip listener received the real failure status"
+    );
+    Assert.equal(
+      copyCalls,
+      0,
+      "A failed strip cannot start replacement copying"
+    );
+    Assert.ok(selectedFolder.msgDatabase.containsKey(header.messageKey));
+    Assert.equal(selectedFolder.getTotalMessages(false), 1);
+    Assert.equal(
+      await IOUtils.readUTF8(PathUtils.join(directory, "selected.txt")),
+      "retain original after strip or copy failure"
+    );
+    MailServices.messageServiceFromURI = originalService;
+    MailServices.copy.copyFileMessage = (
+      file,
+      _folder,
+      _header,
+      _draft,
+      _flags,
+      _keywords,
+      listener
+    ) => {
+      copyCalls++;
+      stagingPath = file.path;
+      listener.onStopCopy(failure);
+    };
+    await Assert.rejects(
+      AttachmentInfo.detachAttachments(header, [attachment], directory),
+      error => error.result == failure
+    );
+    Assert.equal(
+      copyCalls,
+      1,
+      "Replacement copying received one terminal failure"
+    );
+    Assert.ok(stagingPath, "The real strip created a staged replacement");
+    Assert.equal(
+      await IOUtils.exists(stagingPath),
+      false,
+      "The failed copy's staged message is removed"
+    );
+    Assert.ok(selectedFolder.msgDatabase.containsKey(header.messageKey));
+    Assert.equal(
+      selectedFolder.getTotalMessages(false),
+      1,
+      "No failed replacement deletes or duplicates the original"
+    );
+  } finally {
+    MailServices.messageServiceFromURI = originalService;
+    MailServices.copy.copyFileMessage = originalCopy;
+  }
+  Assert.equal(
+    new TextDecoder().decode(await attachment.fetchAttachment()),
+    "retain original after strip or copy failure"
+  );
+});
+
+add_task(async function test_folderPermissionRefusesAttachmentRewrite() {
+  const { selectedFolder, header, attachment } = await s376MenuAttachment(
+    "S376FolderPermission",
+    "retain under ordinary folder permissions"
+  );
+  const { AttachmentInfo } = ChromeUtils.importESModule(
+    "resource:///modules/AttachmentInfo.sys.mjs"
+  );
+  const hadQueue = selectedFolder.getFlag(Ci.nsMsgFolderFlags.Queue);
+  try {
+    selectedFolder.setFlag(Ci.nsMsgFolderFlags.Queue);
+    Assert.equal(
+      selectedFolder.canFileMessages,
+      false,
+      "The real folder gate prohibits replacement filing"
+    );
+    await Assert.rejects(
+      AttachmentInfo.deleteAttachments(header, [attachment]),
+      /Cannot file messages/
+    );
+    Assert.ok(selectedFolder.msgDatabase.containsKey(header.messageKey));
+    Assert.equal(selectedFolder.getTotalMessages(false), 1);
+  } finally {
+    if (!hadQueue) {
+      selectedFolder.clearFlag(Ci.nsMsgFolderFlags.Queue);
+    }
+  }
+  Assert.equal(
+    new TextDecoder().decode(await attachment.fetchAttachment()),
+    "retain under ordinary folder permissions"
   );
 });

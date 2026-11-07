@@ -1093,6 +1093,9 @@ add_task(async function test_attachmentStaleSelectionRejectsBeforeOpening() {
 
 add_task(async function test_attachmentRetrievalFailureHasNoSideEffects() {
   Assert.ok(s376Imap && s376News, "both real protocol fixtures completed");
+  const { AttachmentInfo } = ChromeUtils.importESModule(
+    "resource:///modules/AttachmentInfo.sys.mjs"
+  );
   const directory = await s376SaveDirectory();
   const { server, folders, generator } = s376Imap;
   const message = generator.makeMessage({
@@ -1108,14 +1111,25 @@ add_task(async function test_attachmentRetrievalFailureHasNoSideEffects() {
   const key = header.messageKey;
   const imapPart = s376UnfetchedAttachment(header);
   const imapTarget = PathUtils.join(directory, "imap-failed.txt");
-  server.daemon.commandToFail = "FETCH";
+  const originalCommandToFail = server.daemon.commandToFail;
+  server.daemon.commandToFail = "UID";
   try {
     await Assert.rejects(
       imapPart.saveToFile(imapTarget),
       e => e.result == Cr.NS_MSG_ERROR_IMAP_COMMAND_FAILED
     );
+    for (const command of [
+      () => imapPart.save(window.browsingContext),
+      () => AttachmentInfo.saveAttachments([imapPart], window.browsingContext),
+      () => imapPart.detachFromMessage(window.browsingContext),
+    ]) {
+      await Assert.rejects(
+        command(),
+        error => error.result == Cr.NS_MSG_ERROR_IMAP_COMMAND_FAILED
+      );
+    }
   } finally {
-    server.daemon.commandToFail = null;
+    server.daemon.commandToFail = originalCommandToFail;
   }
   Assert.equal(await IOUtils.exists(imapTarget), false);
   Assert.ok(
@@ -1156,6 +1170,16 @@ add_task(async function test_attachmentRetrievalFailureHasNoSideEffects() {
     newsPart.saveToFile(newsTarget),
     e => e.result == Cr.NS_ERROR_FAILURE
   );
+  for (const command of [
+    () => newsPart.save(window.browsingContext),
+    () => AttachmentInfo.saveAttachments([newsPart], window.browsingContext),
+    () => newsPart.detachFromMessage(window.browsingContext),
+  ]) {
+    await Assert.rejects(
+      command(),
+      error => error.result == Cr.NS_ERROR_FAILURE
+    );
+  }
   Assert.equal(await IOUtils.exists(newsTarget), false);
   Assert.ok(news.folders[0].msgDatabase.containsKey(newsKey));
   Assert.deepEqual(
@@ -1177,6 +1201,13 @@ add_task(async function test_attachmentCachedTempFileDoesNotOutliveSelection() {
     "resource:///modules/MailUtils.sys.mjs"
   );
   const originalOpen = MailUtils.openEMLFile;
+  const originalSetup = attachment.setupTempFile;
+  const temporaryPaths = new Set();
+  attachment.setupTempFile = async function (name) {
+    const file = await originalSetup.call(this, name);
+    temporaryPaths.add(file.path);
+    return file;
+  };
   const originalFetch = attachment.fetchAttachment;
   const opened = [];
   let fetches = 0;
@@ -1215,6 +1246,371 @@ add_task(async function test_attachmentCachedTempFileDoesNotOutliveSelection() {
     );
   } finally {
     MailUtils.openEMLFile = originalOpen;
+    attachment.setupTempFile = originalSetup;
     attachment.fetchAttachment = originalFetch;
+    for (const path of temporaryPaths) {
+      await IOUtils.remove(path, { ignoreAbsent: true });
+    }
+  }
+});
+
+add_task(async function test_cachedMessageRejectsReplacedDatabaseFacade() {
+  const inner =
+    "From: selected@example.invalid\r\nSubject: retained source\r\n\r\nOnly the retained physical message.\r\n";
+  const { selectedFolder, header, attachment } = await s376LocalAttachment(
+    inner,
+    "message/rfc822",
+    "retained-source.eml"
+  );
+  const { MailUtils } = ChromeUtils.importESModule(
+    "resource:///modules/MailUtils.sys.mjs"
+  );
+  const originalOpen = MailUtils.openEMLFile;
+  const originalSetup = attachment.setupTempFile;
+  const temporaryPaths = new Set();
+  attachment.setupTempFile = async function (name) {
+    const file = await originalSetup.call(this, name);
+    temporaryPaths.add(file.path);
+    return file;
+  };
+  const files = [];
+  MailUtils.openEMLFile = (_win, file) => files.push(file.clone());
+  try {
+    await attachment.open(window.browsingContext);
+    Assert.equal(files.length, 1);
+    Assert.ok(
+      (await IOUtils.readUTF8(files[0].path)).includes(
+        "Only the retained physical message."
+      )
+    );
+    const key = header.messageKey;
+    await be_in_folder(folder);
+    const oldDB = selectedFolder.msgDatabase;
+    oldDB.forceClosed();
+    const currentDB = selectedFolder.msgDatabase;
+    Assert.notStrictEqual(
+      currentDB,
+      oldDB,
+      "The actual folder now has a replacement facade"
+    );
+    Assert.ok(
+      currentDB.containsKey(key),
+      "The physical message still exists in the new facade"
+    );
+    await Assert.rejects(
+      attachment.open(window.browsingContext),
+      error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+    );
+    await Assert.rejects(
+      attachment.fetchAttachment(),
+      error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+    );
+    Assert.equal(
+      files.length,
+      1,
+      "The old retained source cannot reuse its cached EML"
+    );
+  } finally {
+    MailUtils.openEMLFile = originalOpen;
+    attachment.setupTempFile = originalSetup;
+    for (const path of temporaryPaths) {
+      await IOUtils.remove(path, { ignoreAbsent: true });
+    }
+  }
+});
+
+add_task(async function test_nativeBodyFailurePrecedesSaveOrOpenEffects() {
+  const { selectedFolder, header, attachment } = await s376LocalAttachment(
+    "Retain this body after a real store read failure."
+  );
+  const directory = await s376SaveDirectory();
+  const target = PathUtils.join(directory, "unavailable.txt");
+  await be_in_folder(folder);
+  const token = header.storeToken;
+  const expectedStore = selectedFolder.msgStore.storeType;
+  let nativeError;
+  try {
+    header.storeToken =
+      expectedStore == "maildir" ? "s376-missing-owned-body" : "123456789";
+    nativeError = await new Promise(resolve => {
+      const { NetUtil } = ChromeUtils.importESModule(
+        "resource://gre/modules/NetUtil.sys.mjs"
+      );
+      const listener = {
+        QueryInterface: ChromeUtils.generateQI(["nsIStreamListener"]),
+        onStartRequest() {},
+        onDataAvailable(_request, stream, _offset, count) {
+          NetUtil.readInputStreamToString(stream, count);
+        },
+        onStopRequest(_request, status) {
+          resolve(status);
+        },
+      };
+      try {
+        MailServices.messageServiceFromURI(
+          selectedFolder.getUriForMsg(header)
+        ).streamMessage(
+          selectedFolder.getUriForMsg(header),
+          listener,
+          null,
+          null,
+          false,
+          "",
+          true
+        );
+      } catch (error) {
+        resolve(error.result);
+      }
+    });
+    Assert.ok(
+      nativeError && !Components.isSuccessCode(nativeError),
+      "The actual selected native store reports a failed terminal read"
+    );
+    await Assert.rejects(
+      attachment.saveToFile(target),
+      error => error.result == nativeError
+    );
+    await Assert.rejects(
+      attachment.open(window.browsingContext),
+      error => error.result == nativeError
+    );
+    Assert.equal(await IOUtils.exists(target), false);
+    Assert.ok(selectedFolder.msgDatabase.containsKey(header.messageKey));
+    Assert.equal(selectedFolder.getTotalMessages(false), 1);
+  } finally {
+    header.storeToken = token;
+  }
+  Assert.equal(
+    new TextDecoder().decode(await attachment.fetchAttachment()),
+    "Retain this body after a real store read failure."
+  );
+});
+
+/**
+ * Build a small valid one-page PDF with distinguishable selected bytes.
+ *
+ * @param {string} label - ASCII text in this fixture's PDF page.
+ * @returns {string} Complete PDF source with exact cross-reference offsets.
+ */
+function s376Pdf(label) {
+  const stream = `BT /F1 12 Tf 20 100 Td (${label}) Tj ET`;
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    `<< /Length ${stream.length} >>\r\nstream\r\n${stream}\r\nendstream`,
+  ];
+  let pdf = "%PDF-1.4\r\n";
+  const offsets = [];
+  for (const [index, object] of objects.entries()) {
+    offsets.push(pdf.length);
+    pdf += `${index + 1} 0 obj\r\n${object}\r\nendobj\r\n`;
+  }
+  const start = pdf.length;
+  pdf += `xref\r\n0 ${objects.length + 1}\r\n0000000000 65535 f \r\n`;
+  for (const offset of offsets) {
+    pdf += `${String(offset).padStart(10, "0")} 00000 n \r\n`;
+  }
+  return (
+    pdf +
+    `trailer\r\n<< /Size ${objects.length + 1} /Root 1 0 R >>\r\nstartxref\r\n${start}\r\n%%EOF\r\n`
+  );
+}
+
+add_task(async function test_pdfTabUsesSelectedBytesAcrossImapUidReuse() {
+  const { server, incoming, generator } = s376Imap;
+  const { PromiseTestUtils } = ChromeUtils.importESModule(
+    "resource://testing-common/mailnews/PromiseTestUtils.sys.mjs"
+  );
+  const name = "S376PdfEpoch";
+  const mailbox = server.daemon.createMailbox(name, {
+    subscribed: true,
+    uidvalidity: 8101,
+    uidnext: 12001,
+  });
+  const discovered = new PromiseTestUtils.PromiseUrlListener();
+  MailServices.imap.discoverAllFolders(incoming.rootFolder, discovered, null);
+  await discovered.promise;
+  const selectedFolder = incoming.rootFolder.getChildNamed(name);
+  const tabmail = document.getElementById("tabmail");
+  const handlerInfo = mimeService.getFromTypeAndExtension(
+    "application/pdf",
+    "pdf"
+  );
+  const oldHandler = {
+    preferredAction: handlerInfo.preferredAction,
+    alwaysAskBeforeHandling: handlerInfo.alwaysAskBeforeHandling,
+  };
+  const tabs = [];
+  const files = new Set();
+  handlerInfo.preferredAction = Ci.nsIHandlerInfo.handleInternally;
+  handlerInfo.alwaysAskBeforeHandling = false;
+  handlerService.store(handlerInfo);
+  let firstAttachment;
+  let firstTransport;
+  let oldKey;
+  try {
+    for (const [index, label] of [
+      "Original physical PDF",
+      "Fresh physical PDF",
+    ].entries()) {
+      const pdf = s376Pdf(label);
+      const message = generator.makeMessage({
+        attachments: [
+          {
+            body: btoa(pdf),
+            encoding: "base64",
+            contentType: "application/pdf",
+            filename: "selected.pdf",
+          },
+        ],
+      });
+      message.messageId = "s376-pdf-reused-uid@example.invalid";
+      if (index) {
+        await be_in_folder(folder);
+        incoming.closeCachedConnections();
+        await TestUtils.waitForCondition(
+          () => !server.daemon.getConnections().length
+        );
+        mailbox.uidvalidity = 8102;
+        mailbox._messages.length = 0;
+        mailbox.uidnext = 12001;
+      }
+      await server.addMessages(selectedFolder, [message]);
+      await be_in_folder(selectedFolder);
+      await select_click_row(0);
+      const [attachment] = get_about_message().currentAttachments;
+      Assert.equal(attachment.partID, "1.2");
+      Assert.equal(
+        new TextDecoder().decode(await attachment.fetchAttachment()),
+        pdf
+      );
+      if (index) {
+        Assert.equal(
+          attachment.url,
+          firstTransport,
+          "The IMAP wire URL and part were reused"
+        );
+        if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+          Assert.notEqual(
+            attachment.message.messageKey,
+            oldKey,
+            "The fresh epoch has a distinct native physical key"
+          );
+        }
+        await Assert.rejects(
+          firstAttachment.open(window.browsingContext),
+          error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+        );
+      } else {
+        firstAttachment = attachment;
+        firstTransport = attachment.url;
+        oldKey = attachment.message.messageKey;
+      }
+      const opened = BrowserTestUtils.waitForEvent(
+        tabmail.tabContainer,
+        "TabOpen",
+        false,
+        event => event.detail.tabInfo.mode.name == "contentTab"
+      );
+      const rendered = opened.then(event =>
+        BrowserTestUtils.waitForContentEvent(
+          event.detail.tabInfo.browser,
+          "textlayerrendered",
+          false,
+          null,
+          true
+        )
+      );
+      const originalSetup = attachment.setupTempFile;
+      attachment.setupTempFile = async function (filename) {
+        const file = await originalSetup.call(this, filename);
+        files.add(file.path);
+        return file;
+      };
+      try {
+        await attachment.open(window.browsingContext);
+      } finally {
+        attachment.setupTempFile = originalSetup;
+      }
+      const tab = (await opened).detail.tabInfo;
+      tabs.push(tab);
+      await rendered;
+      const fileURL = Services.io
+        .newURI(tab.browser.currentURI.spec)
+        .QueryInterface(Ci.nsIFileURL);
+      await SpecialPowers.spawn(tab.browser, [label], async expected => {
+        const pdfDocument =
+          content.wrappedJSObject.PDFViewerApplication.pdfDocument;
+        Assert.ok(
+          pdfDocument,
+          "The ordinary PDF viewer loaded the selected bytes"
+        );
+        const text = await (await pdfDocument.getPage(1)).getTextContent();
+        Assert.ok(text.items.some(item => item.str == expected));
+      });
+      Assert.equal(await IOUtils.readUTF8(fileURL.file.path), pdf);
+      if (index) {
+        Assert.notEqual(
+          tabs[0],
+          tab,
+          "A new physical message never switches to its predecessor's PDF tab"
+        );
+        Assert.notEqual(
+          tabs[0].browser.currentURI.spec,
+          tab.browser.currentURI.spec
+        );
+      }
+    }
+  } finally {
+    handlerInfo.preferredAction = oldHandler.preferredAction;
+    handlerInfo.alwaysAskBeforeHandling = oldHandler.alwaysAskBeforeHandling;
+    handlerService.store(handlerInfo);
+    for (const tab of tabs) {
+      tabmail.closeTab(tab);
+    }
+    for (const path of files) {
+      await IOUtils.remove(path, { ignoreAbsent: true });
+    }
+    await be_in_folder(folder);
+  }
+});
+
+add_task(async function test_helperApplicationReceivesCheckedSelectedBytes() {
+  const body = "Only these physical bytes reach the helper application.";
+  const type = "test/s376-helper";
+  createMockedHandler(type, Ci.nsIHandlerInfo.useHelperApp, false);
+  const { attachment } = await s376LocalAttachment(body, type, "selected.s376");
+  const originalOpen = attachment._openFile;
+  const originalSetup = attachment.setupTempFile;
+  const paths = new Set();
+  const opened = [];
+  attachment.setupTempFile = async function (filename) {
+    const file = await originalSetup.call(this, filename);
+    paths.add(file.path);
+    return file;
+  };
+  attachment._openFile = (_mimeInfo, file) => opened.push(file.clone());
+  try {
+    await attachment.open(window.browsingContext);
+    Assert.equal(
+      opened.length,
+      1,
+      "One helper dispatch follows the successful selected retrieval"
+    );
+    Assert.equal(await IOUtils.readUTF8(opened[0].path), body);
+    Assert.equal(
+      (await IOUtils.stat(opened[0].path)).permissions & 0o222,
+      0,
+      "The helper receives the ordinary read-only temporary attachment"
+    );
+  } finally {
+    attachment._openFile = originalOpen;
+    attachment.setupTempFile = originalSetup;
+    for (const path of paths) {
+      await IOUtils.setPermissions(path, 0o600);
+      await IOUtils.remove(path, { ignoreAbsent: true });
+    }
   }
 });

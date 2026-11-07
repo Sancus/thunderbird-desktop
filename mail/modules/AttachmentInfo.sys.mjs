@@ -36,7 +36,7 @@ ChromeUtils.defineLazyGetter(
  */
 export class AttachmentInfo {
   /**
-   * A cache of message/rfc822 attachments saved to temporary files for display.
+   * A cache of message/rfc822 and selected PDF attachments saved for display.
    * Saving the same attachment again is avoided.
    *
    * @type {Map<string, {file: nsIFile, bodyIdentity: ?string}>}
@@ -278,6 +278,7 @@ export class AttachmentInfo {
    * @returns {?string} the path of the saved attachment. null if not saved.
    */
   async save(browsingContext, fpDialogTitle) {
+    this.#checkSelection();
     if (!this.hasFile) {
       return null;
     }
@@ -310,6 +311,7 @@ export class AttachmentInfo {
     } catch (e) {} // Pref may not be set, yet.
 
     const result = await new Promise(resolve => fp.open(resolve));
+    this.#checkSelection();
     if (result == Ci.nsIFilePicker.returnCancel) {
       return null;
     }
@@ -323,6 +325,9 @@ export class AttachmentInfo {
     try {
       await this.saveToFile(path);
     } catch (e) {
+      if (this.#selection) {
+        throw e;
+      }
       console.warn(`Saving ${this.name} to ${path} FAILED.`, e);
       Services.prompt.alert(
         null,
@@ -348,6 +353,7 @@ export class AttachmentInfo {
    */
   static async saveAttachments(attachments, browsingContext, fpDialogTitle) {
     for (const attachment of attachments) {
+      attachment.#checkSelection();
       if (!attachment.hasFile) {
         return null;
       }
@@ -370,6 +376,9 @@ export class AttachmentInfo {
     } catch (e) {} // Pref may not be set, yet.
 
     const result = await new Promise(resolve => fp.open(resolve));
+    for (const attachment of attachments) {
+      attachment.#checkSelection();
+    }
     if (result == Ci.nsIFilePicker.returnCancel) {
       return null;
     }
@@ -394,6 +403,9 @@ export class AttachmentInfo {
         await attachment.saveToFile(path);
       }
     } catch (e) {
+      if (attachments.some(attachment => attachment.#selection)) {
+        throw e;
+      }
       console.warn(`Saving attachments to ${fp.file.path} FAILED.`, e);
       Services.prompt.alert(
         browsingContext.window,
@@ -647,9 +659,11 @@ export class AttachmentInfo {
     }
 
     const win = browsingContext.topChromeWindow;
+    const isPDF =
+      this.contentType == "application/pdf" || /\.pdf$/i.test(this.name);
     const cached = this.#temporaryFiles.get(this.url);
     const reuseTemporaryFile =
-      this.contentType == "message/rfc822" &&
+      (this.contentType == "message/rfc822" || (this.#selection && isPDF)) &&
       cached?.file.exists() &&
       cached.bodyIdentity === this.#temporaryBodyIdentity();
     const buffer =
@@ -700,6 +714,30 @@ export class AttachmentInfo {
         // dialog. For most attachments the MIME code has already put it in the
         // URL, but not for external attachments.
         let url = this.url;
+        if (this.#selection) {
+          // A transport URL can be reused for a different IMAP physical source.
+          // Hand PDF.js the checked bytes, never another transport retrieval.
+          let tempFile = reuseTemporaryFile ? cached.file : null;
+          if (!tempFile) {
+            const filename = /\.pdf$/i.test(this.#filename)
+              ? this.#filename
+              : `${this.#filename}.pdf`;
+            tempFile = await this.setupTempFile(filename);
+            try {
+              await saveAttachment(tempFile.path, true);
+              this.#checkSelection();
+            } catch (error) {
+              await IOUtils.remove(tempFile.path);
+              throw error;
+            }
+            this.#temporaryFiles.set(this.url, {
+              file: tempFile,
+              bodyIdentity: this.#temporaryBodyIdentity(),
+            });
+          }
+          this.#checkSelection();
+          url = Services.io.newFileURI(tempFile).spec;
+        }
         const parsedURL = URL.parse(url);
         if (parsedURL && !parsedURL.searchParams.has("type")) {
           parsedURL.searchParams.set("type", "application/pdf");
@@ -909,6 +947,65 @@ export class AttachmentInfo {
   }
 
   /**
+   * Capture and recheck the physical parent of a modifying command. The caller's
+   * header must name the same selected message as every attachment, including
+   * after confirmation, retrieval and replacement staging.
+   *
+   * @param {nsIMsgDBHdr} msgHdr - The message to modify.
+   * @param {AttachmentInfo[]} attachments - The selected parts.
+   * @returns {function(): void} Rechecks the captured parent and parts.
+   * @throws {Components.Exception} For an unavailable or mismatched parent.
+   */
+  static #modificationGuard(msgHdr, attachments) {
+    const folder = msgHdr.folder;
+    const database = folder.msgDatabase;
+    const key = msgHdr.messageKey;
+    const uri = folder.getUriForMsg(msgHdr);
+    const selections = attachments.map(attachment => ({
+      attachment,
+      message: attachment.message,
+      uri: attachment.uri,
+      url: attachment.url,
+      part: attachment.partID,
+    }));
+    const check = () => {
+      if (
+        !msgHdr.isLive ||
+        !database.containsKey(key) ||
+        msgHdr.folder?.URI !== folder.URI ||
+        msgHdr.messageKey !== key ||
+        folder.getUriForMsg(msgHdr) !== uri
+      ) {
+        throw new Components.Exception(
+          "The message selected for attachment modification changed",
+          Cr.NS_ERROR_NOT_AVAILABLE
+        );
+      }
+      for (const selected of selections) {
+        const { attachment } = selected;
+        const selectedURI = attachment.#checkSelection();
+        if (
+          attachment.message !== selected.message ||
+          attachment.uri !== selected.uri ||
+          attachment.url !== selected.url ||
+          attachment.partID !== selected.part ||
+          !attachment.message?.isLive ||
+          attachment.message.folder?.URI !== folder.URI ||
+          attachment.message.messageKey !== key ||
+          (selectedURI && selectedURI !== uri)
+        ) {
+          throw new Components.Exception(
+            "The attachment does not belong to the selected physical message",
+            Cr.NS_ERROR_NOT_AVAILABLE
+          );
+        }
+      }
+    };
+    check();
+    return check;
+  }
+
+  /**
    * Delete this attachment from the message. Deleting removes the attachment
    * from the message, leavning only a placeholder noting that the message used
    * to contain an attachment.
@@ -927,6 +1024,10 @@ export class AttachmentInfo {
    * @param {boolean} [silent=true] - If true, ask for confirmation to proceed.
    */
   static async deleteAttachments(msgHdr, attachments, silent = true) {
+    const checkSelection = AttachmentInfo.#modificationGuard(
+      msgHdr,
+      attachments
+    );
     if (attachments.some(a => a.contentType == "text/x-moz-deleted")) {
       throw new Error(`An attachment was already deleted.`);
     }
@@ -940,7 +1041,13 @@ export class AttachmentInfo {
       }
     }
     const attachmentsMap = new Map(attachments.map(a => [a.url, null]));
-    await AttachmentInfo.#modifyMessage(msgHdr, attachmentsMap, "DELETE");
+    checkSelection();
+    await AttachmentInfo.#modifyMessage(
+      msgHdr,
+      attachmentsMap,
+      "DELETE",
+      checkSelection
+    );
   }
 
   /**
@@ -951,6 +1058,8 @@ export class AttachmentInfo {
    * @param {BrowsingContext} browsingContext - The browsing context to use.
    */
   async detachFromMessage(browsingContext) {
+    const msgHdr = this.message;
+    const checkSelection = AttachmentInfo.#modificationGuard(msgHdr, [this]);
     if (this.contentType == "text/x-moz-deleted") {
       throw new Error(`${this.name} was already deleted.`);
     }
@@ -959,6 +1068,7 @@ export class AttachmentInfo {
       "attachment-detach-dialog-title"
     );
     const path = await this.save(browsingContext, fpDialogTitle);
+    checkSelection();
     if (!path) {
       return;
     }
@@ -969,10 +1079,12 @@ export class AttachmentInfo {
     if (!Services.prompt.confirm(browsingContext.window, null, message)) {
       return;
     }
+    checkSelection();
     await AttachmentInfo.#modifyMessage(
-      this.message,
+      msgHdr,
       new Map([[this.url, path]]),
-      "DETACH"
+      "DETACH",
+      checkSelection
     );
   }
 
@@ -993,6 +1105,10 @@ export class AttachmentInfo {
     detachDir = null,
     browsingContext = null
   ) {
+    const checkSelection = AttachmentInfo.#modificationGuard(
+      msgHdr,
+      attachments
+    );
     if (attachments.some(a => a.contentType == "text/x-moz-deleted")) {
       throw new Error(`An attachment was already deleted.`);
     }
@@ -1031,7 +1147,13 @@ export class AttachmentInfo {
         return;
       }
     }
-    await AttachmentInfo.#modifyMessage(msgHdr, attachmentsMap, "DETACH");
+    checkSelection();
+    await AttachmentInfo.#modifyMessage(
+      msgHdr,
+      attachmentsMap,
+      "DETACH",
+      checkSelection
+    );
   }
 
   /**
@@ -1044,8 +1166,15 @@ export class AttachmentInfo {
    *   full path were each attachment has been stored.
    *   For deletion, paths will be null.
    * @param {"DELETE"|"DETACH"} operation - Delete or detach.
+   * @param {function(): void} checkSelection - Recheck the retained operation parent.
    */
-  static async #modifyMessage(msgHdr, attachmentsMap, operation) {
+  static async #modifyMessage(
+    msgHdr,
+    attachmentsMap,
+    operation,
+    checkSelection
+  ) {
+    checkSelection();
     const data = await AttachmentInfo.stripAttachments(
       msgHdr,
       attachmentsMap,
@@ -1055,7 +1184,13 @@ export class AttachmentInfo {
       return;
     }
 
-    await AttachmentInfo.#copyMessageToOriginalFolder(data, msgHdr);
+    checkSelection();
+    await AttachmentInfo.#copyMessageToOriginalFolder(
+      data,
+      msgHdr,
+      checkSelection
+    );
+    checkSelection();
     await AttachmentInfo.#deleteOriginal(msgHdr);
     await AttachmentInfo.#updateFolder(msgHdr.folder);
   }
@@ -1134,7 +1269,7 @@ export class AttachmentInfo {
       onStopRequest(_request, statusCode) {
         if (!Components.isSuccessCode(statusCode)) {
           reject(
-            new Error(`${operation} - strip FAILED: ${statusCode.toString(16)}`)
+            new Components.Exception(`${operation} - strip FAILED`, statusCode)
           );
           return;
         }
@@ -1170,59 +1305,75 @@ export class AttachmentInfo {
    *
    * @param {string} data - The modified message data.
    * @param {nsIMsgDBHdr} msgHdr - The message to replace.
+   * @param {function(): void} checkSelection - Recheck immediately before copying.
    */
-  static async #copyMessageToOriginalFolder(data, msgHdr) {
+  static async #copyMessageToOriginalFolder(data, msgHdr, checkSelection) {
     const msgFilePath = await IOUtils.createUniqueFile(
       PathUtils.tempDir,
       "tmp-msg.eml",
       0o600
     );
-    await IOUtils.write(
-      msgFilePath,
-      lazy.MailStringUtils.byteStringToUint8Array(data)
-    );
-    const msgFile = await IOUtils.getFile(msgFilePath);
+    let copyError;
+    try {
+      await IOUtils.write(
+        msgFilePath,
+        lazy.MailStringUtils.byteStringToUint8Array(data)
+      );
+      const msgFile = await IOUtils.getFile(msgFilePath);
 
-    const { promise, resolve, reject } = Promise.withResolvers();
-    /** @implements {nsIMsgCopyServiceListener} */
-    const copyServiceListener = {
-      onStartCopy() {},
-      onProgress() {},
-      setMessageKey(key) {
-        Services.obs.notifyObservers(
-          null,
-          "attachment-delete-msgkey-changed",
-          JSON.stringify({
-            oldMessageKey: msgHdr.messageKey,
-            newMessageKey: key,
-            folderURI: msgHdr.folder.URI,
-          })
-        );
-      },
-      getMessageId() {
-        return null;
-      },
-      onStopCopy(statusCode) {
-        if (!Components.isSuccessCode(statusCode)) {
-          reject(new Error(`Copy FAILED: ${statusCode.toString(16)}`));
-          return;
+      const { promise, resolve, reject } = Promise.withResolvers();
+      /** @implements {nsIMsgCopyServiceListener} */
+      const copyServiceListener = {
+        onStartCopy() {},
+        onProgress() {},
+        setMessageKey(key) {
+          Services.obs.notifyObservers(
+            null,
+            "attachment-delete-msgkey-changed",
+            JSON.stringify({
+              oldMessageKey: msgHdr.messageKey,
+              newMessageKey: key,
+              folderURI: msgHdr.folder.URI,
+            })
+          );
+        },
+        getMessageId() {
+          return null;
+        },
+        onStopCopy(statusCode) {
+          if (!Components.isSuccessCode(statusCode)) {
+            reject(new Components.Exception("Copy FAILED", statusCode));
+            return;
+          }
+          resolve();
+        },
+      };
+
+      checkSelection();
+      MailServices.copy.copyFileMessage(
+        msgFile,
+        msgHdr.folder,
+        msgHdr,
+        false,
+        msgHdr.flags,
+        msgHdr.getStringProperty("keywords"),
+        copyServiceListener,
+        null
+      );
+      await promise;
+    } catch (error) {
+      copyError = error;
+      throw error;
+    } finally {
+      try {
+        await IOUtils.remove(msgFilePath);
+      } catch (error) {
+        if (!copyError) {
+          throw error;
         }
-        resolve();
-      },
-    };
-
-    MailServices.copy.copyFileMessage(
-      msgFile,
-      msgHdr.folder,
-      msgHdr,
-      false,
-      msgHdr.flags,
-      msgHdr.getStringProperty("keywords"),
-      copyServiceListener,
-      null
-    );
-    await promise;
-    await IOUtils.remove(msgFilePath); // Cleanup.
+        console.error(error);
+      }
+    }
   }
 
   /**
@@ -1243,7 +1394,7 @@ export class AttachmentInfo {
       onStopCopy(statusCode) {
         if (!Components.isSuccessCode(statusCode)) {
           reject(
-            new Error(`Delete original FAILED: ${statusCode.toString(16)}`)
+            new Components.Exception("Delete original FAILED", statusCode)
           );
           return;
         }
@@ -1277,7 +1428,7 @@ export class AttachmentInfo {
       OnStartRunningUrl() {},
       OnStopRunningUrl(url, statusCode) {
         if (!Components.isSuccessCode(statusCode)) {
-          reject(new Error(`Update folder FAILED: ${statusCode}`));
+          reject(new Components.Exception("Update folder FAILED", statusCode));
           return;
         }
         resolve();
@@ -1398,7 +1549,8 @@ export class AttachmentInfo {
    * is accessible. For http and file urls, fetch() will have the size
    * in the content-length header.
    *
-   * @returns {boolean} true if the attachment is empty or error.
+   * @returns {Promise<boolean>} True for an empty part or an unavailable external URL.
+   * @throws {Components.Exception} If a selected stored part cannot be read.
    */
   async isEmpty() {
     if (this.isDeleted) {
@@ -1413,6 +1565,16 @@ export class AttachmentInfo {
       const uri = Services.io.newURI(url);
       return !(uri.username || uri.userPass);
     };
+
+    this.#checkSelection();
+    if (this.#selection && !this.sizeResolved) {
+      // Stored parts must reach a successful terminal result. A failed body
+      // read is an error, not an empty attachment or a cancelled save picker.
+      const buffer = await this.fetchAttachment();
+      this.size = buffer.byteLength;
+      this.sizeResolved = true;
+      return this.size == 0;
+    }
 
     // We have a resolved size.
     if (this.sizeResolved) {

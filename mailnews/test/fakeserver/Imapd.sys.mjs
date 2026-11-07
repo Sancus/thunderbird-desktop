@@ -1485,10 +1485,8 @@ export class IMAP_RFC3501_handler {
   SEARCH(args) {
     if (args[0] == "UNDELETED") {
       // RFC 3501 HEADER matches a case-insensitive substring of the field.
+      // Other criteria remain unsupported and still match every message.
       const header = args.length == 4 && args[1].toUpperCase() == "HEADER";
-      if (args.length != 1 && !header) {
-        return "BAD not here yet";
-      }
       const matches = message => {
         if (!header) {
           return true;

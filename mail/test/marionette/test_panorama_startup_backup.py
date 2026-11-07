@@ -296,7 +296,11 @@ class TestPanoramaStartupBackup(MarionetteTestCase):
         for original, snapshot in external_before.items():
             self.assertEqual(snapshot, archive[original])
 
-        parent = self.root / "restore-parent"
+        # A restore nests the backed-up profile storage one level deeper than
+        # the backup; keep its parent shallow so Windows paths stay valid.
+        restore_work = tempfile.TemporaryDirectory(prefix="r")
+        self.addCleanup(restore_work.cleanup)
+        parent = Path(restore_work.name).resolve() / "p"
         parent.mkdir()
         restored = self.stage_restore(backup, parent)
         self.assertNotIn("error", restored, restored)

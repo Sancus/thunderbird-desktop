@@ -407,6 +407,7 @@ class nsImapMailFolder : public nsMsgDBFolder,
                                        nsImapMailCopyState* state,
                                        uint32_t index, uint32_t epoch,
                                        ImapUid uid);
+  bool IsImportHeldHeader(nsMsgKey key);
   nsresult StageNativeOnlineAppend(
       nsIMsgDBHdr* parsed,
       const mozilla::mailnews::FinishedMessageBody& finished, nsIFile* recovery,

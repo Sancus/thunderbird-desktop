@@ -347,7 +347,17 @@ async function createSubfolder(parent, name) {
   const promiseAdded = MailPromiseTestUtils.promiseFolderAdded(name);
   parent.createSubfolder(name, null);
   await promiseAdded;
-  return parent.getChildNamed(name);
+  const folder = parent.getChildNamed(name);
+  if (parent.server.type == "imap") {
+    // Admit the actual server UIDVALIDITY before an operation captures this
+    // cold destination's database. The first SELECT may replace a legacy DB.
+    const listener = new MailPromiseTestUtils.PromiseUrlListener();
+    folder
+      .QueryInterface(Ci.nsIMsgImapMailFolder)
+      .updateFolderWithListener(null, listener);
+    await listener.promise;
+  }
+  return folder;
 }
 
 async function createMessages(folder, makeMessagesArg) {

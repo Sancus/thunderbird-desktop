@@ -158,9 +158,10 @@ NS_IMETHODIMP Message::MarkRead(bool read) {
     MOZ_TRY(messages->GetMessageFolderId(mKey, folderId));
     if (folderId) {
       uint32_t folderFlags = MOZ_TRY(core->FolderDB().GetFolderFlags(folderId));
-      if (folderFlags & nsMsgFolderFlags::Newsgroup) {
-        // Ordinary news folder reads arrive through this header API. Clear its
-        // stored New bit in the same transaction as Read and the news read set.
+      if (folderFlags &
+          (nsMsgFolderFlags::Newsgroup | nsMsgFolderFlags::ImapBox)) {
+        // Protocol folder reads arrive through this header API. Clear stored
+        // New with Read, including the ordinary IMAP folder operation.
         nextFlags &= ~nsMsgMessageFlags::New;
       }
     }

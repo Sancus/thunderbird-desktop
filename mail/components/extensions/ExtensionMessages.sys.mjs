@@ -280,9 +280,23 @@ function getParentMsgInfo(msgHdr) {
   for (const param of params) {
     url.searchParams.delete(param);
   }
-  const parentMsgHdr = Services.io
+  const messageUrl = Services.io
     .newURI(url.href)
-    .QueryInterface(Ci.nsIMsgMessageUrl).messageHeader;
+    .QueryInterface(Ci.nsIMsgMessageUrl);
+  if (url.protocol == "imap:") {
+    // A parsed fetch URL has its server UID, but no weak folder reference.
+    // Use only its folder URI here; messageHeader resolves the UID through
+    // the actual folder database instead of treating it as a physical key.
+    const folderURI = messageUrl.uri
+      .split("#")[0]
+      .replace(/^imap-message:/, "imap:");
+    const folder = MailServices.folderLookup.getFolderForURL(folderURI);
+    if (!folder || folder.server.type != "imap") {
+      throw new ExtensionError("Parent IMAP message folder is unavailable");
+    }
+    messageUrl.QueryInterface(Ci.nsIMsgMailNewsUrl).folder = folder;
+  }
+  const parentMsgHdr = messageUrl.messageHeader;
   return { msgHdr: parentMsgHdr, partName };
 }
 

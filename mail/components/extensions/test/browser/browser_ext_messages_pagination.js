@@ -739,7 +739,12 @@ add_task(
     subFolders.test1.msgDatabase.refreshCache(saved.virtualFolder.URI, [
       header.messageKey,
     ]);
-    saved.searchString = "AND (subject,unsupported-operation,scope)";
+    // Simulate invalid persisted terms without bypassing the public setter's
+    // validation during ordinary use.
+    saved.virtualFolder.msgDatabase.dBFolderInfo.setCharProperty(
+      "searchStr",
+      "AND (subject,unsupported-operation,scope)"
+    );
     const extension = ExtensionTestUtils.loadExtension({
       files: {
         "utils.js": await getUtilsJS(),
@@ -1432,15 +1437,20 @@ add_task(async function test_folderEnumerationErrorAndCancelledRead() {
   );
   const failure = new Error("S378 folder enumeration failure");
   const actual = subFolders.test1;
-  const broken = new Proxy(actual, {
-    get(target, property) {
-      if (property == "messages") {
-        throw failure;
-      }
-      const value = Reflect.get(target, property, target);
-      return typeof value == "function" ? value.bind(target) : value;
-    },
-  });
+  // The forwarding target is ordinary JS so XPCOM's non-configurable method
+  // properties do not impose invariants on the injected enumeration failure.
+  const broken = new Proxy(
+    {},
+    {
+      get(target, property) {
+        if (property == "messages") {
+          throw failure;
+        }
+        const value = Reflect.get(actual, property, actual);
+        return typeof value == "function" ? value.bind(actual) : value;
+      },
+    }
+  );
   Assert.throws(
     () => getMessagesInFolder(broken),
     error => error === failure,

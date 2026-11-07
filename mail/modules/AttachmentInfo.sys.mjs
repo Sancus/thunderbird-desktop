@@ -449,7 +449,6 @@ export class AttachmentInfo {
     const sourceURI = Services.io.newURI(url);
     if (
       messageURI &&
-      sourceURI.schemeIs("imap") &&
       this.#selection.folder.server.type == "imap" &&
       this.partID
     ) {

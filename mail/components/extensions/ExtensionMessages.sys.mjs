@@ -1674,10 +1674,10 @@ export class MessageTracker extends EventEmitter {
         this._headerPromises.delete(hash);
       } else if (!waiting.seen.has(physical)) {
         waiting.seen.add(physical);
-        waiting.pending.shift().resolve(cachedHdr);
-        if (!waiting.pending.length) {
-          this._headerPromises.delete(hash);
+        for (const deferred of waiting.pending) {
+          deferred.resolve(cachedHdr);
         }
+        this._headerPromises.delete(hash);
       }
     }
 

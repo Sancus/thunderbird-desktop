@@ -1241,9 +1241,33 @@ export class MessageTracker extends EventEmitter {
   _get(msgIdentifier) {
     const hash = this.getHash(msgIdentifier);
     if (this._messageIds.has(hash)) {
-      return this._messageIds.get(hash);
+      const id = this._messageIds.get(hash);
+      if (
+        msgIdentifier.database &&
+        !this._samePhysicalIdentifier(this._messages.get(id), msgIdentifier)
+      ) {
+        return null;
+      }
+      return id;
     }
     return null;
+  }
+
+  /**
+   * Compare captured physical sources, including the database and IMAP epoch.
+   *
+   * @param {MsgIdentifier} left - First captured source.
+   * @param {MsgIdentifier} right - Second captured source.
+   * @returns {boolean} Whether both identifiers describe the same physical row.
+   */
+  _samePhysicalIdentifier(left, right) {
+    return (
+      left?.folderURI === right.folderURI &&
+      left.messageKey === right.messageKey &&
+      left.database === right.database &&
+      left.uidValidity === right.uidValidity &&
+      left.headerMessageId === right.headerMessageId
+    );
   }
 
   /**
@@ -1351,6 +1375,28 @@ export class MessageTracker extends EventEmitter {
     }
     id = this._nextId++;
 
+    if (msgIdentifier.folderURI && msgHdr instanceof CachedMsgHeader) {
+      let current;
+      try {
+        const folder = MailServices.folderLookup.getFolderForURL(
+          msgIdentifier.folderURI
+        );
+        const header = folder?.msgDatabase.getMsgHdrForKey(
+          msgIdentifier.messageKey
+        );
+        if (header) {
+          current = this.getIdentifier(header);
+        }
+      } catch (ex) {
+        console.error(ex);
+      }
+      if (!current || !this._samePhysicalIdentifier(current, msgIdentifier)) {
+        // A retired event snapshot can receive an ID without replacing the
+        // lookup for a newer physical message at the same folder/key.
+        this._messages.set(id, { ...msgIdentifier, trackerId: id });
+        return id;
+      }
+    }
     this._set(id, msgIdentifier, msgHdr);
     return id;
   }

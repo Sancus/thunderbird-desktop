@@ -531,10 +531,13 @@ add_task(
       SQLiteDirectory.checkMigrationPathLinks(file, "Refused migration link");
     const refused = error => error.message == "Refused migration link";
 
+    // Links beside the profile are outside it on every platform; the harness
+    // temporary directory may itself be inside the profile.
+    const beside = profile.parent;
     // A system link outside the profile to one of its ancestors, like /var.
     const ancestor = link(
-      profile.parent.path,
-      PathUtils.join(PathUtils.tempDir, "ancestor-alias-" + ++serial)
+      beside.path,
+      PathUtils.join(beside.path, "ancestor-alias-" + ++serial)
     );
     const throughAncestor = ancestor.clone();
     throughAncestor.append(profile.leafName);
@@ -548,12 +551,12 @@ add_task(
     Assert.throws(() => check(link("/", inside.path)), refused);
 
     // An outside link that does not resolve to a profile ancestor is refused.
-    const elsewhere = Services.dirsvc.get("TmpD", Ci.nsIFile);
+    const elsewhere = beside.clone();
     elsewhere.append("unrelated-" + ++serial);
     elsewhere.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
     const unrelated = link(
       elsewhere.path,
-      PathUtils.join(PathUtils.tempDir, "unrelated-alias-" + serial)
+      PathUtils.join(beside.path, "unrelated-alias-" + serial)
     );
     Assert.throws(() => check(unrelated), refused);
   }

@@ -2600,7 +2600,6 @@ add_task(
     const folders = ordinaryBatchFolders("reentry");
     const early = new LiveView();
     early.initWithFolders(folders);
-    let f;
     let nested = false;
     let cancel = false;
     early.setListener({
@@ -2626,7 +2625,7 @@ add_task(
         messageDB.removeMessage(message.id);
       },
     });
-    f = await ordinaryBatchAdapter(folders);
+    const f = await ordinaryBatchAdapter(folders);
     try {
       const added = addMessage({
         folderId: folders[0],

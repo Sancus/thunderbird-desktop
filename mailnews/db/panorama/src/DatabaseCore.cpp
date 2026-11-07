@@ -5350,7 +5350,12 @@ nsresult CheckFullImportRecords(JSContext* cx, JS::Handle<JSObject*> request,
     // The legacy unread cache defaults to zero when absent. Only IMAP admits
     // that exact representation, and the computed live unread count must agree.
     bool absentUnread = imap && !meta->cells.Contains("unreadChildren"_ns);
-    NS_ENSURE_TRUE(meta->cells.Count() == (absentUnread ? 5u : 6u),
+    // nsMsgThread defaults an absent newest-date cache to zero and computes
+    // the live maximum on read. Preserve absence just like an explicit zero;
+    // no original row/cell is rewritten or newly marked as accounted here.
+    bool absentNewest = !meta->cells.Contains("threadNewestMsgDate"_ns);
+    NS_ENSURE_TRUE(meta->cells.Count() ==
+                       6u - uint32_t(absentUnread) - uint32_t(absentNewest),
                    NS_ERROR_NOT_IMPLEMENTED);
     uint32_t values[6] = {};
     const char* names[] = {"threadRoot",     "threadId",
@@ -5358,7 +5363,7 @@ nsresult CheckFullImportRecords(JSContext* cx, JS::Handle<JSObject*> request,
                            "unreadChildren", "threadNewestMsgDate"};
     for (uint32_t i = 0; i < 6; ++i) {
       nsDependentCString name(names[i]);
-      if (i == 4 && absentUnread) continue;
+      if ((i == 4 && absentUnread) || (i == 5 && absentNewest)) continue;
       NS_ENSURE_TRUE(meta->cells.Contains(name), NS_ERROR_NOT_IMPLEMENTED);
       MOZ_TRY(ImportCellNumber(*meta, name, values[i]));
     }
@@ -11441,11 +11446,14 @@ nsresult DatabaseCore::CheckProfileActivation(
         uint64_t root = MOZ_TRY(mFolderDatabase->GetFolderRoot(folder));
         nsCString actualKey = MOZ_TRY(mFolderDatabase->GetFolderName(root));
         if (serverKey != actualKey) continue;
+        // A cold account service runs Init while this operation is busy.
+        // Its metadata-only admission must cover acquisition as well as the
+        // bound server/path reads; ordinary account work remains closed.
+        AutoRestore<uint32_t> metadata(mStartupMetadataDepth);
+        ++mStartupMetadataDepth;
         nsCOMPtr<nsIMsgAccountManager> accounts =
             do_GetService("@mozilla.org/messenger/account-manager;1");
         NS_ENSURE_TRUE(accounts, NS_ERROR_NOT_AVAILABLE);
-        AutoRestore<uint32_t> metadata(mStartupMetadataDepth);
-        ++mStartupMetadataDepth;
         nsCOMPtr<nsIMsgIncomingServer> server;
         MOZ_TRY(accounts->GetIncomingServer(serverKey, getter_AddRefs(server)));
         NS_ENSURE_TRUE(server, NS_ERROR_NOT_AVAILABLE);

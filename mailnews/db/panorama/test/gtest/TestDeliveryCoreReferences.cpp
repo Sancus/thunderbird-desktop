@@ -45,6 +45,7 @@
 #include "nsDirectoryServiceDefs.h"
 #include "nsDirectoryServiceUtils.h"
 #include "nsIComponentRegistrar.h"
+#include "nsIServiceManager.h"
 #include "nsICommandLineRunner.h"
 #include "nsCommandLine.h"
 #include "nsIPrefBranch.h"
@@ -3180,7 +3181,7 @@ class DeliveryCoreReferences : public testing::Test {
   nsresult CheckRawImport(const nsAString& data, bool imap = true,
                           bool unread = false,
                           Maybe<uint32_t> folderFlags = Nothing(),
-                          bool emptyProjection = false) {
+                          bool emptyProjection = false, uint32_t date = 0) {
     mozilla::dom::AutoJSAPI jsapi;
     NS_ENSURE_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()), NS_ERROR_FAILURE);
     JSContext* cx = jsapi.cx();
@@ -3211,12 +3212,18 @@ class DeliveryCoreReferences : public testing::Test {
       auto& message = *member.snapshot.messages.AppendElement();
       message.sourceKey = message.rootSourceKey = 5001;
       message.header.subject = "live"_ns;
+      message.header.date = int64_t(date) * PR_USEC_PER_SEC;
       message.header.flags = unread ? 0 : nsMsgMessageFlags::Read;
       message.header.priority = nsMsgPriority::notSet;
       message.header.extras = {{"subject"_ns, "live"_ns},
                                {"flags"_ns, unread ? "0"_ns : "1"_ns},
                                {"msgThreadId"_ns, "1389"_ns},
                                {"threadParent"_ns, "ffffffff"_ns}};
+      if (date) {
+        nsCString text;
+        text.AppendInt(date, 16);
+        message.header.extras.AppendElement(RawHdr::kv{"date"_ns, text});
+      }
     }
     return mCore->CheckImportRecordsForTesting(
         cx, request, folder, member.snapshot, imap ? &member : nullptr);
@@ -3454,6 +3461,7 @@ class DeliveryCoreReferences : public testing::Test {
     return mCore->SettleProfileStartup(error);
   }
   bool StartupClosePending() { return mCore->mStartupClosePending; }
+  uint32_t StartupMetadataDepth() { return mCore->mStartupMetadataDepth; }
   nsresult WriteStartupSelector(const char* origin = "initialized-empty",
                                 const char* backend = "panorama",
                                 const char* version = nullptr,
@@ -3595,7 +3603,9 @@ class DeliveryCoreReferences : public testing::Test {
                                  nsIFile* source, nsIFile** journal,
                                  nsACString& journalPath,
                                  nsACString& completeJournal,
-                                 nsACString* selectorOutput = nullptr) {
+                                 nsACString* selectorOutput = nullptr,
+                                 const nsACString* retainedRoot = nullptr,
+                                 const nsACString* retainedRelative = nullptr) {
     dom::AutoJSAPI jsapi;
     NS_ENSURE_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()), NS_ERROR_FAILURE);
     JSContext* cx = jsapi.cx();
@@ -3611,7 +3621,16 @@ class DeliveryCoreReferences : public testing::Test {
     MOZ_TRY(archive->AppendNative("root-0"_ns));
     MOZ_TRY(archive->Create(nsIFile::DIRECTORY_TYPE, 0700));
     MOZ_TRY(source->GetNativeLeafName(leaf));
-    MOZ_TRY(source->CopyToNative(archive, leaf));
+    NS_ENSURE_TRUE(bool(retainedRoot) == bool(retainedRelative),
+                   NS_ERROR_INVALID_ARG);
+    nsCString entries;
+    if (retainedRoot) {
+      nsTArray<nsCString> parts;
+      bool first = true;
+      MOZ_TRY(JSONCacheCopyTree(cx, mProfile, archive, parts, entries, first));
+    } else {
+      MOZ_TRY(source->CopyToNative(archive, leaf));
+    }
     MOZ_TRY(work->Clone(getter_AddRefs(manifest)));
     MOZ_TRY(manifest->AppendNative("manifest.json"_ns));
     MOZ_TRY(work->Clone(getter_AddRefs(record)));
@@ -3620,6 +3639,8 @@ class DeliveryCoreReferences : public testing::Test {
         token(input.identity.token), hash(input.identity.sourceSha256),
         database(input.identity.databaseSourceId), backupHash, appVersion,
         build;
+    nsCString root(retainedRoot ? *retainedRoot : EmptyCString());
+    nsCString relative(retainedRelative ? *retainedRelative : EmptyCString());
     MOZ_TRY(source->GetNativePath(sourcePath));
     MOZ_TRY(manifest->GetNativePath(manifestPath));
     MOZ_TRY(record->GetNativePath(path));
@@ -3629,7 +3650,9 @@ class DeliveryCoreReferences : public testing::Test {
     MOZ_TRY(app->GetAppBuildID(build));
     auto expand = [&](nsCString& json) -> nsresult {
       for (auto entry :
-           {std::pair{"@SOURCE@", &sourcePath},
+           {std::pair{"@SERVERROOT@", &root},
+            std::pair{"@RELATIVE@", &relative},
+            std::pair{"@SOURCE@", &sourcePath},
             std::pair{"@SOURCEID@", &sourceId}, std::pair{"@TOKEN@", &token},
             std::pair{"@HASH@", &hash}, std::pair{"@DATABASE@", &database},
             std::pair{"@MANIFEST@", &manifestPath},
@@ -3659,6 +3682,11 @@ class DeliveryCoreReferences : public testing::Test {
         "\"directory\":\"root-0\",\"entries\":[{\"parts\":[@LEAF@],\"type\":"
         "\"regular\","
         "\"size\":0,\"sha256\":@HASH@}]}]}");
+    if (retainedRoot)
+      document =
+          "{\"version\":1,\"complete\":true,\"roots\":[{\"source\":@PROFILE@,"
+          "\"directory\":\"root-0\",\"entries\":["_ns +
+          entries + "]}]}"_ns;
     MOZ_TRY(expand(document));
     JS::Rooted<JS::Value> value(cx);
     MOZ_TRY(StartupDocument(cx, document, &value));
@@ -3688,6 +3716,11 @@ class DeliveryCoreReferences : public testing::Test {
     nsCString inventory(
         "[{\"id\":@SOURCEID@,\"path\":@SOURCE@,\"sha256\":@HASH@,"
         "\"protocol\":\"none\",\"serverKey\":\"delivery-references\"}]");
+    if (retainedRoot)
+      inventory.ReplaceSubstring(
+          "\"serverKey\":\"delivery-references\"",
+          "\"serverKey\":\"delivery-references\",\"serverRoot\":@SERVERROOT@,"
+          "\"physicalRelativePath\":@RELATIVE@");
     nsCString row(
         "{\"state\":\"imported\",\"id\":@SOURCEID@,\"token\":@TOKEN@,"
         "\"path\":@SOURCE@,\"sha256\":@HASH@,\"protocol\":\"none\","
@@ -25097,6 +25130,238 @@ TEST_F(DeliveryCoreReferences,
     ASSERT_EQ(NS_OK, JSONCacheReadFile(target, retained));
     EXPECT_EQ("retained bytes"_ns, retained);
   }
+}
+
+TEST_F(DeliveryCoreReferences, ThreadNewestCacheAbsenceUsesNativeZero) {
+  ASSERT_EQ(NS_OK, Start());
+  for (bool imap : {false, true}) {
+    for (bool absentUnread : {false, true}) {
+      for (bool unread : {false, true}) {
+        auto data = RawImportRecords(false, false, absentUnread, unread);
+        data.ReplaceSubstring(u",{\"k\":\"threadNewestMsgDate\",\"v\":\"0\"}",
+                              u"");
+        const auto original = data;
+        const bool wrongUnread = absentUnread && (!imap || unread);
+        EXPECT_EQ(wrongUnread ? NS_ERROR_NOT_IMPLEMENTED : NS_OK,
+                  CheckRawImport(data, imap, unread));
+        EXPECT_EQ(original, data);
+      }
+    }
+  }
+}
+
+TEST_F(DeliveryCoreReferences,
+       ThreadNewestCacheAbsenceAndZeroRecomputeLiveMaximum) {
+  ASSERT_EQ(NS_OK, Start());
+  auto original = RawImportRecords(false, false, false);
+  original.ReplaceSubstring(u"{\"k\":\"subject\"",
+                            u"{\"k\":\"date\",\"v\":\"b\"},{\"k\":\"subject\"");
+  for (bool imap : {false, true}) {
+    auto missing = original;
+    missing.ReplaceSubstring(u",{\"k\":\"threadNewestMsgDate\",\"v\":\"0\"}",
+                             u"");
+    const auto preserved = missing;
+    EXPECT_EQ(NS_OK,
+              CheckRawImport(missing, imap, false, Nothing(), false, 11));
+    EXPECT_EQ(preserved, missing);
+    EXPECT_EQ(NS_OK,
+              CheckRawImport(original, imap, false, Nothing(), false, 11));
+    auto exact = original;
+    exact.ReplaceSubstring(u"\"threadNewestMsgDate\",\"v\":\"0\"",
+                           u"\"threadNewestMsgDate\",\"v\":\"b\"");
+    EXPECT_EQ(NS_OK, CheckRawImport(exact, imap, false, Nothing(), false, 11));
+    auto wrong = original;
+    wrong.ReplaceSubstring(u"\"threadNewestMsgDate\",\"v\":\"0\"",
+                           u"\"threadNewestMsgDate\",\"v\":\"c\"");
+    EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED,
+              CheckRawImport(wrong, imap, false, Nothing(), false, 11));
+  }
+}
+
+TEST_F(DeliveryCoreReferences,
+       ThreadNewestCacheStillRefusesMalformedAndUnknownCells) {
+  ASSERT_EQ(NS_OK, Start());
+  for (bool imap : {false, true}) {
+    for (const char16_t* invalid : {u"", u"not-hex"}) {
+      auto data = RawImportRecords(false, false, false);
+      const nsString replacement(u"\"threadNewestMsgDate\",\"v\":\""_ns +
+                                 nsDependentString(invalid) + u"\""_ns);
+      data.ReplaceSubstring(u"\"threadNewestMsgDate\",\"v\":\"0\"",
+                            replacement.get());
+      EXPECT_EQ(NS_ERROR_INVALID_ARG, CheckRawImport(data, imap));
+    }
+    auto unknown = RawImportRecords(false, false, false);
+    unknown.ReplaceSubstring(u"threadNewestMsgDate", u"unknownNewestCache");
+    EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED, CheckRawImport(unknown, imap));
+    auto missingRoot = RawImportRecords(false, false, false);
+    missingRoot.ReplaceSubstring(
+        u",{\"k\":\"threadNewestMsgDate\",\"v\":\"0\"}", u"");
+    missingRoot.ReplaceSubstring(u"threadRoot", u"unrecognizedRoot");
+    EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED, CheckRawImport(missingRoot, imap));
+  }
+}
+
+TEST_F(DeliveryCoreReferences,
+       ThreadNewestCacheAbsenceKeepsRetiredRecordAccounting) {
+  ASSERT_EQ(NS_OK, Start());
+  auto data = RawImportRecords(true, true, true);
+  data.ReplaceSubstring(u",{\"k\":\"threadNewestMsgDate\",\"v\":\"0\"}", u"");
+  const auto original = data;
+  EXPECT_EQ(NS_OK, CheckRawImport(data));
+  EXPECT_EQ(original, data);
+  data.ReplaceSubstring(u"\"children\",\"v\":\"0\"",
+                        u"\"children\",\"v\":\"1\"");
+  EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED, CheckRawImport(data));
+}
+
+// Stock mach gtest runs suites in separate processes. This native fixture uses
+// a second ordinary invocation in the same whole Linux job: AccountManager has
+// process-wide shutdown state, and a cached service would conceal its Init
+// guard.
+class DeliveryCoreStartupCold : public DeliveryCoreReferences {};
+
+TEST_F(DeliveryCoreStartupCold, RetainedMetadataScope) {
+  nsCOMPtr<nsIServiceManager> services;
+  ASSERT_EQ(NS_OK, NS_GetServiceManager(getter_AddRefs(services)));
+  constexpr auto accountContract = "@mozilla.org/messenger/account-manager;1";
+  bool instantiated = true;
+  ASSERT_EQ(NS_OK, services->IsServiceInstantiatedByContractID(
+                       accountContract, NS_GET_IID(nsIMsgAccountManager),
+                       &instantiated));
+  ASSERT_FALSE(instantiated)
+  << "Requires the declared fresh whole-job gtest invocation";
+  (void)StaticPrefs::mail_panorama_enabled_AtStartup();
+  AutoRestore<bool> native(
+      StaticPrefs::sMirror_mail_panorama_enabled_AtStartup);
+  StaticPrefs::sMirror_mail_panorama_enabled_AtStartup = true;
+  nsCOMPtr<nsIComponentRegistrar> registrar;
+  ASSERT_EQ(NS_OK, NS_GetComponentRegistrar(getter_AddRefs(registrar)));
+  const char* contracts[] = {"@mozilla.org/msgDatabase/msgDBService;1",
+                             "@mozilla.org/mailnews/virtual-folder-wrapper;1"};
+  nsCID before[2];
+  bool registered[2] = {};
+  for (uint32_t i = 0; i < 2; ++i) {
+    nsCID* cid = nullptr;
+    if (NS_SUCCEEDED(registrar->ContractIDToCID(contracts[i], &cid))) {
+      ASSERT_TRUE(cid);
+      before[i] = *cid;
+      registered[i] = true;
+      std::free(cid);
+    }
+  }
+  nsCOMPtr<nsIPrefBranch> prefs =
+      do_GetService("@mozilla.org/preferences-service;1");
+  ASSERT_TRUE(prefs);
+  constexpr auto prefix = "mail.server.delivery-references.";
+  nsTArray<nsCString> oldPrefs;
+  ASSERT_EQ(NS_OK, prefs->GetChildList(prefix, oldPrefs));
+  ASSERT_TRUE(oldPrefs.IsEmpty());
+  auto clearPrefs =
+      MakeScopeExit([&] { EXPECT_EQ(NS_OK, prefs->DeleteBranch(prefix)); });
+  auto restore = MakeScopeExit([&] {
+    // Settle the real account blocker/SQLite connection before restoring the
+    // previous contract associations. The actual Init-created factories retain
+    // their normal component-manager lifetime in this dedicated test process.
+    FinishSelectedStartup();
+    for (uint32_t i = 0; i < 2; ++i) {
+      if (registered[i])
+        EXPECT_EQ(NS_OK, registrar->RegisterFactory(before[i], "", contracts[i],
+                                                    nullptr));
+    }
+  });
+  nsCOMPtr<nsIFile> root, children;
+  ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(root)));
+  ASSERT_EQ(NS_OK, root->AppendNative("cold-store"_ns));
+  ASSERT_EQ(NS_OK, root->Create(nsIFile::DIRECTORY_TYPE, 0700));
+  ASSERT_EQ(NS_OK, root->Clone(getter_AddRefs(children)));
+  ASSERT_EQ(NS_OK, children->AppendNative("Inbox.sbd"_ns));
+  ASSERT_EQ(NS_OK, children->Create(nsIFile::DIRECTORY_TYPE, 0700));
+  for (const char* leaf : {"Inbox", "Trash", "Unsent Messages"}) {
+    nsCOMPtr<nsIFile> body;
+    ASSERT_EQ(NS_OK, root->Clone(getter_AddRefs(body)));
+    ASSERT_EQ(NS_OK, body->AppendNative(nsDependentCString(leaf)));
+    ASSERT_EQ(NS_OK, body->Create(nsIFile::NORMAL_FILE_TYPE, 0600));
+  }
+  nsCOMPtr<nsIFile> body;
+  ASSERT_EQ(NS_OK, children->Clone(getter_AddRefs(body)));
+  ASSERT_EQ(NS_OK, body->AppendNative("Import"_ns));
+  ASSERT_EQ(NS_OK, body->Create(nsIFile::NORMAL_FILE_TYPE, 0600));
+  ASSERT_EQ(NS_OK, prefs->SetCharPref("mail.server.delivery-references.type",
+                                      "none"_ns));
+  ASSERT_EQ(NS_OK,
+            prefs->SetCharPref("mail.server.delivery-references.userName",
+                               "cold-native"_ns));
+  ASSERT_EQ(NS_OK,
+            prefs->SetCharPref("mail.server.delivery-references.hostname",
+                               "localhost"_ns));
+  ASSERT_EQ(NS_OK, prefs->SetCharPref(
+                       "mail.server.delivery-references.storeContractID",
+                       "@mozilla.org/msgstore/berkeleystore;1"_ns));
+  ASSERT_EQ(NS_OK,
+            prefs->SetComplexValue("mail.server.delivery-references.directory",
+                                   NS_GET_IID(nsIFile), root));
+  ASSERT_EQ(NS_OK, Start());
+  FolderImportSnapshot input;
+  nsCOMPtr<nsIFile> source;
+  ASSERT_EQ(NS_OK, PrepareNativeImport(input, getter_AddRefs(source)));
+  ASSERT_EQ(NS_OK, source->MoveToNative(children, "Import.msf"_ns));
+  ASSERT_EQ(NS_OK, source->GetPath(input.identity.sourcePath));
+  FolderImportReceipt receipt;
+  ASSERT_EQ(NS_OK, ImportNativeFile(source, input, receipt));
+  nsCOMPtr<nsIFile> journal;
+  nsCString journalPath, complete, serverRoot;
+  ASSERT_EQ(NS_OK, root->GetNativePath(serverRoot));
+  const nsCString badRelative("Inbox/Import.msf");
+  ASSERT_EQ(NS_OK, StartupReceiptControl(input, receipt, source,
+                                         getter_AddRefs(journal), journalPath,
+                                         complete, nullptr, &serverRoot,
+                                         &badRelative));
+  Stop();
+  ASSERT_EQ(NS_OK, ArmSelectedStartup());
+  nsCString selected;
+  ASSERT_EQ(NS_OK, DescribeStartup(selected));
+  ASSERT_EQ(NS_OK, OpenStartup("reuse"));
+  ASSERT_EQ(NS_OK, services->IsServiceInstantiatedByContractID(
+                       accountContract, NS_GET_IID(nsIMsgAccountManager),
+                       &instantiated));
+  ASSERT_FALSE(instantiated);
+  // This error is reached AFTER the actual cold service/Init and server-path
+  // lookup. The old acquisition order failed earlier with NOT_AVAILABLE.
+  EXPECT_EQ(NS_ERROR_FILE_CORRUPTED,
+            CheckStartupActivation(false, &journalPath));
+  ASSERT_EQ(NS_OK, services->IsServiceInstantiatedByContractID(
+                       accountContract, NS_GET_IID(nsIMsgAccountManager),
+                       &instantiated));
+  EXPECT_TRUE(instantiated);
+  EXPECT_EQ(0u, StartupMetadataDepth());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DatabaseCore::CheckAccountStartup());
+  EXPECT_EQ(NS_OK, StartupContextCheck());
+  complete.ReplaceSubstring("Inbox/Import.msf", "Inbox.sbd/Import.msf");
+  ASSERT_EQ(NS_OK, StartupWriteControl(journal, complete));
+  ASSERT_EQ(NS_OK, CheckStartupActivation(false, &journalPath));
+  EXPECT_EQ(0u, StartupMetadataDepth());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DatabaseCore::CheckAccountStartup());
+  ASSERT_EQ(NS_OK, CheckStartupActivation(true, &journalPath));
+  EXPECT_EQ(0u, StartupMetadataDepth());
+  EXPECT_EQ(NS_OK, DatabaseCore::CheckAccountStartup());
+  nsCString currentSource;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(currentSource));
+  EXPECT_EQ(input.identity.databaseSourceId, currentSource);
+  int64_t originalBytes = -1;
+  ASSERT_EQ(NS_OK, source->GetFileSize(&originalBytes));
+  EXPECT_EQ(0, originalBytes);
+  ASSERT_EQ(NS_OK, StartupClose(NS_ERROR_ABORT));
+  EXPECT_TRUE(SpinEventLoopUntil("ColdAccountActualStorageSettlement"_ns,
+                                 [&] { return !StartupClosePending(); }));
+  bool ready = true;
+  ASSERT_EQ(NS_OK, mConnection->GetConnectionReady(&ready));
+  EXPECT_FALSE(ready);
+  EXPECT_EQ(NS_ERROR_ABORT, DatabaseCore::CheckAccountStartup());
+  nsCOMPtr<nsIFile> held;
+  ASSERT_EQ(NS_OK, mSelectedLock->GetDirectory(getter_AddRefs(held)));
+  bool same;
+  ASSERT_EQ(NS_OK, held->Equals(mProfile, &same));
+  EXPECT_TRUE(same);
 }
 
 TEST_F(DeliveryCoreReferences, StartupBeginPreservesSettledParserFailure) {

@@ -1201,3 +1201,178 @@ add_task(async function test_imapUnitRejectsUnknownOrAmbiguousBinding() {
     Assert.equal([...imapFolders.get(entry.source.id).messages].length, 0);
   }
 });
+
+// Retained whole015 native IMAP summary, byte-exact SHA256 below.
+const MISSING_NEWEST_IMAP_SHA256 =
+  "740a7bd8d9a44550e72c783df794aeb9e3acab63b42790a91192763507bf2f9d";
+const MISSING_NEWEST_IMAP_SOURCE = [
+  "// <!-- <mdb:mork:z v=\"1.4\"/> -->",
+  "< <(a=c)> // (f=iso-8859-1)",
+  "  (80=ns:msg:db:row:scope:msgs:all)(81=subject)(82=sender)(83=message-id)",
+  "  (84=references)(85=recipients)(86=date)(87=size)(88=flags)(89=priority)",
+  "  (8A=label)(8B=numLines)(8C=ccList)(8D=bccList)(8E=msgThreadId)",
+  "  (8F=threadId)(90=threadFlags)(91=threadNewestMsgDate)(92=children)",
+  "  (93=unreadChildren)(94=threadSubject)(95=msgCharSet)",
+  "  (96=ns:msg:db:table:kind:msgs)(97=ns:msg:db:table:kind:thread)",
+  "  (98=ns:msg:db:table:kind:allthreads)",
+  "  (99=ns:msg:db:row:scope:threads:all)(9A=threadParent)(9B=threadRoot)",
+  "  (9C=msgOffset)(9D=offlineMsgSize)(9E=uidOnServer)",
+  "  (9F=ns:msg:db:row:scope:dbfolderinfo:all)",
+  "  (A0=ns:msg:db:table:kind:dbfolderinfo)(A1=numMsgs)(A2=numNewMsgs)",
+  "  (A3=folderSize)(A4=expungedBytes)(A5=folderDate)(A6=highWaterKey)",
+  "  (A7=mailboxName)(A8=UIDValidity)(A9=totPendingMsgs)",
+  "  (AA=unreadPendingMsgs)(AB=version)(AC=forceReparse)",
+  "  (AD=fixedBadRefThreading)(AE=onlineName)(AF=userSortOrder)",
+  "  (B0=folderName)(B1=indexingPriority)(B2=imapFlags)(B3=s526-custom)",
+  "  (B4=ProtoThreadFlags)(B5=ns:msg:db:row:scope:pending:all)",
+  "  (B6=ns:msg:db:table:kind:pending)>",
+  "<(8A=2a)(81=0)(80=1)>[1:m(^9B=2a)(^8F=2a)(^90=0)(^92=1)(^93=1)]",
+  "",
+  "<(88=imap-activation-s526@invalid)(89=Original IMAP startup migration)",
+  "  (8B=imap-retained)(8C=ffffffff)>",
+  "{1:^80 {(k^96:c)(s=9)} ",
+  "  [2A(^83^88)(^81^89)(^9E=2a)(^B3^8B)(^9A^8C)(^8E=2a)(^B4=0)]}",
+  "{2A:^80 {(k^97:c)(s=9)1:m } 2A }",
+  "{FFFFFFFD:^99 {(k^98:c)(s=9)} [2A(^94^89)]}",
+  "",
+  "<(82=INBOX)(85=8003014)(86=e000)(87=20e)>",
+  "{1:^9F {(k^A0:c)(s=9u)} ",
+  "  [1(^AB=1)(^AC=0)(^AD=1)(^AE^82)(^88^85)(^A7^82)(^B2^86)(^A8^87)(^A1=1)",
+  "    (^A2=1)(^A6=2a)]}",
+  "",
+  "@$${C{@",
+  "@$$}C}@",
+  ""
+].join("\n");
+
+/**
+ * Copies the retained native summary to an owned IMAP folder and reads it.
+ * Does not open a Mork database or add missing cells to the original bytes.
+ *
+ * @returns {Promise<{input: object, source: object, folderFlags: number}>}
+ *   Ordinary reader input and its source plan for the existing converter.
+ */
+async function missingNewestImapEntry() {
+  const root = MailServices.accounts.getIncomingServer(imapServerKey).rootFolder;
+  const folder = root.addSubfolder(
+    "missing-newest-" + Services.uuid.generateUUID().toString().slice(1, -1)
+  );
+  folder.flags = 0x8003014;
+  const summary = folder.summaryFile;
+  Assert.ok(!summary.exists(), "The test owns a new summary path");
+  await IOUtils.write(
+    summary.path,
+    new TextEncoder().encode(MISSING_NEWEST_IMAP_SOURCE),
+    { mode: "create" }
+  );
+  registerCleanupFunction(() =>
+    IOUtils.remove(summary.path, { ignoreAbsent: true })
+  );
+  const inventory =
+    AppConstants.platform == "win"
+      ? captureMorkFolderWindowsInventory(
+          summary,
+          do_get_profile(),
+          folder.filePath,
+          do_get_profile()
+        )
+      : undefined;
+  const input = await readMorkFolderImport(
+    folder,
+    "snapshot-missing-newest-" + folder.id,
+    inventory
+  );
+  Assert.equal(input.source.sha256, MISSING_NEWEST_IMAP_SHA256);
+  return {
+    input,
+    source: {
+      id: "retained-missing-newest-" + folder.id,
+      protocol: "imap",
+      originalFolderURI: folder.URI,
+      token: input.token,
+      databaseSourceId: database.sourceId,
+      destinationFolderId: folder.id,
+      ...input.source,
+      ...(inventory ? { inventory } : {}),
+      state: "importing",
+      receipt: null,
+    },
+    folderFlags: folder.flags,
+  };
+}
+
+add_task(async function test_convertsOriginalImapNoNewestDateCache() {
+  const entry = await missingNewestImapEntry();
+  const original = structuredClone(entry.input);
+  const metadata = original.records.rows.find(row => row.scope == "m");
+  Assert.ok(!metadata.cells.some(cell => cell.k == "threadNewestMsgDate"));
+  const request = convertMorkProtocolUnit(
+    [entry],
+    "missing-newest-unit",
+    database.sourceId
+  );
+  const member = request.folders[0];
+  Assert.equal(member.recordsComplete, true);
+  Assert.deepEqual(member.unhandledRecords, []);
+  Assert.deepEqual(member.records, original.records);
+  Assert.deepEqual(member.source.messageKeys, [42]);
+  Assert.equal(member.messages[0].sourceKey, 42);
+  Assert.equal(member.messages[0].rootSourceKey, 42);
+  Assert.equal(member.messages[0].parentSourceKey, null);
+  Assert.equal(member.messages[0].header.date, 0);
+  Assert.deepEqual(member.imap.serverUids, [{ sourceKey: 42, uid: 42 }]);
+  Assert.deepEqual(member.imap.uidValidity, { present: true, value: 526 });
+  Assert.deepEqual(entry.input, original, "No source cell is inserted or changed");
+  Assert.deepEqual(
+    await IOUtils.read(entry.source.path),
+    new TextEncoder().encode(MISSING_NEWEST_IMAP_SOURCE)
+  );
+});
+
+add_task(async function test_rejectsInvalidMetadataWithNoNewestDateCache() {
+  const entry = await missingNewestImapEntry();
+  const convertEntry = value =>
+    convertMorkProtocolUnit([value], "missing-newest-refusal", database.sourceId);
+  Assert.equal(convertEntry(entry).folders.length, 1);
+  for (const [name, value, expected] of [
+    ["threadNewestMsgDate", "1", /Unsupported Mork newest-date cache/],
+    ["threadNewestMsgDate", "ffffffff", /Unsupported Mork newest-date cache/],
+    ["threadNewestMsgDate", "g", /Invalid structural Mork uint32/],
+    ["unknownThreadCell", "0", /Unsupported Mork thread metadata\/state/],
+    ["threadFlags", "1", /Unsupported Mork thread metadata\/state/],
+    ["children", "2", /Unsupported Mork thread metadata\/state/],
+    ["unreadChildren", "0", /Unsupported Mork thread metadata\/state/],
+    ["threadRoot", "2b", /Missing Mork semantic root/],
+  ]) {
+    const changed = structuredClone(entry);
+    const row = changed.input.records.rows.find(record => record.scope == "m");
+    const cell = row.cells.find(item => item.k == name);
+    if (cell) {
+      cell.v = value;
+    } else {
+      row.cells.push({ k: name, v: value });
+    }
+    Assert.throws(() => convertEntry(changed), expected, name + ": " + value);
+  }
+  for (const name of [
+    "threadRoot",
+    "threadId",
+    "threadFlags",
+    "children",
+    "unreadChildren",
+  ]) {
+    const changed = structuredClone(entry);
+    const row = changed.input.records.rows.find(record => record.scope == "m");
+    row.cells = row.cells.filter(cell => cell.k != name);
+    Assert.throws(
+      () => convertEntry(changed),
+      /Unsupported Mork thread metadata\/state/,
+      name + " stays required for this original unread message"
+    );
+  }
+  Assert.equal(
+    await IOUtils.computeHexDigest(entry.source.path, "sha256"),
+    MISSING_NEWEST_IMAP_SHA256,
+    "Refusal variants change only owned parsed models"
+  );
+});

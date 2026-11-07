@@ -342,6 +342,12 @@ class DatabaseCore : public nsIDatabaseCore,
                                   JS::MutableHandle<JS::Value> output);
   nsresult OpenProfileStartup(JSContext* cx, JS::Handle<JS::Value> plan);
   nsresult BuildStartupFolders();
+  // Only the validated activation readback lends these bindings to the native
+  // folder initializer. They never grant ordinary writer admission.
+  nsresult BindStartupFolderPath(uint64_t folderId, nsCOMPtr<nsIFile>& path);
+  nsresult BindStartupChildNames(uint64_t parentId, nsIFile* parentPath,
+                                 nsTArray<nsCString>& childNames);
+  const nsTHashMap<uint64_t, nsCString>* mStartupLocalPaths = nullptr;
   static nsresult ReadStartupMailSource(JSContext* cx,
                                         JS::Handle<JSObject*> source,
                                         ProfileStartupOperation& operation,

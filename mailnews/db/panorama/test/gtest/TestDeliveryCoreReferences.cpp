@@ -3906,6 +3906,8 @@ class DeliveryCoreReferences : public testing::Test {
       MOZ_TRY(folder->GetMsgStore(getter_AddRefs(store)));
       MOZ_TRY(store->GetStoreType(storeType));
     }
+    nsCString originalSummaryPath;
+    if (!isServer) originalSummaryPath = cachePath;
     nsCString quotedDescriptor;
     MOZ_TRY(JSONCacheQuote(cx, descriptor, quotedDescriptor));
     nsCString raw("{");
@@ -4003,7 +4005,7 @@ class DeliveryCoreReferences : public testing::Test {
                          std::pair{"protocol", &protocol},
                          std::pair{"storeType", &storeType}, std::pair {
                            "originalSummaryPath",
-                           &cachePath
+                           &originalSummaryPath
                          }}) {
         nsCString quoted;
         MOZ_TRY(JSONCacheQuote(cx, *field.second, quoted));
@@ -5168,6 +5170,234 @@ class DeliveryCoreReferences : public testing::Test {
     }
     if (completeCache) CompleteStartupRootCache(root, journal, raw);
     action(manager, server, message, prefs, accountKey);
+  }
+
+  // Real native import/receipt/backup and factory controls. Raw Mork/body
+  // conversion remains covered by this whole issue's ordinary startup test.
+  void CheckCommittedColdLocalReuse(const nsACString& name, bool maildir,
+                                    uint32_t fault = 0) {
+    nsCOMPtr<nsIMsgAccountManager> manager =
+        do_GetService("@mozilla.org/messenger/account-manager;1");
+    ASSERT_TRUE(manager);
+    ASSERT_EQ(NS_OK, manager->UnloadAccounts());
+    (void)StaticPrefs::mail_panorama_enabled_AtStartup();
+    AutoRestore<bool> native(
+        StaticPrefs::sMirror_mail_panorama_enabled_AtStartup);
+    StaticPrefs::sMirror_mail_panorama_enabled_AtStartup = true;
+    nsCOMPtr<nsIPrefBranch> prefs =
+        do_GetService("@mozilla.org/preferences-service;1");
+    ASSERT_TRUE(prefs);
+    constexpr auto prefix = "mail.server.delivery-references.";
+    nsTArray<nsCString> previous;
+    ASSERT_EQ(NS_OK, prefs->GetChildList(prefix, previous));
+    ASSERT_TRUE(previous.IsEmpty());
+    auto clearPrefs =
+        MakeScopeExit([&] { EXPECT_EQ(NS_OK, prefs->DeleteBranch(prefix)); });
+    nsCOMPtr<nsIComponentRegistrar> registrar;
+    ASSERT_EQ(NS_OK, NS_GetComponentRegistrar(getter_AddRefs(registrar)));
+    constexpr auto contract = "@mozilla.org/msgDatabase/msgDBService;1";
+    nsCID* old = nullptr;
+    ASSERT_EQ(NS_OK, registrar->ContractIDToCID(contract, &old));
+    ASSERT_TRUE(old);
+    const nsCID oldCID = *old;
+    std::free(old);
+    const nsCID nativeCID = nsID::GenerateUUID();
+    RefPtr<GenericFactory> factory =
+        new GenericFactory([](const nsIID& iid, void** output) -> nsresult {
+          RefPtr<DatabaseCore> core = DatabaseCore::GetInstanceForService();
+          return core->QueryInterface(iid, output);
+        });
+    ASSERT_EQ(NS_OK,
+              registrar->RegisterFactory(nativeCID, "", contract, factory));
+    auto restore = MakeScopeExit([&] {
+      if (mSelectedStartup)
+        FinishSelectedStartup();
+      else
+        Stop();
+      EXPECT_EQ(NS_OK, manager->UnloadAccounts());
+      EXPECT_EQ(NS_OK,
+                registrar->RegisterFactory(oldCID, "", contract, nullptr));
+      EXPECT_EQ(NS_OK, registrar->UnregisterFactory(nativeCID, factory));
+    });
+    nsCOMPtr<nsIFile> root, children, body;
+    ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(root)));
+    ASSERT_EQ(NS_OK, root->AppendNative("cold-legacy-store"_ns));
+    ASSERT_EQ(NS_OK, root->Create(nsIFile::DIRECTORY_TYPE, 0700));
+    auto createBody = [&](nsIFile* directory, const nsACString& leaf,
+                          nsIFile** result) -> nsresult {
+      nsCOMPtr<nsIFile> file;
+      MOZ_TRY(directory->Clone(getter_AddRefs(file)));
+      MOZ_TRY(file->AppendNative(leaf));
+      MOZ_TRY(file->Create(
+          maildir ? nsIFile::DIRECTORY_TYPE : nsIFile::NORMAL_FILE_TYPE,
+          maildir ? 0700 : 0600));
+      if (maildir) {
+        for (const char* leaf : {"cur", "new", "tmp"}) {
+          nsCOMPtr<nsIFile> part;
+          MOZ_TRY(file->Clone(getter_AddRefs(part)));
+          MOZ_TRY(part->AppendNative(nsDependentCString(leaf)));
+          MOZ_TRY(part->Create(nsIFile::DIRECTORY_TYPE, 0700));
+        }
+      }
+      file.forget(result);
+      return NS_OK;
+    };
+    for (const char* leaf : {"Inbox", "Trash", "Unsent Messages", "Ordinary"}) {
+      nsCOMPtr<nsIFile> file;
+      ASSERT_EQ(NS_OK, createBody(root, nsDependentCString(leaf),
+                                  getter_AddRefs(file)));
+    }
+    ASSERT_EQ(NS_OK, root->Clone(getter_AddRefs(children)));
+    ASSERT_EQ(NS_OK, children->AppendNative("Inbox.sbd"_ns));
+    ASSERT_EQ(NS_OK, children->Create(nsIFile::DIRECTORY_TYPE, 0700));
+    const nsCString physical(
+        NS_ConvertUTF16toUTF8(NS_MsgHashIfNecessary(name)));
+    ASSERT_EQ(NS_OK, createBody(children, physical, getter_AddRefs(body)));
+    ASSERT_EQ(NS_OK, prefs->SetCharPref("mail.server.delivery-references.type",
+                                        "none"_ns));
+    ASSERT_EQ(NS_OK,
+              prefs->SetCharPref("mail.server.delivery-references.userName",
+                                 "cold-legacy-native"_ns));
+    ASSERT_EQ(NS_OK,
+              prefs->SetCharPref("mail.server.delivery-references.hostname",
+                                 "localhost"_ns));
+    ASSERT_EQ(NS_OK, prefs->SetCharPref(
+                         "mail.server.delivery-references.storeContractID",
+                         maildir ? "@mozilla.org/msgstore/maildirstore;1"_ns
+                                 : "@mozilla.org/msgstore/berkeleystore;1"_ns));
+    ASSERT_EQ(NS_OK, prefs->SetComplexValue(
+                         "mail.server.delivery-references.directory",
+                         NS_GET_IID(nsIFile), root));
+    ASSERT_EQ(NS_OK, Start());
+    FolderImportSnapshot input;
+    nsCOMPtr<nsIFile> source;
+    ASSERT_EQ(NS_OK, PrepareNativeImport(input, getter_AddRefs(source)));
+    ASSERT_EQ(NS_OK,
+              mCore->FolderDB().UpdateName(input.identity.folderId, name));
+    auto logicalPath = mCore->FolderDB().GetFolderPath(input.identity.folderId);
+    ASSERT_TRUE(logicalPath.isOk());
+    input.identity.folderPath = logicalPath.unwrap();
+    ASSERT_EQ(NS_OK, source->MoveToNative(children, physical + ".msf"_ns));
+    ASSERT_EQ(NS_OK, source->GetPath(input.identity.sourcePath));
+    FolderImportReceipt receipt;
+    ASSERT_EQ(NS_OK, ImportNativeFile(source, input, receipt));
+    ASSERT_EQ(2u, receipt.keys.Length());
+    nsCOMPtr<nsIFile> journal;
+    nsCString journalPath, complete, serverRoot;
+    ASSERT_EQ(NS_OK, root->GetNativePath(serverRoot));
+    const nsCString relative("Inbox.sbd/"_ns + physical + ".msf"_ns);
+    ASSERT_EQ(NS_OK,
+              StartupReceiptControl(input, receipt, source,
+                                    getter_AddRefs(journal), journalPath,
+                                    complete, nullptr, &serverRoot, &relative));
+    Stop();
+    for (uint32_t restart = 0; restart < 2; ++restart) {
+      ASSERT_EQ(NS_OK, ArmSelectedStartup());
+      nsCString selected;
+      ASSERT_EQ(NS_OK, DescribeStartup(selected));
+      ASSERT_EQ(NS_OK, OpenStartup("reuse"));
+      if (fault && restart == 0) {
+        nsCOMPtr<nsIFile> collision, moved;
+        nsCString bodyPath;
+        ASSERT_EQ(NS_OK, body->GetNativePath(bodyPath));
+        if (fault == 1) {
+          const nsCString alias(NS_ConvertUTF16toUTF8(EncodeFilename(name)));
+          ASSERT_NE(physical, alias);
+          ASSERT_EQ(NS_OK,
+                    createBody(children, alias, getter_AddRefs(collision)));
+        } else {
+          ASSERT_EQ(NS_OK, body->Clone(getter_AddRefs(moved)));
+          ASSERT_EQ(NS_OK,
+                    moved->MoveToNative(mProfile, "retained-cold-body"_ns));
+          if (fault == 2) {
+            nsCString target;
+            ASSERT_EQ(NS_OK, moved->GetNativePath(target));
+            ASSERT_EQ(0, symlink(target.get(), bodyPath.get()));
+          }
+        }
+        auto restoreBody = MakeScopeExit([&] {
+          if (collision) EXPECT_EQ(NS_OK, collision->Remove(true));
+          if (moved) {
+            if (fault == 2) EXPECT_EQ(NS_OK, body->Remove(false));
+            EXPECT_EQ(NS_OK, moved->MoveToNative(children, physical));
+          }
+        });
+        EXPECT_EQ(fault == 1   ? NS_ERROR_NOT_AVAILABLE
+                  : fault == 2 ? NS_ERROR_FILE_ACCESS_DENIED
+                               : NS_ERROR_FILE_NOT_FOUND,
+                  CheckStartupActivation(false, &journalPath));
+        EXPECT_FALSE(mCore->mStartupLocalPaths);
+        EXPECT_EQ(0u, StartupMetadataDepth());
+        EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DatabaseCore::CheckAccountStartup());
+        uint64_t count;
+        ASSERT_EQ(NS_OK, mCore->MessageDB().GetNumMessages(
+                             input.identity.folderId, &count));
+        EXPECT_EQ(2u, count);
+        auto retainedName =
+            mCore->FolderDB().GetFolderName(input.identity.folderId);
+        ASSERT_TRUE(retainedName.isOk());
+        EXPECT_EQ(name, retainedName.unwrap());
+      }
+      ASSERT_EQ(NS_OK, CheckStartupActivation(false, &journalPath));
+      EXPECT_FALSE(mCore->mStartupLocalPaths);
+      EXPECT_EQ(0u, StartupMetadataDepth());
+      EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DatabaseCore::CheckAccountStartup());
+      ASSERT_EQ(NS_OK, CheckStartupActivation(true, &journalPath));
+      EXPECT_EQ(NS_OK, DatabaseCore::CheckAccountStartup());
+      nsCOMPtr<nsIMsgFolder> actual;
+      ASSERT_EQ(NS_OK, mCore->FolderDB().GetMsgFolderForFolder(
+                           input.identity.folderId, getter_AddRefs(actual)));
+      ASSERT_TRUE(actual);
+      uint64_t id;
+      ASSERT_EQ(NS_OK, actual->GetId(&id));
+      EXPECT_EQ(input.identity.folderId, id);
+      nsCOMPtr<nsIFile> actualPath;
+      ASSERT_EQ(NS_OK, actual->GetFilePath(getter_AddRefs(actualPath)));
+      bool same;
+      ASSERT_EQ(NS_OK, actualPath->Equals(body, &same));
+      EXPECT_TRUE(same);
+      auto retainedName = mCore->FolderDB().GetFolderName(id);
+      ASSERT_TRUE(retainedName.isOk());
+      EXPECT_EQ(name, retainedName.unwrap());
+      uint64_t count;
+      ASSERT_EQ(NS_OK, mCore->MessageDB().GetNumMessages(id, &count));
+      EXPECT_EQ(2u, count);
+      for (const auto& key : receipt.keys) {
+        CapturedMessage retained;
+        ASSERT_EQ(NS_OK,
+                  mCore->MessageDB().CaptureMessage(key.destination, retained));
+        EXPECT_EQ(id, retained.folderId);
+      }
+      auto rootId = mCore->FolderDB().GetFolderRoot(id);
+      ASSERT_TRUE(rootId.isOk());
+      auto discovered =
+          mCore->FolderDB().GetFolderChildNamed(rootId.unwrap(), "Ordinary"_ns);
+      ASSERT_TRUE(discovered.isOk());
+      EXPECT_NE(0u, discovered.unwrap());
+      nsCString sourceId;
+      ASSERT_EQ(NS_OK, mCore->GetSourceId(sourceId));
+      EXPECT_EQ(input.identity.databaseSourceId, sourceId);
+      Maybe<FolderImportReceipt> retained;
+      ASSERT_EQ(NS_OK,
+                mCore->ReadFolderImportReceipt(input.identity, retained));
+      ASSERT_TRUE(retained);
+      ASSERT_EQ(receipt.keys.Length(), retained->keys.Length());
+      for (uint32_t i = 0; i < receipt.keys.Length(); ++i) {
+        EXPECT_EQ(receipt.keys[i].source, retained->keys[i].source);
+        EXPECT_EQ(receipt.keys[i].destination, retained->keys[i].destination);
+      }
+      int64_t sourceSize = -1;
+      ASSERT_EQ(NS_OK, source->GetFileSize(&sourceSize));
+      EXPECT_EQ(0, sourceSize);
+      if (!restart) {
+        actual = nullptr;
+        ASSERT_EQ(NS_OK, manager->UnloadAccounts());
+        nsCOMPtr<nsIFile> retainedWork = mStartupFixtureWork;
+        mStartupFixtureWork = nullptr;
+        FinishSelectedStartup();
+        mStartupFixtureWork = retainedWork;
+      }
+    }
   }
 
   void CheckObservedStartupFailure() {
@@ -25756,6 +25986,40 @@ TEST_F(DeliveryCoreReferences, StartupUnknownNumericCacheCellStillRefuses) {
   nsCString retained;
   ASSERT_EQ(NS_OK, JSONCacheReadFile(file, retained));
   EXPECT_EQ(raw, retained);
+}
+
+TEST_F(DeliveryCoreReferences, StartupColdReuseKeepsLiteralPercentName) {
+  CheckCommittedColdLocalReuse("literal%20name"_ns, false);
+}
+
+TEST_F(DeliveryCoreReferences, StartupColdReuseKeepsShortenedMboxName) {
+  nsCString name("Original logical name ");
+  for (uint32_t i = 0; i < 45; ++i) name.AppendLiteral("long");
+  CheckCommittedColdLocalReuse(name, false);
+}
+
+TEST_F(DeliveryCoreReferences, StartupColdReuseKeepsShortenedMaildirName) {
+  nsCString name("Original logical name ");
+  for (uint32_t i = 0; i < 45; ++i) name.AppendLiteral("long");
+  CheckCommittedColdLocalReuse(name, true);
+}
+
+TEST_F(DeliveryCoreReferences, StartupColdReuseRefusesPhysicalAliasCollision) {
+  nsCString name("Original logical name ");
+  for (uint32_t i = 0; i < 45; ++i) name.AppendLiteral("long");
+  CheckCommittedColdLocalReuse(name, true, 1);
+}
+
+TEST_F(DeliveryCoreReferences, StartupColdReuseRefusesLinkedPhysicalStore) {
+  nsCString name("Original logical name ");
+  for (uint32_t i = 0; i < 45; ++i) name.AppendLiteral("long");
+  CheckCommittedColdLocalReuse(name, true, 2);
+}
+
+TEST_F(DeliveryCoreReferences, StartupColdReuseRefusesMissingPhysicalStore) {
+  nsCString name("Original logical name ");
+  for (uint32_t i = 0; i < 45; ++i) name.AppendLiteral("long");
+  CheckCommittedColdLocalReuse(name, true, 3);
 }
 
 #endif

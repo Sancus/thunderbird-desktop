@@ -11260,6 +11260,101 @@ nsresult DatabaseCore::CheckStartupCachePublication(JSContext* cx,
 }
 #endif
 
+// A stack-owned binding map is installed only after durable activation
+// readback. Folder construction must use it before discovery can reconcile a
+// legacy physical spelling against the committed logical hierarchy.
+nsresult DatabaseCore::BindStartupFolderPath(uint64_t folderId,
+                                             nsCOMPtr<nsIFile>& path) {
+  if (!mStartupLocalPaths) return NS_OK;
+  MOZ_TRY(CheckProfileStartup(ProfileStartupToken(), true));
+  NS_ENSURE_TRUE(mStartupMetadataDepth && mProfileStartup->busy &&
+                     mProfileStartup->opened && !mProfileStartup->ready &&
+                     mProfileStartup->mode == "reuse"_ns,
+                 NS_ERROR_NOT_AVAILABLE);
+  auto retained = mStartupLocalPaths->Lookup(folderId);
+  if (!retained) return NS_OK;
+  uint64_t root = MOZ_TRY(mFolderDatabase->GetFolderRoot(folderId));
+  nsCString key = MOZ_TRY(mFolderDatabase->GetFolderName(root));
+  nsCOMPtr<nsIMsgAccountManager> accounts =
+      do_GetService("@mozilla.org/messenger/account-manager;1");
+  NS_ENSURE_TRUE(accounts, NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<nsIMsgIncomingServer> server;
+  MOZ_TRY(accounts->GetIncomingServer(key, getter_AddRefs(server)));
+  NS_ENSURE_TRUE(server, NS_ERROR_NOT_AVAILABLE);
+  nsCString protocol, contract;
+  MOZ_TRY(server->GetType(protocol));
+  MOZ_TRY(server->GetStringValue("storeContractID", contract));
+  if (contract.IsEmpty())
+    contract.AssignLiteral("@mozilla.org/msgstore/berkeleystore;1");
+  NS_ENSURE_TRUE(protocol == "none"_ns, NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<nsIFile> selected, serverPath, parent;
+  MOZ_TRY(NS_NewNativeLocalFile(retained.Data(), getter_AddRefs(selected)));
+  MOZ_TRY(server->GetLocalPath(getter_AddRefs(serverPath)));
+  bool inside;
+  MOZ_TRY(serverPath->Contains(selected, &inside));
+  NS_ENSURE_TRUE(inside, NS_ERROR_FILE_ACCESS_DENIED);
+  MOZ_TRY(selected->GetParent(getter_AddRefs(parent)));
+  nsCString physicalParent;
+  MOZ_TRY(StartupDirectory(parent, physicalParent));
+  MOZ_TRY(CheckStartupMailStore(retained.Data(), contract, false));
+  MOZ_TRY(CheckProfileStartup(ProfileStartupToken(), true));
+  path = selected;
+  return NS_OK;
+}
+
+nsresult DatabaseCore::BindStartupChildNames(uint64_t parentId,
+                                             nsIFile* parentPath,
+                                             nsTArray<nsCString>& childNames) {
+  if (!mStartupLocalPaths) return NS_OK;
+  MOZ_TRY(CheckProfileStartup(ProfileStartupToken(), true));
+  nsTArray<uint64_t> children =
+      MOZ_TRY(mFolderDatabase->GetFolderChildren(parentId));
+  nsTArray<nsCString> names = childNames.Clone();
+  nsTHashSet<uint32_t> bound;
+  nsCOMPtr<nsIFile> directory;
+  MOZ_TRY(parentPath->Clone(getter_AddRefs(directory)));
+  if (MOZ_TRY(mFolderDatabase->GetFolderParent(parentId))) {
+    nsCString leaf;
+    MOZ_TRY(directory->GetNativeLeafName(leaf));
+    MOZ_TRY(directory->SetNativeLeafName(leaf + ".sbd"_ns));
+  }
+  for (uint64_t id : children) {
+    if (!mStartupLocalPaths->Contains(id)) continue;
+    nsCOMPtr<nsIFile> physical, parent;
+    MOZ_TRY(BindStartupFolderPath(id, physical));
+    NS_ENSURE_TRUE(physical, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(physical->GetParent(getter_AddRefs(parent)));
+    nsCString expected, actual, leaf;
+    MOZ_TRY(directory->GetNativePath(expected));
+    MOZ_TRY(parent->GetNativePath(actual));
+    NS_ENSURE_TRUE(actual == expected, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(physical->GetNativeLeafName(leaf));
+    nsCString decoded = DecodeFilename(NS_ConvertUTF8toUTF16(leaf));
+    uint32_t matches = 0, index = 0;
+    for (uint32_t n = 0; n < childNames.Length(); ++n) {
+      if (childNames[n] != decoded) continue;
+      ++matches;
+      index = n;
+    }
+    NS_ENSURE_TRUE(matches == 1 && !bound.Contains(index),
+                   NS_ERROR_NOT_AVAILABLE);
+    bound.Insert(index);
+    names[index] = MOZ_TRY(mFolderDatabase->GetFolderName(id));
+  }
+  if (!bound.Count()) return NS_OK;
+  // A second physical child must not alias a retained committed logical row.
+  for (uint32_t i = 0; i < names.Length(); ++i) {
+    names[i] = MOZ_TRY(DatabaseUtils::Normalize(names[i]));
+    for (uint32_t j = 0; j < i; ++j)
+      NS_ENSURE_FALSE(
+          names[i].Equals(names[j], nsCaseInsensitiveUTF8StringComparator),
+          NS_ERROR_NOT_AVAILABLE);
+  }
+  MOZ_TRY(CheckProfileStartup(ProfileStartupToken(), true));
+  childNames = std::move(names);
+  return NS_OK;
+}
+
 nsresult DatabaseCore::CheckProfileActivation(
     JSContext* cx, JS::Handle<JS::Value> activation) {
   MOZ_TRY(CheckProfileStartup(ProfileStartupToken()));
@@ -12021,6 +12116,10 @@ nsresult DatabaseCore::CheckProfileActivation(
     nsTArray<Binding> bindings;
     AutoRestore<uint32_t> metadata(mStartupMetadataDepth);
     ++mStartupMetadataDepth;
+    NS_ENSURE_FALSE(mStartupLocalPaths, NS_ERROR_IN_PROGRESS);
+    AutoRestore<const nsTHashMap<uint64_t, nsCString>*> paths(
+        mStartupLocalPaths);
+    mStartupLocalPaths = &retainedLocalPaths;
     for (auto entry = retainedLocalPaths.Iter(); !entry.Done(); entry.Next()) {
       auto& binding = *bindings.AppendElement();
       MOZ_TRY(mFolderDatabase->GetMsgFolderForFolder(

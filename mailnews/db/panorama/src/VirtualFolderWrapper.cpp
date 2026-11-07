@@ -14,6 +14,7 @@
 #include "nsIObserver.h"
 #include "nsIObserverService.h"
 #include "nsIMsgEnumerator.h"
+#include "nsIMsgHdr.h"
 #include "nsIMsgMailSession.h"
 #include "nsIMsgSearchSession.h"
 #include "nsMsgFolderFlags.h"

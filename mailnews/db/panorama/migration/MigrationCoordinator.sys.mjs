@@ -2281,12 +2281,12 @@ function captureStartupMigration(signal) {
       const matches = servers.filter(server =>
         new FileUtils.File(server.root).contains(file)
       );
-      const roots = servers.filter(
+      const rootMatches = servers.filter(
         server =>
           server.protocol === "imap" && file.path === server.root + ".msf"
       );
-      if (roots.length === 1 && matches.length === 0) {
-        const server = roots[0];
+      if (rootMatches.length === 1 && matches.length === 0) {
+        const server = rootMatches[0];
         serverSummaries.push({
           id: "server-summary:" + file.getRelativePath(profile),
           role: "imap-server-root-summary",
@@ -2299,7 +2299,7 @@ function captureStartupMigration(signal) {
         });
         continue;
       }
-      if (matches.length !== 1 || roots.length) {
+      if (matches.length !== 1 || rootMatches.length) {
         throw new Error(
           "Mork summary has no unique persisted server root: " +
             file.path +

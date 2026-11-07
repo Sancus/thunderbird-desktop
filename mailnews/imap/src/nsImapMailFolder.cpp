@@ -129,6 +129,15 @@ struct NativeOnlineTransferEntry {
   nsCOMPtr<nsIFile> recovery;
   bool publishing = false;
   bool settled = false;
+  // Set by settlement. The upload may still hold recovery open (Windows then
+  // refuses removal), so it is removed only when this transfer is released.
+  bool recoveryRedundant = false;
+
+  ~NativeOnlineTransferEntry() {
+    if (recoveryRedundant && recovery) {
+      [[maybe_unused]] nsresult rv = recovery->Remove(false);
+    }
+  }
 };
 
 struct NativeOfflineCopyEntry {
@@ -9678,12 +9687,9 @@ nsresult nsImapMailFolder::PublishNativeOnlineTransfer(
     // Compose observes this real header before the copy listener completes.
     notifier->NotifyMsgsClassified({published.get()}, false, false);
   }
-  // Finished provider bytes now own recovery. The upload snapshot is redundant.
-  if (entry.recovery) {
-    nsresult removed = entry.recovery->Remove(false);
-    if (NS_FAILED(removed)) return removed;
-    entry.recovery = nullptr;
-  }
+  // Finished provider bytes now own recovery. The upload snapshot is redundant
+  // but may still be open for the upload; remove it when the entry is released.
+  entry.recoveryRedundant = true;
   return NS_OK;
 }
 

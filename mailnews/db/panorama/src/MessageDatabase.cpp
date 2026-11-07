@@ -9212,8 +9212,7 @@ nsresult MessageDatabase::SetMessageFlags(nsMsgKey key, uint32_t newFlags) {
     if (NS_SUCCEEDED(FetchMsg(key, diagPrevious)) &&
         (diagPrevious.flags & nsMsgMessageFlags::Read) &&
         !(newFlags & nsMsgMessageFlags::Read)) {
-      printf_stderr("DIAG-007 read-cleared key=%u old=0x%x new=0x%x
-", key,
+      printf_stderr("DIAG-007 read-cleared key=%u old=0x%x new=0x%x\n", key,
                     diagPrevious.flags, newFlags);
       MozWalkTheStack(stderr);
     }

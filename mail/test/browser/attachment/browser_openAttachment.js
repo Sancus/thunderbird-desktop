@@ -1834,6 +1834,9 @@ add_task(async function test_helperApplicationReceivesCheckedSelectedBytes() {
 });
 
 add_task(async function test_statusActivityMultipleWindowsAndMissedTerminal() {
+  await SpecialPowers.pushPrefEnv({
+    set: [["mail.shell.checkDefaultClient", false]],
+  });
   const { promise_new_window } = ChromeUtils.importESModule(
     "resource://testing-common/mail/WindowHelpers.sys.mjs"
   );
@@ -1947,6 +1950,7 @@ add_task(async function test_statusActivityMultipleWindowsAndMissedTerminal() {
     secondWindow.close();
     await closed;
     Services.focus.focusedWindow = window;
+    await SpecialPowers.popPrefEnv();
   }
 });
 

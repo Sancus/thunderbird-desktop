@@ -185,8 +185,10 @@ async function readMigrationBytes(path) {
     if (before.type != "regular" || before.size > MAX_SUMMARY_BYTES) {
       throw new Error("Unsupported migration source type or size");
     }
+    // IOUtils allocates maxBytes up front; one byte past the measured size
+    // still detects growth without a 64MB buffer per summary.
     const bytes = await IOUtils.read(file.path, {
-      maxBytes: MAX_SUMMARY_BYTES + 1,
+      maxBytes: before.size + 1,
     });
     const hash = Cc["@mozilla.org/security/hash;1"].createInstance(
       Ci.nsICryptoHash

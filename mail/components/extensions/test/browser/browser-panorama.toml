@@ -25,6 +25,8 @@ tags = ["webextensions"]
 # Tests in this folder are split across multiple manifests. When adding a test,
 # please put it in the manifest with its (alphabetical) neighbours.
 
+["browser_ext_compose_sendMessage.js"]
+
 ["browser_ext_menus_context_tabs.js"]
 support-files = [
   "data/content.html",
@@ -32,3 +34,5 @@ support-files = [
   "data/tb-logo.png",
 ]
 tags = ["contextmenu"]
+
+["browser_ext_messages_pagination.js"]

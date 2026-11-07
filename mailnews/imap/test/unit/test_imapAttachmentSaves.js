@@ -43,7 +43,9 @@ add_setup(async function () {
     teardownIMAPPump();
   });
 
-  await setupIMAPPump(undefined, { awaitInbox: true });
+  // The original and modified messages coexist until copy completion. UIDPLUS
+  // gives the replacement APPEND an unambiguous server identity.
+  await setupIMAPPump("RFC2195,RFC4315", { awaitInbox: true });
 });
 
 add_task(async function testImapAttachmentDetac() {

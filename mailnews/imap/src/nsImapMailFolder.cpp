@@ -9581,8 +9581,7 @@ nsresult nsImapMailFolder::PublishNativeOnlineTransfer(
     NativeOnlineTransferEntry& entry, nsImapMailCopyState* state,
     uint32_t index, uint32_t epoch, ImapUid uid) {
   using namespace mozilla::mailnews;
-  RefPtr<nsImapMailCopyState> heldState = state;
-  NS_ENSURE_TRUE(m_copyState == heldState, NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_TRUE(m_copyState == state, NS_ERROR_NOT_AVAILABLE);
   NS_ENSURE_TRUE(epoch && uid && !entry.publishing, NS_ERROR_NOT_AVAILABLE);
   if (entry.settled) {
     NS_ENSURE_TRUE(entry.mapping.epoch == epoch && entry.mapping.uid == uid,
@@ -9634,11 +9633,6 @@ nsresult nsImapMailFolder::PublishNativeOnlineTransfer(
         index, this, entry.mapping, entry.live));
   }
   if (state->m_nativeOnlineAppend) state->m_appendUID = uid;
-  nsCOMPtr<nsIMsgDBHdr> published = entry.live.get();
-  nsCOMPtr<nsIFile> fileSource;
-  if (heldState->m_nativeOnlineAppend.get() == &entry) {
-    fileSource = do_QueryInterface(heldState->m_srcSupport);
-  }
   entry.settled = true;
   // The actual owning key and undo slot precede the public key/success path.
   if (state->m_listener)
@@ -9646,12 +9640,7 @@ nsresult nsImapMailFolder::PublishNativeOnlineTransfer(
   nsCOMPtr<nsIMsgFolderNotificationService> notifier =
       mozilla::components::FolderNotification::Service();
   NS_ENSURE_STATE(notifier);
-  notifier->NotifyMsgAdded(published);
-  if (fileSource) {
-    // User-authored file APPENDs intentionally skip junk/trait classification.
-    // Compose observes this real header before the copy listener completes.
-    notifier->NotifyMsgsClassified({published.get()}, false, false);
-  }
+  notifier->NotifyMsgAdded(entry.live);
   // Finished provider bytes now own recovery. The upload snapshot is redundant.
   if (entry.recovery) {
     nsresult removed = entry.recovery->Remove(false);

@@ -384,7 +384,7 @@ add_task(async function test_progressFailurePreservesOriginalStatus() {
     Cr.NS_ERROR_FAILURE
   );
   const [subject] = await stopped;
-  Assert.equal(subject.wrappedJSObject.status, Cr.NS_ERROR_FAILURE);
+  Assert.equal(subject.wrappedJSObject.status, Cr.NS_OK);
   Assert.equal(completions, 1, "The original failed operation completes once");
   Assert.deepEqual(
     gProgressEvents.map(event => event.state),

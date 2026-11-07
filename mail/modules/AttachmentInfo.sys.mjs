@@ -526,10 +526,27 @@ export class AttachmentInfo {
           loadUsingSystemPrincipal: true,
         },
         (inputStream, status) => {
-          if (Components.isSuccessCode(status)) {
-            resolve(lazy.NetUtil.readInputStream(inputStream));
+          let data;
+          let failure;
+          try {
+            if (!Components.isSuccessCode(status)) {
+              throw new Components.Exception(`Failed to fetch ${url}`, status);
+            }
+            data = lazy.NetUtil.readInputStream(inputStream);
+          } catch (error) {
+            failure = error;
+          }
+          // NetUtil closes the pipe's output, leaving its input to the caller.
+          // Release it before publishing bytes and retain the first failure.
+          try {
+            inputStream.close();
+          } catch (error) {
+            failure ??= error;
+          }
+          if (failure) {
+            reject(failure);
           } else {
-            reject(new Components.Exception(`Failed to fetch ${url}`, status));
+            resolve(data);
           }
         }
       );

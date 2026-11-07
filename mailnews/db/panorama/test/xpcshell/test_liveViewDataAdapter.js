@@ -2350,7 +2350,8 @@ add_task(async function test_nativeOrdinaryFlatBatchPhysicalIdentity() {
   const f = await ordinaryBatchAdapter(folders);
   try {
     const old = [...f.adapter._rowMap];
-    f.selection.select(1);
+    f.selection.rangedSelect(1, 1, false);
+    Assert.equal(f.selection.shiftSelectPivot, 1, "Establish a real physical pivot");
     const selected = old[1].message.id;
     const added = addMessage({
       folderId: folders[1],
@@ -2726,26 +2727,67 @@ add_task(async function test_nativeOrdinaryFlatBatchConsumerFailure() {
 });
 
 add_task(async function test_nativeOrdinaryFlatBatchPublicNewProjection() {
-  const folders = ordinaryBatchFolders("new-word");
-  const root = addMessage({
-    folderId: folders[0],
-    messageId: "new-root",
-    flags: Ci.nsMsgMessageFlags.New,
-  });
-  const f = await ordinaryBatchAdapter(folders);
+  const { MessageInjection } = ChromeUtils.importESModule(
+    "resource://testing-common/mailnews/MessageInjection.sys.mjs"
+  );
+  const { MessageGenerator, SyntheticMessageSet } = ChromeUtils.importESModule(
+    "resource://testing-common/mailnews/MessageGenerator.sys.mjs"
+  );
+  const injection = new MessageInjection({ mode: "local" });
+  const generator = new MessageGenerator();
+  const parent = generator.makeMessage({ subject: "ordinary-public-new" });
+  const folder = await injection.makeEmptyFolder();
+  const set = new SyntheticMessageSet([parent]);
+  await injection.addSetsToFolders([folder], [set]);
+  const root = set.msgHdrList[0];
+  root.flags = 0;
+  folder.msgDatabase.addToNewList(root.messageKey);
+  const folderId = folderDB.getFolderByPath(
+    `${folder.server.key}/${folder.name}`
+  );
+  Assert.greater(folderId, 0);
+  Assert.equal(
+    messageDB.getMessage(root.messageKey).flags,
+    0,
+    "Native raw word stays zero"
+  );
+  const f = await ordinaryBatchAdapter([folderId]);
   try {
-    addMessage({
-      folderId: folders[1],
-      messageId: "new-child",
-      references: ["new-root"],
-      flags: 0,
-    });
-    Assert.equal(f.payloads[0].rows[0].before.flags, Ci.nsMsgMessageFlags.New);
+    Assert.equal(f.adapter.rowAt(0).message.flags, Ci.nsMsgMessageFlags.New);
+    const child = new SyntheticMessageSet([
+      generator.makeMessage({ inReplyTo: parent }),
+    ]);
+    await injection.addSetsToFolders([folder], [child]);
     Assert.equal(
-      f.adapter._rowMap.find(row => row.message.id == root).message.flags,
+      f.payloads.length,
+      1,
+      "Real completed native file publication"
+    );
+    const before = f.payloads[0].rows.find(
+      row => row.before?.id == root.messageKey
+    );
+    Assert.equal(before.before.flags, Ci.nsMsgMessageFlags.New);
+    Assert.equal(before.after.flags, Ci.nsMsgMessageFlags.New);
+    Assert.equal(
+      f.adapter._rowMap.find(row => row.message.id == root.messageKey).message
+        .flags,
       Ci.nsMsgMessageFlags.New
     );
-    Assert.deepEqual(f.events, [["reset"]]);
+    Assert.deepEqual(
+      ordinaryBatchPairs(f.adapter)
+        .map(pair => pair[1])
+        .sort((a, b) => a - b),
+      [root.messageKey, child.msgHdrList[0].messageKey].sort((a, b) => a - b)
+    );
+    Assert.deepEqual(
+      f.events.filter(event => event[0] != "row"),
+      [["reset"]]
+    );
+    Assert.equal(
+      messageDB.getMessage(root.messageKey).flags,
+      0,
+      "Projection never writes the native source word"
+    );
   } finally {
     f.adapter.setTree(null);
   }

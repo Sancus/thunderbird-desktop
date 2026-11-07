@@ -531,34 +531,47 @@ add_task(
       SQLiteDirectory.checkMigrationPathLinks(file, "Refused migration link");
     const refused = error => error.message == "Refused migration link";
 
-    // Links beside the profile are outside it on every platform; the harness
-    // temporary directory may itself be inside the profile.
-    const beside = profile.parent;
-    // A system link outside the profile to one of its ancestors, like /var.
-    const ancestor = link(
-      beside.path,
-      PathUtils.join(beside.path, "ancestor-alias-" + ++serial)
-    );
-    const throughAncestor = ancestor.clone();
-    throughAncestor.append(profile.leafName);
-    check(throughAncestor);
-    check(profile);
+    // A unique directory beside the profile is outside it on every platform;
+    // the harness temporary directory may itself be inside the profile, and
+    // the profile's parent is shared by parallel tests and retries.
+    const beside = profile.parent.clone();
+    beside.append("migration-links");
+    beside.createUnique(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+    const links = [];
+    try {
+      // A system link outside the profile to one of its ancestors, like /var.
+      const ancestor = link(
+        profile.parent.path,
+        PathUtils.join(beside.path, "ancestor-alias")
+      );
+      links.push(ancestor);
+      const throughAncestor = ancestor.clone();
+      throughAncestor.append(profile.leafName);
+      check(throughAncestor);
+      check(profile);
 
-    // A link inside the profile is refused even when it resolves to an
-    // ancestor of the profile.
-    const inside = profile.clone();
-    inside.append("inside-alias-" + ++serial);
-    Assert.throws(() => check(link("/", inside.path)), refused);
+      // A link inside the profile is refused even when it resolves to an
+      // ancestor of the profile.
+      const inside = profile.clone();
+      inside.append("inside-alias");
+      inside.createUnique(Ci.nsIFile.NORMAL_FILE_TYPE, 0o600);
+      inside.remove(false);
+      links.push(link(profile.parent.path, inside.path));
+      Assert.throws(() => check(links.at(-1)), refused);
 
-    // An outside link that does not resolve to a profile ancestor is refused.
-    const elsewhere = beside.clone();
-    elsewhere.append("unrelated-" + ++serial);
-    elsewhere.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
-    const unrelated = link(
-      elsewhere.path,
-      PathUtils.join(beside.path, "unrelated-alias-" + serial)
-    );
-    Assert.throws(() => check(unrelated), refused);
+      // An outside link that does not resolve to a profile ancestor is
+      // refused.
+      const elsewhere = beside.clone();
+      elsewhere.append("unrelated");
+      elsewhere.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+      links.push(link(elsewhere.path, PathUtils.join(beside.path, "alias")));
+      Assert.throws(() => check(links.at(-1)), refused);
+    } finally {
+      // Unlink each link itself; never remove recursively through a link.
+      for (const file of links) {
+        file.remove(false);
+      }
+    }
   }
 );
 

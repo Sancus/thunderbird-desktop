@@ -1077,10 +1077,14 @@ add_task(
     );
     const request = createMorkFolderCacheRequest(cache);
     Assert.equal(request.version, 2);
+    const canonicalProfile = lock.directory.clone();
+    canonicalProfile.normalize();
+    const canonicalManifest = new FileUtils.File(backup.path);
+    canonicalManifest.normalize();
     Assert.deepEqual(request.proof, {
-      profilePath: lock.directory.path,
+      profilePath: canonicalProfile.path,
       manifest: {
-        path: backup.path,
+        path: canonicalManifest.path,
         size: (await IOUtils.stat(backup.path)).size,
         sha256: backup.sha256,
       },

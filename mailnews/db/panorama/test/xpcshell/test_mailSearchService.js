@@ -1271,7 +1271,7 @@ add_task(async function test_recoveredBodiesFollowCurrentNativePolicy() {
     Assert.equal(await index.getRecoveredText(String(byRole.empty.key)), null);
     const suppressed = await index.getRecoveryRecords();
     for (const row of suppressed.filter(
-      row => row.documentId !== String(byRole.deleted.key)
+      record => record.documentId !== String(byRole.deleted.key)
     )) {
       Assert.equal(
         row.erased,
@@ -1357,14 +1357,14 @@ add_task(async function test_recoveredBodiesFollowCurrentNativePolicy() {
       if (failure) {
         failures.unshift(failure);
       }
-      throw new AggregateError(
+      failure = new AggregateError(
         failures,
         "Recovered policy fixture operation/cleanup failed"
       );
     }
-    if (failure) {
-      throw failure;
-    }
+  }
+  if (failure) {
+    throw failure;
   }
 });
 

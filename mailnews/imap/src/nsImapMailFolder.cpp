@@ -10854,6 +10854,9 @@ nsImapFolderCopyState::nsImapFolderCopyState(nsIMsgFolder* destParent,
 }
 
 nsresult nsImapFolderCopyState::Finish(nsresult aStatus) {
+  if (NS_FAILED(aStatus)) {
+    NS_WARNING("CI051 diag4: Finish with failure");
+  }
   if (m_completed) return m_status;
   RefPtr<nsImapFolderCopyState> kungFuDeathGrip(this);
   nsCOMPtr<nsIMsgFolder> completionFolder = m_origDestParent;
@@ -10919,13 +10922,22 @@ nsImapFolderCopyState::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
   nsCOMPtr<nsIMsgFolder> phaseSource = m_curSrcFolder;
   const uint64_t phase = m_messagePhase;
 #endif
-  if (NS_FAILED(aExitCode)) return Finish(aExitCode);
+  if (NS_FAILED(aExitCode)) {
+    NS_WARNING("CI051 diag4: folder-copy URL failed");
+    return Finish(aExitCode);
+  }
   nsresult rv;
   nsCOMPtr<nsIImapUrl> imapUrl = do_QueryInterface(aUrl, &rv);
-  if (NS_FAILED(rv)) return Finish(rv);
+  if (NS_FAILED(rv)) {
+    NS_WARNING("CI051 diag4: OnStopRunningUrl rv site 1");
+    return Finish(rv);
+  }
   nsImapAction action;
   rv = imapUrl->GetImapAction(&action);
-  if (NS_FAILED(rv)) return Finish(rv);
+  if (NS_FAILED(rv)) {
+    NS_WARNING("CI051 diag4: OnStopRunningUrl rv site 2");
+    return Finish(rv);
+  }
   if (action != nsIImapUrl::nsImapEnsureExistsFolder) {
     return Finish(NS_ERROR_UNEXPECTED);
   }
@@ -10936,12 +10948,18 @@ nsImapFolderCopyState::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
   // URI may substitute for actual membership and the exact captured UTF-8 name.
   nsTArray<RefPtr<nsIMsgFolder>> destinations;
   rv = m_curDestParent->GetSubFolders(destinations);
-  if (NS_FAILED(rv)) return Finish(rv);
+  if (NS_FAILED(rv)) {
+    NS_WARNING("CI051 diag4: OnStopRunningUrl rv site 3");
+    return Finish(rv);
+  }
   nsCOMPtr<nsIMsgFolder> newMsgFolder;
   for (nsIMsgFolder* child : destinations) {
     nsCString name;
     rv = child->GetName(name);
-    if (NS_FAILED(rv)) return Finish(rv);
+    if (NS_FAILED(rv)) {
+      NS_WARNING("CI051 diag4: OnStopRunningUrl rv site 4");
+      return Finish(rv);
+    }
     if (!name.Equals(m_curFolderName)) continue;
     if (newMsgFolder) return Finish(NS_ERROR_NOT_AVAILABLE);
     newMsgFolder = child;
@@ -10949,13 +10967,19 @@ nsImapFolderCopyState::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
   if (!newMsgFolder) return Finish(NS_ERROR_NOT_AVAILABLE);
   nsCOMPtr<nsIMsgFolder> parent;
   rv = newMsgFolder->GetParent(getter_AddRefs(parent));
-  if (NS_FAILED(rv)) return Finish(rv);
+  if (NS_FAILED(rv)) {
+    NS_WARNING("CI051 diag4: OnStopRunningUrl rv site 5");
+    return Finish(rv);
+  }
   if (parent != m_curDestParent) return Finish(NS_ERROR_NOT_AVAILABLE);
   if (!m_newDestFolder) m_newDestFolder = newMsgFolder;
 
   nsTArray<RefPtr<nsIMsgFolder>> subFolders;
   rv = m_curSrcFolder->GetSubFolders(subFolders);
-  if (NS_FAILED(rv)) return Finish(rv);
+  if (NS_FAILED(rv)) {
+    NS_WARNING("CI051 diag4: OnStopRunningUrl rv site 6");
+    return Finish(rv);
+  }
   uint32_t childIndex = 0;
   for (nsIMsgFolder* folder : subFolders) {
     m_srcChildFolders.InsertElementAt(m_childIndex + childIndex + 1, folder);
@@ -10965,20 +10989,32 @@ nsImapFolderCopyState::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
 
   nsCOMPtr<nsIMsgEnumerator> enumerator;
   rv = m_curSrcFolder->GetMessages(getter_AddRefs(enumerator));
-  if (NS_FAILED(rv)) return Finish(rv);
+  if (NS_FAILED(rv)) {
+    NS_WARNING("CI051 diag4: OnStopRunningUrl rv site 7");
+    return Finish(rv);
+  }
   if (!enumerator) return Finish(NS_ERROR_NOT_AVAILABLE);
   nsTArray<RefPtr<nsIMsgDBHdr>> messages;
   bool hasMore;
   rv = enumerator->HasMoreElements(&hasMore);
-  if (NS_FAILED(rv)) return Finish(rv);
+  if (NS_FAILED(rv)) {
+    NS_WARNING("CI051 diag4: OnStopRunningUrl rv site 8");
+    return Finish(rv);
+  }
   while (hasMore) {
     nsCOMPtr<nsIMsgDBHdr> header;
     rv = enumerator->GetNext(getter_AddRefs(header));
-    if (NS_FAILED(rv)) return Finish(rv);
+    if (NS_FAILED(rv)) {
+      NS_WARNING("CI051 diag4: OnStopRunningUrl rv site 9");
+      return Finish(rv);
+    }
     if (!header) return Finish(NS_ERROR_NOT_AVAILABLE);
     messages.AppendElement(header);
     rv = enumerator->HasMoreElements(&hasMore);
-    if (NS_FAILED(rv)) return Finish(rv);
+    if (NS_FAILED(rv)) {
+      NS_WARNING("CI051 diag4: OnStopRunningUrl rv site 10");
+      return Finish(rv);
+    }
   }
   if (messages.IsEmpty()) return AdvanceToNextFolder(NS_OK);
   if (WeAreOffline()) return Finish(NS_MSG_ERROR_OFFLINE);
@@ -10987,11 +11023,22 @@ nsImapFolderCopyState::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
   if (mail_panorama_enabled_AtStartup()) {
     nsCOMPtr<nsIMsgDatabase> database;
     rv = newMsgFolder->GetMsgDatabase(getter_AddRefs(database));
-    if (NS_FAILED(rv)) return Finish(rv);
+    if (NS_FAILED(rv)) {
+      NS_WARNING("CI051 diag4: OnStopRunningUrl rv site 11");
+      return Finish(rv);
+    }
     nsTArray<nsMsgKey> keys;
     if (database) rv = database->ListAllKeys(keys);
-    if (NS_FAILED(rv)) return Finish(rv);
+    if (NS_FAILED(rv)) {
+      NS_WARNING("CI051 diag4: OnStopRunningUrl rv site 12");
+      return Finish(rv);
+    }
     if (m_completed) return m_status;
+    if (!database) NS_WARNING("CI051 diag4: no destination database");
+    if (m_messageDestination) NS_WARNING("CI051 diag4: message destination still set");
+    if (phase != m_messagePhase) NS_WARNING("CI051 diag4: message phase changed");
+    if (phaseSource != m_curSrcFolder) NS_WARNING("CI051 diag4: source changed");
+    if (parent != m_curDestParent) NS_WARNING("CI051 diag4: parent changed");
     if (!database || m_messageDestination || phase != m_messagePhase ||
         phaseSource != m_curSrcFolder || parent != m_curDestParent)
       return Finish(NS_ERROR_NOT_AVAILABLE);
@@ -11007,6 +11054,9 @@ nsImapFolderCopyState::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
   // service request. Only our final subtree completion may settle that request.
   rv = newMsgFolder->CopyMessages(m_curSrcFolder, messages, m_isMoveMessages,
                                   m_msgWindow, this, true, false);
+  if (NS_FAILED(rv)) {
+    NS_WARNING("CI051 diag4: CopyMessages failed synchronously");
+  }
   return NS_FAILED(rv) ? Finish(rv) : rv;
 }
 
@@ -11063,6 +11113,9 @@ NS_IMETHODIMP nsImapFolderCopyState::OnStopCopy(nsresult aStatus) {
   auto outputs = std::move(m_messageOutputs);
   m_messageKeys.Clear();
   ++m_messagePhase;
+  if (NS_FAILED(aStatus)) {
+    NS_WARNING("CI051 diag4: message phase OnStopCopy failed");
+  }
   return AdvanceToNextFolder(aStatus);
 }
 

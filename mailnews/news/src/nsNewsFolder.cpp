@@ -1019,7 +1019,7 @@ nsresult nsMsgNewsFolder::InitializeNativeDatabase(nsIMsgDatabase* candidate) {
       return;
     }
     if (listenerAdded) {
-      nsresult cleanupRv = database->RemoveListener(this);
+      [[maybe_unused]] nsresult cleanupRv = database->RemoveListener(this);
       NS_WARNING_ASSERTION(NS_SUCCEEDED(cleanupRv),
                            "Failed to detach news database listener");
     }

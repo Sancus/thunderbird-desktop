@@ -826,6 +826,7 @@ nsresult MessageDatabase::SetNewsReadSet(
                      &installed == &owner.mNewsReadSet,
                  NS_ERROR_NOT_AVAILABLE);
   RefPtr<PerFolderDatabase> pin = &owner;
+  (void)pin;
   RefPtr<nsMsgKeySet> incoming = proposed;
   auto item = MakeUnique<PreparedNewsReadSet>();
   MOZ_TRY(ReadNewsGroupIdentity(sourceId, folderId, item->group, true));

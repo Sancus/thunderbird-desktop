@@ -528,6 +528,7 @@ add_task(async function testCrossServerArchiveFailureAndRetry() {
       command == "CREATE"
         ? destination.folder.getChildNamed("2031")
         : destination.folder;
+    await destination.server.addMessages(target, [], true);
     const archived = [...target.messages];
     Assert.equal(archived.length, 1);
     Assert.equal(archived[0].messageId, messageId);

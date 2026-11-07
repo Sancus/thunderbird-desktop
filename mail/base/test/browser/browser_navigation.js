@@ -103,7 +103,16 @@ add_setup(async function () {
   folderDMessages = [...folderD.messages];
   folderD.markAllMessagesRead(null);
 
-  registerCleanupFunction(() => {
+  registerCleanupFunction(async () => {
+    tabmail.closeOtherTabs(0);
+    threadTree.selectedIndex = -1;
+    await assertNoDisplayedMessage(messageBrowser.contentWindow);
+    if (service instanceof Ci.nsIDatabaseCore) {
+      const { closeMailSearch } = ChromeUtils.importESModule(
+        "resource:///modules/panorama/MailSearch.sys.mjs"
+      );
+      await closeMailSearch();
+    }
     MailServices.accounts.removeAccount(account, false);
   });
 });
@@ -1086,11 +1095,6 @@ add_task(async function testHistoryPrunesDeletedAndReopensPhysicalMessage() {
   const loaded = BrowserTestUtils.waitForEvent(window, "MsgLoaded");
   window.OpenMessageInNewTab(message, { background: false });
   await loaded;
-  registerCleanupFunction(async () => {
-    tabmail.closeOtherTabs(0);
-    threadTree.selectedIndex = -1;
-    await assertNoDisplayedMessage(messageBrowser.contentWindow);
-  });
   const body =
     tabmail.currentAboutMessage.getMessagePaneBrowser().contentDocument.body
       .textContent;

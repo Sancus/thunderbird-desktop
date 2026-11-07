@@ -945,6 +945,10 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
                         if (phase === 'inputs') {
                             require(!d.mail && !d.chat, 'fresh inputs only after the S716 prefix');
                             s.inputSetup = {waiting: null, completed: [], cancelled: false, accountUpdated: false};
+                            mail = await MailSearchService.open(new FileUtils.File(f.mailSidecar), core.sourceId, core.messageDB);
+                            d.recoveryRecords = await mail.getRecoveryRecords();
+                            await mail.close();
+                            mail = null;
                             d.mail = {};
                             d.factorySidecar = PathUtils.join(PathUtils.profileDir, 'panorama-chat-search.sqlite');
                             require(d.factorySidecar !== f.chatSidecar, 'factory and retained sidecar remain distinct');
@@ -1023,7 +1027,13 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
                                 const item = c.chat[name];
                                 conv.writeMessage('NativeSpeaker', item.oldText || item.text, {incoming: true, remoteId: item.remoteId});
                             }
-                            const other = s.account.prplAccount.wrappedJSObject.makeDM(c.chat.conversation + '-other');
+                            const selectedPath = logger.getLogWriter(conv).currentPath;
+                            await TestUtils.waitForCondition(() =>
+                                logger.getLogFilePathForConversation(conv, Date.now()) !== selectedPath,
+                                'a distinct real logger session filename under the same conversation');
+                            const other = s.account.prplAccount.wrappedJSObject.makeDM(c.chat.conversation);
+                            require(other.account.id === conv.account.id && other.normalizedName === conv.normalizedName,
+                                'same real account and normalized logical conversation');
                             s.conversations.push(other);
                             other.writeMessage('OtherSpeaker', c.chat.otherPhysical, {incoming: true, remoteId: c.chat.keep.remoteId});
                             const path = logger.getLogWriter(conv).currentPath;
@@ -1031,6 +1041,17 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
                             d.chat = {path, id: chatSearchDocumentId(path), otherPath, otherId: chatSearchDocumentId(otherPath)};
                             require(d.chat.id !== d.chat.otherId, 'equal remote ID never groups physical logs');
                             await inputStep('chat-logger-factory-flush', () => chat.flush());
+                            const selectedHeader = JSON.parse((await IOUtils.readUTF8(path)).split('\n')[0]);
+                            const otherHeader = JSON.parse((await IOUtils.readUTF8(otherPath)).split('\n')[0]);
+                            for (const key of ['account', 'protocol', 'normalizedName', 'isChat']) {
+                                require(selectedHeader[key] === otherHeader[key], 'equal physical log header identity: ' + key);
+                            }
+                            const selectedText = await chat.getText(d.chat.id);
+                            const otherText = await chat.getText(d.chat.otherId);
+                            require(selectedText && otherText && selectedText.contentRevision !== otherText.contentRevision &&
+                                otherText.body.includes(c.chat.otherPhysical) && !selectedText.body.includes(c.chat.otherPhysical),
+                                'independent bodies and revisions in competing same-conversation sessions');
+                            d.chat.logicalIdentity = selectedHeader;
                             s.oldView = await inputStep('pre-edit-native-query', () => query(c.chat.edit.oldText));
                             d.oldItem = s.oldView.context.chatSearchResultSet.items.find(item => item.hit.id === d.chat.id);
                             require(d.oldItem?.document.body.includes(c.chat.edit.oldText), 'actual captured pre-edit result');
@@ -1040,7 +1061,11 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
                             value = {inputs: d, identity: identity(), inputSetup: s.inputSetup};
                         } else if (phase === 'identity' || phase === 'resumed') {
                             value = {identity: identity()};
-                            if (phase === 'resumed') { value.privacy = await privacy(); }
+                            if (phase === 'resumed') {
+                                value.privacy = await privacy();
+                                mail = await MailSearchService.open(new FileUtils.File(f.mailSidecar), core.sourceId, core.messageDB);
+                                value.recoveryRecords = await mail.getRecoveryRecords();
+                            }
                         } else if (phase === 'update' || phase === 'cancel') {
                             mail = await MailSearchService.open(new FileUtils.File(f.mailSidecar), core.sourceId, core.messageDB);
                             if (phase === 'update') {
@@ -1181,6 +1206,13 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
                             }
                             const staleView = await query(c.chat.keep.text.split(' ')[0]);
                             const count = tabmail.tabInfo.length;
+                            for (const malformed of [null, {id: d.chat.id}]) {
+                                let refusal;
+                                try { await chat.resolveLog(malformed); } catch (error) { refusal = error; }
+                                require(refusal?.name === 'TypeError' && refusal.message === 'A current chat search hit is required',
+                                    'actual shared resolver preserves null/incomplete delivery refusal');
+                                require(tabmail.tabInfo.length === count, 'null/incomplete delivery adds no reader tab');
+                            }
                             require(await staleView.context.openChatSearchConversation(d.oldItem) === null && tabmail.tabInfo.length === count,
                                 'pre-edit tokens refused after real process restart');
                             const item = staleView.context.chatSearchResultSet.items.find(row => row.hit.id === d.chat.id);
@@ -1344,9 +1376,27 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
         self.s717_inputs = {"profile": str(self.profile), "work": str(self.work)}
         failure = None
         try:
+            self.start_s717_account_storage_phase()
             inputs = self.s717_operation("inputs")
             self.s717_inputs = inputs["inputs"]
             self.record("s717-inputs", inputs)
+            original_records = self.s717_inputs["recoveryRecords"]
+            self.assertEqual(len(original_records), 6)
+            survivor = next(
+                row
+                for row in original_records
+                if row["documentId"] == self.fixture["recovered"]["id"]
+            )
+            self.assertEqual(
+                survivor["sourceRevision"], self.digest(Path(self.fixture["backedUp"]))
+            )
+            self.assertEqual(
+                survivor["payload"]["message"]["text"]["body"], self.fixture["recovered"]["body"]
+            )
+            self.assertEqual(
+                survivor["payload"]["provenance"]["importReceipt"]["databaseSourceId"],
+                self.fixture["sourceId"],
+            )
             target_ids = self.mail_ids | {row["id"] for row in self.s717_inputs["mail"].values()}
             history = []
             for batch in range(200):
@@ -1423,6 +1473,7 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
             self.assertEqual(after["identity"]["sourceId"], self.fixture["sourceId"])
             self.assertEqual(after["identity"]["members"], before["identity"]["members"])
             self.assertEqual(after["privacy"], before["privacy"])
+            self.assertEqual(after["recoveryRecords"], original_records)
             self.assertEqual(self.snapshot("mailSidecar"), mail)
             self.assertEqual(self.snapshot("chatSidecar"), chat)
             self.assert_source_hashes()
@@ -1494,14 +1545,18 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
                 {row["documentId"] for row in current["documents"]}, target_ids - forbidden
             )
             self.record("s717-settled", {"history": history, "mail": current, "noReplay": stable})
-            self.record("s717-mail-open", self.s717_operation("mail-final"))
+            mail_final = self.s717_operation("mail-final")
+            self.assertEqual(mail_final["records"], original_records)
+            self.record("s717-mail-open", mail_final)
             self.record("s717-chat-open", self.s717_operation("chat-final"))
             rebuilt = self.s717_rebuild_projection()
+            mail_final = self.s717_operation("mail-final")
+            self.assertEqual(mail_final["records"], original_records)
             self.record(
                 "s717-final",
                 {
                     "rebuild": rebuilt,
-                    "mail": self.s717_operation("mail-final"),
+                    "mail": mail_final,
                     "chat": self.s717_operation("chat-final"),
                 },
             )
@@ -1658,3 +1713,46 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
             self.assertIs(instance.profile, self.initial_profile)
             self.marionette.start_session(capabilities=self.capabilities)
             self.marionette.set_context(self.marionette.CONTEXT_CHROME)
+
+    def start_s717_account_storage_phase(self):
+        """Keep the completed no-cert-db trial separate from ordinary IM account storage."""
+        instance = self.marionette.instance
+        self.assertIs(instance.profile, self.trial_profile)
+        self.assertIs(self.marionette.get_pref("security.nocertdb"), True)
+        before = self.assert_identity()
+        mail = self.snapshot("mailSidecar")
+        chat = self.snapshot("chatSidecar")
+        self.assert_source_hashes()
+        self.assert_receipt_keys()
+        # The full unchanged S716 prefix has finished. NSS selects no-DB mode at
+        # initialization; changing a live pref cannot reopen its persistent key token.
+        # End that process normally and use the existing retained Profile, never a clone.
+        shutdown = self.stop()
+        self.assertIs(instance.profile, self.trial_profile)
+        self.trial_profile.set_preferences({"security.nocertdb": False})
+        instance.prefs = {**(instance.prefs or {}), "security.nocertdb": False}
+        # The original restore_fixture/cleanTest restores all five saved fixture prefs,
+        # removes this Profile's managed preference blocks and restores instance.prefs.
+        after = self.start()
+        self.assertIs(instance.profile, self.trial_profile)
+        self.assertIs(self.marionette.get_pref("security.nocertdb"), False)
+        self.assertNotEqual(before["pid"], after["pid"])
+        self.assertEqual(before["profile"], after["profile"])
+        self.assertEqual(before["sourceId"], after["sourceId"])
+        self.assertEqual(before["members"], after["members"])
+        self.assertEqual(self.snapshot("mailSidecar"), mail)
+        self.assertEqual(self.snapshot("chatSidecar"), chat)
+        self.assert_source_hashes()
+        self.assert_receipt_keys()
+        self.assertEqual(self.digest(Path(self.fixture["journalPath"])), self.journal_hash)
+        self.record(
+            "s717-account-storage-startup",
+            {
+                "before": before,
+                "after": after,
+                "shutdown": shutdown,
+                "security.nocertdb": False,
+                "mail": mail,
+                "chat": chat,
+            },
+        )

@@ -900,3 +900,202 @@ add_task(
     Assert.equal(await index.getText("details-copy"), null);
   }
 );
+
+add_task(async function test_recoveryRescanPreservesEligibleSources() {
+  const fixture = await createIndex("recovery-policy-rescan");
+  let { index } = fixture;
+  const originals = ["survivor", "excluded", "changed", "deleted"].map(id =>
+    document(fixture.states, id, id + "recoveryneedle")
+  );
+  const records = originals.map(source => ({
+    recordId: "receipt-" + source.id,
+    documentId: source.id,
+    kind: "mail",
+    sourceRevision: "a".repeat(64),
+    payload: {
+      originalKey: source.id,
+      importReceipt: { keys: [[1, source.id]] },
+    },
+    document: source,
+  }));
+  await index.retainRecovery(records);
+  await apply(
+    index,
+    0,
+    4,
+    originals.map((source, i) => change(source.id, i + 1))
+  );
+  for (const job of await index.getPendingJobs()) {
+    Assert.ok(
+      await index.finishJob(
+        job,
+        originals.find(row => row.id === job.id)
+      )
+    );
+  }
+  const provenance = await index.getRecoveryRecords();
+  for (const state of fixture.states.values()) {
+    state.generation = 5;
+    state.policyRevision = 5;
+  }
+  fixture.states.get("excluded").eligible = false;
+  fixture.states.get("changed").contentRevision = "text-2";
+  Assert.equal(
+    await index.getRecoveredText("survivor"),
+    null,
+    "Current eligibility alone cannot authorize a changed policy"
+  );
+  await index.beginRescan("fixture-source", 5);
+  await index.applyRescanPage({
+    sequence: 5,
+    afterKey: 0,
+    nextKey: 4,
+    changes: originals.map(source =>
+      change(source.id, 5, {
+        generation: 5,
+        policyRevision: 5,
+        kind: source.id === "excluded" ? "exclude" : "index",
+      })
+    ),
+  });
+  await index.applyRescanPage({
+    sequence: 5,
+    afterKey: 4,
+    nextKey: 4,
+    changes: [],
+    done: true,
+  });
+  const retained = await index.getRecoveredText("survivor");
+  Assert.equal(retained.body, originals[0].body);
+  Assert.equal(retained.policyRevision, 5);
+  Assert.equal(retained.generation, 5);
+  Assert.equal(await index.getRecoveredText("excluded"), null);
+  Assert.equal(await index.getRecoveredText("changed"), null);
+  const metadata = {
+    ...originals[0],
+    generation: 5,
+    policyRevision: 5,
+    body: "",
+    bodyIndexed: false,
+  };
+  Assert.ok(
+    await index.refreshJob(
+      (await index.getPendingJobs()).find(job => job.id === "survivor"),
+      metadata
+    )
+  );
+  Assert.equal((await index.getText("survivor")).body, originals[0].body);
+  Assert.deepEqual(
+    await index.getRecoveryRecords(),
+    provenance,
+    "Policy authorization does not rewrite any source revision, identity or receipt"
+  );
+  await index.close();
+  index = await fixture.open();
+  Assert.equal(
+    (await index.getRecoveredText("survivor")).body,
+    originals[0].body
+  );
+  for (const state of fixture.states.values()) {
+    state.generation = 6;
+    state.policyRevision = 6;
+  }
+  fixture.states.get("excluded").eligible = true;
+  await index.beginRescan("fixture-source", 6);
+  await index.applyRescanPage({
+    sequence: 6,
+    afterKey: 0,
+    nextKey: 4,
+    changes: originals.map(source =>
+      change(source.id, 6, { generation: 6, policyRevision: 6 })
+    ),
+  });
+  await index.applyRescanPage({
+    sequence: 6,
+    afterKey: 4,
+    nextKey: 4,
+    changes: [],
+    done: true,
+  });
+  Assert.equal(
+    await index.getRecoveredText("excluded"),
+    null,
+    "An eligible rescan after reopen cannot revive an excluded backup"
+  );
+  const excludedMetadata = {
+    ...originals[1],
+    generation: 6,
+    policyRevision: 6,
+    body: "",
+    bodyIndexed: false,
+  };
+  Assert.equal(
+    await index.refreshJob(
+      (await index.getPendingJobs()).find(job => job.id === "excluded"),
+      excludedMetadata
+    ),
+    false
+  );
+  Assert.equal(await index.getRecoveredText("changed"), null);
+  Assert.equal(
+    (await index.getRecoveredText("survivor")).body,
+    originals[0].body
+  );
+  Assert.deepEqual(await index.getRecoveryRecords(), provenance);
+  fixture.states.delete("deleted");
+  await apply(index, 6, 7, [
+    change("deleted", 7, { generation: 7, policyRevision: 6, kind: "delete" }),
+  ]);
+  await index.retainRecovery(records);
+  const [erased] = await index.getRecoveryRecords("deleted");
+  Assert.ok(erased.erased);
+  Assert.equal(erased.payload, null);
+  Assert.equal(await index.getRecoveredText("deleted"), null);
+  await index.rebuild();
+  Assert.deepEqual((await index.search("excludedrecoveryneedle")).items, []);
+  Assert.deepEqual((await index.search("deletedrecoveryneedle")).items, []);
+
+  // A pre-upgrade record has no evidence that intervening policy was observed.
+  const legacy = await createIndex("legacy-recovery-policy");
+  const source = document(legacy.states, "legacy", "legacyrecoveryneedle");
+  await legacy.index.retainRecovery([
+    {
+      ...records[0],
+      recordId: "legacy-record",
+      documentId: "legacy",
+      document: source,
+    },
+  ]);
+  await apply(legacy.index, 0, 1, [change("legacy", 1)]);
+  await legacy.index.close();
+  const connection = Services.storage.openUnsharedDatabase(legacy.file);
+  try {
+    connection.executeSimpleSQL("DROP TABLE recovery_policy");
+    connection.schemaVersion = 7;
+  } finally {
+    connection.close();
+  }
+  const upgraded = await legacy.open();
+  Assert.equal((await upgraded.getRecoveredText("legacy")).body, source.body);
+  legacy.states.get("legacy").generation = 2;
+  legacy.states.get("legacy").policyRevision = 2;
+  await upgraded.beginRescan("fixture-source", 2);
+  await upgraded.applyRescanPage({
+    sequence: 2,
+    afterKey: 0,
+    nextKey: 1,
+    changes: [change("legacy", 2, { generation: 2, policyRevision: 2 })],
+  });
+  await upgraded.applyRescanPage({
+    sequence: 2,
+    afterKey: 1,
+    nextKey: 1,
+    changes: [],
+    done: true,
+  });
+  Assert.equal(
+    await upgraded.getRecoveredText("legacy"),
+    null,
+    "Upgrade cannot invent unobserved authorization history"
+  );
+});

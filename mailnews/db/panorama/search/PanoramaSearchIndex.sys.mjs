@@ -265,7 +265,7 @@ export class PanoramaSearchIndex {
       Cc["@mozilla.org/messenger/fts3tokenizer;1"]
         .getService(Ci.nsIFts3Tokenizer)
         .registerTokenizer(connection);
-      if (connection.schemaVersion > 7) {
+      if (connection.schemaVersion > 8) {
         throw new Error("Unsupported search index schema");
       }
       await index.#transaction(async () => {
@@ -386,7 +386,12 @@ export class PanoramaSearchIndex {
         await index.#execute(
           "CREATE TABLE IF NOT EXISTS recovery_erased (documentId TEXT PRIMARY KEY)"
         );
-        await index.#execute("PRAGMA user_version = 7");
+        await index.#execute(
+          "CREATE TABLE IF NOT EXISTS recovery_policy (" +
+            "documentId TEXT PRIMARY KEY,policyRevision INTEGER NOT NULL," +
+            "suppressed INTEGER NOT NULL DEFAULT 0)"
+        );
+        await index.#execute("PRAGMA user_version = 8");
       });
       return index;
     } catch (error) {
@@ -821,6 +826,14 @@ export class PanoramaSearchIndex {
     // Version checks hide stale rows until refresh. Keep index-change FTS text
     // so a flag-only projection can advance without tokenizing the body again.
     if (change.kind != "index") {
+      // Consuming an exclusion revokes backup reuse even after policy is restored.
+      // Keep the original recovery record and receipt unchanged.
+      await this.#execute(
+        "INSERT INTO recovery_policy(documentId,policyRevision,suppressed) " +
+          "VALUES(:id,:policyRevision,1) ON CONFLICT(documentId) " +
+          "DO UPDATE SET suppressed=1",
+        { id: change.id, policyRevision: change.policyRevision }
+      );
       await this.#erase(change.id, change.kind == "delete");
     }
     await this.#execute("DELETE FROM index_jobs WHERE documentId=:id", {
@@ -945,6 +958,23 @@ export class PanoramaSearchIndex {
         }
         for (const change of changes) {
           await this.#queueChange(change);
+          if (change.kind == "index") {
+            // Only the bounded authoritative eligibility rescan can advance a
+            // recovery authorization. A stale page or consumed exclusion cannot.
+            await this.#execute(
+              "UPDATE recovery_policy SET policyRevision=:policyRevision " +
+                "WHERE documentId=:id AND suppressed=0 AND EXISTS(" +
+                "SELECT 1 FROM document_versions WHERE documentId=:id " +
+                "AND sequence=:sequence AND generation=:generation " +
+                "AND policyRevision=:policyRevision AND kind='index')",
+              {
+                id: change.id,
+                sequence: change.sequence,
+                generation: change.generation,
+                policyRevision: change.policyRevision,
+              }
+            );
+          }
         }
         await this.#execute(
           done
@@ -1083,16 +1113,20 @@ export class PanoramaSearchIndex {
         ["document"],
         signal
       );
-      // An unchanged MIME body can cross a policy marker after current-source
-      // validation. Recovery is only admitted under its captured policy; do not
-      // let this metadata fast path turn a rejected backup into fresh evidence.
+      // Recovery needs its captured policy or an explicit eligible rescan.
+      // Never turn a consumed exclusion into fresh MIME evidence.
+      const policy = recovered.length
+        ? await this.#getRecoveryPolicy(job.id, signal)
+        : null;
       if (
         recovered.some(row => {
           const source = copyDocument(JSON.parse(row.document));
           return (
             source.contentRevision === body.contentRevision &&
             source.body === body.body &&
-            source.policyRevision !== metadata.policyRevision
+            (policy?.suppressed ||
+              (source.policyRevision !== metadata.policyRevision &&
+                policy?.policyRevision !== metadata.policyRevision))
           );
         })
       ) {
@@ -1591,6 +1625,18 @@ export class PanoramaSearchIndex {
           ) {
             throw new Error("Recovered source or physical binding changed");
           }
+          if (!old && record.document !== null) {
+            // Do not invent policy history for records written by an old schema.
+            // An exclusion recorded before import also prevents authorization.
+            await this.#execute(
+              "INSERT INTO recovery_policy(documentId,policyRevision) " +
+                "VALUES(:id,:policyRevision) ON CONFLICT DO NOTHING",
+              {
+                id: record.documentId,
+                policyRevision: JSON.parse(record.document).policyRevision,
+              }
+            );
+          }
           await this.#execute(
             "INSERT INTO recovery_records(recordId,documentId,kind,sourceRevision,payload,document,erased) " +
               "VALUES(:recordId,:documentId,:kind,:sourceRevision," +
@@ -1640,8 +1686,27 @@ export class PanoramaSearchIndex {
   }
 
   /**
-   * Loads recovered text only for its still-current native content and policy.
-   * Metadata-only generation changes may reuse the same content revision.
+   * Reads the last authorized recovery policy and durable suppression state.
+   * Missing state does not authorize a legacy record under a changed policy.
+   *
+   * @param {string} id - Exact physical mail key.
+   * @param {AbortSignal} [signal] - Cancels the lookup.
+   * @returns {Promise<?{policyRevision: number, suppressed: number}>} Stored state, or null.
+   */
+  async #getRecoveryPolicy(id, signal) {
+    const [policy] = await this.#execute(
+      "SELECT policyRevision,suppressed FROM recovery_policy WHERE documentId=:id",
+      { id },
+      ["policyRevision", "suppressed"],
+      signal
+    );
+    return policy ?? null;
+  }
+
+  /**
+   * Loads recovered text for current native content under an authorized policy.
+   * An eligible rescan can advance policy without changing the source record.
+   * A consumed exclusion suppresses that recovery across reopen and rebuild.
    *
    * @param {string} id - Exact physical mail key.
    * @param {AbortSignal} [signal] - Cancels lookup and delivery.
@@ -1660,8 +1725,9 @@ export class PanoramaSearchIndex {
           signal
         );
         const state = await this.#resolveDocument(id, signal);
+        const policy = await this.#getRecoveryPolicy(id, signal);
         signal?.throwIfAborted();
-        if (state?.eligible !== true) {
+        if (state?.eligible !== true || policy?.suppressed) {
           return null;
         }
         const candidates = rows
@@ -1669,7 +1735,8 @@ export class PanoramaSearchIndex {
           .filter(
             document =>
               document.contentRevision === state.contentRevision &&
-              document.policyRevision === (state.policyRevision ?? 0)
+              (document.policyRevision === (state.policyRevision ?? 0) ||
+                policy?.policyRevision === (state.policyRevision ?? 0))
           );
         if (!candidates.length) {
           return null;
@@ -1683,7 +1750,11 @@ export class PanoramaSearchIndex {
         ) {
           throw new Error("Conflicting recovered semantic sources");
         }
-        return { ...candidates[0], generation: state.generation };
+        return {
+          ...candidates[0],
+          generation: state.generation,
+          policyRevision: state.policyRevision ?? 0,
+        };
       }),
       signal
     );

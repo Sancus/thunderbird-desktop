@@ -44,8 +44,6 @@ tags = ["webextensions"]
 
 ["browser_ext_compose_saveTemplate.js"]
 
-["browser_ext_compose_sendMessage.js"]
-
 ["browser_ext_compose_sendMessage_mv3.js"]
 
 ["browser_ext_contentScripts.js"]

@@ -1351,7 +1351,7 @@ add_task(async function test_rejectsInvalidMetadataWithNoNewestDateCache() {
     ["threadFlags", "1", /Unsupported Mork thread metadata\/state/],
     ["children", "2", /Unsupported Mork thread metadata\/state/],
     ["unreadChildren", "0", /Unsupported Mork thread metadata\/state/],
-    ["threadRoot", "2b", /Missing Mork semantic root/],
+    ["threadRoot", "2b", /Source thread root is not an imported member/],
   ]) {
     const changed = structuredClone(entry);
     const row = changed.input.records.rows.find(record => record.scope == "m");
@@ -1363,19 +1363,20 @@ add_task(async function test_rejectsInvalidMetadataWithNoNewestDateCache() {
     }
     Assert.throws(() => convertEntry(changed), expected, name + ": " + value);
   }
-  for (const name of [
-    "threadRoot",
-    "threadId",
-    "threadFlags",
-    "children",
-    "unreadChildren",
+  // Original source-key relations reject missing roots before metadata checks.
+  for (const [name, expected] of [
+    ["threadRoot", /Invalid source thread root/],
+    ["threadId", /Unsupported Mork thread metadata\/state/],
+    ["threadFlags", /Unsupported Mork thread metadata\/state/],
+    ["children", /Unsupported Mork thread metadata\/state/],
+    ["unreadChildren", /Unsupported Mork thread metadata\/state/],
   ]) {
     const changed = structuredClone(entry);
     const row = changed.input.records.rows.find(record => record.scope == "m");
     row.cells = row.cells.filter(cell => cell.k != name);
     Assert.throws(
       () => convertEntry(changed),
-      /Unsupported Mork thread metadata\/state/,
+      expected,
       name + " stays required for this original unread message"
     );
   }

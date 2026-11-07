@@ -98,6 +98,7 @@
 #include "nsIMimeConverter.h"
 #include "nsIMsgOfflineImapOperation.h"
 #include "nsIMsgPluggableStore.h"
+#include "nsIFolderLookupService.h"
 #include "nsIObserverService.h"
 #include "nsIUUIDGenerator.h"
 #include "nsIAbManager.h"
@@ -10674,6 +10675,143 @@ nsresult DatabaseCore::BuildStartupFolders() {
       return a->localNames.Length() < b->localNames.Length() ? -1 : 1;
     return Compare(a->storePath, b->storePath);
   });
+  // Map actual legacy store discovery through retained summary/cache names.
+  // A shortened physical leaf is not a public AddSubfolder row birth.
+  auto reconcileLocal = [&](nsIMsgFolder* parent,
+                            const StartupMailSource& source, uint32_t depth,
+                            const nsTArray<nsCString>& discovered) -> nsresult {
+    nsTArray<nsCString> names;
+    nsTHashSet<nsCString> physicalNames;
+    for (const auto& name : discovered) {
+      NS_ENSURE_FALSE(physicalNames.Contains(name), NS_ERROR_NOT_AVAILABLE);
+      physicalNames.Insert(name);
+      names.AppendElement(MOZ_TRY(DatabaseUtils::Normalize(name)));
+    }
+    bool root;
+    MOZ_TRY(parent->GetIsServer(&root));
+    nsTHashMap<nsCString, nsCString> boundNames;
+    for (const auto* candidate : local) {
+      if (candidate->serverKey != source.serverKey ||
+          candidate->serverRoot != source.serverRoot ||
+          candidate->localLeaves.Length() <= depth)
+        continue;
+      bool sameParent = true;
+      for (uint32_t i = 0; i < depth; ++i)
+        sameParent &= candidate->localLeaves[i] == source.localLeaves[i];
+      if (!sameParent) continue;
+      nsCString decoded =
+          DecodeFilename(NS_ConvertUTF8toUTF16(candidate->localLeaves[depth]));
+      auto index = discovered.IndexOf(decoded);
+      NS_ENSURE_TRUE(index != nsTArray<nsCString>::NoIndex,
+                     NS_ERROR_NOT_AVAILABLE);
+      nsCString name =
+          MOZ_TRY(DatabaseUtils::Normalize(candidate->localNames[depth]));
+      if (root) {
+        for (const auto& canonical :
+             {"Inbox"_ns, "Unsent Messages"_ns, "Drafts"_ns, "Trash"_ns,
+              "Sent"_ns, "Templates"_ns, "Archives"_ns}) {
+          if (name.Equals(canonical, nsCaseInsensitiveUTF8StringComparator)) {
+            name = canonical;
+            break;
+          }
+        }
+      }
+      if (auto prior = boundNames.Lookup(decoded))
+        NS_ENSURE_TRUE(prior.Data() == name, NS_ERROR_NOT_AVAILABLE);
+      boundNames.InsertOrUpdate(decoded, name);
+      names[index] = name;
+    }
+    bool changed = false;
+    for (uint32_t i = 0; i < names.Length(); ++i) {
+      changed |= names[i] != MOZ_TRY(DatabaseUtils::Normalize(discovered[i]));
+      for (uint32_t j = 0; j < i; ++j)
+        NS_ENSURE_FALSE(
+            names[i].Equals(names[j], nsCaseInsensitiveUTF8StringComparator),
+            NS_ERROR_NOT_AVAILABLE);
+    }
+    if (!changed) return NS_OK;
+    uint64_t parentId;
+    MOZ_TRY(parent->GetId(&parentId));
+    FolderDatabase::CacheOrigin parentOrigin;
+    MOZ_TRY(
+        mFolderDatabase->CheckCacheProjectionOrigin(parentId, parentOrigin));
+    auto* nativeParent = static_cast<nsMsgDBFolder*>(parent);
+    nsTArray<nsMsgDBFolder::FolderInitialization> retired;
+    nsTArray<RefPtr<nsIMsgFolder>> detached;
+    // Supersede only fresh untouched native discovery objects, never a public,
+    // sealed, pending, imported or data-bearing row. Retain every other guard.
+    std::function<nsresult(nsMsgDBFolder*)> capture =
+        [&](nsMsgDBFolder* folder) -> nsresult {
+      uint64_t id;
+      MOZ_TRY(folder->GetId(&id));
+      FolderDatabase::CacheOrigin origin;
+      MOZ_TRY(mFolderDatabase->CheckCacheProjectionOrigin(id, origin));
+      bool imported;
+      MOZ_TRY(mFolderDatabase->HasCacheImportBinding(id, imported));
+      nsCOMPtr<mozIStorageStatement> receipt;
+      MOZ_TRY(sConnection->CreateStatement(
+          "SELECT EXISTS(SELECT 1 FROM folder_import_receipts WHERE folderId=:folder)"_ns,
+          getter_AddRefs(receipt)));
+      MOZ_TRY(receipt->BindInt64ByName("folder"_ns, id));
+      bool row;
+      MOZ_TRY(receipt->ExecuteStep(&row));
+      NS_ENSURE_TRUE(row, NS_ERROR_FILE_CORRUPTED);
+      int32_t mailImported;
+      MOZ_TRY(receipt->GetInt32(0, &mailImported));
+      receipt = nullptr;
+      NS_ENSURE_TRUE(
+          origin.birthSite ==
+                  uint32_t(CacheDiscoveryFlagSite::LocalInitialChild) &&
+              !origin.explicitMask && !imported && !mailImported &&
+              !MOZ_TRY(MessageDB().GetNumMessages(id)),
+          NS_ERROR_NOT_AVAILABLE);
+      nsTArray<uint64_t> childIds =
+          MOZ_TRY(mFolderDatabase->GetFolderChildren(id));
+      nsTHashSet<uint64_t> seen;
+      nsTArray<RefPtr<nsIMsgFolder>> children;
+      for (nsIMsgFolder* child : folder->mSubFolders) {
+        uint64_t childId;
+        MOZ_TRY(child->GetId(&childId));
+        NS_ENSURE_TRUE(childIds.Contains(childId) && !seen.Contains(childId),
+                       NS_ERROR_NOT_AVAILABLE);
+        seen.Insert(childId);
+        children.AppendElement(child);
+      }
+      NS_ENSURE_TRUE(seen.Count() == childIds.Length(), NS_ERROR_NOT_AVAILABLE);
+      retired.AppendElement(nsMsgDBFolder::FolderInitialization{
+          folder, nullptr, std::move(children)});
+      for (nsIMsgFolder* child : folder->mSubFolders)
+        MOZ_TRY(capture(static_cast<nsMsgDBFolder*>(child)));
+      return NS_OK;
+    };
+    nsTArray<uint64_t> priorIds =
+        MOZ_TRY(mFolderDatabase->GetFolderChildren(parentId));
+    nsTHashSet<uint64_t> seen;
+    for (nsIMsgFolder* child : nativeParent->mSubFolders) {
+      uint64_t id;
+      MOZ_TRY(child->GetId(&id));
+      NS_ENSURE_TRUE(priorIds.Contains(id) && !seen.Contains(id),
+                     NS_ERROR_NOT_AVAILABLE);
+      seen.Insert(id);
+      if (names.Contains(MOZ_TRY(mFolderDatabase->GetFolderName(id)))) continue;
+      MOZ_TRY(capture(static_cast<nsMsgDBFolder*>(child)));
+      detached.AppendElement(child);
+    }
+    NS_ENSURE_TRUE(seen.Count() == priorIds.Length(), NS_ERROR_NOT_AVAILABLE);
+    nsCOMPtr<nsIFolderLookupService> lookup =
+        do_GetService("@mozilla.org/mail/folder-lookup;1");
+    NS_ENSURE_TRUE(lookup, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(CheckProfileStartup(ProfileStartupToken(), true));
+    MOZ_TRY(mFolderDatabase->ReconcileCacheDiscoveryChildren(operation.sourceId,
+                                                             parentId, names));
+    // Evict and invalidate only the superseded native wrappers using existing
+    // initialization rollback. Normal factories below attach the newly
+    // discovered logical children with their separately retained physical path.
+    nsMsgDBFolder::RollbackFolderInitialization(lookup, retired);
+    for (const auto& child : detached)
+      nativeParent->mSubFolders.RemoveObject(child);
+    return CheckProfileStartup(ProfileStartupToken(), true);
+  };
   nsTHashMap<uint64_t, nsCString> physical;
   nsTHashMap<nsCString, nsCOMPtr<nsIMsgFolder>> localBindings;
   for (const auto* source : local) {
@@ -10689,6 +10827,7 @@ nsresult DatabaseCore::BuildStartupFolders() {
       NS_ENSURE_TRUE(children.Contains(DecodeFilename(
                          NS_ConvertUTF8toUTF16(source->localLeaves[i]))),
                      NS_ERROR_NOT_AVAILABLE);
+      MOZ_TRY(reconcileLocal(parent, *source, i, children));
       nsCOMPtr<nsIFile> path;
       MOZ_TRY(parent->GetFilePath(getter_AddRefs(path)));
       bool server;
@@ -11022,7 +11161,9 @@ nsresult DatabaseCore::SettleProfileStartup(nsresult failure) {
         promise->MaybeResolveWithUndefined();
     }
     operation->settlements.Clear();
-    if (operation->ready) {
+    // Preserve a failed ready operation's first error until the ordinary
+    // profile-before-change observer retires the already settled owner.
+    if (operation->ready && NS_SUCCEEDED(operation->firstError)) {
       nsCOMPtr<nsIObserverService> observers = services::GetObserverService();
       if (observers) observers->RemoveObserver(self, "profile-before-change");
       if (sInstance == self) sInstance = nullptr;
@@ -11849,7 +11990,8 @@ nsresult DatabaseCore::CheckProfileActivation(
               NS_ENSURE_TRUE(
                   server.path == folder.storePath &&
                       server.protocol == folder.protocol &&
-                      server.protocol == "none"_ns &&
+                      (server.protocol == "none"_ns ||
+                       server.protocol == "imap"_ns) &&
                       ((folder.storeType == "mbox"_ns &&
                         server.contract ==
                             "@mozilla.org/msgstore/berkeleystore;1"_ns) ||

@@ -307,6 +307,92 @@ async function createChatInput(work) {
   }
 }
 
+/**
+ * Declares independent policy inputs and creates their empty physical folders.
+ * Folder policy is established before eligible legacy recovery is captured.
+ * The application adds mutable MIME/log records only after the S716 assertions.
+ *
+ * @param {nsIMsgLocalMailFolder} root - Actual retained Local Folders root.
+ * @returns {object} Fixed case text and owned empty physical folder identities.
+ */
+function createPolicyCases(root) {
+  const mail = {
+    edit: {
+      messageId: "s717-edit@example.invalid",
+      folder: "S717Edit",
+      oldSubject: "s717oldsubject",
+      newSubject: "s717newsubject",
+      body: "s717editbody",
+    },
+    deleted: {
+      messageId: "s717-delete@example.invalid",
+      folder: "S717Delete",
+      subject: "s717deletesubject",
+      body: "s717deletedbody",
+    },
+    excluded: {
+      messageId: "s717-exclude@example.invalid",
+      folder: "S717Exclude",
+      subject: "s717excludesubject",
+      body: "s717excludedbody",
+    },
+    open: {
+      messageId: "s717-selected@example.invalid",
+      folders: ["S717Selected", "S717OtherCopy"],
+      subject: "s717selectedsubject",
+      body: "s717selectedbody caf\u00e9 e\u0301 \ud83d\ude00",
+    },
+  };
+  const folders = {};
+  for (const name of [
+    mail.edit.folder,
+    mail.deleted.folder,
+    mail.excluded.folder,
+    ...mail.open.folders,
+  ]) {
+    Assert.ok(
+      !root.containsChildNamed(name),
+      "A mutable case owns a new folder"
+    );
+    const folder = root
+      .createLocalSubfolder(name)
+      .QueryInterface(Ci.nsIMsgLocalMailFolder);
+    folder.setFlag(Ci.nsMsgFolderFlags.Mail);
+    folders[name] = {
+      id: folder.id,
+      uri: folder.URI,
+      bodyPath: folder.filePath.path,
+      originalFlags: folderDB.getFolderFlags(folder.id),
+    };
+    Assert.ok(folders[name].originalFlags & Ci.nsMsgFolderFlags.Mail);
+  }
+  return {
+    version: 1,
+    folders,
+    mail,
+    chat: {
+      account: "s717-policy",
+      conversation: "buddy",
+      speaker: "S717Speaker",
+      edit: {
+        remoteId: "edit",
+        oldText: "s717chatoldneedle",
+        newText: "s717chatnewneedle caf\u00e9 e\u0301 \ud83d\ude00",
+      },
+      deleted: { remoteId: "deleted", text: "s717chatdeletedneedle" },
+      noLog: { remoteId: "nolog", text: "s717chatnologneedle" },
+      redacted: { remoteId: "redacted", text: "s717chatredactedneedle" },
+      keep: {
+        remoteId: "keep",
+        text: "s717chatkeepneedle caf\u00e9 e\u0301 \ud83d\ude00",
+      },
+      otherPhysical: "s717otherphysicalneedle",
+    },
+    immutableRecovery: "Original recovered id/body/receipt/source revision",
+    mutableSources: "Only these empty folders and new S717 logger paths",
+  };
+}
+
 add_task(async function test_createRetainedNativeRebuildTrial() {
   const profile = do_get_profile();
   const savedPrefs = selectTrialPreferences();
@@ -426,6 +512,7 @@ add_task(async function test_createRetainedNativeRebuildTrial() {
     );
     // Finish native folder policy changes before capturing eligible recovery.
     const copies = addMimeCopies(root);
+    const s717 = createPolicyCases(root);
     const missingKey = messageDB.addMessage(
       copies.folders[0].id,
       "s716-unavailable@example.invalid",
@@ -630,6 +717,7 @@ add_task(async function test_createRetainedNativeRebuildTrial() {
         eligible: 2,
       },
       chat,
+      s717,
       savedPrefs,
     };
     await journal.close();

@@ -265,7 +265,7 @@ export class PanoramaSearchIndex {
       Cc["@mozilla.org/messenger/fts3tokenizer;1"]
         .getService(Ci.nsIFts3Tokenizer)
         .registerTokenizer(connection);
-      if (connection.schemaVersion > 7) {
+      if (connection.schemaVersion > 9) {
         throw new Error("Unsupported search index schema");
       }
       await index.#transaction(async () => {
@@ -381,12 +381,64 @@ export class PanoramaSearchIndex {
         await index.#execute(
           "CREATE TABLE IF NOT EXISTS recovery_records (" +
             "recordId TEXT PRIMARY KEY,documentId TEXT,kind TEXT NOT NULL," +
-            "sourceRevision TEXT NOT NULL,payload TEXT,document TEXT,erased INTEGER NOT NULL DEFAULT 0)"
+            "sourceRevision TEXT NOT NULL,payload TEXT,document TEXT,erased INTEGER NOT NULL DEFAULT 0," +
+            "suppressed INTEGER NOT NULL DEFAULT 0,validatedPolicyRevision INTEGER)"
         );
         await index.#execute(
           "CREATE TABLE IF NOT EXISTS recovery_erased (documentId TEXT PRIMARY KEY)"
         );
-        await index.#execute("PRAGMA user_version = 7");
+        const recoveryColumns = await index.#execute(
+          "PRAGMA table_info(recovery_records)",
+          {},
+          ["name"]
+        );
+        const addSuppression = !recoveryColumns.some(
+          column => column.name == "suppressed"
+        );
+        if (addSuppression) {
+          await index.#execute(
+            "ALTER TABLE recovery_records ADD COLUMN suppressed INTEGER NOT NULL DEFAULT 0"
+          );
+        }
+        // Preserve any explicit accepted exclusion still recorded by older
+        // sidecars. A policy-version mismatch alone is not a revocation.
+        const legacy = await index.#execute(
+          "SELECT r.recordId,r.document,v.kind,v.generation,v.policyRevision FROM recovery_records r " +
+            "LEFT JOIN document_versions v ON v.documentId=r.documentId " +
+            "WHERE r.kind='mail' AND (r.suppressed IS NULL OR :upgrading=1)",
+          { upgrading: Number(addSuppression) },
+          ["recordId", "document", "kind", "generation", "policyRevision"]
+        );
+        for (const row of legacy) {
+          const source =
+            row.document === null
+              ? null
+              : copyDocument(JSON.parse(row.document));
+          const revoked =
+            row.kind === "exclude" &&
+            (!source ||
+              (row.generation >= source.generation &&
+                row.policyRevision >= source.policyRevision));
+          await index.#execute(
+            "UPDATE recovery_records SET suppressed=:suppressed WHERE recordId=:recordId",
+            { recordId: row.recordId, suppressed: Number(revoked) }
+          );
+        }
+        await index.#execute(
+          "UPDATE recovery_records SET suppressed=0 WHERE suppressed IS NULL"
+        );
+        // Keep the already-created trial schema9 layout readable. Its old
+        // checkpoint is no longer used to authorize or withhold any content.
+        if (
+          !recoveryColumns.some(
+            column => column.name == "validatedPolicyRevision"
+          )
+        ) {
+          await index.#execute(
+            "ALTER TABLE recovery_records ADD COLUMN validatedPolicyRevision INTEGER"
+          );
+        }
+        await index.#execute("PRAGMA user_version = 9");
       });
       return index;
     } catch (error) {
@@ -540,7 +592,10 @@ export class PanoramaSearchIndex {
     return this.#enqueue(async () => {
       const version = await this.#getVersion(document.id);
       if (
-        !matchesState(await this.#resolveDocument(document.id), document) ||
+        !matchesState(
+          await this.#observeDocumentState(document.id),
+          document
+        ) ||
         (version &&
           (version.kind != "index" ||
             version.generation != document.generation ||
@@ -821,6 +876,9 @@ export class PanoramaSearchIndex {
     // Version checks hide stale rows until refresh. Keep index-change FTS text
     // so a flag-only projection can advance without tokenizing the body again.
     if (change.kind != "index") {
+      if (change.kind == "exclude") {
+        await this.#suppressRecovery(change.id);
+      }
       await this.#erase(change.id, change.kind == "delete");
     }
     await this.#execute("DELETE FROM index_jobs WHERE documentId=:id", {
@@ -1011,10 +1069,7 @@ export class PanoramaSearchIndex {
         if (!(await this.#hasJob(job, signal))) {
           return null;
         }
-        const state = await withAbort(
-          this.#resolveDocument(job.id, signal),
-          signal
-        );
+        const state = await this.#observeDocumentState(job.id, signal);
         signal?.throwIfAborted();
         return state?.eligible === true &&
           state.generation == job.generation &&
@@ -1077,26 +1132,29 @@ export class PanoramaSearchIndex {
         return false;
       }
       const recovered = await this.#execute(
-        "SELECT document FROM recovery_records WHERE documentId=:id AND kind='mail' " +
+        "SELECT document,suppressed FROM recovery_records WHERE documentId=:id AND kind='mail' " +
           "AND erased=0 AND document IS NOT NULL",
         { id: job.id },
-        ["document"],
+        ["document", "suppressed"],
         signal
       );
-      // An unchanged MIME body can cross a policy marker after current-source
-      // validation. Recovery is only admitted under its captured policy; do not
-      // let this metadata fast path turn a rejected backup into fresh evidence.
-      if (
-        recovered.some(row => {
-          const source = copyDocument(JSON.parse(row.document));
-          return (
-            source.contentRevision === body.contentRevision &&
-            source.body === body.body &&
-            source.policyRevision !== metadata.policyRevision
-          );
-        })
-      ) {
-        return false;
+      if (recovered.length) {
+        const state = await this.#observeDocumentState(job.id, signal);
+        if (!matchesState(state, metadata)) {
+          return false;
+        }
+        if (
+          recovered.some(row => {
+            const source = copyDocument(JSON.parse(row.document));
+            return (
+              source.contentRevision === body.contentRevision &&
+              source.body === body.body &&
+              row.suppressed !== 0
+            );
+          })
+        ) {
+          return false;
+        }
       }
       const document = {
         ...metadata,
@@ -1109,7 +1167,7 @@ export class PanoramaSearchIndex {
       };
       if (
         !matchesState(
-          await withAbort(this.#resolveDocument(job.id, signal), signal),
+          await this.#observeDocumentState(job.id, signal),
           document
         )
       ) {
@@ -1167,7 +1225,7 @@ export class PanoramaSearchIndex {
       if (
         !pending ||
         !matchesState(
-          await withAbort(this.#resolveDocument(job.id, signal), signal),
+          await this.#observeDocumentState(job.id, signal),
           document
         )
       ) {
@@ -1418,10 +1476,7 @@ export class PanoramaSearchIndex {
         if (!row) {
           return null;
         }
-        const state = await withAbort(
-          this.#resolveDocument(id, signal),
-          signal
-        );
+        const state = await this.#observeDocumentState(id, signal);
         signal?.throwIfAborted();
         row.bodyIndexed = !!row.bodyIndexed;
         row.attachmentPresence = decodeAttachmentPresence(
@@ -1482,8 +1537,8 @@ export class PanoramaSearchIndex {
         );
         const items = [];
         for (const row of rows) {
-          const state = await withAbort(
-            this.#resolveDocument(row.documentId, signal),
+          const state = await this.#observeDocumentState(
+            row.documentId,
             signal
           );
           signal?.throwIfAborted();
@@ -1592,11 +1647,11 @@ export class PanoramaSearchIndex {
             throw new Error("Recovered source or physical binding changed");
           }
           await this.#execute(
-            "INSERT INTO recovery_records(recordId,documentId,kind,sourceRevision,payload,document,erased) " +
+            "INSERT INTO recovery_records(recordId,documentId,kind,sourceRevision,payload,document,erased,suppressed) " +
               "VALUES(:recordId,:documentId,:kind,:sourceRevision," +
               "CASE WHEN EXISTS(SELECT 1 FROM recovery_erased WHERE documentId=:documentId) THEN NULL ELSE :payload END," +
               "CASE WHEN EXISTS(SELECT 1 FROM recovery_erased WHERE documentId=:documentId) THEN NULL ELSE :document END," +
-              "EXISTS(SELECT 1 FROM recovery_erased WHERE documentId=:documentId)) " +
+              "EXISTS(SELECT 1 FROM recovery_erased WHERE documentId=:documentId),0) " +
               "ON CONFLICT(recordId) DO NOTHING",
             record
           );
@@ -1640,8 +1695,42 @@ export class PanoramaSearchIndex {
   }
 
   /**
-   * Loads recovered text only for its still-current native content and policy.
-   * Metadata-only generation changes may reuse the same content revision.
+   * Records an observed or accepted exclusion without erasing raw provenance.
+   *
+   * @param {string} id - Excluded physical message key.
+   * @returns {Promise} Completion of the durable suppression update.
+   */
+  #suppressRecovery(id) {
+    return this.#execute(
+      "UPDATE recovery_records SET suppressed=1 WHERE documentId=:id AND kind='mail'",
+      { id }
+    );
+  }
+
+  /**
+   * Resolves native state and durably records an observed mail exclusion.
+   * Every index reader and worker uses this boundary before refusing content.
+   * Null or unknown state alone does not establish an exclusion.
+   *
+   * @param {string} id - Physical document identity.
+   * @param {AbortSignal} [signal] - Cancel native selection before observation.
+   * @returns {Promise<?SearchDocumentState>} Current authoritative native state.
+   */
+  async #observeDocumentState(id, signal) {
+    const state = await withAbort(this.#resolveDocument(id, signal), signal);
+    signal?.throwIfAborted();
+    if (state?.eligible === false) {
+      await this.#suppressRecovery(id);
+    }
+    return state;
+  }
+
+  /**
+   * Revalidates recovered text against current eligibility and native content.
+   * Policy and generation may advance while the verified source stays unchanged.
+   * Prior observed or accepted own-record exclusions remain suppressed.
+   * Unrelated policy markers do not revoke an unchanged eligible source.
+   * The returned projection uses current tokens; stored provenance is untouched.
    *
    * @param {string} id - Exact physical mail key.
    * @param {AbortSignal} [signal] - Cancels lookup and delivery.
@@ -1653,25 +1742,32 @@ export class PanoramaSearchIndex {
       this.#enqueue(async () => {
         signal?.throwIfAborted();
         const rows = await this.#execute(
-          "SELECT document FROM recovery_records WHERE documentId=:id AND kind='mail' " +
+          "SELECT document,suppressed FROM recovery_records WHERE documentId=:id AND kind='mail' " +
             "AND erased=0 AND document IS NOT NULL",
           { id },
-          ["document"],
+          ["document", "suppressed"],
           signal
         );
-        const state = await this.#resolveDocument(id, signal);
+        const state = await this.#observeDocumentState(id, signal);
         signal?.throwIfAborted();
         if (state?.eligible !== true) {
           return null;
         }
         const candidates = rows
+          .filter(row => row.suppressed === 0)
           .map(row => copyDocument(JSON.parse(row.document)))
           .filter(
             document =>
+              document.id === id &&
               document.contentRevision === state.contentRevision &&
-              document.policyRevision === (state.policyRevision ?? 0)
+              document.generation <= state.generation &&
+              document.policyRevision <= (state.policyRevision ?? 0)
           );
         if (!candidates.length) {
+          return null;
+        }
+        const current = await this.#observeDocumentState(id, signal);
+        if (!matchesState(current, state)) {
           return null;
         }
         if (
@@ -1683,7 +1779,11 @@ export class PanoramaSearchIndex {
         ) {
           throw new Error("Conflicting recovered semantic sources");
         }
-        return { ...candidates[0], generation: state.generation };
+        return {
+          ...candidates[0],
+          generation: state.generation,
+          policyRevision: state.policyRevision ?? 0,
+        };
       }),
       signal
     );
@@ -1793,8 +1893,8 @@ export class PanoramaSearchIndex {
               break;
             }
             for (const row of rows) {
-              const state = await withAbort(
-                this.#resolveDocument(row.documentId, signal),
+              const state = await this.#observeDocumentState(
+                row.documentId,
                 signal
               );
               signal?.throwIfAborted();

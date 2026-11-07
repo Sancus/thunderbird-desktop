@@ -19,7 +19,26 @@ add_setup(function setupLegacyBackend() {
     !(glue._getMailSearchBackend() instanceof Ci.nsIDatabaseCore),
     "This process must select the real legacy database before startup"
   );
-  registerCleanupFunction(() => glue._shutdownMailSearch());
+  registerCleanupFunction(async () => {
+    const closed = await Promise.allSettled([glue._shutdownMailSearch()]);
+    const errors = closed
+      .filter(row => row.status === "rejected")
+      .map(row => row.reason);
+    try {
+      const module = "resource:///modules/gloda/GlodaIndexer.sys.mjs";
+      if (Cu.isESModuleLoaded(module)) {
+        const { GlodaIndexer } = ChromeUtils.importESModule(module);
+        GlodaIndexer._shutdown();
+      }
+    } catch (error) {
+      errors.push(error);
+    }
+    if (errors.length) {
+      throw errors.length === 1
+        ? errors[0]
+        : new AggregateError(errors, "Legacy startup cleanup failed");
+    }
+  });
 });
 
 add_task(async function test_legacyStartupLoadsOnlyTheRetainedIndexer() {

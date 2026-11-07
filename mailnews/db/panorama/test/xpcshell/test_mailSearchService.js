@@ -2,6 +2,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+const { PanoramaSearchIndex } = ChromeUtils.importESModule(
+  "resource:///modules/panorama/PanoramaSearchIndex.sys.mjs"
+);
+const { loadMailSearchMetadata } = ChromeUtils.importESModule(
+  "resource:///modules/panorama/MailSearchContent.sys.mjs"
+);
 const { MailSearchService } = ChromeUtils.importESModule(
   "resource:///modules/panorama/MailSearchService.sys.mjs"
 );
@@ -902,3 +908,615 @@ add_task(async function test_openKeepsOriginalCancellationAndErrors() {
     await service.close();
   }
 });
+
+add_task(async function test_recoveredBodiesFollowCurrentNativePolicy() {
+  const input = await fixture("recovered-policy");
+  let service = input.service;
+  let index, failure, scanController, scanPending, scanReason;
+  const target = rootFolder
+    .createLocalSubfolder("recovered-policy-unrelated")
+    .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  fixtureFolders.push(target);
+  const targetFlags = folderDB.getFolderFlags(target.id);
+  const originalFlags = folderDB.getFolderFlags(input.folder.id);
+  const checkpointFirst = addStoredMessage(
+    input.folder,
+    "policycheckpointordinary"
+  );
+  const body = "\uFEFFrecoverypolicyneedle e\u0301 \ud83d\ude00\0tail";
+  const cases = [
+    ["kept", body],
+    ["empty", ""],
+    ["changed", "changedrecoveryneedle"],
+    ["deleted", "deletedrecoveryneedle"],
+    ["quarantined", "quarantinerecoveryneedle"],
+    ["publicRead", body],
+    ["publicEmpty", ""],
+  ].map(([role, text]) => ({
+    role,
+    text,
+    key: messageDB.addMessage(
+      input.folder.id,
+      "recovered-policy-" + role + "@example.invalid",
+      [],
+      123456,
+      "Sender <sender@example.invalid>",
+      "Recipient <recipient@example.invalid>",
+      "",
+      "",
+      "recovered policy " + role,
+      0,
+      "",
+      Ci.nsMsgPriority.notSet
+    ),
+  }));
+  addStoredMessage(target, "unrelatedpolicyneedle");
+  const byRole = Object.fromEntries(cases.map(row => [row.role, row]));
+  try {
+    await drain(service);
+    // This trusted-index unit input represents already validated import output.
+    // The retained-profile whole test independently checks actual import receipts.
+    const records = cases.map(row => {
+      const id = String(row.key);
+      const state = service.resolveDocument(id);
+      Assert.ok(state.eligible);
+      Assert.equal(state.originalContentAvailable, false);
+      const metadata = loadMailSearchMetadata(
+        {
+          id,
+          generation: state.generation,
+          policyRevision: state.policyRevision,
+        },
+        state
+      );
+      Assert.ok(metadata);
+      return {
+        recordId: "verified-policy-fixture-" + row.role,
+        documentId: id,
+        kind: "mail",
+        sourceRevision: "a".repeat(64),
+        payload: {
+          fixture: "prevalidated native import output",
+          sourceId: input.sourceId,
+          key: row.key,
+          originalText: row.text,
+        },
+        document:
+          row.role === "quarantined"
+            ? null
+            : {
+                ...metadata,
+                body: row.text,
+                attachmentNames: "original.txt",
+                bodyIndexed: true,
+              },
+      };
+    });
+    await service.close();
+    index = await PanoramaSearchIndex.open(input.file, id =>
+      resolveMailSearchDocument(messageDB, id)
+    );
+    await index.retainRecovery(records);
+    const provenance = await index.getRecoveryRecords();
+    const expectedPayloads = new Map(
+      records.map(row => [row.recordId, row.payload])
+    );
+    Assert.deepEqual(
+      provenance.map(row => row.recordId),
+      [...expectedPayloads.keys()].sort()
+    );
+    for (const row of provenance) {
+      Assert.deepEqual(row.payload, expectedPayloads.get(row.recordId));
+    }
+    const captured = messageDB.getSearchState(byRole.kept.key);
+    Assert.equal(
+      (await index.getRecoveredText(String(byRole.kept.key))).body,
+      body
+    );
+    Assert.equal(
+      await index.getRecoveredText(String(byRole.quarantined.key)),
+      null
+    );
+    await index.close();
+    index = null;
+    service = await MailSearchService.open(
+      input.file,
+      input.sourceId,
+      messageDB
+    );
+    await service.rebuild();
+    Assert.equal((await drain(service)).unavailable, 1);
+    const originalText = await service.getText(String(byRole.kept.key));
+    Assert.equal(originalText.body, body);
+    Assert.equal((await service.getText(String(byRole.empty.key))).body, "");
+    await service.close();
+    folderDB.updateFlags(target.id, targetFlags | Ci.nsMsgFolderFlags.Trash);
+    folderDB.updateFlags(
+      target.id,
+      ((targetFlags | Ci.nsMsgFolderFlags.Trash) ^
+        Ci.nsMsgFolderFlags.Favorite) >>>
+        0
+    );
+    const current = messageDB.getSearchState(byRole.kept.key);
+    Assert.greaterOrEqual(
+      messageDB
+        .getSearchChanges(Number(captured.policyRevision), 500)
+        .changes.filter(
+          row =>
+            row.messageKey === null &&
+            row.sequence <= Number(current.policyRevision)
+        ).length,
+      2,
+      "At least two unrelated native markers committed while the owned sidecar was closed"
+    );
+    Assert.greater(
+      Number(current.policyRevision),
+      Number(captured.policyRevision)
+    );
+    Assert.equal(current.contentRevision, captured.contentRevision);
+    service = await MailSearchService.open(
+      input.file,
+      input.sourceId,
+      messageDB
+    );
+    Assert.equal((await drain(service)).unavailable, 1);
+    const refreshed = await service.getText(String(byRole.kept.key));
+    Assert.equal(refreshed.body, body);
+    Assert.equal(
+      refreshed.textRevision,
+      originalText.textRevision,
+      "Unchanged recovered text is not rewritten by the metadata fast path"
+    );
+    const hit = (await service.search("recoverypolicyneedle")).items[0];
+    Assert.equal(hit.id, String(byRole.kept.key));
+    for (const field of [
+      "generation",
+      "contentRevision",
+      "policyRevision",
+      "textRevision",
+    ]) {
+      Assert.equal(hit[field], refreshed[field]);
+    }
+    Assert.equal(refreshed.generation, current.generation);
+    Assert.equal(refreshed.policyRevision, Number(current.policyRevision));
+    Assert.equal(hit.originalContentAvailable, false);
+    Assert.deepEqual((await service.search("unrelatedpolicyneedle")).items, []);
+    Assert.deepEqual(await service.getRecoveryRecords(), provenance);
+    await service.close();
+    service = await MailSearchService.open(
+      input.file,
+      input.sourceId,
+      messageDB
+    );
+    await service.rebuild();
+    Assert.equal((await drain(service)).unavailable, 1);
+    Assert.equal((await service.getText(String(byRole.kept.key))).body, body);
+    Assert.equal((await service.getText(String(byRole.empty.key))).body, "");
+    Assert.deepEqual(await service.getRecoveryRecords(), provenance);
+    // Rebuild schedules idle work even after the explicit drain settles.
+    // Retire that owner before starting the read-only observation interval.
+    await service.close();
+    service = await MailSearchService.open(
+      input.file,
+      input.sourceId,
+      messageDB
+    );
+    // Only the public getter observes this interval. No excluded update or
+    // special recovered-text read may establish the revocation for these rows.
+    folderDB.updateFlags(
+      input.folder.id,
+      originalFlags | Ci.nsMsgFolderFlags.Trash
+    );
+    const observedPolicy = Number(
+      messageDB.getSearchState(byRole.publicRead.key).policyRevision
+    );
+    for (const role of ["publicRead", "publicEmpty"]) {
+      Assert.equal(
+        await service.getText(String(byRole[role].key)),
+        null,
+        "The ordinary public getter observes actual native ineligibility"
+      );
+    }
+    await service.close();
+    index = await PanoramaSearchIndex.open(input.file, id =>
+      resolveMailSearchDocument(messageDB, id)
+    );
+    Assert.less(
+      (await index.getProgress()).acceptedThrough,
+      observedPolicy,
+      "No excluded source page was accepted before closing the public reader"
+    );
+    Assert.equal(await index.getRescan(), null);
+    Assert.deepEqual(await index.getRecoveryRecords(), provenance);
+    await index.close();
+    index = null;
+    folderDB.updateFlags(input.folder.id, originalFlags);
+    service = await MailSearchService.open(
+      input.file,
+      input.sourceId,
+      messageDB
+    );
+    await service.rebuild();
+    await drain(service);
+    for (const role of ["publicRead", "publicEmpty"]) {
+      const text = await service.getText(String(byRole[role].key));
+      Assert.equal(
+        text.bodyIndexed,
+        false,
+        "A public read exclusion survives close, re-enable, reopen and rebuild"
+      );
+      Assert.equal(text.body, "", "The old recovered body is not delivered");
+    }
+    Assert.equal((await service.getText(String(byRole.kept.key))).body, body);
+    Assert.equal((await service.getText(String(byRole.empty.key))).body, "");
+    Assert.deepEqual(await service.getRecoveryRecords(), provenance);
+    messageDB.getMessage(byRole.changed.key).subject =
+      "new content interpretation";
+    Assert.notEqual(
+      messageDB.getSearchState(byRole.changed.key).contentRevision,
+      records.find(row => row.documentId === String(byRole.changed.key))
+        .document.contentRevision
+    );
+    messageDB.removeMessage(byRole.deleted.key);
+    await drain(service);
+    Assert.equal(
+      (await service.getText(String(byRole.changed.key))).bodyIndexed,
+      false
+    );
+    Assert.deepEqual((await service.search("changedrecoveryneedle")).items, []);
+    Assert.equal(await service.getText(String(byRole.deleted.key)), null);
+    Assert.deepEqual((await service.search("deletedrecoveryneedle")).items, []);
+    Assert.deepEqual(
+      (await service.search("quarantinerecoveryneedle")).items,
+      []
+    );
+    await service.close();
+    index = await PanoramaSearchIndex.open(input.file, id =>
+      resolveMailSearchDocument(messageDB, id)
+    );
+    for (const role of ["changed", "deleted", "quarantined"]) {
+      Assert.equal(
+        await index.getRecoveredText(String(byRole[role].key)),
+        null
+      );
+    }
+    const reason = new Error("Cancel recovered content delivery");
+    const controller = new AbortController();
+    controller.abort(reason);
+    await Assert.rejects(
+      index.getRecoveredText(String(byRole.kept.key), controller.signal),
+      error => error === reason
+    );
+    await index.close();
+    index = null;
+    service = await MailSearchService.open(
+      input.file,
+      input.sourceId,
+      messageDB
+    );
+    // Exercise observed revocation before a bounded scan accepts either
+    // recovered row, using this same settled source/sidecar incarnation.
+    folderDB.updateFlags(
+      input.folder.id,
+      originalFlags | Ci.nsMsgFolderFlags.Trash
+    );
+    Assert.ok((await service.update({ limit: 1 })).rebuilding);
+    Assert.ok((await service.update({ limit: 1 })).rebuilding);
+    scanController = new AbortController();
+    scanReason = new Error("Stop the real policy scan before recovered rows");
+    let scanSettled = false;
+    scanPending = service
+      .update({ limit: 1, signal: scanController.signal })
+      .then(
+        () => {
+          scanSettled = true;
+          return { resolved: true };
+        },
+        error => {
+          scanSettled = true;
+          return { error };
+        }
+      );
+    await Promise.resolve();
+    await Promise.resolve();
+    Assert.equal(
+      scanSettled,
+      false,
+      "The non-preaborted bounded update is actually pending"
+    );
+    scanController.abort(scanReason);
+    Assert.equal((await scanPending).error, scanReason);
+    await service.close();
+    index = await PanoramaSearchIndex.open(input.file, id =>
+      resolveMailSearchDocument(messageDB, id)
+    );
+    Assert.equal(
+      await index.getRecoveredText(String(byRole.kept.key)),
+      null,
+      "Current exclusion withholds recovery before its durable erase is advanced"
+    );
+    Assert.equal(await index.getRecoveredText(String(byRole.empty.key)), null);
+    const scan = await index.getRescan();
+    Assert.ok(scan, "The actual policy scan remains unfinished");
+    Assert.greater(
+      scan.afterKey,
+      0,
+      "A real bounded native snapshot page was accepted"
+    );
+    Assert.lessOrEqual(scan.afterKey, checkpointFirst.messageKey);
+    Assert.less(
+      scan.afterKey,
+      Math.min(byRole.kept.key, byRole.empty.key),
+      "No recovered row exclusion has been accepted"
+    );
+    await index.close();
+    index = null;
+    service = await MailSearchService.open(
+      input.file,
+      input.sourceId,
+      messageDB
+    );
+    await drain(service);
+    Assert.equal(await service.getText(String(byRole.kept.key)), null);
+    await service.close();
+    folderDB.updateFlags(input.folder.id, originalFlags);
+    index = await PanoramaSearchIndex.open(input.file, id =>
+      resolveMailSearchDocument(messageDB, id)
+    );
+    Assert.equal(
+      await index.getRecoveredText(String(byRole.kept.key)),
+      null,
+      "Re-enabling current policy does not reauthorize a previously excluded recovery"
+    );
+    Assert.equal(await index.getRecoveredText(String(byRole.empty.key)), null);
+    const suppressed = await index.getRecoveryRecords();
+    for (const row of suppressed.filter(
+      row => row.documentId !== String(byRole.deleted.key)
+    )) {
+      Assert.equal(
+        row.erased,
+        false,
+        "Exclusion preserves raw provenance rather than erasing it"
+      );
+      Assert.deepEqual(row.payload, expectedPayloads.get(row.recordId));
+    }
+    await index.close();
+    index = null;
+    service = await MailSearchService.open(
+      input.file,
+      input.sourceId,
+      messageDB
+    );
+    await service.rebuild();
+    await drain(service);
+    for (const role of ["kept", "empty"]) {
+      Assert.equal(
+        (await service.getText(String(byRole[role].key))).bodyIndexed,
+        false,
+        "Canonical refresh and rebuild cannot revive a suppressed recovered body"
+      );
+    }
+    Assert.deepEqual((await service.search("recoverypolicyneedle")).items, []);
+    Assert.deepEqual(await service.getRecoveryRecords(), suppressed);
+    await service.close();
+    index = await PanoramaSearchIndex.open(input.file, id =>
+      resolveMailSearchDocument(messageDB, id)
+    );
+    await index.remove(String(byRole.kept.key));
+    const [erased] = await index.getRecoveryRecords(String(byRole.kept.key));
+    Assert.equal(
+      erased.erased,
+      true,
+      "The explicit permanent erase actually completed"
+    );
+    Assert.equal(erased.payload, null);
+    await index.close();
+    index = await PanoramaSearchIndex.open(input.file, id =>
+      resolveMailSearchDocument(messageDB, id)
+    );
+    await index.retainRecovery(records);
+    await index.rebuild();
+    Assert.equal(
+      await index.getRecoveredText(String(byRole.kept.key)),
+      null,
+      "Re-enabling current policy cannot revive explicitly erased recovery"
+    );
+    Assert.equal(await index.getText(String(byRole.kept.key)), null);
+    const replayed = await index.getRecoveryRecords();
+    const erasedIds = [String(byRole.deleted.key), String(byRole.kept.key)];
+    Assert.equal(
+      replayed.filter(row => erasedIds.includes(row.documentId)).length,
+      2
+    );
+    for (const row of replayed) {
+      Assert.equal(row.erased, erasedIds.includes(row.documentId));
+      Assert.deepEqual(
+        row.payload,
+        row.erased ? null : expectedPayloads.get(row.recordId)
+      );
+    }
+  } catch (error) {
+    failure = error;
+  } finally {
+    scanController?.abort(scanReason);
+    const scanOutcome = await scanPending;
+    const closed = await Promise.allSettled([service.close(), index?.close()]);
+    const failures = closed
+      .filter(row => row.status === "rejected")
+      .map(row => row.reason);
+    if (scanOutcome?.error && scanOutcome.error !== scanReason) {
+      failures.push(scanOutcome.error);
+    }
+    try {
+      folderDB.updateFlags(target.id, targetFlags);
+      folderDB.updateFlags(input.folder.id, originalFlags);
+    } catch (error) {
+      failures.push(error);
+    }
+    if (failures.length) {
+      if (failure) {
+        failures.unshift(failure);
+      }
+      throw new AggregateError(
+        failures,
+        "Recovered policy fixture operation/cleanup failed"
+      );
+    }
+    if (failure) {
+      throw failure;
+    }
+  }
+});
+
+add_task(
+  async function test_legacyRecoveryUpgradePreservesEligibleTextAndRevocation() {
+    const file = do_get_profile().clone();
+    file.append("legacy-recovery-policy-history.sqlite");
+    let state = {
+      eligible: true,
+      generation: 3,
+      policyRevision: 1,
+      contentRevision: "legacy-content",
+      location: null,
+      originalContentAvailable: false,
+    };
+    const document = {
+      id: "legacy-policy-copy",
+      generation: 3,
+      policyRevision: 1,
+      contentRevision: "legacy-content",
+      subject: "",
+      body: "legacyhistoryneedle",
+      attachmentNames: "",
+      author: "",
+      recipients: "",
+    };
+    const resolve = id => (id === document.id ? state : null);
+    let index = await PanoramaSearchIndex.open(file, resolve);
+    try {
+      await index.retainRecovery([
+        {
+          recordId: "legacy-policy-source",
+          documentId: document.id,
+          kind: "mail",
+          sourceRevision: "b".repeat(64),
+          payload: { fixture: "schema-7 recovery" },
+          document,
+        },
+      ]);
+      Assert.ok(await index.index(document));
+      await index.close();
+      // Recreate the actual prior sidecar layout, with no exclusion-history field.
+      const connection = Services.storage.openUnsharedDatabase(file);
+      try {
+        connection.executeSimpleSQL(
+          "ALTER TABLE recovery_records DROP COLUMN suppressed"
+        );
+        connection.executeSimpleSQL(
+          "ALTER TABLE recovery_records DROP COLUMN validatedPolicyRevision"
+        );
+        connection.schemaVersion = 7;
+      } finally {
+        connection.close();
+      }
+      index = await PanoramaSearchIndex.open(file, resolve);
+      Assert.equal(
+        (await index.getRecoveredText(document.id)).body,
+        document.body,
+        "An unchanged current legacy policy remains readable after schema upgrade"
+      );
+      const provenance = await index.getRecoveryRecords();
+      state = { ...state, generation: 4, policyRevision: 3 };
+      await index.applyChanges({
+        sourceId: "legacy-policy-fixture",
+        from: 0,
+        through: 4,
+        changes: [
+          {
+            id: document.id,
+            generation: 4,
+            policyRevision: 3,
+            sequence: 4,
+            kind: "index",
+          },
+        ],
+      });
+      Assert.equal(
+        (await index.getRecoveredText(document.id)).body,
+        document.body,
+        "An unrelated policy change does not revoke an eligible upgraded source"
+      );
+      const [job] = await index.getPendingJobs();
+      Assert.equal(
+        await index.refreshJob(job, {
+          ...document,
+          generation: 4,
+          policyRevision: 3,
+          body: "",
+          bodyIndexed: false,
+        }),
+        true
+      );
+      await index.close();
+      index = await PanoramaSearchIndex.open(file, resolve);
+      Assert.equal(
+        (await index.getRecoveredText(document.id)).body,
+        document.body
+      );
+      Assert.deepEqual(await index.getRecoveryRecords(), provenance);
+      state = { ...state, eligible: false, generation: 5, policyRevision: 4 };
+      await index.applyChanges({
+        sourceId: "legacy-policy-fixture",
+        from: 4,
+        through: 5,
+        changes: [
+          {
+            id: document.id,
+            generation: 5,
+            policyRevision: 4,
+            sequence: 5,
+            kind: "exclude",
+          },
+        ],
+      });
+      Assert.equal(await index.getRecoveredText(document.id), null);
+      state = { ...state, eligible: true, generation: 6, policyRevision: 5 };
+      await index.applyChanges({
+        sourceId: "legacy-policy-fixture",
+        from: 5,
+        through: 6,
+        changes: [
+          {
+            id: document.id,
+            generation: 6,
+            policyRevision: 5,
+            sequence: 6,
+            kind: "index",
+          },
+        ],
+      });
+      Assert.equal(
+        await index.getRecoveredText(document.id),
+        null,
+        "A real accepted exclusion remains revoked after re-enable"
+      );
+      const [suppressedJob] = await index.getPendingJobs();
+      Assert.equal(
+        await index.refreshJob(suppressedJob, {
+          ...document,
+          generation: 6,
+          policyRevision: 5,
+          body: "",
+          bodyIndexed: false,
+        }),
+        false
+      );
+      await index.close();
+      index = await PanoramaSearchIndex.open(file, resolve);
+      Assert.equal(await index.getRecoveredText(document.id), null);
+      Assert.deepEqual(await index.getRecoveryRecords(), provenance);
+    } finally {
+      await index.close();
+    }
+  }
+);

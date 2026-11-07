@@ -10,6 +10,7 @@ with Files("**"):
 JS_PREFERENCE_PP_FILES += ["composer.js"]
 
 BROWSER_CHROME_MANIFESTS += [
+    "test/browser/browser-panorama.toml",
     "test/browser/browser.toml",
 ]
 

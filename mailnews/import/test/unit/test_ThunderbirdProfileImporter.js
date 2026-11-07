@@ -16,6 +16,9 @@ Services.prefs.setBoolPref(
 var { MailServices } = ChromeUtils.importESModule(
   "resource:///modules/MailServices.sys.mjs"
 );
+var { SQLiteDirectory } = ChromeUtils.importESModule(
+  "resource:///modules/SQLiteDirectory.sys.mjs"
+);
 var { MockRegistrar } = ChromeUtils.importESModule(
   "resource://testing-common/MockRegistrar.sys.mjs"
 );
@@ -482,7 +485,9 @@ add_task(async function test_importAddressBooks() {
       await IOUtils.read(PathUtils.join(tmpProfileDir.path, "mork.mab")),
       originalMab
     );
-    const book = MailServices.ab.getDirectory("jsaddrbook://mork.sqlite");
+    const book = SQLiteDirectory.forFile("mork.sqlite");
+    Assert.ok(book instanceof SQLiteDirectory);
+    Assert.equal(book.fileName, "mork.sqlite");
     const cards = book.childCards.filter(card => !card.isMailList);
     Assert.equal(cards.length, 1);
     Assert.equal(cards[0].displayName, "contact number one");

@@ -295,6 +295,9 @@ add_task(async function test_importMabRetainsFirstStorageError() {
   Assert.equal(input.target.childNodes.length, 1);
   Assert.deepEqual(input.progress, [2, 2, 10]);
   Assert.equal(await IOUtils.readUTF8(input.file.path), MAB_SOURCE);
+  // Finalize unreachable wrappers from the deliberate failed storage write
+  // before the normal fixture cleanup closes its connection.
+  Cu.forceGC();
 });
 
 add_task(async function test_importMabRetainsReadOnlyError() {

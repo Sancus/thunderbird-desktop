@@ -25,6 +25,19 @@ const PROFILE_FILE = "panorama-profile.json";
  */
 
 /**
+ * @typedef {object} StartupMigrationProfileRecord
+ * @property {2} formatVersion - Native startup selection format.
+ * @property {"panorama"} backend - Selected native backend.
+ * @property {string} origin - Empty initialization, adoption or migration.
+ * @property {"prepared"|"active"|"restore-required"} state - Startup eligibility.
+ * @property {{version: string, buildId: string}} application - Original reader floor.
+ * @property {{profilePath: string, databaseSourceId: ?string,
+ *   schemaVersion: ?number, journalPath: ?string, backup: ?object,
+ *   imports: object[], books: object[], caches: object[]}} identity - Actual native
+ *   incarnation and optional complete migration/recovery identities.
+ */
+
+/**
  * Publishes an in-place profile format after journal validation.
  * Writes prepared state before completing the journal, then active state.
  * A prepared record blocks normal startup until this operation resumes.
@@ -40,6 +53,9 @@ const PROFILE_FILE = "panorama-profile.json";
 export async function activateMigrationProfile(journalPath, profilePath) {
   const profile = canonicalFile(profilePath);
   let record = await readProfileRecord(profile.path);
+  if (record?.formatVersion === 2) {
+    throw new Error("Startup profile activation requires its native operation");
+  }
   const application = {
     version: Services.appinfo.version,
     buildId: Services.appinfo.appBuildID,
@@ -111,7 +127,7 @@ export async function activateMigrationProfile(journalPath, profilePath) {
  * Absence identifies an unconverted profile, not a successful migration.
  *
  * @param {string} profilePath - Profile directory selected by startup.
- * @returns {Promise<{state: string, record: MigrationProfileRecord|null}>} legacy, prepared,
+ * @returns {Promise<{state: string, record: MigrationProfileRecord|StartupMigrationProfileRecord|null}>} legacy, prepared,
  *   active or restore-required with its persisted format record.
  * @throws {Error} For corrupt/newer formats, unknown application metadata or
  *   a version/build older than the build that prepared the selector.
@@ -179,6 +195,9 @@ async function readProfileRecord(profilePath) {
     throw new Error("Migration profile record is not a regular file");
   }
   const record = await IOUtils.readJSON(path);
+  if (record?.formatVersion === 2) {
+    return validateStartupProfileRecord(record, profilePath);
+  }
   const identity = record?.identity;
   if (
     record?.formatVersion != FORMAT_VERSION ||
@@ -326,4 +345,341 @@ async function saveProfileRecord(profilePath, record) {
     tmpPath: path + ".tmp",
     flush: true,
   });
+}
+
+/**
+ * Writes the pending native migration selection before target creation.
+ * Existing selectors are never replaced. The journal and backup must already
+ * exist, and the native startup operation must retain ordinary writer exclusion.
+ *
+ * @param {string} profilePath - Actual startup-selected profile.
+ * @param {string} journalPath - Retained startup journal outside the profile.
+ * @param {{path: string, sha256: string}} backup - Verified complete backup.
+ * @returns {Promise<object>} Durable prepared format2 record.
+ * @throws {Error} For an occupied selector, invalid backup or journal identity.
+ */
+export async function prepareStartupMigrationProfile(
+  profilePath,
+  journalPath,
+  backup
+) {
+  const profile = startupProfileDirectory(profilePath);
+  if (await readProfileRecord(profile.path)) {
+    throw new Error("An existing Panorama selection requires recovery");
+  }
+  const journal = await MigrationJournal.open(journalPath, profile.path);
+  try {
+    if (
+      journal.state.version !== 7 ||
+      journal.state.stage !== "backup" ||
+      journal.state.cancelled ||
+      PathUtils.join(journal.state.backupPath, "manifest.json") !== backup.path
+    ) {
+      throw new Error("Startup selection requires its pending migration plan");
+    }
+    const actual = await verifyMigrationBackup(journal.state.backupPath);
+    if (actual.path !== backup.path || actual.sha256 !== backup.sha256) {
+      throw new Error("Startup backup identity changed");
+    }
+    const record = startupProfileRecord(profile.path, "migrated", {
+      databaseSourceId: null,
+      schemaVersion: null,
+      journalPath,
+      backup: structuredClone(backup),
+      imports: [],
+      books: [],
+      caches: [],
+    });
+    await IOUtils.writeJSON(
+      PathUtils.join(profile.path, PROFILE_FILE),
+      record,
+      {
+        mode: "create",
+        flush: true,
+      }
+    );
+    return record;
+  } finally {
+    journal.close();
+  }
+}
+
+/**
+ * Persists the native backend and version after complete import readback.
+ * Core independently reads this durable record before admitting normal startup.
+ * This function does not release the native operation or XRE's profile lock.
+ *
+ * @param {nsIDatabaseCore} core - Actual target service.
+ * @param {nsISupports} operation - Native-owned selected startup operation.
+ * @param {"initialized-empty"|"adopted-existing"|"migrated"} origin - Selection.
+ * @param {MigrationJournal} [journal] - Validated complete migration journal.
+ * @returns {Promise<object>} Durable active backend/version record.
+ * @throws {Error} For incomplete work, changed native identity or downgrade.
+ */
+export async function activateStartupMigrationProfile(
+  core,
+  operation,
+  origin,
+  journal
+) {
+  const database = core.QueryInterface(Ci.nsIDatabaseCore);
+  const selected = database.validateProfileStartup(operation);
+  const profile = startupProfileDirectory(selected.profilePath);
+  let record = await readProfileRecord(profile.path);
+  checkApplicationVersion(
+    record ?? { application: currentStartupApplication() }
+  );
+  if (
+    selected.phase !== "target-open" ||
+    !selected.databaseSourceId ||
+    selected.databaseSourceId !== database.sourceId ||
+    !Number.isSafeInteger(selected.schemaVersion)
+  ) {
+    throw new Error("Startup target is not ready for profile activation");
+  }
+  const identity = {
+    databaseSourceId: selected.databaseSourceId,
+    schemaVersion: selected.schemaVersion,
+    journalPath: null,
+    backup: null,
+    imports: [],
+    books: [],
+    caches: [],
+  };
+  if (origin === "migrated") {
+    if (!(journal instanceof MigrationJournal)) {
+      throw new TypeError("A validated startup migration journal is required");
+    }
+    const state = journal.state;
+    if (
+      state.version !== 7 ||
+      state.profilePath !== profile.path ||
+      state.startup.databaseSourceId !== selected.databaseSourceId ||
+      state.cancelled ||
+      !["activate", "complete"].includes(state.stage) ||
+      record?.formatVersion !== 2 ||
+      record.origin !== origin ||
+      record.identity.backup?.sha256 !== state.backup?.sha256
+    ) {
+      throw new Error("Startup migration has not completed native validation");
+    }
+    identity.journalPath = record.identity.journalPath;
+    identity.backup = structuredClone(state.backup);
+    identity.imports = state.sources.map(source => ({
+      id: source.id,
+      token: source.token,
+      sha256: source.sha256,
+      folderId: source.destinationFolderId,
+      receipt: structuredClone(source.receipt),
+    }));
+    identity.books = (state.books ?? []).map(book => ({
+      id: book.id,
+      token: book.token,
+      sha256: book.sha256,
+      receipt: structuredClone(book.receipt),
+      publication: structuredClone(book.publication?.receipt),
+    }));
+    identity.caches = (state.caches ?? []).map(cache => ({
+      id: cache.id,
+      token: cache.token,
+      sha256: cache.sha256,
+      receipt: structuredClone(cache.receipt),
+    }));
+  } else if (!["initialized-empty", "adopted-existing"].includes(origin)) {
+    throw new Error("Unsupported native profile origin");
+  }
+  if (record) {
+    if (
+      record.formatVersion !== 2 ||
+      record.origin !== origin ||
+      record.state === "restore-required" ||
+      (record.identity.databaseSourceId !== null &&
+        record.identity.databaseSourceId !== identity.databaseSourceId)
+    ) {
+      throw new Error("Existing native profile selection requires recovery");
+    }
+    if (record.state === "active") {
+      if (
+        JSON.stringify(record.identity) !==
+        JSON.stringify({ profilePath: profile.path, ...identity })
+      ) {
+        throw new Error("Active native profile identity changed");
+      }
+      return record;
+    }
+    record.identity = { profilePath: profile.path, ...identity };
+  } else {
+    record = startupProfileRecord(profile.path, origin, identity);
+    await IOUtils.writeJSON(
+      PathUtils.join(profile.path, PROFILE_FILE),
+      record,
+      {
+        mode: "create",
+        flush: true,
+      }
+    );
+  }
+  database.validateProfileStartup(operation);
+  if (journal?.state.stage === "activate") {
+    await journal.finishStage("activate");
+  }
+  record.state = "active";
+  validateStartupProfileRecord(record, profile.path);
+  await saveProfileRecord(profile.path, record);
+  database.validateProfileStartup(operation);
+  return record;
+}
+
+/**
+ * Blocks a just-published selection after failed native final readback.
+ * Keeps its original application floor, native identities and recovery inputs.
+ *
+ * @param {string} profilePath - Startup-selected profile.
+ * @returns {Promise<void>} Durable recovery selection, when one exists.
+ */
+export async function requireStartupProfileRecovery(profilePath) {
+  const profile = startupProfileDirectory(profilePath);
+  const record = await readProfileRecord(profile.path);
+  if (record?.formatVersion === 2) {
+    checkApplicationVersion(record);
+    record.state = "restore-required";
+    await saveProfileRecord(profile.path, record);
+  }
+}
+
+/** @returns {{version: string, buildId: string}} Current checked version floor. */
+function currentStartupApplication() {
+  const application = {
+    version: Services.appinfo.version,
+    buildId: Services.appinfo.appBuildID,
+  };
+  applicationBuildTime(application);
+  return application;
+}
+
+/**
+ * Constructs a prepared format2 record without a fictitious legacy import.
+ *
+ * @param {string} profilePath - Actual selected root.
+ * @param {string} origin - Native initialization, adoption or migration.
+ * @param {object} identity - Native and optional migration identities.
+ * @returns {object} Validated prepared record.
+ */
+function startupProfileRecord(profilePath, origin, identity) {
+  const record = {
+    formatVersion: 2,
+    backend: "panorama",
+    origin,
+    state: "prepared",
+    application: currentStartupApplication(),
+    identity: { profilePath, ...identity },
+  };
+  return validateStartupProfileRecord(record, profilePath);
+}
+
+/**
+ * Validates native selection metadata without opening a writable database.
+ *
+ * @param {object} record - Persisted format2 selection.
+ * @param {string} profilePath - Expected selected physical profile.
+ * @returns {object} The unchanged validated record.
+ * @throws {Error} For unknown formats, inconsistent origins or partial identity.
+ */
+function validateStartupProfileRecord(record, profilePath) {
+  const identity = record.identity;
+  const pending = record.state !== "active" && record.origin === "migrated";
+  if (
+    record.backend !== "panorama" ||
+    !["initialized-empty", "adopted-existing", "migrated"].includes(
+      record.origin
+    ) ||
+    !["prepared", "active", "restore-required"].includes(record.state) ||
+    !identity ||
+    identity.profilePath !== profilePath ||
+    !PathUtils.isAbsolute(profilePath) ||
+    typeof record.application?.version !== "string" ||
+    typeof record.application?.buildId !== "string" ||
+    ![identity.imports, identity.books, identity.caches].every(Array.isArray) ||
+    (!(
+      pending &&
+      identity.databaseSourceId === null &&
+      identity.schemaVersion === null
+    ) &&
+      (typeof identity.databaseSourceId !== "string" ||
+        !identity.databaseSourceId ||
+        identity.databaseSourceId.includes("\0") ||
+        !Number.isSafeInteger(identity.schemaVersion) ||
+        identity.schemaVersion < 0))
+  ) {
+    throw new Error("Invalid or unsupported native profile format");
+  }
+  if (record.origin === "migrated") {
+    if (
+      typeof identity.journalPath !== "string" ||
+      !PathUtils.isAbsolute(identity.journalPath) ||
+      !identity.backup ||
+      typeof identity.backup.path !== "string" ||
+      !PathUtils.isAbsolute(identity.backup.path) ||
+      !/^[a-f0-9]{64}$/.test(identity.backup.sha256)
+    ) {
+      throw new Error("Native migration profile has no recovery identity");
+    }
+  } else if (
+    identity.journalPath !== null ||
+    identity.backup !== null ||
+    identity.imports.length ||
+    identity.books.length ||
+    identity.caches.length
+  ) {
+    throw new Error("Native initialization must not invent migration receipts");
+  }
+  const ids = new Set();
+  const tokens = new Set();
+  for (const unit of [
+    ...identity.imports,
+    ...identity.books,
+    ...identity.caches,
+  ]) {
+    if (
+      typeof unit.id !== "string" ||
+      !unit.id ||
+      ids.has(unit.id) ||
+      typeof unit.token !== "string" ||
+      !unit.token ||
+      tokens.has(unit.token) ||
+      !/^[a-f0-9]{64}$/.test(unit.sha256) ||
+      !unit.receipt ||
+      (identity.imports.includes(unit) &&
+        (!Number.isSafeInteger(unit.folderId) || unit.folderId <= 0)) ||
+      (identity.books.includes(unit) && !unit.publication)
+    ) {
+      throw new Error("Invalid native profile committed-unit identity");
+    }
+    ids.add(unit.id);
+    tokens.add(unit.token);
+  }
+  return record;
+}
+
+/**
+ * Rejects links in every component of a startup profile path.
+ *
+ * @param {string} path - Absolute selected profile root.
+ * @returns {nsIFile} Canonical existing directory.
+ */
+function startupProfileDirectory(path) {
+  const file = canonicalFile(path);
+  for (
+    let component = new FileUtils.File(path);
+    component;
+    component = component.parent
+  ) {
+    if (component.isSymlink()) {
+      throw new Error("Startup profile path contains a link");
+    }
+  }
+  if (!file.isDirectory()) {
+    throw new Error("Startup profile is not a directory");
+  }
+  return file;
 }

@@ -9,13 +9,42 @@ interface nsIFolderDatabase;
 interface nsIMessageDatabase;
 interface nsIMsgFolder;
 
-[scriptable, builtinclass, uuid(3b51b952-21c9-48dd-bb1f-365a531aa807)]
+[scriptable, builtinclass, uuid(20b465a0-a224-41cd-b223-cb070ff3312e)]
 interface nsIDatabaseCore : nsISupports {
   /**
    * Open a connection to the database and load in the folders from it.
-   * Returns a promise that resolves (with no value) when loading is complete.
+   * This is synchronous. Selected production startup uses the operation below.
    */
   void startup();
+
+  /**
+   * Select startup before any writable native or account service admission.
+   * Resolves to a native operation after XRE's app-startup notification. The
+   * opaque object is not a profile lock and must never be used as one.
+   */
+  [implicit_jscontext] Promise beginProfileStartup();
+
+  /**
+   * Check the persisted startup plan and open only its selected target.
+   * Returns the selected identity and real native folder bindings. Ordinary
+   * account work remains blocked until durable activation is read back.
+   */
+  [implicit_jscontext] jsval openProfileStartupTarget(in nsISupports operation,
+                                                      in jsval plan);
+
+  /** Inspect the same live native operation around asynchronous caller work. */
+  [implicit_jscontext] jsval validateProfileStartup(in nsISupports operation);
+
+  /** Re-read durable activation/receipts, then admit ordinary startup once. */
+  [implicit_jscontext] Promise completeProfileStartup(in nsISupports operation,
+                                                       in jsval activation);
+
+  /**
+   * Caller invokes this only after joining its already-started work. Retains
+   * the first failure, closes native storage, then removes the shutdown block.
+   */
+  [implicit_jscontext] Promise failProfileStartup(in nsISupports operation,
+                                                   in nsresult firstError);
 
   /**
    * Persistent identity of this database, available after startup. Reopening

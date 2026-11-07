@@ -20,6 +20,8 @@ const {
   activateMigrationProfile,
   getMigrationProfileState,
   stageMigrationProfileRestore,
+  prepareStartupMigrationProfile,
+  requireStartupProfileRecovery,
 } = ChromeUtils.importESModule(
   "resource:///modules/panorama/MigrationProfile.sys.mjs"
 );
@@ -585,3 +587,222 @@ add_task(async function test_restoreRequiredKeepsFloorAndRecoveryState() {
     Assert.deepEqual(await IOUtils.read(input.journalPath), journal);
   });
 });
+
+/**
+ * Creates a selector-reader fixture, without claiming a native database import.
+ *
+ * @param {string} origin - Empty initialization or existing-database adoption.
+ * @returns {Promise<{profilePath: string, path: string, record: object}>} Fixture.
+ */
+async function startupSelector(origin = "initialized-empty") {
+  const profilePath = await IOUtils.createUniqueDirectory(
+    PathUtils.tempDir,
+    "native-profile-selector-"
+  );
+  registerCleanupFunction(() =>
+    IOUtils.remove(profilePath, { recursive: true })
+  );
+  const path = PathUtils.join(profilePath, "panorama-profile.json");
+  const record = {
+    formatVersion: 2,
+    backend: "panorama",
+    origin,
+    state: "active",
+    application: { ...activatingApplication },
+    identity: {
+      profilePath,
+      databaseSourceId: "selector-reader-unit-identity",
+      schemaVersion: 21,
+      journalPath: null,
+      backup: null,
+      imports: [],
+      books: [],
+      caches: [],
+    },
+  };
+  await IOUtils.writeJSON(path, record);
+  return { profilePath, path, record };
+}
+
+add_task(async function test_getMigrationProfileStateWithNativeOrigins() {
+  for (const origin of ["initialized-empty", "adopted-existing"]) {
+    const input = await startupSelector(origin);
+    const before = await IOUtils.read(input.path);
+    await withApplication(activatingApplication, async () => {
+      const result = await getMigrationProfileState(input.profilePath);
+      Assert.equal(result.state, "active");
+      Assert.equal(result.record.backend, "panorama");
+      Assert.equal(result.record.origin, origin);
+      Assert.strictEqual(result.record.identity.journalPath, null);
+      Assert.strictEqual(result.record.identity.backup, null);
+      Assert.deepEqual(result.record.application, activatingApplication);
+    });
+    Assert.deepEqual(
+      await IOUtils.read(input.path),
+      before,
+      "Reading native selection does not invent or rewrite migration progress"
+    );
+    Assert.deepEqual((await IOUtils.getChildren(input.profilePath)).sort(), [
+      input.path,
+    ]);
+  }
+});
+
+add_task(
+  async function test_getMigrationProfileStateRefusesInvalidNativeSelection() {
+    const input = await startupSelector();
+    for (const change of [
+      record => {
+        record.backend = "mork";
+      },
+      record => {
+        record.origin = "unknown";
+      },
+      record => {
+        record.identity.databaseSourceId = null;
+      },
+      record => {
+        record.identity.schemaVersion = -1;
+      },
+      record => {
+        record.identity.journalPath = input.path;
+      },
+      record => {
+        record.identity.backup = { path: input.path, sha256: "a".repeat(64) };
+      },
+      record => {
+        record.identity.imports = [{ id: "fabricated" }];
+      },
+    ]) {
+      const record = structuredClone(input.record);
+      change(record);
+      await IOUtils.writeJSON(input.path, record);
+      const before = await IOUtils.read(input.path);
+      await withApplication(activatingApplication, () =>
+        Assert.rejects(
+          getMigrationProfileState(input.profilePath),
+          /native profile|must not invent|committed-unit/,
+          "An inconsistent backend/origin/identity cannot authorize startup"
+        )
+      );
+      Assert.deepEqual(await IOUtils.read(input.path), before);
+    }
+  }
+);
+
+add_task(
+  async function test_getMigrationProfileStateWithNativeDowngradeFloor() {
+    const input = await startupSelector();
+    const before = await IOUtils.read(input.path);
+    for (const application of [
+      { version: "161.1.9", buildId: "20261101000000" },
+      { version: "161.2.0", buildId: "20261028123455" },
+    ]) {
+      await withApplication(application, () =>
+        Assert.rejects(
+          getMigrationProfileState(input.profilePath),
+          /compatible application/
+        )
+      );
+      Assert.deepEqual(
+        await IOUtils.read(input.path),
+        before,
+        "Downgrade does not write the native selection"
+      );
+    }
+    await withApplication(
+      { version: "161.3.0", buildId: "20261001000000" },
+      async () => {
+        const selected = await getMigrationProfileState(input.profilePath);
+        Assert.deepEqual(
+          selected.record.application,
+          activatingApplication,
+          "A newer reader preserves the first preparing minimum"
+        );
+      }
+    );
+    Assert.deepEqual(await IOUtils.read(input.path), before);
+  }
+);
+
+add_task(
+  { skip_if: () => AppConstants.platform === "win" },
+  async function test_prepareStartupMigrationProfileRetainsActualRecoveryInputs() {
+    const root = await IOUtils.createUniqueDirectory(
+      PathUtils.tempDir,
+      "startup-profile-"
+    );
+    registerCleanupFunction(() => IOUtils.remove(root, { recursive: true }));
+    const profilePath = PathUtils.join(root, "profile");
+    const work = PathUtils.join(root, "work");
+    await IOUtils.makeDirectory(profilePath);
+    await IOUtils.makeDirectory(work);
+    const source = PathUtils.join(profilePath, "Inbox.msf");
+    await IOUtils.copy(do_get_file("data/migration.msf").path, source);
+    const backupPath = PathUtils.join(root, "backup");
+    const backup = await createMigrationBackup(profilePath, [], backupPath);
+    const journalPath = PathUtils.join(work, "journal.json");
+    const journal = await MigrationJournal.create(journalPath, {
+      profilePath,
+      mailPaths: [],
+      backupPath,
+      sources: [],
+      startupInventory: {
+        sources: [
+          {
+            id: "original",
+            serverKey: "server1",
+            serverRoot: profilePath,
+            protocol: "none",
+            storeType: "mbox",
+            storeContractID: "@mozilla.org/msgstore/berkeleystore;1",
+            storePath: source.slice(0, -4),
+            origin: { provider: "local-store-discovery" },
+            path: source,
+            sha256: await IOUtils.computeHexDigest(source, "sha256"),
+            size: (await IOUtils.stat(source)).size,
+          },
+        ],
+        caches: [],
+      },
+    });
+    journal.close();
+    const rawJournal = await IOUtils.read(journalPath);
+    await withApplication(activatingApplication, async () => {
+      const record = await prepareStartupMigrationProfile(
+        profilePath,
+        journalPath,
+        backup
+      );
+      Assert.equal(record.state, "prepared");
+      Assert.equal(record.origin, "migrated");
+      Assert.strictEqual(
+        record.identity.databaseSourceId,
+        null,
+        "No native incarnation is invented before actual target bootstrap"
+      );
+      Assert.equal(record.identity.journalPath, journalPath);
+      Assert.deepEqual(record.identity.backup, backup);
+      Assert.ok(
+        !(await IOUtils.exists(PathUtils.join(profilePath, "panorama.sqlite")))
+      );
+      const selectorPath = PathUtils.join(profilePath, "panorama-profile.json");
+      const rawSelector = await IOUtils.read(selectorPath);
+      await Assert.rejects(
+        prepareStartupMigrationProfile(profilePath, journalPath, backup),
+        /requires recovery/
+      );
+      Assert.deepEqual(
+        await IOUtils.read(selectorPath),
+        rawSelector,
+        "Repeated startup does not replace existing recovery state"
+      );
+      await requireStartupProfileRecovery(profilePath);
+      Assert.equal(
+        (await getMigrationProfileState(profilePath)).state,
+        "restore-required"
+      );
+      Assert.deepEqual(await IOUtils.read(journalPath), rawJournal);
+    });
+  }
+);

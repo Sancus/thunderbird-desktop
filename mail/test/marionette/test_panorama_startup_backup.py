@@ -340,3 +340,377 @@ class TestPanoramaStartupBackup(MarionetteTestCase):
         for original, snapshot in external_before.items():
             self.assertEqual(snapshot, self.tree_snapshot(Path(original)))
         self.assertEqual(expected[self.source], self.source.read_bytes())
+
+
+
+class TestPanoramaStartupActivation(MarionetteTestCase):
+    """Exercise the real XRE/ordinary command/profile lifecycle on Linux."""
+
+    def setUp(self):
+        super().setUp()
+        self.original_prefs = self.marionette.instance.prefs
+        self.original_args = list(self.marionette.instance.app_args or [])
+        self.created_work = set()
+        self.profile = None
+
+    def stop_application(self):
+        """Settle ordinary writers and release the real process profile lock."""
+        if self.marionette.session:
+            self.marionette.set_context(self.marionette.CONTEXT_CHROME)
+            self.marionette.execute_script("Services.prefs.savePrefFile(null);")
+            self.marionette.quit(in_app=True)
+
+    def clean_profile(self, enabled):
+        """Use the ordinary runner after a normal quit, with a fresh profile."""
+        self.stop_application()
+        self.marionette.instance.restart(
+            prefs={**(self.original_prefs or {}), "mail.panorama.enabled": enabled},
+            clean=True,
+        )
+        self.marionette.start_session()
+        self.marionette.set_context(self.marionette.CONTEXT_CHROME)
+        self.profile = Path(self.marionette.execute_script(
+            "return Services.dirsvc.get('ProfD', Ci.nsIFile).path;"
+        )).resolve()
+        self.assertEqual("mail:3pane", self.marionette.get_window_type())
+
+    def start_same_profile(self, enabled):
+        """Start the same stopped profile through its original normal runner."""
+        self.marionette.instance.prefs = {
+            **(self.original_prefs or {}), "mail.panorama.enabled": enabled
+        }
+        self.marionette.start_session()
+        self.marionette.set_context(self.marionette.CONTEXT_CHROME)
+        selected = self.marionette.execute_script(
+            "return Services.dirsvc.get('ProfD', Ci.nsIFile).path;"
+        )
+        self.assertEqual(self.profile, Path(selected).resolve())
+        self.assertEqual("mail:3pane", self.marionette.get_window_type())
+
+    def selection(self):
+        """Read actual durable backend/native identities after ordinary startup."""
+        result = self.marionette.execute_async_script("""
+            const done = arguments[arguments.length - 1];
+            (async () => {
+              const { MailGlue } = ChromeUtils.importESModule(
+                'resource:///modules/MailGlue.sys.mjs');
+              await MailGlue.panoramaStartup;
+              const profile = Services.dirsvc.get('ProfD', Ci.nsIFile).path;
+              const record = await IOUtils.readJSON(
+                PathUtils.join(profile, 'panorama-profile.json'));
+              const core = Cc['@mozilla.org/mailnews/database-core;1']
+                .getService(Ci.nsIDatabaseCore);
+              return {record, sourceId: core.sourceId};
+            })().then(done, error => done({error: String(error)}));
+        """)
+        self.assertNotIn("error", result)
+        record = result["record"]
+        self.assertEqual(2, record["formatVersion"])
+        self.assertEqual("active", record["state"])
+        self.assertEqual("panorama", record["backend"])
+        self.assertEqual(result["sourceId"], record["identity"]["databaseSourceId"])
+        self.assertTrue(result["sourceId"])
+        if record["identity"]["backup"]:
+            self.created_work.add(Path(record["identity"]["backup"]["path"]).parent.parent)
+        return result
+
+    def create_legacy_message(self, store):
+        """Write genuine Mork/store data through the normal legacy mail API."""
+        result = self.marionette.execute_script("""
+            const { MailServices } = ChromeUtils.importESModule(
+              'resource:///modules/MailServices.sys.mjs');
+            const { FileUtils } = ChromeUtils.importESModule(
+              'resource://gre/modules/FileUtils.sys.mjs');
+            const root = PathUtils.join(PathUtils.profileDir, 'Mail',
+              's526-' + Services.uuid.generateUUID().toString());
+            const file = new FileUtils.File(root);
+            if (!file.parent.exists()) {
+              file.parent.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+            }
+            file.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+            const server = MailServices.accounts.createIncomingServer(
+              's526', 'localhost', 'none');
+            server.setCharValue('storeContractID', arguments[0] === 'maildir'
+              ? '@mozilla.org/msgstore/maildirstore;1'
+              : '@mozilla.org/msgstore/berkeleystore;1');
+            server.localPath = file;
+            const account = MailServices.accounts.createAccount();
+            account.incomingServer = server;
+            const parent = server.rootFolder;
+            parent.createSubfolder('Inbox', null);
+            const folder = parent.getChildNamed('Inbox')
+              .QueryInterface(Ci.nsIMsgLocalMailFolder);
+            const header = folder.addMessage(
+              'From - Thu Nov 05 00:00:00 2026\r\n' +
+              'Message-ID: <activation-s526@invalid>\r\n' +
+              'From: source@example.invalid\r\n' +
+              'To: destination@example.invalid\r\n' +
+              'Subject: Original startup migration\r\n' +
+              'Date: Thu, 5 Nov 2026 00:00:00 +0000\r\n\r\n' +
+              'Preserved message body.\r\n');
+            header.setStringProperty('s526-custom', 'retained');
+            folder.msgDatabase.Commit(Ci.nsMsgDBCommitType.kLargeCommit);
+            Services.prefs.savePrefFile(null);
+            return {serverKey: server.key, root, summary: folder.summaryFile.path,
+              key: header.messageKey, store: folder.msgStore.storeType};
+        """, script_args=[store])
+        self.assertEqual(store, result["store"])
+        return result
+
+    def assert_message_after_activation(self, source):
+        """Read the imported message through the ordinary native folder/header API."""
+        result = self.marionette.execute_script("""
+            const { MailServices } = ChromeUtils.importESModule(
+              'resource:///modules/MailServices.sys.mjs');
+            const server = MailServices.accounts.getIncomingServer(arguments[0]);
+            const folder = server.rootFolder.getChildNamed('Inbox');
+            return [...folder.msgDatabase.enumerateMessages()].map(header => ({
+              messageId: header.messageId,
+              subject: header.subject,
+              property: header.getStringProperty('s526-custom'),
+              key: header.messageKey,
+            }));
+        """, script_args=[source["serverKey"]])
+        self.assertEqual(1, len(result))
+        self.assertEqual("activation-s526@invalid", result[0]["messageId"])
+        self.assertEqual("Original startup migration", result[0]["subject"])
+        self.assertEqual("retained", result[0]["property"])
+        return result
+
+    def assert_mork_migration(self, store):
+        """Migrate genuine legacy data, then prove identity-preserving reuse."""
+        self.clean_profile(False)
+        source = self.create_legacy_message(store)
+        self.stop_application()
+        source_root = Path(source["root"])
+        before = {path: path.read_bytes() for path in source_root.rglob("*") if path.is_file()}
+        self.assertIn(Path(source["summary"]), before)
+        self.assertFalse((self.profile / "panorama.sqlite").exists())
+        self.start_same_profile(True)
+        selected = self.selection()
+        record = selected["record"]
+        self.assertEqual("migrated", record["origin"])
+        self.assertTrue(record["identity"]["imports"])
+        headers = self.assert_message_after_activation(source)
+        backup = Path(record["identity"]["backup"]["path"])
+        manifest = json.loads(backup.read_text())
+        self.assertTrue(manifest["complete"])
+        self.assertEqual(self.profile, Path(manifest["roots"][0]["source"]))
+        for path, original in before.items():
+            self.assertEqual(original, path.read_bytes())
+            archived = backup.parent / "root-0" / path.relative_to(self.profile)
+            self.assertEqual(original, archived.read_bytes())
+        self.stop_application()
+        selector = (self.profile / "panorama-profile.json").read_bytes()
+        journal_path = Path(record["identity"]["journalPath"])
+        journal = journal_path.read_bytes()
+        self.assertEqual("complete", json.loads(journal)["stage"])
+        # Old Mork is deliberately stale now; the native database must win.
+        Path(source["summary"]).write_bytes(b"stale legacy Mork must not be imported\n")
+        self.start_same_profile(True)
+        repeated = self.selection()
+        self.assertEqual(selected["sourceId"], repeated["sourceId"])
+        self.assertEqual(headers, self.assert_message_after_activation(source))
+        self.assertEqual(selector, (self.profile / "panorama-profile.json").read_bytes())
+        self.assertEqual(journal, journal_path.read_bytes())
+        self.assertEqual(before[Path(source["summary"])],
+                         (backup.parent / "root-0" / Path(source["summary"]).relative_to(self.profile)).read_bytes())
+
+    def test_empty_profile_initialization_and_repeated_reuse(self):
+        self.clean_profile(True)
+        selected = self.selection()
+        self.assertEqual("initialized-empty", selected["record"]["origin"])
+        self.assertIsNone(selected["record"]["identity"]["backup"])
+        self.assertIsNone(selected["record"]["identity"]["journalPath"])
+        self.assertEqual([], selected["record"]["identity"]["imports"])
+        self.stop_application()
+        before = (self.profile / "panorama-profile.json").read_bytes()
+        stale = self.profile / "stale.mab"
+        stale.write_bytes(b"unrelated stale Mork must not be imported\n")
+        self.start_same_profile(True)
+        self.assertEqual(selected["sourceId"], self.selection()["sourceId"])
+        self.assertEqual(before, (self.profile / "panorama-profile.json").read_bytes())
+        self.assertEqual(b"unrelated stale Mork must not be imported\n", stale.read_bytes())
+
+    def test_genuine_mork_mbox_migration_and_reuse(self):
+        self.assert_mork_migration("mbox")
+
+    def test_genuine_mork_maildir_migration_and_reuse(self):
+        self.assert_mork_migration("maildir")
+
+    def test_existing_native_database_without_selector_is_adopted_before_mork(self):
+        """A valid existing native source wins even without a selection record."""
+        self.clean_profile(True)
+        selected = self.selection()
+        source = self.create_legacy_message("mbox")
+        headers = self.assert_message_after_activation(source)
+        self.stop_application()
+        selector = self.profile / "panorama-profile.json"
+        saved = self.profile / "saved-original-selector.json"
+        original = selector.read_bytes()
+        selector.replace(saved)
+        stale = self.profile / "unrelated-old.mab"
+        stale.write_bytes(b"Invalid stale Mork must not replace native data.\n")
+        self.start_same_profile(True)
+        adopted = self.selection()
+        self.assertEqual("adopted-existing", adopted["record"]["origin"])
+        self.assertEqual(selected["sourceId"], adopted["sourceId"])
+        self.assertEqual(headers, self.assert_message_after_activation(source))
+        self.assertEqual(original, saved.read_bytes())
+        self.assertIsNone(adopted["record"]["identity"]["backup"])
+        self.assertIsNone(adopted["record"]["identity"]["journalPath"])
+        self.stop_application()
+        before = selector.read_bytes()
+        self.start_same_profile(True)
+        self.assertEqual(adopted["sourceId"], self.selection()["sourceId"])
+        self.assertEqual(before, selector.read_bytes())
+
+    def test_unsafe_external_store_refuses_before_target_creation(self):
+        """An unowned external writer root is never an empty-profile input."""
+        self.clean_profile(False)
+        source = self.create_legacy_message("mbox")
+        external = tempfile.TemporaryDirectory(prefix="s526-external-")
+        self.addCleanup(external.cleanup)
+        path = Path(external.name).resolve()
+        data = path / "retained-source"
+        data.write_bytes(b"External writer source stays owned by its caller.\n")
+        self.marionette.execute_script("""
+            const { FileUtils } = ChromeUtils.importESModule(
+              'resource://gre/modules/FileUtils.sys.mjs');
+            Services.prefs.clearUserPref('mail.server.' + arguments[0] + '.directory-rel');
+            Services.prefs.setComplexValue('mail.server.' + arguments[0] + '.directory',
+              Ci.nsIFile, new FileUtils.File(arguments[1]));
+            Services.prefs.savePrefFile(null);
+        """, script_args=[source["serverKey"], str(path)])
+        self.stop_application()
+        self.assert_startup_refuses(
+            [data, Path(source["summary"])],
+            absent=[self.profile / "panorama.sqlite", self.profile / "panorama-profile.json"],
+        )
+        work = self.profile.parent / ("panorama-migration-" + self.profile.name)
+        self.assertFalse(work.exists(), "Refusal precedes even backup/target work")
+
+    def test_legacy_default_does_not_create_panorama(self):
+        self.clean_profile(False)
+        source = self.create_legacy_message("mbox")
+        self.stop_application()
+        summary = Path(source["summary"]).read_bytes()
+        self.start_same_profile(False)
+        self.assertFalse(self.marionette.get_pref("mail.panorama.enabled"))
+        self.assertFalse((self.profile / "panorama.sqlite").exists())
+        self.assertFalse((self.profile / "panorama-profile.json").exists())
+        self.assertEqual(summary, Path(source["summary"]).read_bytes())
+        self.assertEqual("activation-s526@invalid",
+                         self.assert_message_after_activation(source)[0]["messageId"])
+
+    def test_native_downgrade_and_backend_fallback_refuse(self):
+        from marionette_driver import errors
+
+        self.clean_profile(True)
+        selected = self.selection()
+        self.stop_application()
+        selector_path = self.profile / "panorama-profile.json"
+        original = selector_path.read_bytes()
+        database_path = self.profile / "panorama.sqlite"
+        original_database = database_path.read_bytes()
+        current = selected["record"]
+        # Use the actual running build/version; only the durable reader floor changes.
+        future = dict(current["application"])
+        future["buildId"] = str(int(future["buildId"][:4]) + 1) + future["buildId"][4:]
+        future_version = {**current["application"], "version": "9999.0"}
+        for changed, enabled in [
+            (future_version, True),
+            (future, True),
+            (current["application"], False),
+        ]:
+            record = json.loads(original)
+            record["application"] = changed
+            selector_path.write_text(json.dumps(record))
+            before = selector_path.read_bytes()
+            self.marionette.instance.prefs = {
+                **(self.original_prefs or {}), "mail.panorama.enabled": enabled
+            }
+            with self.assertRaises((OSError, errors.SessionNotCreatedException,
+                                    errors.TimeoutException)):
+                self.marionette.start_session()
+            self.assertIsNotNone(self.marionette.instance.runner.returncode,
+                                 "The native failure must terminate startup, not hang")
+            self.assertEqual(before, selector_path.read_bytes())
+            self.assertEqual(original_database, database_path.read_bytes())
+            selector_path.write_bytes(original)
+            self.start_same_profile(True)
+            self.assertEqual(selected["sourceId"], self.selection()["sourceId"])
+            self.stop_application()
+            original_database = database_path.read_bytes()
+
+    def assert_startup_refuses(self, files, absent=()):
+        """Require an actual stopped application and exact recovery preservation."""
+        from marionette_driver import errors
+
+        before = {path: path.read_bytes() for path in files}
+        self.marionette.instance.prefs = {
+            **(self.original_prefs or {}), "mail.panorama.enabled": True
+        }
+        with self.assertRaises((OSError, errors.SessionNotCreatedException,
+                                errors.TimeoutException)):
+            self.marionette.start_session()
+        self.assertIsNotNone(self.marionette.instance.runner.returncode,
+                             "Recovery must stop startup, not hang")
+        for path, contents in before.items():
+            self.assertEqual(contents, path.read_bytes())
+        for path in absent:
+            self.assertFalse(path.exists(), "Recovery must not create " + str(path))
+
+    def test_corrupt_prepared_and_interrupted_states_are_never_absence(self):
+        self.clean_profile(True)
+        selected = self.selection()
+        self.stop_application()
+        selector = self.profile / "panorama-profile.json"
+        database = self.profile / "panorama.sqlite"
+        selector_bytes = selector.read_bytes()
+        database_bytes = database.read_bytes()
+        database.write_bytes(b"corrupt native database must not be recreated\n")
+        self.assert_startup_refuses([selector, database])
+        database.write_bytes(database_bytes)
+        self.start_same_profile(True)
+        self.assertEqual(selected["sourceId"], self.selection()["sourceId"])
+        self.stop_application()
+        database_bytes = database.read_bytes()
+        saved_database = self.profile / "saved-native-database.sqlite"
+        database.replace(saved_database)
+        record = json.loads(selector_bytes)
+        record["state"] = "prepared"
+        selector.write_text(json.dumps(record))
+        self.assert_startup_refuses([selector, saved_database], absent=[database])
+        selector.write_bytes(selector_bytes)
+        saved_database.replace(database)
+        self.start_same_profile(True)
+        self.assertEqual(selected["sourceId"], self.selection()["sourceId"])
+        self.stop_application()
+        database.replace(saved_database)
+        saved_selector = self.profile / "saved-native-selector.json"
+        selector.replace(saved_selector)
+        work = self.profile.parent / ("panorama-migration-" + self.profile.name)
+        self.assertFalse(work.exists())
+        work.mkdir(mode=0o700)
+        self.created_work.add(work)
+        journal = work / "journal.json"
+        journal.write_bytes(b'{"interrupted":"retained journal requires recovery"}\n')
+        self.assert_startup_refuses(
+            [saved_selector, saved_database, journal], absent=[database, selector]
+        )
+        self.assertFalse((work / "backup").exists(),
+                         "An existing journal cannot be hidden behind another backup")
+
+    def tearDown(self):
+        try:
+            self.stop_application()
+            self.marionette.instance.app_args = self.original_args
+            self.marionette.instance.restart(prefs=self.original_prefs, clean=True)
+            self.marionette.start_session()
+            for work in self.created_work:
+                # Remove only this disposable test's exact outside-profile archive.
+                self.assertTrue(work.name.startswith("panorama-migration-"))
+                shutil.rmtree(work)
+        finally:
+            super().tearDown()

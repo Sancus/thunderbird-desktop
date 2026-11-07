@@ -10,6 +10,7 @@ ChromeUtils.defineESModuleGetters(lazy, {
   openLinkExternally: "resource:///modules/LinkHelper.sys.mjs",
   FeedUtils: "resource:///modules/FeedUtils.sys.mjs",
   MailUtils: "resource:///modules/MailUtils.sys.mjs",
+  MailGlue: "resource:///modules/MailGlue.sys.mjs",
   MimeParser: "resource:///modules/mimeParser.sys.mjs",
   MorkParser: "resource:///modules/MorkParser.sys.mjs",
   NetUtil: "resource://gre/modules/NetUtil.sys.mjs",
@@ -75,6 +76,9 @@ function handleIndexerResult(aFile) {
 }
 
 async function getOrOpen3PaneWindow() {
+  if (lazy.MailGlue.panoramaStartup) {
+    await lazy.MailGlue.panoramaStartup;
+  }
   let win = Services.wm.getMostRecentWindow("mail:3pane");
 
   if (!win) {
@@ -213,6 +217,27 @@ export class MessengerContentHandler {
 
   /** @see {nsICommandLineHandler} */
   handle(cmdLine) {
+    const ready = lazy.MailGlue.panoramaStartup;
+    if (!ready) {
+      this.#handleReady(cmdLine);
+      return;
+    }
+    // Keep the ordinary command and window route alive until selection settles.
+    Services.startup.enterLastWindowClosingSurvivalArea();
+    ready
+      .then(() => this.#handleReady(cmdLine))
+      .catch(console.error)
+      .finally(() => {
+        Services.startup.exitLastWindowClosingSurvivalArea();
+      });
+  }
+
+  /**
+   * Runs the existing command handler after native profile startup is ready.
+   *
+   * @param {nsICommandLine} cmdLine - The original command, handled once.
+   */
+  #handleReady(cmdLine) {
     // Migration is also handled from command line. But differently: the flag
     // is already removed by toolkit. We don't want any other windows.
     if (isMigration) {

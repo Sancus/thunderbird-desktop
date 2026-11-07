@@ -7,6 +7,14 @@
 #include <utility>
 
 #include "DatabaseCore.h"
+#include "js/PropertyAndElement.h"
+#include "mozilla/dom/Promise.h"
+#include "nsIAsyncShutdown.h"
+#include "nsIToolkitProfile.h"
+#include "nsIXULAppInfo.h"
+#ifndef XP_WIN
+#  include "../../../../../../toolkit/xre/nsAppRunner.h"
+#endif
 #include "FolderDatabase.h"
 #include "js/JSON.h"
 #ifdef XP_WIN
@@ -327,6 +335,9 @@ class DeliveryCoreReferences : public testing::Test {
   }
 
   void TearDown() override {
+#ifndef XP_WIN
+    FinishSelectedStartup();
+#endif
     Stop();
     if (mDirectoryChanged) {
       // An uncached provider is restored by removing only our override.
@@ -3237,6 +3248,232 @@ class DeliveryCoreReferences : public testing::Test {
     MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
     return stmt->ExecuteStep(&known);
   }
+
+#ifndef XP_WIN
+  // Only our unique temporary profile is locked. The production arming entry
+  // still receives its selected directories from XRE's app-startup callback.
+  nsresult ArmSelectedStartup() {
+    NS_ENSURE_FALSE(mSelectedStartup || mCore, NS_ERROR_ALREADY_INITIALIZED);
+    for (auto entry :
+         {std::pair{NS_APP_PROFILE_DIR_STARTUP, &mOldStartupProfile},
+          std::pair {
+            NS_APP_PROFILE_LOCAL_DIR_STARTUP,
+            &mOldStartupLocal
+          }}) {
+      (void)mDirectories->Get(entry.first, NS_GET_IID(nsIFile),
+                              getter_AddRefs(*entry.second));
+      (void)mDirectories->Undefine(entry.first);
+      MOZ_TRY(mDirectories->Set(entry.first, mProfile));
+    }
+    mSelectedStartup = true;
+    MOZ_TRY(NS_LockProfilePath(mProfile, mProfile, nullptr,
+                               getter_AddRefs(mSelectedLock)));
+    mCore = DatabaseCore::GetInstanceForService();
+    return mCore->ArmProfileStartup(mProfile, mProfile);
+  }
+
+  void FinishSelectedStartup() {
+    if (!mSelectedStartup) return;
+    if (mCore && mCore->mProfileStartup) {
+      EXPECT_EQ(NS_OK, mCore->SettleProfileStartup(NS_ERROR_ABORT));
+      EXPECT_TRUE(SpinEventLoopUntil("StartupFixtureStorageClosed"_ns, [&] {
+        return !mCore->mStartupClosePending;
+      }));
+    }
+    // Retire the failed/ready native singleton only after actual close.
+    if (mCore)
+      EXPECT_EQ(NS_OK,
+                mCore->Observe(nullptr, "profile-before-change", nullptr));
+    mConnection = nullptr;
+    mCore = nullptr;
+    if (mSelectedLock) EXPECT_EQ(NS_OK, mSelectedLock->Unlock());
+    mSelectedLock = nullptr;
+    for (auto entry :
+         {std::pair{NS_APP_PROFILE_DIR_STARTUP, &mOldStartupProfile},
+          std::pair {
+            NS_APP_PROFILE_LOCAL_DIR_STARTUP,
+            &mOldStartupLocal
+          }}) {
+      EXPECT_EQ(NS_OK, mDirectories->Undefine(entry.first));
+      if (*entry.second)
+        EXPECT_EQ(NS_OK, mDirectories->Set(entry.first, *entry.second));
+      *entry.second = nullptr;
+    }
+    mSelectedStartup = false;
+  }
+
+  static bool StartupJSONSink(const char16_t* text, uint32_t size,
+                              void* output) {
+    static_cast<nsAString*>(output)->Append(text, size);
+    return true;
+  }
+  nsresult StartupJSONValue(JSContext* cx, JS::Handle<JS::Value> input,
+                            nsACString& output) {
+    JS::Rooted<JS::Value> value(cx, input);
+    nsString text;
+    NS_ENSURE_TRUE(JS_Stringify(cx, &value, nullptr, JS::NullHandleValue,
+                                StartupJSONSink, &text),
+                   NS_ERROR_FAILURE);
+    CopyUTF16toUTF8(text, output);
+    return NS_OK;
+  }
+  nsresult StartupDocument(JSContext* cx, const nsACString& json,
+                           JS::MutableHandle<JS::Value> value) {
+    nsCString path;
+    MOZ_TRY(mProfile->GetNativePath(path));
+    JS::Rooted<JSString*> string(
+        cx, JS_NewStringCopyN(cx, path.get(), path.Length()));
+    NS_ENSURE_TRUE(string, NS_ERROR_OUT_OF_MEMORY);
+    JS::Rooted<JS::Value> profile(cx, JS::StringValue(string));
+    nsCString quoted;
+    MOZ_TRY(StartupJSONValue(cx, profile, quoted));
+    nsCString expanded(json);
+    expanded.ReplaceSubstring("@PROFILE@", quoted.get());
+    NS_ConvertUTF8toUTF16 text(expanded);
+    NS_ENSURE_TRUE(JS_ParseJSON(cx, text.get(), text.Length(), value),
+                   NS_ERROR_INVALID_ARG);
+    return NS_OK;
+  }
+  nsresult WriteStartupFile(const char* leaf, const nsACString& bytes) {
+    nsCOMPtr<nsIFile> file;
+    MOZ_TRY(mProfile->Clone(getter_AddRefs(file)));
+    MOZ_TRY(file->AppendNative(nsDependentCString(leaf)));
+    nsCOMPtr<nsIOutputStream> stream;
+    MOZ_TRY(NS_NewLocalFileOutputStream(
+        getter_AddRefs(stream), file, PR_WRONLY | PR_CREATE_FILE | PR_TRUNCATE,
+        0600));
+    uint32_t written;
+    nsresult rv = stream->Write(bytes.BeginReading(), bytes.Length(), &written);
+    nsresult close = stream->Close();
+    MOZ_TRY(rv);
+    NS_ENSURE_TRUE(written == bytes.Length(), NS_ERROR_FAILURE);
+    return close;
+  }
+  nsresult DescribeStartup(nsACString& json) {
+    dom::AutoJSAPI jsapi;
+    NS_ENSURE_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()), NS_ERROR_FAILURE);
+    JS::Rooted<JS::Value> descriptor(jsapi.cx());
+    MOZ_TRY(mCore->DescribeProfileStartup(jsapi.cx(), &descriptor));
+    return StartupJSONValue(jsapi.cx(), descriptor, json);
+  }
+  nsresult OpenStartup(const char* mode, bool reenter = false) {
+    dom::AutoJSAPI jsapi;
+    NS_ENSURE_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()), NS_ERROR_FAILURE);
+    JSContext* cx = jsapi.cx();
+    nsCString json("{\"profilePath\":@PROFILE@,\"mode\":\"");
+    json.Append(mode);
+    json.AppendLiteral("\"}");
+    JS::Rooted<JS::Value> plan(cx);
+    MOZ_TRY(StartupDocument(cx, json, &plan));
+    if (reenter) {
+      JS::Rooted<JSObject*> object(cx, &plan.toObject());
+      NS_ENSURE_TRUE(JS_DefineProperty(cx, object, "mode", StartupReentry,
+                                       nullptr, JSPROP_ENUMERATE),
+                     NS_ERROR_FAILURE);
+    }
+    nsresult rv = mCore->OpenProfileStartup(cx, plan);
+    mConnection = Connection();
+    if (jsapi.HasException()) jsapi.ClearException();
+    return rv;
+  }
+  static bool StartupReentry(JSContext* cx, unsigned argc, JS::Value* vp) {
+    JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+    auto& core = *DatabaseCore::sInstance;
+    JS::Rooted<JS::Value> ignored(cx);
+    sStartupReentry =
+        core.ValidateProfileStartup(core.ProfileStartupToken(), cx, &ignored);
+    JS::Rooted<JSString*> mode(cx, JS_NewStringCopyZ(cx, "initialize"));
+    if (!mode) return false;
+    args.rval().setString(mode);
+    return true;
+  }
+  nsresult StartupContextCheck(nsISupports* token = nullptr) {
+    return mCore->CheckProfileStartup(token ? token
+                                            : mCore->ProfileStartupToken());
+  }
+  nsresult StartupMetadataCheck(bool scope) {
+    AutoRestore<uint32_t> depth(mCore->mStartupMetadataDepth);
+    if (scope) ++mCore->mStartupMetadataDepth;
+    return DatabaseCore::CheckAccountStartup(true);
+  }
+  nsresult StartupClose(nsresult error) {
+    return mCore->SettleProfileStartup(error);
+  }
+  bool StartupClosePending() { return mCore->mStartupClosePending; }
+  nsresult WriteStartupSelector(const char* origin = "initialized-empty",
+                                const char* backend = "panorama",
+                                const char* version = nullptr,
+                                bool falseReceipt = false) {
+    dom::AutoJSAPI jsapi;
+    NS_ENSURE_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()), NS_ERROR_FAILURE);
+    JSContext* cx = jsapi.cx();
+    nsCOMPtr<nsIXULAppInfo> app = do_GetService("@mozilla.org/xre/app-info;1");
+    NS_ENSURE_TRUE(app, NS_ERROR_NOT_AVAILABLE);
+    nsCString appVersion, build, source;
+    MOZ_TRY(app->GetVersion(appVersion));
+    MOZ_TRY(app->GetAppBuildID(build));
+    if (version) appVersion = version;
+    MOZ_TRY(mCore->GetSourceId(source));
+    int32_t schema;
+    MOZ_TRY(mConnection->GetSchemaVersion(&schema));
+    nsCString json("{\"formatVersion\":2,\"backend\":\"");
+    json.Append(backend);
+    json.AppendLiteral("\",\"origin\":\"");
+    json.Append(origin);
+    json.AppendLiteral(
+        "\",\"state\":\"active\",\"application\":{\"version\":\"");
+    json.Append(appVersion);
+    json.AppendLiteral("\",\"buildId\":\"");
+    json.Append(build);
+    json.AppendLiteral(
+        "\"},\"identity\":{\"profilePath\":@PROFILE@,\"databaseSourceId\":\"");
+    json.Append(source);
+    json.AppendLiteral("\",\"schemaVersion\":");
+    json.AppendInt(schema);
+    json.AppendLiteral(
+        ",\"journalPath\":null,\"backup\":null,\"books\":[],\"caches\":[],"
+        "\"imports\":");
+    json.Append(falseReceipt ? "[{\"id\":\"missing\",\"receipt\":{}}]" : "[]");
+    json.AppendLiteral("}}");
+    JS::Rooted<JS::Value> value(cx);
+    MOZ_TRY(StartupDocument(cx, json, &value));
+    nsCString bytes;
+    MOZ_TRY(StartupJSONValue(cx, value, bytes));
+    return WriteStartupFile("panorama-profile.json", bytes);
+  }
+  nsresult CheckStartupActivation(bool complete = false) {
+    dom::AutoJSAPI jsapi;
+    NS_ENSURE_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()), NS_ERROR_FAILURE);
+    JS::Rooted<JS::Value> descriptor(jsapi.cx());
+    MOZ_TRY(StartupDocument(
+        jsapi.cx(),
+        "{\"profilePath\":@PROFILE@,\"selectorPath\":\"\",\"journalPath\":null}"_ns,
+        &descriptor));
+    JS::Rooted<JSObject*> object(jsapi.cx(), &descriptor.toObject());
+    nsCString path;
+    MOZ_TRY(mProfile->GetNativePath(path));
+    path.AppendLiteral("/panorama-profile.json");
+    JS::Rooted<JSString*> string(
+        jsapi.cx(), JS_NewStringCopyN(jsapi.cx(), path.get(), path.Length()));
+    NS_ENSURE_TRUE(string, NS_ERROR_OUT_OF_MEMORY);
+    JS::Rooted<JS::Value> pathValue(jsapi.cx(), JS::StringValue(string));
+    NS_ENSURE_TRUE(
+        JS_SetProperty(jsapi.cx(), object, "selectorPath", pathValue),
+        NS_ERROR_FAILURE);
+    if (!complete) return mCore->CheckProfileActivation(jsapi.cx(), descriptor);
+    RefPtr<dom::Promise> promise;
+    MOZ_TRY(mCore->CompleteProfileStartup(mCore->ProfileStartupToken(),
+                                          descriptor, jsapi.cx(),
+                                          getter_AddRefs(promise)));
+    NS_ENSURE_TRUE(promise->State() == dom::Promise::PromiseState::Resolved,
+                   NS_ERROR_FAILURE);
+    return NS_OK;
+  }
+  static nsresult sStartupReentry;
+  nsCOMPtr<nsIFile> mOldStartupProfile, mOldStartupLocal;
+  nsCOMPtr<nsIProfileLock> mSelectedLock;
+  bool mSelectedStartup = false;
+#endif
 
   nsCOMPtr<nsIProperties> mDirectories;
   nsCOMPtr<nsIFile> mOldProfile, mProfile, mFile;
@@ -21801,5 +22038,228 @@ TEST_F(DeliveryCoreReferences,
   EXPECT_EQ(NS_OK, mCore->MessageDB().ValidateOfflineAppendAcceptedWithoutUid(
                        expected));
 }
+
+#ifndef XP_WIN
+nsresult DeliveryCoreReferences::sStartupReentry = NS_OK;
+
+TEST_F(DeliveryCoreReferences, StartupSelectsExistingBeforeAnyCreate) {
+  ASSERT_EQ(NS_OK, Start());
+  nsCString source;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
+  Stop();
+  // Stale legacy data cannot defeat a valid selected native database.
+  ASSERT_EQ(NS_OK, WriteStartupFile("obsolete.msf", "not a Mork file"_ns));
+  ASSERT_EQ(NS_OK, ArmSelectedStartup());
+  nsCString selected;
+  ASSERT_EQ(NS_OK, DescribeStartup(selected));
+  EXPECT_NE(kNotFound, selected.Find("\"mode\":\"reuse\""));
+  ASSERT_EQ(NS_OK, OpenStartup("reuse"));
+  nsCString actual;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(actual));
+  EXPECT_EQ(source, actual);
+}
+
+TEST_F(DeliveryCoreReferences, StartupInitializesOnlyGenuinelyEmptyProfile) {
+  ASSERT_EQ(NS_OK, ArmSelectedStartup());
+  nsCString selected;
+  ASSERT_EQ(NS_OK, DescribeStartup(selected));
+  EXPECT_NE(kNotFound, selected.Find("\"mode\":\"initialize\""));
+  bool exists;
+  ASSERT_EQ(NS_OK, mFile->Exists(&exists));
+  EXPECT_FALSE(exists);
+  ASSERT_EQ(NS_OK, OpenStartup("initialize"));
+  nsCString source;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
+  EXPECT_FALSE(source.IsEmpty());
+  ASSERT_EQ(NS_OK, WriteStartupSelector());
+  ASSERT_EQ(NS_OK, CheckStartupActivation(true));
+  EXPECT_EQ(NS_OK, DatabaseCore::CheckAccountStartup());
+}
+
+TEST_F(DeliveryCoreReferences, StartupLegacyTargetRequiresVerifiedBackup) {
+  ASSERT_EQ(NS_OK, WriteStartupFile("legacy.msf", "retained legacy bytes"_ns));
+  ASSERT_EQ(NS_OK, ArmSelectedStartup());
+  nsCString selected;
+  ASSERT_EQ(NS_OK, DescribeStartup(selected));
+  EXPECT_NE(kNotFound, selected.Find("\"mode\":\"migrate\""));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, OpenStartup("initialize"));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, OpenStartup("migrate"));
+  bool exists;
+  ASSERT_EQ(NS_OK, mFile->Exists(&exists));
+  EXPECT_FALSE(exists);
+}
+
+TEST_F(DeliveryCoreReferences, StartupIncompleteOrCorruptIsNeverAbsence) {
+  ASSERT_EQ(NS_OK, WriteStartupFile("panorama.sqlite", "not SQLite"_ns));
+  ASSERT_EQ(NS_OK, ArmSelectedStartup());
+  nsCString selected;
+  EXPECT_TRUE(NS_FAILED(DescribeStartup(selected)));
+  EXPECT_TRUE(NS_FAILED(OpenStartup("initialize")));
+  int64_t size;
+  ASSERT_EQ(NS_OK, mFile->GetFileSize(&size));
+  EXPECT_EQ(10, size);
+  ASSERT_EQ(NS_OK, mFile->Remove(false));
+  ASSERT_EQ(NS_OK, WriteStartupFile("panorama.sqlite-wal", "unsettled"_ns));
+  EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, DescribeStartup(selected));
+  bool exists;
+  ASSERT_EQ(NS_OK, mFile->Exists(&exists));
+  EXPECT_FALSE(exists);
+}
+
+TEST_F(DeliveryCoreReferences,
+       StartupBackendAndVersionFloorPrecedeWritableOpen) {
+  ASSERT_EQ(NS_OK, Start());
+  ASSERT_EQ(NS_OK, WriteStartupSelector("adopted-existing", "other"));
+  Stop();
+  ASSERT_EQ(NS_OK, ArmSelectedStartup());
+  nsCString selected;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DescribeStartup(selected));
+  nsCString json(
+      "{\"formatVersion\":2,\"backend\":\"panorama\",\"origin\":\"adopted-"
+      "existing\",\"state\":\"active\",\"application\":{\"version\":"
+      "\"2147483647.0\",\"buildId\":\"20990101000000\"},\"identity\":{"
+      "\"profilePath\":@PROFILE@}}");
+  dom::AutoJSAPI jsapi;
+  ASSERT_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()));
+  JS::Rooted<JS::Value> value(jsapi.cx());
+  ASSERT_EQ(NS_OK, StartupDocument(jsapi.cx(), json, &value));
+  nsCString bytes;
+  ASSERT_EQ(NS_OK, StartupJSONValue(jsapi.cx(), value, bytes));
+  ASSERT_EQ(NS_OK, WriteStartupFile("panorama-profile.json", bytes));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DescribeStartup(selected));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, OpenStartup("reuse"));
+  EXPECT_FALSE(mConnection);
+}
+
+TEST_F(DeliveryCoreReferences, StartupContextIsBoundToSelectedXRELifetime) {
+  ASSERT_EQ(NS_OK, ArmSelectedStartup());
+  EXPECT_EQ(NS_OK, StartupContextCheck());
+  nsCOMPtr<nsIFile> wrong;
+  ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(wrong)));
+  ASSERT_EQ(NS_OK, wrong->Append(u"other-selected-profile"_ns));
+  ASSERT_EQ(NS_OK, wrong->Create(nsIFile::DIRECTORY_TYPE, 0700));
+  ASSERT_EQ(NS_OK, mDirectories->Undefine(NS_APP_PROFILE_DIR_STARTUP));
+  ASSERT_EQ(NS_OK, mDirectories->Set(NS_APP_PROFILE_DIR_STARTUP, wrong));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, StartupContextCheck());
+  ASSERT_EQ(NS_OK, mDirectories->Undefine(NS_APP_PROFILE_DIR_STARTUP));
+  ASSERT_EQ(NS_OK, mDirectories->Set(NS_APP_PROFILE_DIR_STARTUP, mProfile));
+  EXPECT_EQ(NS_OK, StartupContextCheck());
+  nsCOMPtr<nsIFile> locked;
+  ASSERT_EQ(NS_OK, mSelectedLock->GetDirectory(getter_AddRefs(locked)));
+  bool same;
+  ASSERT_EQ(NS_OK, locked->Equals(mProfile, &same));
+  EXPECT_TRUE(same);
+}
+
+TEST_F(DeliveryCoreReferences, StartupForeignContextAndReentryRefuse) {
+  ASSERT_EQ(NS_OK, ArmSelectedStartup());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, StartupContextCheck(mProfile));
+  nsCString selected;
+  ASSERT_EQ(NS_OK, DescribeStartup(selected));
+  sStartupReentry = NS_OK;
+  ASSERT_EQ(NS_OK, OpenStartup("initialize", true));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, sStartupReentry);
+  EXPECT_EQ(NS_ERROR_ALREADY_INITIALIZED, OpenStartup("initialize"));
+}
+
+TEST_F(DeliveryCoreReferences, StartupFailureAndCleanupKeepFirstError) {
+  ASSERT_EQ(NS_OK, ArmSelectedStartup());
+  nsCString selected;
+  ASSERT_EQ(NS_OK, DescribeStartup(selected));
+  ASSERT_EQ(NS_OK, OpenStartup("initialize"));
+  ASSERT_EQ(NS_OK, StartupClose(NS_ERROR_FILE_CORRUPTED));
+  EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, StartupContextCheck());
+  ASSERT_EQ(NS_OK, StartupClose(NS_ERROR_ABORT));
+  EXPECT_TRUE(SpinEventLoopUntil("StartupFirstFailureClose"_ns,
+                                 [&] { return !StartupClosePending(); }));
+  EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, StartupContextCheck());
+  bool ready;
+  ASSERT_EQ(NS_OK, mConnection->GetConnectionReady(&ready));
+  EXPECT_FALSE(ready);
+}
+
+TEST_F(DeliveryCoreReferences,
+       StartupReadyRequiresDurableSelectorAndReceiptReadback) {
+  ASSERT_EQ(NS_OK, ArmSelectedStartup());
+  nsCString selected;
+  ASSERT_EQ(NS_OK, DescribeStartup(selected));
+  ASSERT_EQ(NS_OK, OpenStartup("initialize"));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, CheckStartupActivation());
+  ASSERT_EQ(NS_OK, WriteStartupSelector("initialized-empty", "panorama",
+                                        nullptr, true));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, CheckStartupActivation());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DatabaseCore::CheckAccountStartup());
+  ASSERT_EQ(NS_OK, WriteStartupSelector());
+  ASSERT_EQ(NS_OK, CheckStartupActivation(true));
+  EXPECT_EQ(NS_OK, DatabaseCore::CheckAccountStartup());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, CheckStartupActivation());
+}
+
+TEST_F(DeliveryCoreReferences,
+       StartupMetadataBindingDoesNotEnableOrdinaryAccountWork) {
+  ASSERT_EQ(NS_OK, ArmSelectedStartup());
+  nsCString selected;
+  ASSERT_EQ(NS_OK, DescribeStartup(selected));
+  ASSERT_EQ(NS_OK, OpenStartup("initialize"));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DatabaseCore::CheckAccountStartup());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, StartupMetadataCheck(false));
+  EXPECT_EQ(NS_OK, StartupMetadataCheck(true));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DatabaseCore::CheckAccountStartup());
+  ASSERT_EQ(NS_OK, WriteStartupSelector());
+  ASSERT_EQ(NS_OK, CheckStartupActivation(true));
+  EXPECT_EQ(NS_OK, DatabaseCore::CheckAccountStartup());
+}
+
+TEST_F(DeliveryCoreReferences,
+       StartupRetryKeepsSourceIdentityAndCommittedUnits) {
+  ASSERT_EQ(NS_OK, Start());
+  FolderImportSnapshot input;
+  nsCOMPtr<nsIFile> file;
+  ASSERT_EQ(NS_OK, PrepareNativeImport(input, getter_AddRefs(file)));
+  FolderImportReceipt receipt;
+  ASSERT_EQ(NS_OK, ImportNativeFile(file, input, receipt));
+  nsCString source;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
+  Stop();
+  ASSERT_EQ(NS_OK, ArmSelectedStartup());
+  nsCString selected;
+  ASSERT_EQ(NS_OK, DescribeStartup(selected));
+  ASSERT_EQ(NS_OK, OpenStartup("reuse"));
+  nsCString actual;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(actual));
+  EXPECT_EQ(source, actual);
+  Maybe<FolderImportReceipt> retained;
+  ASSERT_EQ(NS_OK, mCore->GetFolderImportReceipt(input.identity, retained));
+  ASSERT_TRUE(retained);
+  ASSERT_EQ(receipt.keys.Length(), retained->keys.Length());
+  for (uint32_t i = 0; i < receipt.keys.Length(); ++i) {
+    EXPECT_EQ(receipt.keys[i].source, retained->keys[i].source);
+    EXPECT_EQ(receipt.keys[i].destination, retained->keys[i].destination);
+  }
+  EXPECT_EQ(NS_ERROR_ALREADY_INITIALIZED, OpenStartup("reuse"));
+}
+
+TEST_F(DeliveryCoreReferences, StartupShutdownWaitsForActualSettlement) {
+  ASSERT_EQ(NS_OK, ArmSelectedStartup());
+  nsCString selected;
+  ASSERT_EQ(NS_OK, DescribeStartup(selected));
+  ASSERT_EQ(NS_OK, OpenStartup("initialize"));
+  ASSERT_EQ(NS_OK, WriteStartupSelector());
+  ASSERT_EQ(NS_OK, CheckStartupActivation(true));
+  ASSERT_EQ(NS_OK, mCore->Observe(nullptr, "profile-before-change", nullptr));
+  EXPECT_TRUE(StartupClosePending());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DatabaseCore::CheckAccountStartup());
+  EXPECT_TRUE(SpinEventLoopUntil("StartupActualNativeSettlement"_ns,
+                                 [&] { return !StartupClosePending(); }));
+  bool ready;
+  ASSERT_EQ(NS_OK, mConnection->GetConnectionReady(&ready));
+  EXPECT_FALSE(ready);
+  // Native storage settlement never unlocks the profile owned by XRE/the
+  // fixture.
+  nsCOMPtr<nsIFile> locked;
+  ASSERT_EQ(NS_OK, mSelectedLock->GetDirectory(getter_AddRefs(locked)));
+  EXPECT_TRUE(locked);
+}
+#endif
 
 }  // namespace mozilla::mailnews

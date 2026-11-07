@@ -1740,3 +1740,143 @@ add_task(async function test_stageTransitionsPersistCancellationAndReceipts() {
   Assert.deepEqual(await verifyMigrationBackup(plan.backupPath), backup);
   journal.close();
 });
+
+/**
+ * Creates a real unbound startup plan; no native import/target is fabricated.
+ *
+ * @returns {Promise<{journal: MigrationJournal, path: string, backup: object,
+ *   profilePath: string, source: string}>} Original files and retained plan.
+ */
+async function startupJournalPlan() {
+  const root = await IOUtils.createUniqueDirectory(
+    PathUtils.tempDir,
+    "startup-journal-"
+  );
+  registerCleanupFunction(() => IOUtils.remove(root, { recursive: true }));
+  const profilePath = PathUtils.join(root, "profile");
+  const work = PathUtils.join(root, "work");
+  await IOUtils.makeDirectory(profilePath);
+  await IOUtils.makeDirectory(work);
+  const source = PathUtils.join(profilePath, "Inbox.msf");
+  await IOUtils.copy(do_get_file("data/migration.msf").path, source);
+  const { identity } = await readMorkMigrationSource(source);
+  const backupPath = PathUtils.join(root, "backup");
+  const backup = await createMigrationBackup(profilePath, [], backupPath);
+  const path = PathUtils.join(work, "journal.json");
+  const journal = await MigrationJournal.create(path, {
+    profilePath,
+    mailPaths: [],
+    backupPath,
+    sources: [],
+    startupInventory: {
+      sources: [
+        {
+          id: "Inbox",
+          ...identity,
+          serverKey: "server1",
+          serverRoot: profilePath,
+          protocol: "none",
+          storeType: "mbox",
+          storeContractID: "@mozilla.org/msgstore/berkeleystore;1",
+          storePath: source.slice(0, -4),
+          origin: { provider: "local-store-discovery" },
+        },
+      ],
+      caches: [],
+    },
+  });
+  registerCleanupFunction(() => journal.close());
+  return { journal, path, backup, profilePath, source };
+}
+
+add_task(
+  { skip_if: () => AppConstants.platform === "win" },
+  async function test_startupJournalRetainsInputsBeforeNativeBinding() {
+    const input = await startupJournalPlan();
+    const source = await IOUtils.read(input.source);
+    const state = input.journal.state;
+    Assert.equal(state.version, 7);
+    Assert.equal(state.stage, "backup");
+    Assert.deepEqual(state.sources, [], "No destination IDs are invented");
+    Assert.strictEqual(state.startup.databaseSourceId, null);
+    Assert.equal(state.startup.bound, false);
+    Assert.equal(state.startup.inventory.sources[0].path, input.source);
+    input.journal.close();
+    const reopened = await MigrationJournal.open(input.path, input.profilePath);
+    Assert.deepEqual(
+      reopened.state,
+      state,
+      "Reopen preserves the exact pending plan"
+    );
+    reopened.close();
+    Assert.deepEqual(await IOUtils.read(input.source), source);
+    Assert.ok(
+      !(await IOUtils.exists(
+        PathUtils.join(input.profilePath, "panorama.sqlite")
+      ))
+    );
+  }
+);
+
+add_task(
+  { skip_if: () => AppConstants.platform === "win" },
+  async function test_startupJournalCannotSkipActualNativeBinding() {
+    const input = await startupJournalPlan();
+    const before = await IOUtils.read(input.path);
+    const source = await IOUtils.read(input.source);
+    await Assert.rejects(
+      input.journal.recordBackup(input.backup),
+      /native target binding/,
+      "Even a real verified backup cannot invent the actual native target"
+    );
+    Assert.deepEqual(await IOUtils.read(input.path), before);
+    Assert.deepEqual(await IOUtils.read(input.source), source);
+    Assert.equal(input.journal.state.stage, "backup");
+  }
+);
+
+add_task(
+  { skip_if: () => AppConstants.platform === "win" },
+  async function test_startupJournalCorruptionIsNeverAnEmptyPlan() {
+    const input = await startupJournalPlan();
+    const state = input.journal.state;
+    input.journal.close();
+    state.startup.inventory.sources[0].sha256 = "corrupt";
+    await IOUtils.writeJSON(input.path, state);
+    const before = await IOUtils.read(input.path);
+    await Assert.rejects(
+      MigrationJournal.open(input.path, input.profilePath),
+      /startup source identity/
+    );
+    Assert.deepEqual(
+      await IOUtils.read(input.path),
+      before,
+      "Invalid retained progress is not recreated or repaired"
+    );
+  }
+);
+
+add_task(
+  { skip_if: () => AppConstants.platform === "win" },
+  async function test_startupJournalRefusesChangedNativeProvider() {
+    const input = await startupJournalPlan();
+    const state = input.journal.state;
+    const original = await IOUtils.read(input.source);
+    input.journal.close();
+    state.startup.inventory.sources[0].origin.provider = "public-folder-insert";
+    await IOUtils.writeJSON(input.path, state);
+    const before = await IOUtils.read(input.path);
+    await Assert.rejects(
+      MigrationJournal.open(input.path, input.profilePath),
+      /startup folder origin/,
+      "A public row is not genuine native discovery"
+    );
+    Assert.deepEqual(await IOUtils.read(input.path), before);
+    Assert.deepEqual(await IOUtils.read(input.source), original);
+    Assert.ok(
+      !(await IOUtils.exists(
+        PathUtils.join(input.profilePath, "panorama.sqlite")
+      ))
+    );
+  }
+);

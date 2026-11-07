@@ -686,9 +686,18 @@ nsMsgStatusFeedback.prototype = {
     if (activity instanceof Ci.nsIActivityEvent) {
       this.showStatusString(activity.displayText);
     } else if (activity instanceof Ci.nsIActivityProcess) {
+      const states = Ci.nsIActivityProcess;
+      if (
+        activity.state == states.STATE_COMPLETED ||
+        activity.state == states.STATE_CANCELED
+      ) {
+        return;
+      }
       this._activeProcesses.push(activity);
       activity.addListener(this);
-      this.startMeteors();
+      if (activity.state == states.STATE_INPROGRESS) {
+        this.startMeteors();
+      }
     }
   },
 
@@ -700,10 +709,9 @@ nsMsgStatusFeedback.prototype = {
   },
 
   /**
-   * Balance the startMeteors() call we made for this process in
-   * onAddedActivity(), at most once per process.
+   * Removes this process listener and any running busy request it still owns.
    *
-   * @param {nsIActivityProcess} process
+   * @param {nsIActivityProcess} process - The tracked process to unsubscribe.
    */
   _releaseProcess(process) {
     const index = this._activeProcesses.indexOf(process);
@@ -712,11 +720,29 @@ nsMsgStatusFeedback.prototype = {
     }
     this._activeProcesses.splice(index, 1);
     process.removeListener(this);
-    this.stopMeteors();
+    if (process.state == Ci.nsIActivityProcess.STATE_INPROGRESS) {
+      this.stopMeteors();
+    }
   },
 
-  // nsIActivityListener
-  onStateChanged(aActivity) {
+  /**
+   * Starts or stops one busy request when a tracked process enters or leaves
+   * its running state. Keeps paused and waiting processes subscribed for resume.
+   *
+   * @param {nsIActivityProcess} aActivity - The process whose state changed.
+   * @param {number} aOldState - The state before this notification.
+   */
+  onStateChanged(aActivity, aOldState) {
+    if (!this._activeProcesses.includes(aActivity)) {
+      return;
+    }
+    const running = aActivity.state == Ci.nsIActivityProcess.STATE_INPROGRESS;
+    const wasRunning = aOldState == Ci.nsIActivityProcess.STATE_INPROGRESS;
+    if (running && !wasRunning) {
+      this.startMeteors();
+    } else if (!running && wasRunning) {
+      this.stopMeteors();
+    }
     // Each activity module is individually responsible for calling
     // removeActivity() once its process is done, and the activity manager only
     // prunes finished processes when the user clears the Activity Manager

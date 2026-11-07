@@ -8100,7 +8100,7 @@ TEST_F(DeliveryCoreReferences,
                 MOZ_TRY(stmt->GetInt64(2, &revision));
                 EXPECT_EQ(op.key, key);
                 EXPECT_EQ(static_cast<int64_t>(op.id), id);
-                EXPECT_EQ(op.revision, revision);
+                EXPECT_EQ(static_cast<int64_t>(op.revision), revision);
                 MOZ_TRY(stmt->ExecuteStep(&more));
                 EXPECT_FALSE(more);
               }
@@ -11080,7 +11080,7 @@ TEST_F(DeliveryCoreReferences,
   ASSERT_EQ(NS_OK, stmt->GetInt64(1, &thread));
   ASSERT_EQ(NS_OK, stmt->GetInt64(2, &word));
   EXPECT_EQ(controlFolder, uint64_t(folder));
-  EXPECT_EQ(c.threadId, thread);
+  EXPECT_EQ(static_cast<int64_t>(c.threadId), thread);
   EXPECT_EQ(int64_t(0xabcdef01u), word);
   ASSERT_EQ(NS_OK, stmt->ExecuteStep(&more));
   EXPECT_FALSE(more);

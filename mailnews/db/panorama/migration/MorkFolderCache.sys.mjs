@@ -144,17 +144,18 @@ export function parseJSONFolderCache(bytes) {
       if (!text(name) || name === "key") {
         throw new Error("Invalid native JSON cache property");
       }
+      // The current JSON producer writes userSortOrder as uint32. Historical
+      // Mork conversion retains its original text projection for this property.
+      const unsigned = UNSIGNED32.has(name) || name === "userSortOrder";
       const width = SIGNED64.has(name)
         ? 64
-        : SIGNED32.has(name) || UNSIGNED32.has(name)
+        : SIGNED32.has(name) || unsigned
           ? 32
           : 0;
       let cell;
       if (width) {
-        const minimum = UNSIGNED32.has(name) ? 0 : -(2 ** (width - 1));
-        const maximum = UNSIGNED32.has(name)
-          ? 0xffffffff
-          : 2 ** (width - 1) - 1;
+        const minimum = unsigned ? 0 : -(2 ** (width - 1));
+        const maximum = unsigned ? 0xffffffff : 2 ** (width - 1) - 1;
         if (
           !Number.isSafeInteger(value) ||
           value < minimum ||
@@ -391,7 +392,7 @@ export function createMorkFolderCacheRequest(unit) {
           throw new Error("Invalid cache server identity");
         }
       } else if (typeof value != "string" || !value || value.includes("\0")) {
-        throw new Error("Invalid cache folder field");
+        throw new Error("Invalid cache folder field: " + name);
       }
       if (unique.has(name)) {
         if (unique.get(name).has(value)) {
@@ -579,7 +580,7 @@ export function validateMorkFolderCacheReceipt(unit, receipt) {
     const folder = byFolder.get(cell.id);
     let dispositions;
     if (expected.version >= 2) {
-      validateReconciledCacheCell(cell);
+      validateReconciledCacheCell(cell, expected.version);
       dispositions = [cell.disposition];
     } else if (cell.name == "key") {
       dispositions = ["binding"];
@@ -607,13 +608,14 @@ export function validateMorkFolderCacheReceipt(unit, receipt) {
 }
 
 /**
- * Checks the closed native version2 field disposition and typed projection.
+ * Checks the closed native version2/3 field disposition and typed projection.
  * Raw cells are compared separately against every original source cell.
  *
  * @param {object} cell - One actual native receipt cell.
+ * @param {number} version - Exact retained native request version.
  * @throws {Error} For an invalid alias, value, mask or unresolved field.
  */
-function validateReconciledCacheCell(cell) {
+function validateReconciledCacheCell(cell, version) {
   const pending =
     cell.name == "pendingMsgs" || cell.name == "pendingUnreadMsgs";
   let target = cell.name;
@@ -652,6 +654,21 @@ function validateReconciledCacheCell(cell) {
         cell.nativeInteger > 0x7fffffff
       ) {
         throw new Error("Invalid native cache count projection");
+      }
+    } else if (cell.name == "userSortOrder") {
+      dispositions = ["existing", "applied"];
+      if (
+        version !== 3 ||
+        !Number.isSafeInteger(cell.integer) ||
+        cell.integer < 0 ||
+        cell.integer > 0xffffffff ||
+        cell.text !== cell.integer.toString(16) ||
+        !integer ||
+        cell.nativeInteger < 0 ||
+        cell.nativeInteger > 0xffffffff ||
+        (cell.disposition === "applied" && cell.nativeInteger !== cell.integer)
+      ) {
+        throw new Error("Invalid native JSON cache user order projection");
       }
     } else if (cell.name == "folderName") {
       dispositions = ["native-authoritative"];

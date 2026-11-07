@@ -494,7 +494,7 @@ DatabaseCore::Observe(nsISupports* aSubject, const char* aTopic,
       else {
         JS::Rooted<JS::Value> descriptor(jsapi.cx());
         rv = DescribeProfileStartup(jsapi.cx(), &descriptor);
-        if (jsapi.HasException()) jsapi.ClearException();
+        if (jsapi.HasException()) jsapi.ReportException();
       }
     }
     mStartupFailure = rv;
@@ -7007,7 +7007,9 @@ nsresult ParseCacheBytes(JSContext* cx, const nsACString& bytes,
       MOZ_TRY(ImportText(cx, name, property.name));
       NS_ENSURE_TRUE(JS_GetElement(cx, pair, 1, &field), NS_ERROR_FAILURE);
       MOZ_TRY(ImportText(cx, field, property.text));
-      NS_ENSURE_FALSE(CacheUnsupportedAlias(property.name),
+      const bool jsonUserOrder =
+          input.version == 3 && property.name == "userSortOrder"_ns;
+      NS_ENSURE_FALSE(CacheUnsupportedAlias(property.name) && !jsonUserOrder,
                       NS_ERROR_NOT_IMPLEMENTED);
       if (input.version == 3 && property.name == "key"_ns)
         NS_ENSURE_TRUE(property.text == folder.originalKey,
@@ -7022,6 +7024,17 @@ nsresult ParseCacheBytes(JSContext* cx, const nsACString& bytes,
                                number));
           property.integer = Some(number);
         }
+      }
+      // Only the named JSON3 producer cell can cross the generic alias guard.
+      // Validate its original typed value and canonical text independently of
+      // the shared parser; Mork1/2 and every other alias retain their refusal.
+      if (jsonUserOrder) {
+        NS_ENSURE_TRUE(property.integer && *property.integer >= 0 &&
+                           uint64_t(*property.integer) <= UINT32_MAX,
+                       NS_ERROR_INVALID_ARG);
+        nsAutoCString canonical;
+        canonical.AppendInt(uint32_t(*property.integer), 16);
+        NS_ENSURE_TRUE(property.text == canonical, NS_ERROR_FILE_CORRUPTED);
       }
       folder.properties.AppendElement(std::move(property));
     }
@@ -7120,6 +7133,28 @@ nsresult CheckStoredJSONCacheReceipt(JSContext* cx,
           ImportNumber(value, *original->integer, *original->integer, integer));
     } else {
       NS_ENSURE_TRUE(value.isUndefined(), NS_ERROR_FILE_CORRUPTED);
+    }
+    if (name == "userSortOrder"_ns) {
+      // This is the committed historical projection, not the current live
+      // property. Later native edits must never be undone by receipt reuse.
+      nsCString target, disposition;
+      MOZ_TRY(ImportMember(cx, cell, "target", &value));
+      MOZ_TRY(ImportText(cx, value, target));
+      MOZ_TRY(ImportMember(cx, cell, "disposition", &value));
+      MOZ_TRY(ImportText(cx, value, disposition));
+      NS_ENSURE_TRUE(target == name && (disposition == "existing"_ns ||
+                                        disposition == "applied"_ns),
+                     NS_ERROR_FILE_CORRUPTED);
+      MOZ_TRY(ImportMember(cx, cell, "nativeInteger", &value));
+      int64_t native;
+      MOZ_TRY(ImportNumber(value, 0, UINT32_MAX, native));
+      NS_ENSURE_TRUE(original->integer && (disposition == "existing"_ns ||
+                                           native == *original->integer),
+                     NS_ERROR_FILE_CORRUPTED);
+      for (const char* absent : {"nativeText", "eligibleMask"}) {
+        MOZ_TRY(ImportMember(cx, cell, absent, &value, true));
+        NS_ENSURE_TRUE(value.isUndefined(), NS_ERROR_FILE_CORRUPTED);
+      }
     }
   }
   return NS_OK;
@@ -7641,6 +7676,12 @@ nsresult DatabaseCore::ImportFolderCacheMetadataV2(
         for (const auto& old : plan.before)
           if (old.name == target) present = &old;
         if (present) {
+          if (target == "userSortOrder"_ns) {
+            NS_ENSURE_TRUE(input.version == 3 && present->integer &&
+                               *present->integer >= 0 &&
+                               uint64_t(*present->integer) <= UINT32_MAX,
+                           NS_ERROR_FILE_CORRUPTED);
+          }
           if (target == "folderSize"_ns || target == "expungedBytes"_ns) {
             NS_ENSURE_TRUE(present->integer && *present->integer >= 0,
                            NS_ERROR_NOT_IMPLEMENTED);
@@ -8901,7 +8942,9 @@ nsresult StartupJSONCache(nsIFile* file, bool& empty) {
   JS::Rooted<JSObject*> parsed(cx), entries(cx), source(cx);
   nsresult rv = ParseCacheDocument(cx, bytes, true, &parsed);
   if (NS_FAILED(rv)) {
-    if (jsapi.HasException()) jsapi.ClearException();
+    // Preserve the actual decoder diagnostic before the isolated JSAPI scope
+    // ends. The caller still receives the original native failure code.
+    if (jsapi.HasException()) jsapi.ReportException();
     return rv;
   }
   JS::Rooted<JS::Value> value(cx);
@@ -10384,10 +10427,15 @@ nsresult DatabaseCore::BuildStartupFolders() {
 
 NS_IMETHODIMP DatabaseCore::BeginProfileStartup(JSContext* cx,
                                                 Promise** output) {
-  NS_ENSURE_TRUE(NS_IsMainThread() && !mShuttingDown, NS_ERROR_NOT_AVAILABLE);
-  NS_ENSURE_TRUE(!mStartupBeginRequested &&
-                     (mProfileStartup || (!sConnection && !mStartupObserved)),
-                 NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_TRUE(NS_IsMainThread(), NS_ERROR_NOT_AVAILABLE);
+  // app-startup may already have settled a failed native selection. Its first
+  // consumer must still receive that failure, rather than a shutdown refusal.
+  const bool failedSelection = NS_FAILED(mStartupFailure);
+  NS_ENSURE_TRUE(!mShuttingDown || failedSelection, NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_TRUE(
+      !mStartupBeginRequested && (failedSelection || mProfileStartup ||
+                                  (!sConnection && !mStartupObserved)),
+      NS_ERROR_NOT_AVAILABLE);
   mStartupBeginRequested = true;
   mStartupManaged = true;
   ErrorResult error;

@@ -424,6 +424,7 @@ MailGlue.prototype = {
   /** @type {?AbortController} Cancellation for the selected startup operation. */
   _panoramaStartupController: null,
   _panoramaStartupFailed: false,
+  _panoramaStartupSurvival: false,
   _finalUIStartupObserved: false,
   _panoramaFailureQuitScheduled: false,
   _fogInitialized: false,
@@ -500,6 +501,10 @@ MailGlue.prototype = {
           return;
         }
       }
+      // Keep failed selection alive until its explicit failure quit. The
+      // command handler releases its own survival area when its promise settles.
+      Services.startup.enterLastWindowClosingSurvivalArea();
+      this._panoramaStartupSurvival = true;
       if (!AppConstants.NIGHTLY_BUILD) {
         throw new Error(
           "This application cannot start the selected Panorama profile"
@@ -514,19 +519,36 @@ MailGlue.prototype = {
         this._panoramaStartupController.signal
       );
     } catch (error) {
+      if (!this._panoramaStartupSurvival) {
+        Services.startup.enterLastWindowClosingSurvivalArea();
+        this._panoramaStartupSurvival = true;
+      }
       MailGlue.panoramaStartup = Promise.reject(error);
     }
     // Handle the rejection without replacing the promise seen by real callers.
-    MailGlue.panoramaStartup.catch(error => {
-      console.error("Panorama startup requires recovery", error);
-      Services.obs.notifyObservers(
-        null,
-        "panorama-startup-failed",
-        String(error)
-      );
-      this._panoramaStartupFailed = true;
-      this._quitAfterPanoramaStartupFailure();
-    });
+    MailGlue.panoramaStartup.then(
+      () => this._releasePanoramaStartupSurvival(),
+      error => {
+        console.error("Panorama startup requires recovery", error);
+        Services.obs.notifyObservers(
+          null,
+          "panorama-startup-failed",
+          String(error)
+        );
+        this._panoramaStartupFailed = true;
+        this._quitAfterPanoramaStartupFailure();
+      }
+    );
+  },
+
+  /**
+   * Releases MailGlue's survival area after selection or its explicit failure quit.
+   */
+  _releasePanoramaStartupSurvival() {
+    if (this._panoramaStartupSurvival) {
+      this._panoramaStartupSurvival = false;
+      Services.startup.exitLastWindowClosingSurvivalArea();
+    }
   },
 
   /**
@@ -560,7 +582,12 @@ MailGlue.prototype = {
           error
         );
       } finally {
-        Services.startup.quit(Ci.nsIAppStartup.eForceQuit, Cr.NS_ERROR_FAILURE);
+        try {
+          // nsIAppStartup accepts a process exit code in the range 0-255.
+          Services.startup.quit(Ci.nsIAppStartup.eForceQuit, 5);
+        } finally {
+          this._releasePanoramaStartupSurvival();
+        }
       }
     });
   },

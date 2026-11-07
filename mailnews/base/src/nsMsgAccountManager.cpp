@@ -2081,9 +2081,21 @@ NS_IMETHODIMP
 nsMsgAccountManager::FindServerByURI(nsIURI* aURI,
                                      nsIMsgIncomingServer** aResult) {
   NS_ENSURE_ARG_POINTER(aURI);
+  NS_ENSURE_ARG_POINTER(aResult);
 
-  nsresult rv = LoadAccounts();
-  NS_ENSURE_SUCCESS(rv, rv);
+  bool retainedStartupMetadata = false;
+#ifdef MOZ_PANORAMA
+  // Native folder protocol getters may resolve a retained server before
+  // ordinary account loading is admitted. No new account/root is constructed;
+  // the exact matched server key is checked below against native selection.
+  retainedStartupMetadata =
+      !m_accountsLoaded && NS_FAILED(CheckSelectedAccountStartup());
+#endif
+  nsresult rv;
+  if (!retainedStartupMetadata) {
+    rv = LoadAccounts();
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
 
   // Get username and hostname and port so we can get the server
   nsAutoCString username;
@@ -2123,6 +2135,17 @@ nsMsgAccountManager::FindServerByURI(nsIURI* aURI,
     if (NS_SUCCEEDED(rv) && (port == -1)) port = 0;
   }
 
+  if (retainedStartupMetadata) {
+    nsCOMPtr<nsIMsgIncomingServer> server;
+    MOZ_TRY(findServerInternal(username, hostname, type, port,
+                               getter_AddRefs(server)));
+    NS_ENSURE_TRUE(server, NS_ERROR_NOT_AVAILABLE);
+    nsCString key;
+    MOZ_TRY(server->GetKey(key));
+    MOZ_TRY(CheckSelectedAccountStartup(true, &key));
+    server.forget(aResult);
+    return NS_OK;
+  }
   return findServerInternal(username, hostname, type, port, aResult);
 }
 

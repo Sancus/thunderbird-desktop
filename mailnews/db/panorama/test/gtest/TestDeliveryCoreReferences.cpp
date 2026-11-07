@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "DatabaseCore.h"
+#include "js/Array.h"
 #include "js/PropertyAndElement.h"
 #include "mozilla/dom/Promise.h"
 #include "nsIAsyncShutdown.h"
@@ -43,6 +44,8 @@
 #include "nsDirectoryServiceDefs.h"
 #include "nsDirectoryServiceUtils.h"
 #include "nsIComponentRegistrar.h"
+#include "nsICommandLineRunner.h"
+#include "nsIPrefBranch.h"
 #include "nsID.h"
 #include "nsIEventTarget.h"
 #include "nsIFile.h"
@@ -3254,7 +3257,7 @@ class DeliveryCoreReferences : public testing::Test {
 #ifndef XP_WIN
   // Only our unique temporary profile is locked. The production arming entry
   // still receives its selected directories from XRE's app-startup callback.
-  nsresult ArmSelectedStartup() {
+  nsresult ArmSelectedStartup(bool observe = false) {
     NS_ENSURE_FALSE(mSelectedStartup || mCore, NS_ERROR_ALREADY_INITIALIZED);
     for (auto entry :
          {std::pair{NS_APP_PROFILE_DIR_STARTUP, &mOldStartupProfile},
@@ -3271,6 +3274,15 @@ class DeliveryCoreReferences : public testing::Test {
     MOZ_TRY(NS_LockProfilePath(mProfile, mProfile, nullptr,
                                getter_AddRefs(mSelectedLock)));
     mCore = DatabaseCore::GetInstanceForService();
+    if (observe) {
+      nsCOMPtr<nsICommandLineRunner> commandLine =
+          do_CreateInstance("@mozilla.org/toolkit/command-line;1");
+      NS_ENSURE_TRUE(commandLine, NS_ERROR_NOT_AVAILABLE);
+      const char* argv[] = {"thunderbird"};
+      MOZ_TRY(commandLine->Init(1, argv, mProfile,
+                                nsICommandLine::STATE_INITIAL_LAUNCH));
+      return mCore->Observe(commandLine, "app-startup", nullptr);
+    }
     return mCore->ArmProfileStartup(mProfile, mProfile);
   }
 
@@ -3975,13 +3987,6 @@ class DeliveryCoreReferences : public testing::Test {
     ASSERT_EQ(static_cast<nsIDatabaseCore*>(mCore.get()), selected.get());
     auto unload =
         MakeScopeExit([&] { EXPECT_EQ(NS_OK, manager->UnloadAccounts()); });
-    nsCOMPtr<nsIMsgIncomingServer> server;
-    ASSERT_EQ(NS_OK,
-              manager->CreateIncomingServer("json-native"_ns, "localhost"_ns,
-                                            protocol, getter_AddRefs(server)));
-    auto remove = MakeScopeExit([&] {
-      EXPECT_EQ(NS_OK, manager->RemoveIncomingServer(server, false));
-    });
     nsCOMPtr<nsIFile> path;
     ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(path)));
     ASSERT_EQ(NS_OK, path->AppendNative("json-native-store"_ns));
@@ -4005,12 +4010,40 @@ class DeliveryCoreReferences : public testing::Test {
         }
       }
     }
-    ASSERT_EQ(NS_OK, server->SetLocalPath(path));
-    ASSERT_EQ(NS_OK, server->SetStringValue(
-                         "storeContractID",
-                         type == "mbox"_ns
-                             ? "@mozilla.org/msgstore/berkeleystore;1"_ns
-                             : "@mozilla.org/msgstore/maildirstore;1"_ns));
+    // createKeyedServer eagerly opens its root. Persist the real path, store
+    // and physical local children before that first native factory/discovery.
+    nsCOMPtr<nsIPrefBranch> prefs =
+        do_GetService("@mozilla.org/preferences-service;1");
+    ASSERT_TRUE(prefs);
+    nsCString leaf, key("coreJSON-");
+    ASSERT_EQ(NS_OK, mProfile->GetNativeLeafName(leaf));
+    key.Append(leaf);
+    nsCString prefix("mail.server."_ns + key + "."_ns);
+    nsTArray<nsCString> existing;
+    ASSERT_EQ(NS_OK, prefs->GetChildList(prefix.get(), existing));
+    ASSERT_TRUE(existing.IsEmpty());
+    auto clearPrefs = MakeScopeExit(
+        [&] { EXPECT_EQ(NS_OK, prefs->DeleteBranch(prefix.get())); });
+    auto setText = [&](const char* name, const nsACString& value) -> nsresult {
+      nsCString pref(prefix + nsDependentCString(name));
+      return prefs->SetCharPref(pref.get(), PromiseFlatCString(value).get());
+    };
+    ASSERT_EQ(NS_OK, setText("type", protocol));
+    ASSERT_EQ(NS_OK, setText("userName", "json-native"_ns));
+    ASSERT_EQ(NS_OK, setText("hostname", "localhost"_ns));
+    ASSERT_EQ(NS_OK, setText("storeContractID",
+                             type == "mbox"_ns
+                                 ? "@mozilla.org/msgstore/berkeleystore;1"_ns
+                                 : "@mozilla.org/msgstore/maildirstore;1"_ns));
+    nsCString directoryPref(prefix + "directory"_ns);
+    ASSERT_EQ(NS_OK, prefs->SetComplexValue(directoryPref.get(),
+                                            NS_GET_IID(nsIFile), path));
+    nsCOMPtr<nsIMsgIncomingServer> server;
+    ASSERT_EQ(NS_OK, manager->GetIncomingServer(key, getter_AddRefs(server)));
+    ASSERT_TRUE(server);
+    auto remove = MakeScopeExit([&] {
+      EXPECT_EQ(NS_OK, manager->RemoveIncomingServer(server, false));
+    });
     nsCOMPtr<nsIMsgFolder> root, folder;
     ASSERT_EQ(NS_OK, server->GetRootFolder(getter_AddRefs(root)));
     if (protocol == "imap"_ns) {
@@ -4094,6 +4127,203 @@ class DeliveryCoreReferences : public testing::Test {
     ASSERT_EQ(NS_OK, cache->AppendNative("folderCache.json"_ns));
     ASSERT_EQ(NS_OK, JSONCacheReadFile(cache, read));
     EXPECT_EQ(original, read);
+  }
+
+  void CheckJSONUserOrderProperty(Maybe<uint32_t> expected) {
+    nsTArray<FolderImportProperty> properties;
+    ASSERT_EQ(NS_OK,
+              mCore->FolderDB().GetFolderProperties(mFolderId, properties));
+    uint32_t count = 0;
+    for (const auto& property : properties) {
+      if (property.name != "userSortOrder"_ns) continue;
+      ++count;
+      ASSERT_TRUE(expected);
+      ASSERT_TRUE(property.integer);
+      EXPECT_EQ(int64_t(*expected), *property.integer);
+      EXPECT_TRUE(property.text.IsEmpty());
+    }
+    EXPECT_EQ(expected ? 1u : 0u, count);
+  }
+
+  void CheckJSONUserOrderReceipt(const nsACString& receipt,
+                                 Maybe<uint32_t> original, uint32_t projected,
+                                 bool existing) {
+    dom::AutoJSAPI jsapi;
+    ASSERT_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()));
+    JSContext* cx = jsapi.cx();
+    JS::Rooted<JS::Value> value(cx);
+    NS_ConvertUTF8toUTF16 text(receipt);
+    ASSERT_TRUE(JS_ParseJSON(cx, text.get(), text.Length(), &value));
+    ASSERT_TRUE(value.isObject());
+    JS::Rooted<JSObject*> result(cx, &value.toObject()), cells(cx);
+    ASSERT_TRUE(JS_GetProperty(cx, result, "cells", &value));
+    ASSERT_TRUE(value.isObject());
+    cells = &value.toObject();
+    uint32_t length;
+    ASSERT_TRUE(JS::GetArrayLength(cx, cells, &length));
+    EXPECT_EQ(original ? 2u : 1u,
+              length);  // Original key plus present cells only.
+    uint32_t found = 0;
+    for (uint32_t i = 0; i < length; ++i) {
+      ASSERT_TRUE(JS_GetElement(cx, cells, i, &value));
+      ASSERT_TRUE(value.isObject());
+      JS::Rooted<JSObject*> cell(cx, &value.toObject());
+      ASSERT_TRUE(JS_GetProperty(cx, cell, "name", &value));
+      nsCString name;
+      ASSERT_EQ(NS_OK, StartupJSONValue(cx, value, name));
+      if (name != "\"userSortOrder\""_ns) continue;
+      ++found;
+      ASSERT_TRUE(original);
+      auto number = [&](const char* key, double expected) {
+        ASSERT_TRUE(JS_GetProperty(cx, cell, key, &value));
+        ASSERT_TRUE(value.isNumber());
+        EXPECT_EQ(double(expected), value.toNumber());
+      };
+      number("id", double(mFolderId));
+      number("integer", *original);
+      number("nativeInteger", projected);
+      nsAutoCString hex;
+      hex.AppendInt(*original, 16);
+      nsCString quoted;
+      ASSERT_EQ(NS_OK, JSONCacheQuote(cx, hex, quoted));
+      ASSERT_TRUE(JS_GetProperty(cx, cell, "text", &value));
+      nsCString actual;
+      ASSERT_EQ(NS_OK, StartupJSONValue(cx, value, actual));
+      EXPECT_EQ(quoted, actual);
+      ASSERT_TRUE(JS_GetProperty(cx, cell, "target", &value));
+      ASSERT_EQ(NS_OK, StartupJSONValue(cx, value, actual));
+      EXPECT_EQ("\"userSortOrder\""_ns, actual);
+      ASSERT_TRUE(JS_GetProperty(cx, cell, "disposition", &value));
+      ASSERT_EQ(NS_OK, StartupJSONValue(cx, value, actual));
+      EXPECT_EQ(existing ? "\"existing\""_ns : "\"applied\""_ns, actual);
+      for (const char* key : {"nativeText", "eligibleMask"}) {
+        bool present;
+        ASSERT_TRUE(JS_HasOwnProperty(cx, cell, key, &present));
+        EXPECT_FALSE(present);
+      }
+    }
+    EXPECT_EQ(original ? 1u : 0u, found);
+  }
+
+  void CheckNativeJSONUserOrder(Maybe<uint32_t> original,
+                                Maybe<uint32_t> native,
+                                const nsACString& protocol = "none"_ns,
+                                const nsACString& type = "mbox"_ns) {
+    WithNativeJSONCache(protocol, type, [&](nsIMsgFolder* folder) {
+      CheckJSONUserOrderProperty(Nothing());
+      uint32_t initial;
+      int32_t fallback;
+      ASSERT_EQ(NS_OK, folder->GetUserSortOrder(&initial));
+      EXPECT_EQ(UINT32_MAX, initial);
+      ASSERT_EQ(NS_OK, folder->GetSortOrder(&fallback));
+      if (native) ASSERT_EQ(NS_OK, folder->SetUserSortOrder(*native));
+      CheckJSONUserOrderProperty(native);
+      auto ordinal = mCore->FolderDB().GetFolderOrdinal(mFolderId);
+      ASSERT_TRUE(ordinal.isOk());
+      const auto beforeOrdinal = ordinal.unwrap();
+      // This distinct native FolderInfo property is not the folder getter's
+      // derived order and must not be confused with the original cache cell.
+      ASSERT_EQ(NS_OK, WriteFolderProperty(&mCore->FolderDB(), mFolderId,
+                                           "sortOrder"_ns, int64_t{73}));
+      nsCString cells("{");
+      if (original) {
+        cells.AppendLiteral("\"userSortOrder\":");
+        cells.AppendInt(uint64_t(*original));
+      }
+      cells.Append('}');
+      nsCString request, raw, receipt, read;
+      ASSERT_EQ(NS_OK, PrepareJSONCacheRequest(folder, cells, request, raw));
+      ASSERT_EQ(NS_OK, JSONCacheCall(request, false, receipt));
+      const Maybe<uint32_t> committed = native ? native : original;
+      const uint32_t projected = committed.valueOr(UINT32_MAX);
+      const int32_t derived =
+          projected == UINT32_MAX ? fallback : static_cast<int32_t>(projected);
+      CheckJSONUserOrderReceipt(receipt, original, projected, native.isSome());
+      auto check = [&] {
+        CheckJSONUserOrderProperty(committed);
+        uint32_t actual;
+        int32_t order;
+        ASSERT_EQ(NS_OK, folder->GetUserSortOrder(&actual));
+        EXPECT_EQ(projected, actual);
+        ASSERT_EQ(NS_OK, folder->GetSortOrder(&order));
+        EXPECT_EQ(derived, order);
+        int64_t independent = 0;
+        ASSERT_EQ(NS_OK, ReadFolderProperty(&mCore->FolderDB(), mFolderId,
+                                            "sortOrder"_ns, independent));
+        EXPECT_EQ(73, independent);
+        auto after = mCore->FolderDB().GetFolderOrdinal(mFolderId);
+        ASSERT_TRUE(after.isOk());
+        EXPECT_EQ(beforeOrdinal, after.unwrap());
+      };
+      check();
+      ASSERT_EQ(NS_OK, JSONCacheCall(request, true, read));
+      EXPECT_EQ(receipt, read);
+      // Close the actual per-folder facade before the real storage barrier.
+      ASSERT_EQ(NS_OK, folder->ForceDBClosed());
+      Stop();
+      ASSERT_EQ(NS_OK, Start());
+      check();
+      ASSERT_EQ(NS_OK, JSONCacheCall(request, true, read));
+      EXPECT_EQ(receipt, read);
+      ASSERT_EQ(NS_OK, folder->SetUserSortOrder(91));
+      ASSERT_EQ(NS_OK, JSONCacheCall(request, false, read));
+      EXPECT_EQ(receipt, read);
+      CheckJSONUserOrderProperty(Some(uint32_t{91}));
+      uint32_t live;
+      int32_t order;
+      ASSERT_EQ(NS_OK, folder->GetUserSortOrder(&live));
+      EXPECT_EQ(91u, live);
+      ASSERT_EQ(NS_OK, folder->GetSortOrder(&order));
+      EXPECT_EQ(91, order);
+      nsCOMPtr<nsIFile> file;
+      ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(file)));
+      ASSERT_EQ(NS_OK, file->AppendNative("folderCache.json"_ns));
+      ASSERT_EQ(NS_OK, JSONCacheReadFile(file, read));
+      EXPECT_EQ(raw, read);
+      ASSERT_EQ(NS_OK, folder->ForceDBClosed());
+    });
+  }
+
+  void CheckJSONUserOrderInvalidSource(const nsACString& cell) {
+    WithNativeJSONCache("none"_ns, "mbox"_ns, [&](nsIMsgFolder* folder) {
+      nsCString request, raw, output;
+      ASSERT_EQ(NS_OK, PrepareJSONCacheRequest(folder, cell, request, raw));
+      EXPECT_EQ(NS_ERROR_FAILURE, JSONCacheCall(request, false, output));
+      CheckJSONUserOrderProperty(Nothing());
+      int64_t count = -1;
+      ASSERT_EQ(NS_OK, JSONCacheImportCount(count));
+      EXPECT_EQ(0, count);
+      uint32_t order;
+      ASSERT_EQ(NS_OK, folder->GetUserSortOrder(&order));
+      EXPECT_EQ(UINT32_MAX, order);
+    });
+  }
+
+  void CheckObservedStartupFailure() {
+    (void)StaticPrefs::mail_panorama_enabled_AtStartup();
+    AutoRestore<bool> restoreNative(
+        StaticPrefs::sMirror_mail_panorama_enabled_AtStartup);
+    StaticPrefs::sMirror_mail_panorama_enabled_AtStartup = true;
+    ASSERT_EQ(NS_ERROR_FAILURE, ArmSelectedStartup(true));
+    ASSERT_TRUE(mCore);
+    EXPECT_TRUE(mCore->mShuttingDown);
+    EXPECT_EQ(NS_ERROR_FAILURE, mCore->mStartupFailure);
+    EXPECT_FALSE(mConnection);
+    dom::AutoJSAPI jsapi;
+    ASSERT_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()));
+    RefPtr<dom::Promise> promise;
+    ASSERT_EQ(NS_OK,
+              mCore->BeginProfileStartup(jsapi.cx(), getter_AddRefs(promise)));
+    ASSERT_TRUE(promise);
+    EXPECT_EQ(dom::Promise::PromiseState::Rejected, promise->State());
+    ASSERT_TRUE(promise->SetAnyPromiseIsHandled());
+    EXPECT_EQ(NS_ERROR_FAILURE, mCore->mStartupFailure);
+    RefPtr<dom::Promise> duplicate;
+    EXPECT_EQ(
+        NS_ERROR_NOT_AVAILABLE,
+        mCore->BeginProfileStartup(jsapi.cx(), getter_AddRefs(duplicate)));
+    EXPECT_FALSE(duplicate);
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DatabaseCore::CheckAccountStartup());
   }
 
   static nsresult sStartupReentry;
@@ -23394,6 +23624,238 @@ TEST_F(DeliveryCoreReferences,
   });
 }
 
+TEST_F(DeliveryCoreReferences,
+       NativeJSONUserOrderAbsentSourceLeavesNativeAbsent) {
+  CheckNativeJSONUserOrder(Nothing(), Nothing());
+}
+
+TEST_F(DeliveryCoreReferences, NativeJSONUserOrderAbsentSourceKeepsNative) {
+  CheckNativeJSONUserOrder(Nothing(), Some(uint32_t{17}));
+}
+
+TEST_F(DeliveryCoreReferences, NativeJSONUserOrderExplicitZeroFillsAbsent) {
+  CheckNativeJSONUserOrder(Some(uint32_t{0}), Nothing());
+}
+
+TEST_F(DeliveryCoreReferences, NativeJSONUserOrderCustomFillsAbsent) {
+  CheckNativeJSONUserOrder(Some(uint32_t{37}), Nothing());
+}
+
+TEST_F(DeliveryCoreReferences, NativeJSONUserOrderSentinelFillsAbsent) {
+  CheckNativeJSONUserOrder(Some(uint32_t{UINT32_MAX}), Nothing());
+}
+
+TEST_F(DeliveryCoreReferences, NativeJSONUserOrderNativeZeroWinsConflict) {
+  CheckNativeJSONUserOrder(Some(uint32_t{37}), Some(uint32_t{0}));
+}
+
+TEST_F(DeliveryCoreReferences, NativeJSONUserOrderNativeSentinelWinsConflict) {
+  CheckNativeJSONUserOrder(Some(uint32_t{37}), Some(uint32_t{UINT32_MAX}));
+}
+
+TEST_F(DeliveryCoreReferences, NativeJSONUserOrderNativeCustomWinsConflict) {
+  CheckNativeJSONUserOrder(Some(uint32_t{0}), Some(uint32_t{17}));
+}
+
+TEST_F(DeliveryCoreReferences,
+       NativeJSONUserOrderUnsignedUsesNativeSignedProjection) {
+  CheckNativeJSONUserOrder(Some(uint32_t{0x80000000}), Nothing());
+}
+
+TEST_F(DeliveryCoreReferences, NativeJSONUserOrderMaildirColdReopen) {
+  CheckNativeJSONUserOrder(Some(uint32_t{37}), Nothing(), "none"_ns,
+                           "maildir"_ns);
+}
+
+TEST_F(DeliveryCoreReferences, NativeJSONUserOrderImapColdReopen) {
+  CheckNativeJSONUserOrder(Some(uint32_t{37}), Some(uint32_t{0}), "imap"_ns,
+                           "mbox"_ns);
+}
+
+TEST_F(DeliveryCoreReferences, NativeJSONUserOrderRefusesString) {
+  CheckJSONUserOrderInvalidSource("{\"userSortOrder\":\"0\"}"_ns);
+}
+
+TEST_F(DeliveryCoreReferences, NativeJSONUserOrderRefusesBoolean) {
+  CheckJSONUserOrderInvalidSource("{\"userSortOrder\":false}"_ns);
+}
+
+TEST_F(DeliveryCoreReferences, NativeJSONUserOrderRefusesNull) {
+  CheckJSONUserOrderInvalidSource("{\"userSortOrder\":null}"_ns);
+}
+
+TEST_F(DeliveryCoreReferences, NativeJSONUserOrderRefusesFraction) {
+  CheckJSONUserOrderInvalidSource("{\"userSortOrder\":0.5}"_ns);
+}
+
+TEST_F(DeliveryCoreReferences, NativeJSONUserOrderRefusesNegative) {
+  CheckJSONUserOrderInvalidSource("{\"userSortOrder\":-1}"_ns);
+}
+
+TEST_F(DeliveryCoreReferences, NativeJSONUserOrderRefusesOverflow) {
+  CheckJSONUserOrderInvalidSource("{\"userSortOrder\":4294967296}"_ns);
+}
+
+TEST_F(DeliveryCoreReferences, NativeJSONUserOrderRefusesObject) {
+  CheckJSONUserOrderInvalidSource("{\"userSortOrder\":{}}"_ns);
+}
+
+TEST_F(DeliveryCoreReferences, NativeJSONUserOrderRefusesArray) {
+  CheckJSONUserOrderInvalidSource("{\"userSortOrder\":[]}"_ns);
+}
+
+TEST_F(DeliveryCoreReferences, NativeJSONUserOrderRefusesInvalidNativeTypes) {
+  WithNativeJSONCache("none"_ns, "mbox"_ns, [&](nsIMsgFolder* folder) {
+    nsCString request, raw, output;
+    ASSERT_EQ(NS_OK, PrepareJSONCacheRequest(
+                         folder, "{\"userSortOrder\":37}"_ns, request, raw));
+    ASSERT_EQ(NS_OK, WriteFolderProperty(&mCore->FolderDB(), mFolderId,
+                                         "userSortOrder"_ns, "37"_ns));
+    EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, JSONCacheCall(request, false, output));
+    nsCString text;
+    ASSERT_EQ(NS_OK, ReadFolderProperty(&mCore->FolderDB(), mFolderId,
+                                        "userSortOrder"_ns, text));
+    EXPECT_EQ("37"_ns, text);
+    for (int64_t invalid : {int64_t{-1}, int64_t{4294967296}}) {
+      ASSERT_EQ(NS_OK, WriteFolderProperty(&mCore->FolderDB(), mFolderId,
+                                           "userSortOrder"_ns, invalid));
+      EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, JSONCacheCall(request, false, output));
+      int64_t retained = 0;
+      ASSERT_EQ(NS_OK, ReadFolderProperty(&mCore->FolderDB(), mFolderId,
+                                          "userSortOrder"_ns, retained));
+      EXPECT_EQ(invalid, retained);
+      int64_t count = -1;
+      ASSERT_EQ(NS_OK, JSONCacheImportCount(count));
+      EXPECT_EQ(0, count);
+    }
+    ASSERT_EQ(NS_OK, folder->SetUserSortOrder(UINT32_MAX));
+    ASSERT_EQ(NS_OK, JSONCacheCall(request, false, output));
+    CheckJSONUserOrderProperty(Some(uint32_t{UINT32_MAX}));
+    CheckJSONUserOrderReceipt(output, Some(uint32_t{37}), UINT32_MAX, true);
+  });
+}
+
+TEST_F(DeliveryCoreReferences, NativeJSONUserOrderReadbackRejectsTampering) {
+  WithNativeJSONCache("none"_ns, "mbox"_ns, [&](nsIMsgFolder* folder) {
+    nsCString request, raw, receipt, output;
+    ASSERT_EQ(NS_OK, PrepareJSONCacheRequest(
+                         folder, "{\"userSortOrder\":37}"_ns, request, raw));
+    ASSERT_EQ(NS_OK, JSONCacheCall(request, false, receipt));
+    ASSERT_EQ(
+        NS_OK,
+        mConnection->ExecuteSimpleSQL(
+            "UPDATE folder_cache_imports SET raw=CAST('bad' AS BLOB)"_ns));
+    EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, JSONCacheCall(request, true, output));
+    nsCOMPtr<mozIStorageStatement> restore;
+    ASSERT_EQ(NS_OK, mConnection->CreateStatement(
+                         "UPDATE folder_cache_imports SET raw=:raw"_ns,
+                         getter_AddRefs(restore)));
+    ASSERT_EQ(NS_OK, restore->BindBlobByName(
+                         "raw"_ns,
+                         reinterpret_cast<const uint8_t*>(raw.BeginReading()),
+                         raw.Length()));
+    ASSERT_EQ(NS_OK, restore->Execute());
+    restore = nullptr;
+    ASSERT_EQ(NS_OK, mConnection->CreateStatement(
+                         "UPDATE folder_cache_imports SET receipt=:receipt"_ns,
+                         getter_AddRefs(restore)));
+    for (auto change :
+         {std::pair{"\"text\":\"25\"", "\"text\":\"26\""},
+          std::pair{"\"target\":\"userSortOrder\"", "\"target\":\"sortOrder\""},
+          std::pair{"\"disposition\":\"applied\"",
+                    "\"disposition\":\"native-authoritative\""},
+          std::pair{"\"nativeInteger\":37", "\"nativeInteger\":38"},
+          std::pair{"\"nativeInteger\":37",
+                    "\"nativeInteger\":37,\"nativeText\":\"\""},
+          std::pair{"\"nativeInteger\":37",
+                    "\"nativeInteger\":37,\"eligibleMask\":0"}}) {
+      nsCString damaged(receipt);
+      damaged.ReplaceSubstring(change.first, change.second);
+      ASSERT_NE(receipt, damaged);
+      ASSERT_EQ(NS_OK, restore->Reset());
+      ASSERT_EQ(NS_OK, restore->BindUTF8StringByName("receipt"_ns, damaged));
+      ASSERT_EQ(NS_OK, restore->Execute());
+      EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, JSONCacheCall(request, true, output));
+      CheckJSONUserOrderProperty(Some(uint32_t{37}));
+    }
+    nsCString damaged(receipt);
+    damaged.ReplaceSubstring("\"integer\":37", "\"integer\":38");
+    ASSERT_NE(receipt, damaged);
+    ASSERT_EQ(NS_OK, restore->Reset());
+    ASSERT_EQ(NS_OK, restore->BindUTF8StringByName("receipt"_ns, damaged));
+    ASSERT_EQ(NS_OK, restore->Execute());
+    EXPECT_EQ(NS_ERROR_INVALID_ARG, JSONCacheCall(request, true, output));
+    ASSERT_EQ(NS_OK, restore->Reset());
+    ASSERT_EQ(NS_OK, restore->BindUTF8StringByName("receipt"_ns, receipt));
+    ASSERT_EQ(NS_OK, restore->Execute());
+    restore = nullptr;
+    ASSERT_EQ(NS_OK, JSONCacheCall(request, true, output));
+    EXPECT_EQ(receipt, output);
+    ASSERT_EQ(NS_OK, folder->SetUserSortOrder(91));
+    // The retained original is authoritative for readback, even if the obsolete
+    // source file has changed after this committed import.
+    ASSERT_EQ(NS_OK, WriteStartupFile("folderCache.json", "{}"_ns));
+    ASSERT_EQ(NS_OK, JSONCacheCall(request, false, output));
+    EXPECT_EQ(receipt, output);
+    CheckJSONUserOrderProperty(Some(uint32_t{91}));
+  });
+}
+
+TEST_F(DeliveryCoreReferences,
+       NativeJSONUserOrderRollbackPreservesAbsenceAndRetry) {
+  WithNativeJSONCache("none"_ns, "mbox"_ns, [&](nsIMsgFolder* folder) {
+    nsCString request, raw, output;
+    ASSERT_EQ(NS_OK, PrepareJSONCacheRequest(folder, "{\"userSortOrder\":0}"_ns,
+                                             request, raw));
+    auto ordinal = mCore->FolderDB().GetFolderOrdinal(mFolderId);
+    ASSERT_TRUE(ordinal.isOk());
+    const auto before = ordinal.unwrap();
+    uint32_t order;
+    ASSERT_EQ(NS_OK, folder->GetUserSortOrder(&order));
+    EXPECT_EQ(UINT32_MAX, order);
+    ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+    EXPECT_EQ(NS_ERROR_IN_PROGRESS, JSONCacheCall(request, false, output));
+    bool active = false;
+    ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    EXPECT_TRUE(active);
+    ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+    ASSERT_EQ(NS_OK,
+              mConnection->ExecuteSimpleSQL(
+                  "CREATE TEMP TRIGGER fail_json_user_order BEFORE INSERT "
+                  "ON main.folder_cache_imports BEGIN SELECT "
+                  "RAISE(ABORT,'original receipt failure'); END"_ns));
+    auto cleanup = MakeScopeExit([&] {
+      EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                           "DROP TRIGGER IF EXISTS fail_json_user_order"_ns));
+    });
+    EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+              JSONCacheCall(request, false, output));
+    CheckJSONUserOrderProperty(Nothing());
+    ASSERT_EQ(NS_OK, folder->GetUserSortOrder(&order));
+    EXPECT_EQ(UINT32_MAX, order);
+    int64_t count = -1;
+    ASSERT_EQ(NS_OK, JSONCacheImportCount(count));
+    EXPECT_EQ(0, count);
+    auto after = mCore->FolderDB().GetFolderOrdinal(mFolderId);
+    ASSERT_TRUE(after.isOk());
+    EXPECT_EQ(before, after.unwrap());
+    ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    EXPECT_FALSE(active);
+    nsCOMPtr<nsIFile> file;
+    ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(file)));
+    ASSERT_EQ(NS_OK, file->AppendNative("folderCache.json"_ns));
+    ASSERT_EQ(NS_OK, JSONCacheReadFile(file, output));
+    EXPECT_EQ(raw, output);
+    ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                         "DROP TRIGGER fail_json_user_order"_ns));
+    ASSERT_EQ(NS_OK, JSONCacheCall(request, false, output));
+    CheckJSONUserOrderProperty(Some(uint32_t{0}));
+    CheckJSONUserOrderReceipt(output, Some(uint32_t{0}), 0, false);
+    ASSERT_EQ(NS_OK, folder->GetUserSortOrder(&order));
+    EXPECT_EQ(0u, order);
+  });
+}
+
 TEST_F(DeliveryCoreReferences, NativeJSONCacheGenuineZeroEntryReceipt) {
   ASSERT_EQ(NS_OK, Start());
   nsCString request, original, receipt, output;
@@ -23498,6 +23960,29 @@ TEST_F(DeliveryCoreReferences, StartupEmptyJSONRetainsOtherLegacyData) {
   bool exists;
   ASSERT_EQ(NS_OK, mFile->Exists(&exists));
   EXPECT_FALSE(exists);
+}
+
+TEST_F(DeliveryCoreReferences, StartupBeginPreservesSettledParserFailure) {
+  ASSERT_EQ(NS_OK, WriteStartupFile("folderCache.json", "{corrupt JSON"_ns));
+  CheckObservedStartupFailure();
+}
+
+TEST_F(DeliveryCoreReferences, StartupUnknownNumericCacheCellStillRefuses) {
+  dom::AutoJSAPI jsapi;
+  ASSERT_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()));
+  nsCString descriptor, quoted;
+  ASSERT_EQ(NS_OK, mProfile->GetPersistentDescriptor(descriptor));
+  ASSERT_EQ(NS_OK, JSONCacheQuote(jsapi.cx(), descriptor, quoted));
+  const nsCString raw("{"_ns + quoted +
+                      ":{\"notANativeNumericProperty\":0}}"_ns);
+  ASSERT_EQ(NS_OK, WriteStartupFile("folderCache.json", raw));
+  CheckObservedStartupFailure();
+  nsCOMPtr<nsIFile> file;
+  ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(file)));
+  ASSERT_EQ(NS_OK, file->AppendNative("folderCache.json"_ns));
+  nsCString retained;
+  ASSERT_EQ(NS_OK, JSONCacheReadFile(file, retained));
+  EXPECT_EQ(raw, retained);
 }
 
 #endif

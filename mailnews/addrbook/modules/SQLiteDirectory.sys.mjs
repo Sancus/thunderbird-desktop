@@ -624,6 +624,9 @@ export class SQLiteDirectory extends AddrBookDirectory {
    * @param {string} storageSourceId - Original committed storage token.
    * @param {object} [options] - Connection ownership requirements.
    * @param {boolean} [options.requireClosed=true] - Refuse a live directory.
+   * @param {object} [options.stageIdentity] - For a copy or published target of
+   *   the stage, the stage's receipt stagePhysicalIdentity. On Windows its pin
+   *   must equal this rather than the copy's own physical identity.
    * @returns {object} Verified sourceId, sourceSha256, sourceSize and separate
    *   cards/lists [originalKey, UID] maps; also the Windows physical identity.
    * @throws {Error} On unsafe paths, missing provenance, a foreign transaction,
@@ -633,7 +636,7 @@ export class SQLiteDirectory extends AddrBookDirectory {
     file,
     bytes,
     storageSourceId,
-    { requireClosed = true } = {}
+    { requireClosed = true, stageIdentity = null } = {}
   ) {
     if (
       typeof storageSourceId != "string" ||
@@ -697,7 +700,18 @@ export class SQLiteDirectory extends AddrBookDirectory {
         );
         target.initWithPath(lease.canonicalPath);
       }
-      const physical = lease ? lazy.migrationPhysicalIdentity(lease) : null;
+      let physical = lease ? lazy.migrationPhysicalIdentity(lease) : null;
+      if (physical && stageIdentity) {
+        // A byte copy has its own file ID but retains the stage's pin.
+        if (
+          stageIdentity.version !== 1 ||
+          typeof stageIdentity.id != "string" ||
+          typeof stageIdentity.parentId != "string"
+        ) {
+          throw new Error("Book copy requires its stage physical identity");
+        }
+        physical = { ...stageIdentity };
+      }
       if (!db) {
         db = Services.storage.openUnsharedDatabase(target);
         ownsConnection = true;

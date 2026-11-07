@@ -34,6 +34,8 @@ add_setup(function setupArchiveBackend() {
     "mail.serverDefaultStoreContractID"
   );
   Services.prefs.setCharPref("mail.server.default.storeContractID", contract);
+  // Account startup registers the selected native database service.
+  MailServices.accounts;
   const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
     Ci.nsIMsgDBService
   );
@@ -463,7 +465,7 @@ add_task(async function testCrossServerArchiveFailureAndRetry() {
   );
   targetDaemon = destination.server.daemon;
   const identity = source.account.defaultIdentity;
-  identity.archiveFolder = destination.folder.URI;
+  identity.archivesFolderURI = destination.folder.URI;
   identity.archiveEnabled = true;
   const messages = [2030, 2031].map(year =>
     generator.makeMessage({

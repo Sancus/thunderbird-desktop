@@ -33,6 +33,19 @@ add_setup(async function () {
 
   const account = MailServices.accounts.createLocalMailAccount();
   account.addIdentity(MailServices.accounts.createIdentity());
+  Assert.equal(
+    account.incomingServer.getStringValue("storeContractID"),
+    Services.prefs.getCharPref("mail.serverDefaultStoreContractID"),
+    "The history uses the requested actual message store"
+  );
+  const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIMsgDBService
+  );
+  Assert.equal(
+    service instanceof Ci.nsIDatabaseCore,
+    Services.prefs.getBoolPref("mail.panorama.enabled", false),
+    "The history uses the requested actual database backend"
+  );
   const rootFolder = account.incomingServer.rootFolder.QueryInterface(
     Ci.nsIMsgLocalMailFolder
   );
@@ -992,8 +1005,14 @@ async function subtestForeignHistory(win, aboutMessage, popup = false) {
   const { messageHistory } = aboutMessage;
   messageHistory.clear();
   messageHistory.push(aboutMessage.gMessageURI);
+  const index = aboutMessage.gDBView.findIndexOfMsgHdr(
+    aboutMessage.gMessage,
+    true
+  );
+  const nextMessage = aboutMessage.gDBView.getMsgHdrAt(index + 1);
+  Assert.ok(nextMessage, "The real sorted view has a next physical message");
   win.goDoCommand("cmd_nextMsg");
-  await assertDisplayedMessage(aboutMessage, folderAMessages[1]);
+  await assertDisplayedMessage(aboutMessage, nextMessage);
   const expectedURI = aboutMessage.gMessageURI;
   const expectedBody =
     aboutMessage.getMessagePaneBrowser().contentDocument.body.textContent;
@@ -1013,7 +1032,7 @@ async function subtestForeignHistory(win, aboutMessage, popup = false) {
     expectedURI,
     "A foreign folder entry must not display another physical message"
   );
-  Assert.equal(aboutMessage.gMessage.messageKey, folderAMessages[1].messageKey);
+  Assert.equal(aboutMessage.gMessage.messageKey, nextMessage.messageKey);
   Assert.equal(aboutMessage.gMessage.folder.URI, folderA.URI);
   Assert.equal(
     aboutMessage.getMessagePaneBrowser().contentDocument.body.textContent,
@@ -1032,29 +1051,46 @@ add_task(async function testHistoryRefusesForeignFolderInAbout3Pane() {
   threadTree.selectedIndex = 0;
   await assertDisplayedMessage(
     messageBrowser.contentWindow,
-    folderAMessages[0]
+    about3Pane.gDBView.getMsgHdrAt(0)
   );
   await subtestForeignHistory(window, messageBrowser.contentWindow);
 });
 
 add_task(async function testHistoryRefusesForeignFolderInATab() {
-  await withMessageInATab(folderAMessages[0], subtestForeignHistory);
+  about3Pane.displayFolder(folderA.URI);
+  await withMessageInATab(
+    about3Pane.gDBView.getMsgHdrAt(0),
+    subtestForeignHistory
+  );
 });
 
 add_task(async function testHistoryRefusesForeignFolderInAWindow() {
-  await withMessageInAWindow(folderAMessages[0], (win, message) =>
-    subtestForeignHistory(win, message, true)
+  about3Pane.displayFolder(folderA.URI);
+  await withMessageInAWindow(
+    about3Pane.gDBView.getMsgHdrAt(0),
+    (win, message) => subtestForeignHistory(win, message, true)
   );
 });
 
 add_task(async function testHistoryPrunesDeletedAndReopensPhysicalMessage() {
-  const message = folderAMessages[0];
+  about3Pane.displayFolder(folderA.URI);
+  const message = about3Pane.gDBView.getMsgHdrAt(0);
+  const unrelated = [...folderB.messages][0];
+  Assert.ok(
+    unrelated,
+    "An actual unrelated physical message exists before deletion"
+  );
+  Assert.ok(folderB.msgDatabase.containsKey(unrelated.messageKey));
   const key = message.messageKey;
   const messageURI = folderA.getUriForMsg(message);
   const loaded = BrowserTestUtils.waitForEvent(window, "MsgLoaded");
   window.OpenMessageInNewTab(message, { background: false });
   await loaded;
-  registerCleanupFunction(() => tabmail.closeOtherTabs(0));
+  registerCleanupFunction(async () => {
+    tabmail.closeOtherTabs(0);
+    threadTree.selectedIndex = -1;
+    await assertNoDisplayedMessage(messageBrowser.contentWindow);
+  });
   const body =
     tabmail.currentAboutMessage.getMessagePaneBrowser().contentDocument.body
       .textContent;
@@ -1072,10 +1108,15 @@ add_task(async function testHistoryPrunesDeletedAndReopensPhysicalMessage() {
   );
   tabmail.closeTab(tabmail.currentTabInfo);
   about3Pane.displayFolder(folderA.URI);
-  threadTree.selectedIndex = 0;
+  threadTree.selectedIndex = about3Pane.gDBView.findIndexOfMsgHdr(
+    message,
+    true
+  );
   await assertDisplayedMessage(messageBrowser.contentWindow, message);
   const history = messageBrowser.contentWindow.messageHistory;
-  folderA.deleteMessages([message], null, true, false, null, false);
+  const deleted = new PromiseTestUtils.PromiseCopyListener();
+  folderA.deleteMessages([message], null, true, false, deleted, false);
+  await deleted.promise;
   await TestUtils.waitForCondition(() => !folderA.msgDatabase.containsKey(key));
   Assert.ok(
     !history
@@ -1098,8 +1139,14 @@ add_task(async function testHistoryPrunesDeletedAndReopensPhysicalMessage() {
     tabmail.currentAboutMessage.getMessagePaneBrowser().currentURI.spec,
     "about:blank"
   );
-  Assert.ok(folderB.msgDatabase.containsKey(folderBMessages[0].messageKey));
+  Assert.ok(folderB.msgDatabase.containsKey(unrelated.messageKey));
+  Assert.equal(
+    folderB.GetMessageHeader(unrelated.messageKey).messageId,
+    unrelated.messageId
+  );
   tabmail.closeOtherTabs(0);
+  threadTree.selectedIndex = -1;
+  await assertNoDisplayedMessage(messageBrowser.contentWindow);
 });
 
 function assertSelectedFolder(expected) {

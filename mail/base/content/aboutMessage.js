@@ -200,8 +200,15 @@ function displayMessage(uri, viewWrapper) {
 
   if (uri) {
     try {
-      gMessage =
+      const header =
         MailServices.messageServiceFromURI(uri).messageURIToMsgHdr(uri);
+      if (
+        header &&
+        (!header.folder ||
+          header.folder.msgDatabase.containsKey(header.messageKey))
+      ) {
+        gMessage = header;
+      }
     } catch (error) {
       // A reopened tab may refer to a message that has since been removed.
       console.warn("Unable to reopen message", error);

@@ -2273,6 +2273,7 @@ function captureStartupMigration(signal) {
   };
   visit(profile);
   const summaries = [];
+  const serverSummaries = [];
   const books = [];
   const caches = [];
   for (const file of files) {
@@ -2280,7 +2281,25 @@ function captureStartupMigration(signal) {
       const matches = servers.filter(server =>
         new FileUtils.File(server.root).contains(file)
       );
-      if (matches.length !== 1) {
+      const roots = servers.filter(
+        server =>
+          server.protocol === "imap" && file.path === server.root + ".msf"
+      );
+      if (roots.length === 1 && matches.length === 0) {
+        const server = roots[0];
+        serverSummaries.push({
+          id: "server-summary:" + file.getRelativePath(profile),
+          role: "imap-server-root-summary",
+          path: file.path,
+          serverKey: server.key,
+          serverRoot: server.root,
+          protocol: server.protocol,
+          storeContractID: server.storeContractID,
+          storeType: server.storeType,
+        });
+        continue;
+      }
+      if (matches.length !== 1 || roots.length) {
         throw new Error(
           "Mork summary has no unique persisted server root: " +
             file.path +
@@ -2411,8 +2430,20 @@ function captureStartupMigration(signal) {
       book.dirName = names.get(book.path);
     }
   }
-  if (!summaries.length && !books.length && !caches.length) {
-    return { profilePath: profile.path, servers, summaries, books, caches };
+  if (
+    !summaries.length &&
+    !serverSummaries.length &&
+    !books.length &&
+    !caches.length
+  ) {
+    return {
+      profilePath: profile.path,
+      servers,
+      summaries,
+      serverSummaries,
+      books,
+      caches,
+    };
   }
   // The stable outside-profile path preserves discoverable failed attempts.
   // Never create another archive to conceal an existing journal/partial copy.
@@ -2428,6 +2459,7 @@ function captureStartupMigration(signal) {
     profilePath: profile.path,
     servers,
     summaries,
+    serverSummaries,
     books,
     caches,
     workPath: work.path,
@@ -2651,6 +2683,24 @@ async function finishPanoramaProfileStartup(
         cacheInputs.push({ identity, input });
         database.validateProfileStartup(operation);
       }
+      const serverSummaries = [];
+      for (const source of captured.serverSummaries) {
+        const { identity, summary } = await readMorkMigrationSource(
+          source.path
+        );
+        const rows = [...summary.source.rows.values()];
+        if (
+          summary.messages.length ||
+          rows.length !== 1 ||
+          rows[0].scope !== "ns:msg:db:row:scope:dbfolderinfo:all"
+        ) {
+          throw new Error(
+            "Unsupported data in native IMAP server-root summary"
+          );
+        }
+        serverSummaries.push({ ...source, ...identity });
+        database.validateProfileStartup(operation);
+      }
       const sources = [];
       for (const source of captured.summaries) {
         const { identity, summary } = await readMorkMigrationSource(
@@ -2670,7 +2720,7 @@ async function finishPanoramaProfileStartup(
         backupPath: captured.backupPath,
         sources: [],
         ...(books.length ? { books } : {}),
-        startupInventory: { sources, caches },
+        startupInventory: { sources, caches, serverSummaries },
       });
       journal.close();
       await prepareStartupMigrationProfile(
@@ -2688,6 +2738,7 @@ async function finishPanoramaProfileStartup(
         sources,
         books,
         caches,
+        serverSummaries,
       });
       await journal.bindStartupTarget(database, operation, target.folders);
       await journal.recordBackup(captured.backup);

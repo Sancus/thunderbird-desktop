@@ -144,6 +144,11 @@ struct StartupMailSource {
   char delimiter = 0;
 };
 
+struct StartupServerSummary {
+  nsCString id, path, hash, serverKey, serverRoot, storeContract, storeType;
+  uint64_t size = 0, folderId = 0;
+};
+
 struct StartupServerRoot {
   nsCString key, path, protocol, contract;
 };
@@ -175,9 +180,12 @@ class ProfileStartupOperation final : public nsIAsyncShutdownBlocker {
   nsCString profilePath, localPath, sourceId, mode{"legacy"_ns};
   nsCString journalPath, backupPath, backupHash;
   nsCString initialSelector, retainedSources, retainedBooks, retainedCaches;
+  nsCString retainedServerSummaries{"[]"_ns};
+  nsTArray<StartupServerSummary> serverSummaries;
   nsTArray<StartupMailSource> sources;
   nsTArray<StartupServerRoot> servers;
   nsTHashMap<nsCString, nsCString> backupFiles;
+  nsTHashMap<nsCString, nsCOMPtr<nsIFile>> backupCopies;
   nsTHashMap<nsCString, nsCString> createdEmptyStores;
   nsTArray<nsCString> sourceIds;
   nsTArray<nsCOMPtr<nsIMsgFolder>> folders;
@@ -9242,6 +9250,7 @@ nsresult StartupBackup(JSContext* cx, ProfileStartupOperation& operation,
         if (auto prior = operation.backupFiles.Lookup(originalPath))
           NS_ENSURE_TRUE(prior.Data() == expectedHash, NS_ERROR_NOT_AVAILABLE);
         operation.backupFiles.InsertOrUpdate(originalPath, expectedHash);
+        operation.backupCopies.InsertOrUpdate(originalPath, destination);
       }
     }
   }
@@ -9521,6 +9530,188 @@ nsresult StartupCheckHash(nsIFile* file, const nsACString& expected,
   MOZ_TRY(StartupHash(file, actual));
   return actual == expected ? NS_OK : NS_ERROR_NOT_AVAILABLE;
 }
+// A server's sibling summary is metadata, never a synthetic message folder.
+// Its entire original document remains in the verified backup and inventory.
+nsresult StartupServerSummaryInput(JSContext* cx, JS::Handle<JSObject*> source,
+                                   ProfileStartupOperation& operation,
+                                   StartupServerSummary& output,
+                                   bool historical = false) {
+  nsCString role, protocol;
+  MOZ_TRY(StartupText(cx, source, "role", role));
+  MOZ_TRY(StartupText(cx, source, "protocol", protocol));
+  NS_ENSURE_TRUE(role == "imap-server-root-summary"_ns && protocol == "imap"_ns,
+                 NS_ERROR_NOT_IMPLEMENTED);
+  for (auto entry : {std::pair{"id", &output.id},
+                     {"path", &output.path},
+                     {"sha256", &output.hash},
+                     {"serverKey", &output.serverKey},
+                     {"serverRoot", &output.serverRoot},
+                     {"storeContractID", &output.storeContract},
+                     {"storeType", &output.storeType}}) {
+    MOZ_TRY(StartupText(cx, source, entry.first, *entry.second));
+    NS_ENSURE_FALSE(entry.second->IsEmpty(), NS_ERROR_INVALID_ARG);
+  }
+  NS_ENSURE_TRUE(
+      output.serverKey.FindChar('.') < 0 &&
+          output.path.Equals(output.serverRoot + ".msf"_ns) &&
+          ((output.storeType == "mbox"_ns &&
+            output.storeContract ==
+                "@mozilla.org/msgstore/berkeleystore;1"_ns) ||
+           (output.storeType == "maildir"_ns &&
+            output.storeContract == "@mozilla.org/msgstore/maildirstore;1"_ns)),
+      NS_ERROR_NOT_AVAILABLE);
+  int64_t size;
+  MOZ_TRY(StartupNumber(cx, source, "size", 1, UINT32_MAX - 1, size));
+  output.size = size;
+  nsCOMPtr<nsIFile> original;
+  MOZ_TRY(NS_NewNativeLocalFile(output.path, getter_AddRefs(original)));
+  nsCString literal, relative;
+  MOZ_TRY(original->GetNativePath(literal));
+  bool inside;
+  MOZ_TRY(operation.profile->Contains(original, &inside));
+  MOZ_TRY(original->GetRelativePath(operation.profile, relative));
+  NS_ENSURE_TRUE(inside && literal == output.path &&
+                     output.id.Equals("server-summary:"_ns + relative),
+                 NS_ERROR_FILE_ACCESS_DENIED);
+  if (!historical) {
+    uint32_t matches = 0;
+    for (const auto& server : operation.servers) {
+      nsCOMPtr<nsIFile> root;
+      MOZ_TRY(NS_NewNativeLocalFile(server.path, getter_AddRefs(root)));
+      bool contains;
+      MOZ_TRY(root->Contains(original, &contains));
+      // A summary inside another server's tree has an ambiguous role.
+      NS_ENSURE_FALSE(contains, NS_ERROR_NOT_AVAILABLE);
+      if (server.path == output.serverRoot) {
+        NS_ENSURE_TRUE(server.key == output.serverKey &&
+                           server.protocol == protocol &&
+                           server.contract == output.storeContract,
+                       NS_ERROR_NOT_AVAILABLE);
+        ++matches;
+      }
+    }
+    NS_ENSURE_TRUE(matches == 1, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(StartupCheckHash(original, output.hash, output.size));
+  }
+  auto archived = operation.backupFiles.Lookup(output.path);
+  auto copy = operation.backupCopies.Lookup(output.path);
+  NS_ENSURE_TRUE(archived && archived.Data() == output.hash && copy,
+                 NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<nsIFile> retained = historical ? copy.Data() : original;
+  MOZ_TRY(StartupCheckHash(retained, output.hash, output.size));
+  JS::Rooted<JSObject*> parsed(cx), originalData(cx), rows(cx), tables(cx),
+      messages(cx), info(cx);
+  MOZ_TRY(StartupParseFile(
+      cx, retained,
+      u"resource:///modules/panorama/MorkSummaryReader.sys.mjs"_ns,
+      "parseMorkSummary", &parsed));
+  uint32_t count;
+  MOZ_TRY(StartupArray(cx, parsed, "messages", &messages, count));
+  NS_ENSURE_TRUE(!count, NS_ERROR_NOT_IMPLEMENTED);
+  MOZ_TRY(StartupObject(cx, parsed, "source", &originalData));
+  MOZ_TRY(StartupObject(cx, originalData, "rows", &rows));
+  // Check every original row, including detached or hidden operations.
+  NS_ENSURE_TRUE(JS::MapSize(cx, rows) == 1, NS_ERROR_NOT_IMPLEMENTED);
+  JS::Rooted<JS::Value> value(cx);
+  NS_ENSURE_TRUE(JS::MapValues(cx, rows, &value), NS_ERROR_FAILURE);
+  JS::ForOfIterator rowIterator(cx);
+  NS_ENSURE_TRUE(rowIterator.init(value), NS_ERROR_FAILURE);
+  bool done;
+  NS_ENSURE_TRUE(rowIterator.next(&value, &done) && !done && value.isObject(),
+                 NS_ERROR_FILE_CORRUPTED);
+  info = &value.toObject();
+  nsCString scope;
+  MOZ_TRY(StartupText(cx, info, "scope", scope));
+  NS_ENSURE_TRUE(scope == "ns:msg:db:row:scope:dbfolderinfo:all"_ns,
+                 NS_ERROR_NOT_IMPLEMENTED);
+  JS::Rooted<JSObject*> cells(cx);
+  MOZ_TRY(StartupObject(cx, info, "cells", &cells));
+  NS_ENSURE_TRUE(JS::MapKeys(cx, cells, &value), NS_ERROR_FAILURE);
+  JS::ForOfIterator cellIterator(cx);
+  NS_ENSURE_TRUE(cellIterator.init(value), NS_ERROR_FAILURE);
+  while (true) {
+    NS_ENSURE_TRUE(cellIterator.next(&value, &done), NS_ERROR_FAILURE);
+    if (done) break;
+    nsCString name;
+    MOZ_TRY(ImportText(cx, value, name));
+    // Only the native folder-info metadata role is understood. Unknown cells
+    // may carry state that an empty message table alone cannot account for.
+    bool supported = false;
+    for (const char* known :
+         {"version", "flags", "folderName", "mailboxName", "folderDate",
+          "forceReparse", "fixedBadRefThreading", "numMsgs", "numNewMsgs",
+          "totPendingMsgs", "unreadPendingMsgs", "expungedBytes", "folderSize",
+          "highWaterKey", "UIDValidity"}) {
+      supported |= name.Equals(known);
+    }
+    NS_ENSURE_TRUE(supported, NS_ERROR_NOT_IMPLEMENTED);
+  }
+  for (const char* name : {"numMsgs", "numNewMsgs", "totPendingMsgs",
+                           "unreadPendingMsgs", "expungedBytes", "folderSize",
+                           "highWaterKey", "UIDValidity", "forceReparse"}) {
+    MOZ_TRY(StartupMapEntry(cx, info, "cells", nsDependentCString(name), &value,
+                            true));
+    if (value.isUndefined()) continue;
+    nsCString text;
+    uint64_t number;
+    MOZ_TRY(ImportText(cx, value, text));
+    MOZ_TRY(ImportHex(text, 16, number));
+    NS_ENSURE_TRUE(!number, NS_ERROR_NOT_IMPLEMENTED);
+  }
+  MOZ_TRY(StartupMapEntry(cx, info, "cells", "flags"_ns, &value, true));
+  if (!value.isUndefined()) {
+    nsCString text;
+    uint64_t flags;
+    MOZ_TRY(ImportText(cx, value, text));
+    MOZ_TRY(ImportHex(text, 8, flags));
+    NS_ENSURE_FALSE(
+        flags & (nsMsgFolderFlags::OfflineEvents | nsMsgFolderFlags::Virtual |
+                 nsMsgFolderFlags::Newsgroup),
+        NS_ERROR_NOT_IMPLEMENTED);
+  }
+  MOZ_TRY(StartupObject(cx, originalData, "tables", &tables));
+  NS_ENSURE_TRUE(JS::MapValues(cx, tables, &value), NS_ERROR_FAILURE);
+  JS::ForOfIterator tableIterator(cx);
+  NS_ENSURE_TRUE(tableIterator.init(value), NS_ERROR_FAILURE);
+  bool seenInfo = false, seenMessages = false, seenThreads = false;
+  while (true) {
+    NS_ENSURE_TRUE(tableIterator.next(&value, &done), NS_ERROR_FAILURE);
+    if (done) break;
+    NS_ENSURE_TRUE(value.isObject(), NS_ERROR_FILE_CORRUPTED);
+    JS::Rooted<JSObject*> table(cx, &value.toObject()), members(cx);
+    MOZ_TRY(StartupText(cx, table, "scope", scope));
+    MOZ_TRY(StartupArray(cx, table, "rows", &members, count));
+    JS::Rooted<JS::Value> meta(cx), kindValue(cx);
+    MOZ_TRY(ImportMember(cx, table, "metaRow", &meta));
+    NS_ENSURE_TRUE(meta.isNull(), NS_ERROR_NOT_IMPLEMENTED);
+    MOZ_TRY(StartupMapEntry(cx, table, "cells", "k"_ns, &kindValue));
+    nsCString kind;
+    MOZ_TRY(ImportText(cx, kindValue, kind));
+    if (scope == "ns:msg:db:row:scope:dbfolderinfo:all"_ns &&
+        kind == "ns:msg:db:table:kind:dbfolderinfo"_ns) {
+      NS_ENSURE_TRUE(!seenInfo && count == 1, NS_ERROR_NOT_IMPLEMENTED);
+      seenInfo = true;
+      JS::Rooted<JS::Value> key(cx), row(cx);
+      NS_ENSURE_TRUE(JS_GetElement(cx, members, 0, &key) &&
+                         JS::MapGet(cx, rows, key, &row) && row.isObject() &&
+                         &row.toObject() == info.get(),
+                     NS_ERROR_FILE_CORRUPTED);
+    } else if (scope == "ns:msg:db:row:scope:msgs:all"_ns &&
+               kind == "ns:msg:db:table:kind:msgs"_ns) {
+      NS_ENSURE_TRUE(!seenMessages && !count, NS_ERROR_NOT_IMPLEMENTED);
+      seenMessages = true;
+    } else if (scope == "ns:msg:db:row:scope:threads:all"_ns &&
+               kind == "ns:msg:db:table:kind:allthreads"_ns) {
+      NS_ENSURE_TRUE(!seenThreads && !count, NS_ERROR_NOT_IMPLEMENTED);
+      seenThreads = true;
+    } else {
+      return NS_ERROR_NOT_IMPLEMENTED;
+    }
+  }
+  NS_ENSURE_TRUE(seenInfo && seenMessages, NS_ERROR_NOT_IMPLEMENTED);
+  return StartupCheckHash(retained, output.hash, output.size);
+}
+
 nsresult StartupServer(JSContext* cx, JS::Handle<JSObject*> source,
                        ProfileStartupOperation& operation,
                        StartupMailSource& output) {
@@ -10054,6 +10245,23 @@ nsresult DatabaseCore::DescribeProfileStartup(
   NS_ENSURE_TRUE(
       JS_DefineProperty(cx, result, "folders", folders, JSPROP_ENUMERATE),
       NS_ERROR_OUT_OF_MEMORY);
+  JS::Rooted<JSObject*> serverSummaries(
+      cx, JS::NewArrayObject(cx, operation.serverSummaries.Length()));
+  NS_ENSURE_TRUE(serverSummaries, NS_ERROR_OUT_OF_MEMORY);
+  for (uint32_t i = 0; i < operation.serverSummaries.Length(); ++i) {
+    const auto& summary = operation.serverSummaries[i];
+    JS::Rooted<JSObject*> entry(cx, JS_NewPlainObject(cx));
+    NS_ENSURE_TRUE(
+        summary.folderId && summary.folderId <= 9007199254740991ULL && entry &&
+            text(entry, "sourceId", summary.id) &&
+            JS_DefineProperty(cx, entry, "folderId", double(summary.folderId),
+                              JSPROP_ENUMERATE) &&
+            JS_SetElement(cx, serverSummaries, i, entry),
+        NS_ERROR_NOT_AVAILABLE);
+  }
+  NS_ENSURE_TRUE(JS_DefineProperty(cx, result, "serverSummaries",
+                                   serverSummaries, JSPROP_ENUMERATE),
+                 NS_ERROR_OUT_OF_MEMORY);
   output.setObject(*result);
   return NS_OK;
 }
@@ -10092,8 +10300,13 @@ nsresult DatabaseCore::OpenProfileStartup(JSContext* cx,
   NS_ENSURE_TRUE(
       exists == operation.existing && oldSource == operation.sourceId,
       NS_ERROR_NOT_AVAILABLE);
-  uint32_t count;
+  uint32_t count, serverSummaryCount;
   MOZ_TRY(StartupArray(cx, plan, "sources", &sources, count, true));
+  JS::Rooted<JSObject*> serverSummaries(cx);
+  MOZ_TRY(StartupArray(cx, plan, "serverSummaries", &serverSummaries,
+                       serverSummaryCount, true));
+  NS_ENSURE_TRUE(mode == "migrate"_ns || !serverSummaryCount,
+                 NS_ERROR_NOT_AVAILABLE);
   if (mode == "legacy"_ns) {
     NS_ENSURE_TRUE(!selector && !exists && !count, NS_ERROR_NOT_AVAILABLE);
     operation.mode = mode;
@@ -10237,6 +10450,30 @@ nsresult DatabaseCore::OpenProfileStartup(JSContext* cx,
                                                           : native.storePath));
         operation.sources.AppendElement(std::move(native));
       }
+      JS::Rooted<JSObject*> savedSummaries(cx);
+      uint32_t savedSummaryCount;
+      MOZ_TRY(StartupArray(cx, retained, "serverSummaries", &savedSummaries,
+                           savedSummaryCount, true));
+      expected.setObject(*savedSummaries);
+      actual.setObject(*serverSummaries);
+      MOZ_TRY(StartupEqual(cx, expected, actual));
+      MOZ_TRY(StartupJSON(cx, actual, operation.retainedServerSummaries));
+      operation.serverSummaries.Clear();
+      nsTHashSet<nsCString> summaryServers;
+      for (uint32_t i = 0; i < serverSummaryCount; ++i) {
+        JS::Rooted<JSObject*> entry(cx);
+        MOZ_TRY(StartupItem(cx, serverSummaries, i, &entry));
+        StartupServerSummary summary;
+        MOZ_TRY(StartupServerSummaryInput(cx, entry, operation, summary));
+        NS_ENSURE_TRUE(!ids.Contains(summary.id) &&
+                           !paths.Contains(summary.path) &&
+                           !summaryServers.Contains(summary.serverKey),
+                       NS_ERROR_NOT_AVAILABLE);
+        ids.Insert(summary.id);
+        paths.Insert(summary.path);
+        summaryServers.Insert(summary.serverKey);
+        operation.serverSummaries.AppendElement(std::move(summary));
+      }
       for (const auto& source : operation.sources) {
         if (source.protocol != "imap"_ns) continue;
         int32_t slash = source.canonicalPath.RFindChar('/');
@@ -10354,6 +10591,28 @@ nsresult DatabaseCore::BuildStartupFolders() {
     MOZ_TRY(server->GetRootFolder(getter_AddRefs(root)));
     NS_ENSURE_TRUE(root, NS_ERROR_NOT_AVAILABLE);
     roots.InsertOrUpdate(source.key, root);
+  }
+  for (auto& summary : operation.serverSummaries) {
+    auto root = roots.Lookup(summary.serverKey);
+    NS_ENSURE_TRUE(root, NS_ERROR_NOT_AVAILABLE);
+    bool isServer;
+    MOZ_TRY(root.Data()->GetIsServer(&isServer));
+    uint64_t id;
+    MOZ_TRY(root.Data()->GetId(&id));
+    NS_ENSURE_TRUE(
+        isServer && id && !MOZ_TRY(mFolderDatabase->GetFolderParent(id)) &&
+            MOZ_TRY(mFolderDatabase->GetFolderName(id)) == summary.serverKey,
+        NS_ERROR_NOT_AVAILABLE);
+    nsCOMPtr<nsIFile> file, store;
+    MOZ_TRY(root.Data()->GetSummaryFile(getter_AddRefs(file)));
+    MOZ_TRY(root.Data()->GetFilePath(getter_AddRefs(store)));
+    nsCString filePath, storePath;
+    MOZ_TRY(file->GetNativePath(filePath));
+    MOZ_TRY(store->GetNativePath(storePath));
+    NS_ENSURE_TRUE(filePath == summary.path && storePath == summary.serverRoot,
+                   NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(StartupCheckHash(file, summary.hash, summary.size));
+    summary.folderId = id;
   }
   nsTArray<const StartupMailSource*> local;
   for (const auto& source : operation.sources)
@@ -10486,8 +10745,9 @@ nsresult DatabaseCore::BuildStartupFolders() {
     NS_ENSURE_TRUE(id && !ids.Contains(id), NS_ERROR_NOT_AVAILABLE);
     ids.Insert(id);
     if (source.originalFlags) {
-      uint32_t before;
-      MOZ_TRY(folder->GetFlags(&before));
+      // Public GetFlags opens a message database and reads counts/new state.
+      // Startup admits only metadata until the complete import is ready.
+      uint32_t before = MOZ_TRY(mFolderDatabase->GetFolderFlags(id));
       const uint32_t wanted =
           source.protocol == "imap"_ns
               ? (*source.originalFlags & ~nsMsgFolderFlags::OfflineEvents) |
@@ -10861,6 +11121,15 @@ nsresult DatabaseCore::CheckProfileActivation(
         StartupFieldsEqual(cx, priorIdentity, identity,
                            {"profilePath", "databaseSourceId", "journalPath",
                             "backup", "imports", "books", "caches"}));
+    JS::Rooted<JSObject*> beforeSummaries(cx), afterSummaries(cx);
+    uint32_t beforeCount, afterCount;
+    MOZ_TRY(StartupArray(cx, priorIdentity, "serverSummaries", &beforeSummaries,
+                         beforeCount, true));
+    MOZ_TRY(StartupArray(cx, identity, "serverSummaries", &afterSummaries,
+                         afterCount, true));
+    JS::Rooted<JS::Value> before(cx, JS::ObjectValue(*beforeSummaries)),
+        after(cx, JS::ObjectValue(*afterSummaries));
+    MOZ_TRY(StartupEqual(cx, before, after));
     // An unchanged selector does not prove durable recovery state.
   }
   if (origin != "migrated"_ns) {
@@ -10875,10 +11144,11 @@ nsresult DatabaseCore::CheckProfileActivation(
     JS::Rooted<JS::Value> backup(cx);
     MOZ_TRY(ImportMember(cx, identity, "backup", &backup));
     NS_ENSURE_TRUE(backup.isNull(), NS_ERROR_NOT_AVAILABLE);
-    for (const char* name : {"imports", "books", "caches"}) {
+    for (const char* name : {"imports", "books", "caches", "serverSummaries"}) {
       JS::Rooted<JSObject*> array(cx);
       uint32_t length;
-      MOZ_TRY(StartupArray(cx, identity, name, &array, length));
+      MOZ_TRY(StartupArray(cx, identity, name, &array, length,
+                           strcmp(name, "serverSummaries") == 0));
       NS_ENSURE_TRUE(!length, NS_ERROR_NOT_AVAILABLE);
     }
     return NS_OK;
@@ -10933,6 +11203,62 @@ nsresult DatabaseCore::CheckProfileActivation(
   MOZ_TRY(ImportMember(cx, originalInventory, "sources", &expected));
   MOZ_TRY(StartupEqual(cx, expected, retainedInventory));
   nsTHashSet<nsCString> declaredPaths;
+  JS::Rooted<JSObject*> originalSummaries(cx), selectedSummaries(cx),
+      journalSummaries(cx);
+  uint32_t originalSummaryCount, selectedSummaryCount, journalSummaryCount;
+  MOZ_TRY(StartupArray(cx, originalInventory, "serverSummaries",
+                       &originalSummaries, originalSummaryCount, true));
+  MOZ_TRY(StartupArray(cx, identity, "serverSummaries", &selectedSummaries,
+                       selectedSummaryCount, true));
+  MOZ_TRY(StartupArray(cx, startup, "serverSummaries", &journalSummaries,
+                       journalSummaryCount, true));
+  expected.setObject(*selectedSummaries);
+  actual.setObject(*journalSummaries);
+  MOZ_TRY(StartupEqual(cx, expected, actual));
+  NS_ENSURE_TRUE(originalSummaryCount == selectedSummaryCount,
+                 NS_ERROR_NOT_AVAILABLE);
+  actual.setObject(*originalSummaries);
+  if (reusing) {
+    MOZ_TRY(StartupJSON(cx, actual, operation.retainedServerSummaries));
+  }
+  MOZ_TRY(StartupParse(cx, operation.retainedServerSummaries, &expected));
+  MOZ_TRY(StartupEqual(cx, expected, actual));
+  NS_ENSURE_TRUE(
+      reusing || originalSummaryCount == operation.serverSummaries.Length(),
+      NS_ERROR_NOT_AVAILABLE);
+  nsTHashSet<nsCString> summaryIds, summaryServers;
+  nsTHashSet<uint64_t> summaryRoots;
+  for (uint32_t i = 0; i < originalSummaryCount; ++i) {
+    JS::Rooted<JSObject*> original(cx), binding(cx);
+    MOZ_TRY(StartupItem(cx, originalSummaries, i, &original));
+    MOZ_TRY(StartupItem(cx, selectedSummaries, i, &binding));
+    StartupServerSummary summary;
+    MOZ_TRY(
+        StartupServerSummaryInput(cx, original, operation, summary, reusing));
+    nsCString id;
+    int64_t folder;
+    MOZ_TRY(StartupText(cx, binding, "sourceId", id));
+    MOZ_TRY(
+        StartupNumber(cx, binding, "folderId", 1, 9007199254740991LL, folder));
+    NS_ENSURE_TRUE(id == summary.id && !summaryIds.Contains(id) &&
+                       !summaryServers.Contains(summary.serverKey) &&
+                       !summaryRoots.Contains(folder) &&
+                       !declaredPaths.Contains(summary.path) &&
+                       !MOZ_TRY(mFolderDatabase->GetFolderParent(folder)) &&
+                       MOZ_TRY(mFolderDatabase->GetFolderName(folder)) ==
+                           summary.serverKey,
+                   NS_ERROR_NOT_AVAILABLE);
+    if (!reusing) {
+      NS_ENSURE_TRUE(
+          operation.serverSummaries[i].id == summary.id &&
+              operation.serverSummaries[i].folderId == uint64_t(folder),
+          NS_ERROR_NOT_AVAILABLE);
+    }
+    summaryIds.Insert(id);
+    summaryServers.Insert(summary.serverKey);
+    summaryRoots.Insert(folder);
+    declaredPaths.Insert(summary.path);
+  }
   nsTArray<nsCString> cacheStoreRoots;
   uint32_t count, importCount;
   MOZ_TRY(StartupArray(cx, journal, "sources", &sources, count));
@@ -10959,6 +11285,7 @@ nsresult DatabaseCore::CheckProfileActivation(
     MOZ_TRY(
         StartupNumber(cx, source, "destinationFolderId", 1, INT64_MAX, folder));
     native.folderId = folder;
+    NS_ENSURE_FALSE(declaredPaths.Contains(path), NS_ERROR_NOT_AVAILABLE);
     declaredPaths.Insert(path);
     native.databaseSourceId = current;
     bool planned = false;
@@ -11230,8 +11557,9 @@ nsresult DatabaseCore::CheckProfileActivation(
                                                      getter_AddRefs(folder)));
       NS_ENSURE_TRUE(folder, NS_ERROR_NOT_AVAILABLE);
       if (!m) anchor = folder;
-      uint32_t flags;
-      MOZ_TRY(folder->GetFlags(&flags));
+      // Reconstruct protocol intent from committed native metadata without
+      // opening a public message reader while startup is still closed.
+      uint32_t flags = MOZ_TRY(mFolderDatabase->GetFolderFlags(idNumber));
       JS::Rooted<JSObject*> entry(cx, JS_NewPlainObject(cx));
       NS_ENSURE_TRUE(
           entry &&

@@ -2028,3 +2028,83 @@ add_task(
     );
   }
 );
+
+add_task(
+  { skip_if: () => AppConstants.platform === "win" },
+  async function test_startupJournalRetainsSeparateServerSummary() {
+    const input = await startupJournalPlan();
+    const state = input.journal.state;
+    input.journal.close();
+    // This is unbound journal metadata. Only native startup may admit its bytes.
+    const root = PathUtils.join(
+      input.profilePath,
+      "ImapMail",
+      "server.invalid"
+    );
+    await IOUtils.makeDirectory(PathUtils.parent(root));
+    await IOUtils.makeDirectory(root);
+    const summary = {
+      id: "server-summary:ImapMail/server.invalid.msf",
+      role: "imap-server-root-summary",
+      path: root + ".msf",
+      serverKey: "server2",
+      serverRoot: root,
+      protocol: "imap",
+      storeType: "mbox",
+      storeContractID: "@mozilla.org/msgstore/berkeleystore;1",
+      sha256: "a".repeat(64),
+      size: 526,
+      messageKeys: [],
+    };
+    state.startup.inventory.serverSummaries = [summary];
+    await IOUtils.writeJSON(input.path, state);
+    const retained = await IOUtils.read(input.path);
+    const reopened = await MigrationJournal.open(input.path, input.profilePath);
+    registerCleanupFunction(() => reopened.close());
+    Assert.deepEqual(reopened.state.startup.inventory.serverSummaries, [
+      summary,
+    ]);
+    Assert.equal(reopened.state.startup.inventory.sources.length, 1);
+    Assert.deepEqual(
+      reopened.state.sources,
+      [],
+      "Root metadata invents no import"
+    );
+    Assert.strictEqual(reopened.state.startup.databaseSourceId, null);
+    Assert.deepEqual(await IOUtils.read(input.path), retained);
+    reopened.close();
+    for (const change of [
+      { serverSummaries: null },
+      { serverSummaries: [{ ...summary, role: "child-folder" }] },
+      { serverSummaries: [{ ...summary, storeType: "maildir" }] },
+      { serverSummaries: [{ ...summary, messageKeys: [42] }] },
+      {
+        serverSummaries: [
+          { ...summary, serverRoot: PathUtils.parent(input.profilePath) },
+        ],
+      },
+      {
+        serverSummaries: [
+          summary,
+          { ...summary, id: "duplicate-root", path: root + "-other.msf" },
+        ],
+      },
+    ]) {
+      const changed = structuredClone(state);
+      Object.assign(changed.startup.inventory, change);
+      await IOUtils.writeJSON(input.path, changed);
+      const before = await IOUtils.read(input.path);
+      await Assert.rejects(
+        MigrationJournal.open(input.path, input.profilePath),
+        /startup server-summary|retained startup server-summary/,
+        "Malformed or data-bearing root metadata stays explicit recovery"
+      );
+      Assert.deepEqual(await IOUtils.read(input.path), before);
+      Assert.ok(
+        !(await IOUtils.exists(
+          PathUtils.join(input.profilePath, "panorama.sqlite")
+        ))
+      );
+    }
+  }
+);

@@ -4532,7 +4532,42 @@ class DeliveryCoreReferences : public testing::Test {
         NS_ERROR_NOT_AVAILABLE,
         mCore->BeginProfileStartup(jsapi.cx(), getter_AddRefs(duplicate)));
     EXPECT_FALSE(duplicate);
-    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DatabaseCore::CheckAccountStartup());
+    EXPECT_EQ(NS_ERROR_FAILURE, DatabaseCore::CheckAccountStartup());
+    EXPECT_EQ(NS_ERROR_FAILURE, DatabaseCore::CheckAccountStartup(true));
+    EXPECT_TRUE(mCore->mShuttingDown);
+    EXPECT_EQ(NS_ERROR_FAILURE, mCore->mStartupFailure);
+    EXPECT_FALSE(Connection());
+    EXPECT_EQ(NS_ERROR_FAILURE, StartupContextCheck());
+  }
+
+  void CheckStartupServerSummaryRefusal(const char* mode,
+                                        const nsACString& summaries,
+                                        nsresult expected) {
+    ASSERT_EQ(NS_OK, ArmSelectedStartup());
+    nsCString selected;
+    ASSERT_EQ(NS_OK, DescribeStartup(selected));
+    dom::AutoJSAPI jsapi;
+    ASSERT_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()));
+    JSContext* cx = jsapi.cx();
+    nsCString request("{\"profilePath\":@PROFILE@,\"mode\":\"");
+    request.Append(mode);
+    request.AppendLiteral("\",\"serverSummaries\":");
+    request.Append(summaries);
+    request.Append('}');
+    JS::Rooted<JS::Value> plan(cx), output(cx, JS::Int32Value(91));
+    ASSERT_EQ(NS_OK, StartupDocument(cx, request, &plan));
+    EXPECT_EQ(expected, mCore->OpenProfileStartupTarget(
+                            mCore->ProfileStartupToken(), plan, cx, &output));
+    EXPECT_TRUE(output.isInt32() && output.toInt32() == 91);
+    if (jsapi.HasException()) jsapi.ClearException();
+    EXPECT_FALSE(Connection());
+    EXPECT_EQ(expected, DatabaseCore::CheckAccountStartup());
+    bool exists;
+    ASSERT_EQ(NS_OK, mFile->Exists(&exists));
+    EXPECT_FALSE(exists);
+    nsCOMPtr<nsIFile> locked;
+    ASSERT_EQ(NS_OK, mSelectedLock->GetDirectory(getter_AddRefs(locked)));
+    EXPECT_TRUE(locked);
   }
 
   static nsresult sStartupReentry;
@@ -24379,6 +24414,20 @@ TEST_F(DeliveryCoreReferences, StartupEmptyJSONRetainsOtherLegacyData) {
   bool exists;
   ASSERT_EQ(NS_OK, mFile->Exists(&exists));
   EXPECT_FALSE(exists);
+}
+
+TEST_F(DeliveryCoreReferences,
+       StartupEmptyInitializationRejectsUnboundServerSummary) {
+  CheckStartupServerSummaryRefusal("initialize", "[{}]"_ns,
+                                   NS_ERROR_NOT_AVAILABLE);
+}
+
+TEST_F(DeliveryCoreReferences, StartupLegacyModeRejectsUnboundServerSummary) {
+  CheckStartupServerSummaryRefusal("legacy", "[{}]"_ns, NS_ERROR_NOT_AVAILABLE);
+}
+
+TEST_F(DeliveryCoreReferences, StartupServerSummariesRequireArray) {
+  CheckStartupServerSummaryRefusal("initialize", "{}"_ns, NS_ERROR_INVALID_ARG);
 }
 
 TEST_F(DeliveryCoreReferences, StartupBeginPreservesSettledParserFailure) {

@@ -463,6 +463,7 @@ export async function prepareStartupMigrationProfile(
       imports: [],
       books: [],
       caches: [],
+      serverSummaries: [],
     });
     await IOUtils.writeJSON(
       PathUtils.join(profile.path, PROFILE_FILE),
@@ -519,6 +520,7 @@ export async function activateStartupMigrationProfile(
     imports: [],
     books: [],
     caches: [],
+    serverSummaries: [],
   };
   if (origin === "migrated") {
     if (!(journal instanceof MigrationJournal)) {
@@ -539,6 +541,9 @@ export async function activateStartupMigrationProfile(
     }
     identity.journalPath = record.identity.journalPath;
     identity.backup = structuredClone(state.backup);
+    identity.serverSummaries = structuredClone(
+      state.startup.serverSummaries ?? []
+    );
     identity.imports = state.sources.map(source => ({
       id: source.id,
       token: source.token,
@@ -661,6 +666,8 @@ function startupProfileRecord(profilePath, origin, identity) {
  */
 function validateStartupProfileRecord(record, profilePath) {
   const identity = record.identity;
+  const serverSummaries =
+    identity?.serverSummaries === undefined ? [] : identity.serverSummaries;
   const pending = record.state !== "active" && record.origin === "migrated";
   if (
     record.backend !== "panorama" ||
@@ -673,7 +680,9 @@ function validateStartupProfileRecord(record, profilePath) {
     !PathUtils.isAbsolute(profilePath) ||
     typeof record.application?.version !== "string" ||
     typeof record.application?.buildId !== "string" ||
-    ![identity.imports, identity.books, identity.caches].every(Array.isArray) ||
+    ![identity.imports, identity.books, identity.caches, serverSummaries].every(
+      Array.isArray
+    ) ||
     (!(
       pending &&
       identity.databaseSourceId === null &&
@@ -703,7 +712,8 @@ function validateStartupProfileRecord(record, profilePath) {
     identity.backup !== null ||
     identity.imports.length ||
     identity.books.length ||
-    identity.caches.length
+    identity.caches.length ||
+    serverSummaries.length
   ) {
     throw new Error("Native initialization must not invent migration receipts");
   }
@@ -731,6 +741,22 @@ function validateStartupProfileRecord(record, profilePath) {
     }
     ids.add(unit.id);
     tokens.add(unit.token);
+  }
+  const rootIds = new Set();
+  for (const binding of serverSummaries) {
+    if (
+      typeof binding.sourceId !== "string" ||
+      !binding.sourceId ||
+      ids.has(binding.sourceId) ||
+      !Number.isSafeInteger(binding.folderId) ||
+      binding.folderId <= 0 ||
+      rootIds.has(binding.folderId) ||
+      identity.imports.some(unit => unit.folderId === binding.folderId)
+    ) {
+      throw new Error("Invalid native profile server-root binding");
+    }
+    ids.add(binding.sourceId);
+    rootIds.add(binding.folderId);
   }
   return record;
 }

@@ -673,6 +673,14 @@ add_task(
       record => {
         record.identity.imports = [{ id: "fabricated" }];
       },
+      record => {
+        record.identity.serverSummaries = null;
+      },
+      record => {
+        record.identity.serverSummaries = [
+          { sourceId: "unbound-root", folderId: 1 },
+        ];
+      },
     ]) {
       const record = structuredClone(input.record);
       change(record);

@@ -719,7 +719,8 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.assertEqual(original, cache.read_bytes())
         self.assertEqual(obsolete_bytes, obsolete.read_bytes())
 
-    def test_migratesNativeImapUidAndCacheThenReuses(self):
+    def create_legacy_imap_source(self):
+        """Create genuine root and UID-bearing child summaries with legacy APIs."""
         self.clean_profile(False)
         source = self.marionette.execute_script("""
             const { MailServices } = ChromeUtils.importESModule(
@@ -757,16 +758,26 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             database.commit(Ci.nsMsgDBCommitType.kLargeCommit);
             Services.prefs.savePrefFile(null);
             return {serverKey: server.key, root: file.path,
+              rootSummary: server.rootFolder.summaryFile.path,
               summary: folder.summaryFile.path,
               flags: (database.dBFolderInfo.flags >>> 0).toString(16),
               folderName: folder.name, onlineName: imap.onlineName,
               hierDelim: imap.hierarchyDelimiter.charCodeAt(0).toString(16),
               boxFlags: '0'};
         """)
+        return source
+
+    def test_migratesNativeImapUidAndCacheThenReuses(self):
+        source = self.create_legacy_imap_source()
         self.assertTrue(Path(source["summary"]).is_relative_to(Path(source["root"])))
         self.stop_application()
         summary = Path(source["summary"])
         original = summary.read_bytes()
+        root_summary = Path(source["rootSummary"])
+        self.assertEqual(Path(source["root"] + ".msf"), root_summary)
+        self.assertTrue(root_summary.is_file())
+        self.assertFalse(root_summary.is_symlink())
+        root_original = root_summary.read_bytes()
         cache = self.write_legacy_cache([{"key": str(summary), **{
             name: source[name] for name in
             ["flags", "folderName", "onlineName", "hierDelim", "boxFlags"]}}])
@@ -776,6 +787,20 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.assertEqual("migrated", selected["record"]["origin"])
         self.assertEqual(1, len(selected["record"]["identity"]["imports"]))
         self.assertEqual(1, len(selected["record"]["identity"]["caches"]))
+        root_bindings = selected["record"]["identity"]["serverSummaries"]
+        self.assertEqual(1, len(root_bindings))
+        self.assertEqual("server-summary:" + root_summary.relative_to(self.profile).as_posix(),
+                         root_bindings[0]["sourceId"])
+        actual_root_id = self.marionette.execute_script("""
+            const { MailServices } = ChromeUtils.importESModule(
+              'resource:///modules/MailServices.sys.mjs');
+            return MailServices.accounts.getIncomingServer(arguments[0]).rootFolder.id;
+        """, script_args=[source["serverKey"]])
+        self.assertEqual(actual_root_id, root_bindings[0]["folderId"])
+        backup = Path(selected["record"]["identity"]["backup"]["path"])
+        archived_root = backup.parent / "root-0" / root_summary.relative_to(self.profile)
+        self.assertEqual(root_original, root_summary.read_bytes())
+        self.assertEqual(root_original, archived_root.read_bytes())
         def imported():
             return self.marionette.execute_script("""
                 const { MailServices } = ChromeUtils.importESModule(
@@ -794,12 +819,58 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.assertEqual("imap-retained", messages[0]["value"])
         self.assertEqual(original, summary.read_bytes())
         self.assertEqual(cache_bytes, cache.read_bytes())
+        self.assertEqual(root_original, root_summary.read_bytes())
+        self.assertEqual(root_original, archived_root.read_bytes())
         self.stop_application()
         self.start_same_profile(True)
-        self.assertEqual(selected["sourceId"], self.selection()["sourceId"])
+        repeated = self.selection()
+        self.assertEqual(selected["sourceId"], repeated["sourceId"])
+        self.assertEqual(root_bindings, repeated["record"]["identity"]["serverSummaries"])
         self.assertEqual(messages, imported())
         self.assertEqual(original, summary.read_bytes())
         self.assertEqual(cache_bytes, cache.read_bytes())
+        self.assertEqual(root_original, root_summary.read_bytes())
+        self.assertEqual(root_original, archived_root.read_bytes())
+
+        self.stop_application()
+        journal = Path(selected["record"]["identity"]["journalPath"])
+        original_journal = journal.read_bytes()
+        retained = json.loads(original_journal)
+        self.assertEqual(root_bindings, retained["startup"]["serverSummaries"])
+        retained["startup"]["serverSummaries"][0]["folderId"] += 1
+        journal.write_text(json.dumps(retained), encoding="utf-8")
+        self.assert_startup_refuses([
+            journal, self.profile / "panorama-profile.json", summary,
+            root_summary, cache, archived_root,
+        ])
+        journal.write_bytes(original_journal)
+        self.start_same_profile(True)
+        self.assertEqual(selected["sourceId"], self.selection()["sourceId"])
+        self.assertEqual(messages, imported())
+        self.assertEqual(root_original, root_summary.read_bytes())
+        self.assertEqual(original_journal, journal.read_bytes())
+
+    def test_nativeImapRootSummaryRefusesUnknownAndMessageData(self):
+        for case in ["message-data", "unknown-sibling"]:
+            source = self.create_legacy_imap_source()
+            self.stop_application()
+            summary = Path(source["summary"])
+            root_summary = Path(source["rootSummary"])
+            files = [summary, root_summary]
+            if case == "message-data":
+                # Use genuine original message-bearing Mork, not invented rows.
+                root_summary.write_bytes(summary.read_bytes())
+            else:
+                unknown = root_summary.with_name("unconfigured-root.msf")
+                unknown.write_bytes(root_summary.read_bytes())
+                files.append(unknown)
+            self.assert_startup_refuses(files, absent=[
+                self.profile / "panorama.sqlite",
+                self.profile / "panorama-profile.json",
+            ])
+            work = self.profile.parent / ("panorama-migration-" + self.profile.name)
+            if work.exists():
+                self.created_work.add(work)
 
     def test_invalidActiveJsonCacheNeverFallsBackToMork(self):
         for case in ["malformed", "array", "negativeFlags", "objectName"]:

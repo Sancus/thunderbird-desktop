@@ -59,7 +59,8 @@ export class MigrationJournal {
    * @param {string} path - Absolute journal path in a private work directory.
    * @param {{profilePath: string, backupPath: string, mailPaths: string[],
    *   sources: object[], books?: object[],
-   *   startupInventory?: {sources: object[], caches: object[]}}} plan - Mail sources retain version1
+   *   startupInventory?: {sources: object[], caches: object[],
+   *   serverSummaries?: object[]}}} plan - Mail sources retain version1
    *   fields. Books have id, path, sha256, size, cardKeys, listKeys and stagingPath.
    *   Each stage is a fresh .sqlite child of the private journal directory.
    *   Windows version4 requires original roots and each mail source.inventory (version2),
@@ -909,7 +910,8 @@ export class MigrationJournal {
    * @param {nsIDatabaseCore} core - Actual selected startup target.
    * @param {nsISupports} operation - Live native startup operation.
    * @param {{sourceId: string, folderId: number, folder: nsIMsgFolder}[]} bindings -
-   *   Actual native folder bindings for the complete retained inventory.
+   *   Actual native message-folder bindings. Native server-root IDs come from
+   *   the same validated operation and are retained separately in the journal.
    * @returns {Promise<void>} Durable native target binding before backup advance.
    * @throws {Error} For changed inventory, foreign folders or rebinding.
    */
@@ -923,6 +925,13 @@ export class MigrationJournal {
       !Array.isArray(bindings)
     ) {
       throw new Error("Startup journal requires the actual native target");
+    }
+    const serverBindings =
+      selected.serverSummaries === undefined ? [] : selected.serverSummaries;
+    if (!Array.isArray(serverBindings)) {
+      throw new Error(
+        "Startup target has invalid native server-summary bindings"
+      );
     }
     const folders = new Map();
     for (const binding of bindings) {
@@ -984,6 +993,26 @@ export class MigrationJournal {
           state: "pending",
           receipt: null,
         };
+      });
+      const summaries = state.startup.inventory.serverSummaries ?? [];
+      if (serverBindings.length !== summaries.length) {
+        throw new Error("Startup target omitted a native server-root binding");
+      }
+      const rootIds = new Set();
+      state.startup.serverSummaries = serverBindings.map((binding, index) => {
+        if (
+          binding.sourceId !== summaries[index].id ||
+          !Number.isSafeInteger(binding.folderId) ||
+          binding.folderId <= 0 ||
+          rootIds.has(binding.folderId) ||
+          state.sources.some(
+            source => source.destinationFolderId === binding.folderId
+          )
+        ) {
+          throw new Error("Invalid startup native server-root binding");
+        }
+        rootIds.add(binding.folderId);
+        return { sourceId: binding.sourceId, folderId: binding.folderId };
       });
       state.startup.bound = true;
       state.startup.databaseSourceId = selected.databaseSourceId;
@@ -1570,11 +1599,19 @@ export class MigrationJournal {
     ) {
       throw new Error("Invalid startup migration inventory");
     }
+    const serverSummaries =
+      startup.inventory.serverSummaries === undefined
+        ? []
+        : startup.inventory.serverSummaries;
+    if (!Array.isArray(serverSummaries)) {
+      throw new Error("Invalid startup server-summary inventory");
+    }
     const ids = new Set();
     const paths = new Set();
     for (const input of [
       ...startup.inventory.sources,
       ...startup.inventory.caches,
+      ...serverSummaries,
     ]) {
       if (
         typeof input.id !== "string" ||
@@ -1595,10 +1632,46 @@ export class MigrationJournal {
     for (const source of startup.inventory.sources) {
       validateStartupFolderOrigin(source, startup.inventory.caches);
     }
+    const servers = new Set();
+    for (const source of serverSummaries) {
+      if (
+        source.role !== "imap-server-root-summary" ||
+        source.protocol !== "imap" ||
+        source.size <= 0 ||
+        source.size >= 0xffffffff ||
+        typeof source.serverKey !== "string" ||
+        !source.serverKey ||
+        /[.\0]/.test(source.serverKey) ||
+        servers.has(source.serverKey) ||
+        !PathUtils.isAbsolute(source.serverRoot) ||
+        normalizedPath(source.serverRoot) !== source.serverRoot ||
+        !new FileUtils.File(state.profilePath).contains(
+          new FileUtils.File(source.serverRoot)
+        ) ||
+        source.path !== source.serverRoot + ".msf" ||
+        source.storeContractID !==
+          {
+            mbox: "@mozilla.org/msgstore/berkeleystore;1",
+            maildir: "@mozilla.org/msgstore/maildirstore;1",
+          }[source.storeType] ||
+        !["mbox", "maildir"].includes(source.storeType) ||
+        !Array.isArray(source.messageKeys) ||
+        source.messageKeys.length
+      ) {
+        throw new Error("Invalid retained startup server-summary origin");
+      }
+      servers.add(source.serverKey);
+    }
+    const serverBindings =
+      startup.serverSummaries === undefined ? [] : startup.serverSummaries;
+    if (!Array.isArray(serverBindings)) {
+      throw new Error("Invalid startup server-root binding array");
+    }
     if (!startup.bound) {
       if (
         state.stage !== "backup" ||
         state.sources.length ||
+        serverBindings.length ||
         startup.databaseSourceId !== null
       ) {
         throw new Error("Startup migration has no native target binding");
@@ -1608,9 +1681,25 @@ export class MigrationJournal {
     if (
       typeof startup.databaseSourceId !== "string" ||
       !startup.databaseSourceId ||
-      state.sources.length !== startup.inventory.sources.length
+      state.sources.length !== startup.inventory.sources.length ||
+      serverBindings.length !== serverSummaries.length
     ) {
       throw new Error("Startup migration lost its native incarnation");
+    }
+    const rootIds = new Set();
+    for (const [index, binding] of serverBindings.entries()) {
+      if (
+        binding.sourceId !== serverSummaries[index].id ||
+        !Number.isSafeInteger(binding.folderId) ||
+        binding.folderId <= 0 ||
+        rootIds.has(binding.folderId) ||
+        state.sources.some(
+          source => source.destinationFolderId === binding.folderId
+        )
+      ) {
+        throw new Error("Invalid retained startup native server-root binding");
+      }
+      rootIds.add(binding.folderId);
     }
     for (let index = 0; index < state.sources.length; index++) {
       const source = state.sources[index];

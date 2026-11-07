@@ -1099,3 +1099,86 @@ add_task(async function test_recoveryRescanPreservesEligibleSources() {
     "Upgrade cannot invent unobserved authorization history"
   );
 });
+
+add_task(async function test_exclusionDropsCanonicalText() {
+  const fixture = await createIndex("excluded-canonical-text");
+  let { index } = fixture;
+  const originals = ["full", "retained", "peer"].map(id =>
+    document(fixture.states, id, id + "exclusionneedle")
+  );
+  await apply(
+    index,
+    0,
+    3,
+    originals.map((source, i) => change(source.id, i + 1))
+  );
+  for (const job of await index.getPendingJobs()) {
+    Assert.ok(
+      await index.finishJob(job, originals.find(source => source.id === job.id))
+    );
+  }
+
+  fixture.states.get("retained").contentRevision = "metadata-2";
+  await apply(index, 3, 4, [change("retained", 4)]);
+  await processSearchIndexBatch(index, async () => ({
+    ...originals[1],
+    contentRevision: "metadata-2",
+    body: "",
+    bodyIndexed: false,
+  }));
+  await index.close();
+  let connection = Services.storage.openUnsharedDatabase(fixture.file);
+  let statement = connection.createStatement("SELECT COUNT(*) FROM retained_bodies");
+  try {
+    Assert.ok(statement.executeStep());
+    Assert.equal(statement.getInt64(0), 1, "The fixture retains the old body");
+  } finally {
+    statement.finalize();
+    connection.close();
+  }
+
+  index = await fixture.open();
+  for (const id of ["full", "retained"]) {
+    fixture.states.get(id).eligible = false;
+    fixture.states.get(id).policyRevision = 1;
+  }
+  await apply(index, 4, 6, [
+    change("full", 5, { policyRevision: 1, kind: "exclude" }),
+    change("retained", 6, { policyRevision: 1, kind: "exclude" }),
+  ]);
+  Assert.equal(await index.getText("full"), null);
+  Assert.equal(await index.getText("retained"), null);
+  await index.close();
+
+  connection = Services.storage.openUnsharedDatabase(fixture.file);
+  statement = connection.createStatement(
+    "SELECT " +
+      "(SELECT COUNT(*) FROM documents), " +
+      "(SELECT COUNT(*) FROM retained_bodies), " +
+      "(SELECT COUNT(*) FROM search_text), " +
+      "(SELECT COUNT(*) FROM document_versions WHERE kind='exclude'), " +
+      "(SELECT COUNT(*) FROM recovery_erased)"
+  );
+  try {
+    Assert.ok(statement.executeStep());
+    Assert.equal(statement.getInt64(0), 1, "Only the eligible peer keeps canonical text");
+    Assert.equal(statement.getInt64(1), 0, "Excluded retained bodies are removed");
+    Assert.equal(statement.getInt64(2), 1, "Only the eligible peer keeps FTS text");
+    Assert.equal(statement.getInt64(3), 2, "Both exclusions remain durable");
+    Assert.equal(statement.getInt64(4), 0, "Exclusion does not forge permanent erasure");
+  } finally {
+    statement.finalize();
+    connection.close();
+  }
+
+  index = await fixture.open();
+  await index.rebuild();
+  Assert.equal(await index.getText("full"), null);
+  Assert.equal(await index.getText("retained"), null);
+  Assert.deepEqual((await index.search("fullexclusionneedle")).items, []);
+  Assert.deepEqual((await index.search("retainedexclusionneedle")).items, []);
+  Assert.deepEqual(
+    (await index.search("peerexclusionneedle")).items.map(hit => hit.id),
+    ["peer"]
+  );
+});

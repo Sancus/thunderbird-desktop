@@ -835,6 +835,15 @@ export class PanoramaSearchIndex {
         { id: change.id, policyRevision: change.policyRevision }
       );
       await this.#erase(change.id, change.kind == "delete");
+      if (change.kind == "exclude") {
+        // Drop canonical text without changing immutable recovery provenance.
+        await this.#execute("DELETE FROM documents WHERE documentId=:id", {
+          id: change.id,
+        });
+        await this.#execute("DELETE FROM retained_bodies WHERE documentId=:id", {
+          id: change.id,
+        });
+      }
     }
     await this.#execute("DELETE FROM index_jobs WHERE documentId=:id", {
       id: change.id,

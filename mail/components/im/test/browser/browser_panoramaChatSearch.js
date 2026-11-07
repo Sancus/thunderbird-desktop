@@ -348,9 +348,13 @@ add_task(
     await IOUtils.remove(fixture.path);
     await IOUtils.makeDirectory(fixture.path);
     try {
+      // Windows reports opening a directory as access denied.
       await Assert.rejects(
         view.context.openChatSearchConversation(item),
-        error => /directory/i.test(error.message)
+        error =>
+          Services.appinfo.OS == "WINNT"
+            ? error.name == "NotAllowedError"
+            : /directory/i.test(error.message)
       );
       Assert.notEqual(nativeChatTabmail.currentTabInfo.mode.name, "chat");
     } finally {

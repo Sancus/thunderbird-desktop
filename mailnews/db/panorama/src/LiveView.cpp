@@ -433,8 +433,8 @@ static nsresult ReadBatchCapability(nsILiveViewListener* listener,
   if (!version.get() || !version.get()->isDataDescriptor() ||
       !version.get()->value().isNumber() ||
       (version.get()->value().toNumber() != 1 &&
-       version.get()->value().toNumber() != 0) || !generation.get() ||
-      !generation.get()->isDataDescriptor() ||
+       version.get()->value().toNumber() != 0) ||
+      !generation.get() || !generation.get()->isDataDescriptor() ||
       !generation.get()->value().isNumber() || !owner.get() ||
       !owner.get()->isDataDescriptor() || !owner.get()->value().isObject() ||
       !invalidator.get() || !invalidator.get()->isDataDescriptor() ||
@@ -931,8 +931,9 @@ nsresult LiveView::CaptureQueryView(const CapturedLiveView* context,
   RefPtr<CapturedLiveView> captured = new (fallible) CapturedLiveView();
   NS_ENSURE_TRUE(captured, NS_ERROR_OUT_OF_MEMORY);
   captured->listener = mListener;
-  captured->capability =
-      mBatchCapability && mBatchCapability->enabled ? mBatchCapability : nullptr;
+  captured->capability = mBatchCapability && mBatchCapability->enabled
+                             ? mBatchCapability
+                             : nullptr;
   captured->attachment = mAttachmentGeneration;
   captured->query = mQueryGeneration;
   captured->configuration = mConfigurationGeneration;
@@ -2314,8 +2315,7 @@ NS_IMETHODIMP LiveView::SetListener(nsILiveViewListener* aListener) {
     // Only enrollment changed on this exact listener. Preserve outstanding
     // query/display snapshots and public-status attachments across real chunks.
     mBatchCapability->enabled = capability->enabled;
-    if (mCountQuery &&
-        mCountQuery->viewGeneration == capability->generation &&
+    if (mCountQuery && mCountQuery->viewGeneration == capability->generation &&
         mCountQuery->configuration == mConfigurationGeneration) {
       mMappedQuery = mCountQuery;
     }

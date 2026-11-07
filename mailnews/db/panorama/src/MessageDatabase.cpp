@@ -3579,8 +3579,8 @@ nsresult MessageDatabase::PublishMessageInternal(
       }
     }
     if (!mConversationGroupingEnabled) {
-      MOZ_TRY(CaptureOrdinaryThreadPeers(cached.threadId, *notification,
-                                         captured));
+      MOZ_TRY(
+          CaptureOrdinaryThreadPeers(cached.threadId, *notification, captured));
     }
     {
       nsCOMPtr<mozIStorageStatement> stmt;
@@ -10130,8 +10130,9 @@ nsresult MessageDatabase::ApplyThreadWordRemap(
   return NS_OK;
 }
 
-// Ordinary publication retains the existing thread edges. Capture every physical
-// peer before the visible INSERT, even if a recipient filters that peer out.
+// Ordinary publication retains the existing thread edges. Capture every
+// physical peer before the visible INSERT, even if a recipient filters that
+// peer out.
 nsresult MessageDatabase::CaptureOrdinaryThreadPeers(
     nsMsgKey threadId, QueuedMessageBatch& notification,
     MessageThreadBatch& captured) {

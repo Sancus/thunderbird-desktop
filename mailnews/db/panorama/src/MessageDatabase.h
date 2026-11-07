@@ -1049,7 +1049,7 @@ class MessageDatabase : public nsIMessageDatabase {
                                       QueuedMessageBatch& notification,
                                       MessageThreadBatch& captured);
   nsresult PrepareOrdinaryPublication(QueuedMessageBatch& notification,
-                                       MessageThreadBatch& captured);
+                                      MessageThreadBatch& captured);
   // Consume a staged action only after the final published thread is known,
   // before any prepared delivery can observe its thread state.
   nsresult ConsumeProtoThreadFlagsInTransaction(nsMsgKey key, uint64_t folderId,

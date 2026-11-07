@@ -2351,7 +2351,11 @@ add_task(async function test_nativeOrdinaryFlatBatchPhysicalIdentity() {
   try {
     const old = [...f.adapter._rowMap];
     f.selection.rangedSelect(1, 1, false);
-    Assert.equal(f.selection.shiftSelectPivot, 1, "Establish a real physical pivot");
+    Assert.equal(
+      f.selection.shiftSelectPivot,
+      1,
+      "Establish a real physical pivot"
+    );
     const selected = old[1].message.id;
     const added = addMessage({
       folderId: folders[1],
@@ -2588,7 +2592,9 @@ add_task(
     let nested = false;
     early.setListener({
       onMessageAdded(message) {
-        if (nested) return;
+        if (nested) {
+          return;
+        }
         nested = true;
         messageDB.getMessage(message.id).orFlags(Ci.nsMsgMessageFlags.Marked);
         addMessage({ folderId: folders[1], messageId: "queued-next" });
@@ -2618,7 +2624,10 @@ add_task(
         f.adapter._rowMap.find(row => row.message.id == added).message.flags,
         Ci.nsMsgMessageFlags.Marked
       );
-      Assert.ok(BigInt(f.payloads[1].batchId) > BigInt(f.payloads[0].batchId));
+      Assert.greater(
+        BigInt(f.payloads[1].batchId),
+        BigInt(f.payloads[0].batchId)
+      );
       Assert.equal(f.events.filter(event => event[0] == "reset").length, 2);
       const count = f.payloads.length;
       f.view.clearListener();

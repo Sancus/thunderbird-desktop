@@ -678,13 +678,13 @@ add_task(
       change(record);
       await IOUtils.writeJSON(input.path, record);
       const before = await IOUtils.read(input.path);
-      await withApplication(activatingApplication, () =>
-        Assert.rejects(
+      await withApplication(activatingApplication, async () => {
+        await Assert.rejects(
           getMigrationProfileState(input.profilePath),
           /native profile|must not invent|committed-unit/,
           "An inconsistent backend/origin/identity cannot authorize startup"
-        )
-      );
+        );
+      });
       Assert.deepEqual(await IOUtils.read(input.path), before);
     }
   }
@@ -698,12 +698,12 @@ add_task(
       { version: "161.1.9", buildId: "20261101000000" },
       { version: "161.2.0", buildId: "20261028123455" },
     ]) {
-      await withApplication(application, () =>
-        Assert.rejects(
+      await withApplication(application, async () => {
+        await Assert.rejects(
           getMigrationProfileState(input.profilePath),
           /compatible application/
-        )
-      );
+        );
+      });
       Assert.deepEqual(
         await IOUtils.read(input.path),
         before,

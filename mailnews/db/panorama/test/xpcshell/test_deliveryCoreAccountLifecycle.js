@@ -554,6 +554,10 @@ add_task(function test_foreignSelectedContextCannotMutateOrCloseCore() {
   registerCleanupFunction(() =>
     MailServices.accounts.removeIncomingServer(server, false)
   );
-  Assert.ok(server.rootFolder.id > 0, "Ordinary native discovery still works");
+  Assert.greater(
+    server.rootFolder.id,
+    0,
+    "Ordinary native discovery still works"
+  );
   Assert.strictEqual(database.sourceId, sourceId);
 });

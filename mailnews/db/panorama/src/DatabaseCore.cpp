@@ -186,8 +186,7 @@ class ProfileStartupOperation final : public nsIAsyncShutdownBlocker {
   std::function<nsresult()> onShutdown;
 #ifndef XP_WIN
   int profileFD = -1, localFD = -1, databaseFD = -1;
-  struct stat profileIdentity {
-  }, localIdentity{}, databaseIdentity{};
+  struct stat profileIdentity{}, localIdentity{}, databaseIdentity{};
 #endif
 
  private:
@@ -338,8 +337,7 @@ nsresult DatabaseCore::CheckProfileStartup(nsISupports* token, bool metadata) {
                   NS_ERROR_NOT_AVAILABLE);
   NS_ENSURE_FALSE(operation.busy && !metadata, NS_ERROR_IN_PROGRESS);
 #ifndef XP_WIN
-  struct stat profile {
-  }, local{};
+  struct stat profile{}, local{};
   NS_ENSURE_TRUE(!lstat(operation.profilePath.get(), &profile) &&
                      !lstat(operation.localPath.get(), &local) &&
                      profile.st_dev == operation.profileIdentity.st_dev &&
@@ -351,7 +349,7 @@ nsresult DatabaseCore::CheckProfileStartup(nsISupports* token, bool metadata) {
 #endif
 #ifndef XP_WIN
   if (operation.databaseFD >= 0) {
-    struct stat database {};
+    struct stat database{};
     nsAutoCString path(operation.profilePath + "/panorama.sqlite"_ns);
     NS_ENSURE_TRUE(!lstat(path.get(), &database) && S_ISREG(database.st_mode) &&
                        database.st_dev == operation.databaseIdentity.st_dev &&

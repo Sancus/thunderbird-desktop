@@ -134,6 +134,20 @@ add_task(async function test_virtualFolderMigrationRetainsProperties() {
   }
   stmt.finalize();
 
+  // Cache migration records an internal native origin on each folder imported
+  // from the legacy profile; its value is covered by test_deliveryCoreCacheImport.
+  const origin = "panoramaCacheImportOrigin";
+  Assert.deepEqual(
+    rows.filter(row => row[1] == origin).map(row => row[0]),
+    [
+      folderDB.getFolderByPath("server1"),
+      folderDB.getFolderByPath("server1/foo"),
+      folderDB.getFolderByPath("server1/bar"),
+    ].toSorted((a, b) => a - b),
+    "Only the imported real folders carry a native cache origin"
+  );
+  rows = rows.filter(row => row[1] != origin);
+
   Assert.deepEqual(
     rows,
     [

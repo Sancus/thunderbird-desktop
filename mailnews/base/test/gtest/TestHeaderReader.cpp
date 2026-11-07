@@ -350,9 +350,10 @@ TEST(TestMsgHeaderReader, HeaderBlockMimeAttachment)
   RefPtr<RawTestHeaderBlock> headers = new RawTestHeaderBlock(raw);
   RawHdr wrapped = ParseHeaderBlock(headers);
   EXPECT_EQ(headers->calls, 1u);
-  EXPECT_EQ(wrapped.flags,
-            nsMsgMessageFlags::Attachment | nsMsgMessageFlags::Read |
-                nsMsgMessageFlags::Marked | nsMsgMessageFlags::HasRe);
+  EXPECT_EQ(wrapped.flags, static_cast<uint32_t>(nsMsgMessageFlags::Attachment |
+                                                 nsMsgMessageFlags::Read |
+                                                 nsMsgMessageFlags::Marked |
+                                                 nsMsgMessageFlags::HasRe));
   EXPECT_EQ(wrapped.flags, direct.flags);
   EXPECT_EQ(wrapped.subject, "Header block"_ns);
   EXPECT_EQ(wrapped.messageId, direct.messageId);

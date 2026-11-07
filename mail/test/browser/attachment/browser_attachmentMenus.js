@@ -21,6 +21,7 @@ var {
   get_about_message,
   open_message_from_file,
   select_click_row,
+  select_none,
 } = ChromeUtils.importESModule(
   "resource://testing-common/mail/FolderDisplayHelpers.sys.mjs"
 );
@@ -1015,6 +1016,8 @@ registerCleanupFunction(async function cleanupSelectedAttachmentFolders() {
     return;
   }
   await be_in_folder(folder);
+  // Release the displayed message before deleting its owned fixture folders.
+  await select_none();
   for (const selectedFolder of s376MenuFolders) {
     selectedFolder.deleteSelf(null);
   }

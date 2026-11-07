@@ -25,6 +25,7 @@ tags = ["panorama"]
 support-files = ["../../../../../mail/components/addrbook/test/browser/data/import.mab"]
 
 ["test_MigrationCoordinator.js"]
+requesttimeoutfactor = 2 # About 30s on Windows opt, at the default limit.
 
 ["test_MigrationFileSystemWindows.js"]
 

@@ -863,7 +863,16 @@ add_task(async function test_subscriptionNewsrcPersistsAcrossReopen() {
     server,
     "The account manager reconstructed the server"
   );
-  Assert.equal(reopened.newsrcFilePath.path, path);
+  // A reload may resolve a symlinked temporary directory (macOS /var).
+  const canonical = file => {
+    const clone = file.clone();
+    clone.normalize();
+    return clone.path;
+  };
+  Assert.equal(
+    canonical(reopened.newsrcFilePath),
+    canonical(new FileUtils.File(path))
+  );
   const reopenedGroups = reopened.rootFolder.subFolders;
   Assert.deepEqual(
     reopenedGroups.map(folder => folder.name),

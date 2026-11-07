@@ -508,6 +508,58 @@ add_task(function test_stageFactoryRequiresAnExistingParent() {
 });
 
 add_task(
+  { skip_if: () => AppConstants.platform == "win" },
+  function test_migrationPathLinksOnlyAcceptProfileAncestors() {
+    const profile = do_get_profile().clone();
+    profile.normalize();
+    const link = (target, path) => {
+      const process = Cc["@mozilla.org/process/util;1"].createInstance(
+        Ci.nsIProcess
+      );
+      const ln = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+      ln.initWithPath("/bin/ln");
+      process.init(ln);
+      const args = ["-s", target, path];
+      process.run(true, args, args.length);
+      Assert.equal(process.exitValue, 0);
+      const file = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+      file.initWithPath(path);
+      Assert.ok(file.isSymlink());
+      return file;
+    };
+    const check = file =>
+      SQLiteDirectory.checkMigrationPathLinks(file, "Refused migration link");
+    const refused = error => error.message == "Refused migration link";
+
+    // A system link outside the profile to one of its ancestors, like /var.
+    const ancestor = link(
+      profile.parent.path,
+      PathUtils.join(PathUtils.tempDir, "ancestor-alias-" + ++serial)
+    );
+    const throughAncestor = ancestor.clone();
+    throughAncestor.append(profile.leafName);
+    check(throughAncestor);
+    check(profile);
+
+    // A link inside the profile is refused even when it resolves to an
+    // ancestor of the profile.
+    const inside = profile.clone();
+    inside.append("inside-alias-" + ++serial);
+    Assert.throws(() => check(link("/", inside.path)), refused);
+
+    // An outside link that does not resolve to a profile ancestor is refused.
+    const elsewhere = Services.dirsvc.get("TmpD", Ci.nsIFile);
+    elsewhere.append("unrelated-" + ++serial);
+    elsewhere.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+    const unrelated = link(
+      elsewhere.path,
+      PathUtils.join(PathUtils.tempDir, "unrelated-alias-" + serial)
+    );
+    Assert.throws(() => check(unrelated), refused);
+  }
+);
+
+add_task(
   { skip_if: () => AppConstants.platform != "win" },
   async function test_windowsReceiptRetainsPhysicalStageAcrossReopen() {
     const input = await emptyStage();

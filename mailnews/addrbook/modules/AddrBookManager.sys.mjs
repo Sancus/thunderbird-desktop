@@ -239,11 +239,10 @@ let migrationAdoption = null;
  */
 function migrationBookFile(file) {
   const result = file.QueryInterface(Ci.nsIFile).clone();
-  for (let entry = result; entry; entry = entry.parent) {
-    if (entry.isSymlink()) {
-      throw new Error("Migration book path contains a link");
-    }
-  }
+  lazy.SQLiteDirectory.checkMigrationPathLinks(
+    result,
+    "Migration book path contains a link"
+  );
   result.normalize();
   return result;
 }

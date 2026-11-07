@@ -416,6 +416,7 @@ add_task(async function test_query() {
   extension.sendMessage(account.key);
   await extension.awaitFinish("finished");
   await extension.unload();
+  cleanUpAccount(account);
 });
 
 add_task(async function test_queryWithoutGlobalIndex() {

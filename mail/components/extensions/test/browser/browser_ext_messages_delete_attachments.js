@@ -8,7 +8,7 @@ add_setup(async () => {
   // Create IMAP server which supports UIDPLUS, which is needed to be notified
   // of finished message upload to update the message key (for example when
   // deleting attachments).
-  const account = createAccount("imap", { extensions: ["RFC4315"] });
+  const account = await createAccount("imap", { extensions: ["RFC4315"] });
   const inbox = account.incomingServer.rootFolder.subFolders[0];
   const testFolder = await createSubfolder(inbox, "testFolder");
 

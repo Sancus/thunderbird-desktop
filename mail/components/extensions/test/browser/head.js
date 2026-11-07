@@ -185,9 +185,15 @@ async function check3PaneState(folderPaneOpen = null, messagePaneOpen = null) {
 }
 
 var gIMAPServers = new Map();
+/** Runs a fake IMAP server with selected protocol extensions. */
 class IMAPServer {
+  /**
+   * @param {{extensions?: string[], username?: string}} [options={}] -
+   *   Protocol extensions and login name. The default login name is "user".
+   */
   constructor(options = {}) {
     this.extensions = options?.extensions ?? [];
+    this.username = options?.username ?? "user";
   }
 
   open() {
@@ -203,7 +209,9 @@ class IMAPServer {
     this.ImapMessage = ImapMessage;
     this.daemon = new ImapDaemon();
     this.server = new nsMailServer(daemon => {
-      const handler = new IMAP_RFC3501_handler(daemon);
+      const handler = new IMAP_RFC3501_handler(daemon, {
+        username: this.username,
+      });
       for (const ext of this.extensions) {
         mixinExtension(handler, ImapD[`IMAP_${ext}_extension`]);
       }
@@ -245,6 +253,14 @@ class IMAPServer {
   }
 }
 
+/**
+ * Creates an account and discovers IMAP folders before publishing the account.
+ *
+ * @param {string} [type="none"] - Incoming server type.
+ * @param {{extensions?: string[]}} [options={}] - Fake IMAP extensions.
+ * @returns {nsIMsgAccount|Promise<nsIMsgAccount>} A promise for IMAP accounts;
+ *   other account types return synchronously. IMAP discovery errors reject.
+ */
 function createAccount(type = "none", options = {}) {
   let account;
 
@@ -260,14 +276,29 @@ function createAccount(type = "none", options = {}) {
   }
 
   if (type == "imap") {
-    const server = new IMAPServer(options);
+    const server = new IMAPServer({
+      ...options,
+      username: account.incomingServer.username,
+    });
     server.open();
     account.incomingServer.port = server.port;
-    account.incomingServer.username = "user";
     account.incomingServer.password = "password";
-    const inbox = account.incomingServer.rootFolder.getChildNamed("INBOX");
-    inbox.QueryInterface(Ci.nsIMsgImapMailFolder).hierarchyDelimiter = "/";
-    gIMAPServers.set(account.incomingServer.key, server);
+    const listener = new MailPromiseTestUtils.PromiseUrlListener();
+    MailServices.imap.discoverAllFolders(
+      account.incomingServer.rootFolder,
+      listener,
+      null
+    );
+    return listener.promise.then(() => {
+      const inbox = account.incomingServer.rootFolder.getChildNamed("INBOX");
+      if (!inbox) {
+        throw new Error("IMAP discovery completed without an Inbox");
+      }
+      inbox.QueryInterface(Ci.nsIMsgImapMailFolder).hierarchyDelimiter = "/";
+      gIMAPServers.set(account.incomingServer.key, server);
+      info(`Created account ${account.toString()}`);
+      return account;
+    });
   }
 
   info(`Created account ${account.toString()}`);

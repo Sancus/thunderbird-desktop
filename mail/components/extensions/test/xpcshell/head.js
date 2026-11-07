@@ -52,6 +52,13 @@ function formatVCard(strings, ...values) {
   return outLines.join("");
 }
 
+/**
+ * Creates an account and awaits protocol setup before returning it.
+ *
+ * @param {string} [type="none"] - Incoming server type.
+ * @param {{extensions?: string[]}} [options={}] - Fake IMAP extensions.
+ * @returns {Promise<nsIMsgAccount>} The account after successful setup.
+ */
 async function createAccount(type = "none", options = {}) {
   if (type == "local") {
     const localAccount = MailServices.accounts.createLocalMailAccount();
@@ -72,12 +79,24 @@ async function createAccount(type = "none", options = {}) {
   }
 
   if (type == "imap") {
-    const imapServer = new IMAPServer(options);
+    const imapServer = new IMAPServer({
+      ...options,
+      username: account.incomingServer.username,
+    });
     imapServer.open();
     account.incomingServer.port = imapServer.port;
-    account.incomingServer.username = "user";
     account.incomingServer.password = "password";
+    const listener = new MailPromiseTestUtils.PromiseUrlListener();
+    MailServices.imap.discoverAllFolders(
+      account.incomingServer.rootFolder,
+      listener,
+      null
+    );
+    await listener.promise;
     const inbox = account.incomingServer.rootFolder.getChildNamed("INBOX");
+    if (!inbox) {
+      throw new Error("IMAP discovery completed without an Inbox");
+    }
     inbox.QueryInterface(Ci.nsIMsgImapMailFolder).hierarchyDelimiter = "/";
     gIMAPServers.set(account.incomingServer.key, imapServer);
     info(`Created IMAP account ${account.toString()}`);
@@ -234,9 +253,15 @@ async function getUtilsJS() {
 }
 
 var gIMAPServers = new Map();
+/** Runs a fake IMAP server with selected protocol extensions. */
 class IMAPServer {
+  /**
+   * @param {{extensions?: string[], username?: string}} [options={}] -
+   *   Protocol extensions and login name. The default login name is "user".
+   */
   constructor(options = {}) {
     this.extensions = options?.extensions ?? [];
+    this.username = options?.username ?? "user";
   }
 
   open() {
@@ -249,7 +274,9 @@ class IMAPServer {
     this.ImapMessage = ImapMessage;
     this.daemon = new ImapDaemon();
     this.server = new nsMailServer(daemon => {
-      const handler = new IMAP_RFC3501_handler(daemon);
+      const handler = new IMAP_RFC3501_handler(daemon, {
+        username: this.username,
+      });
       for (const ext of this.extensions) {
         mixinExtension(handler, ImapD[`IMAP_${ext}_extension`]);
       }

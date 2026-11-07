@@ -1069,7 +1069,10 @@ add_task(
     reconciledInput = await plannedCache(2, reconciledBindings);
     const cache = reconciledInput.journal.state.caches[0];
     Assert.equal(cache.id, "panacea-v2");
-    Assert.equal(cache.path, reconciledSource);
+    // The recorded input is canonical; macOS temporary profiles sit below /var.
+    const expected = new FileUtils.File(reconciledSource);
+    expected.normalize();
+    Assert.equal(cache.path, expected.path);
     Assert.notEqual(cache.path, source);
     Assert.deepEqual(
       await IOUtils.read(cache.path),

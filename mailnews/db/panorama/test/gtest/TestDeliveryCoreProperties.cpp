@@ -346,6 +346,11 @@ class DeliveryCoreProperties : public testing::Test {
     }
     MOZ_TRY(connection->ExecuteSimpleSQL(
         "DROP TRIGGER body_relocation_folder_delete; DROP TABLE body_relocation_rows; DROP TABLE body_relocations"_ns));
+    // Versions 20 and 21 add the IMAP import tables and their hold trigger.
+    MOZ_TRY(connection->ExecuteSimpleSQL(
+        "DROP TRIGGER delete_imap_import_hold;"
+        "DROP TABLE imap_import_operation_holds;"
+        "DROP TABLE imap_import_operations; DROP TABLE imap_import_units;"_ns));
     MOZ_TRY(connection->ExecuteSimpleSQL(
         "DROP TRIGGER delete_offline_copies;"
         "DROP TABLE offline_copy_destinations; DROP TABLE offline_attempts;"

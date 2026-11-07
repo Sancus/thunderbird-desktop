@@ -198,6 +198,18 @@ function displayMessage(uri, viewWrapper) {
     gViewWrapper = null;
   }
 
+  if (uri) {
+    try {
+      gMessage =
+        MailServices.messageServiceFromURI(uri).messageURIToMsgHdr(uri);
+    } catch (error) {
+      // A reopened tab may refer to a message that has since been removed.
+      console.warn("Unable to reopen message", error);
+    }
+    if (!gMessage) {
+      uri = null;
+    }
+  }
   gMessageURI = uri;
   ClearCurrentHeaders();
 
@@ -212,7 +224,6 @@ function displayMessage(uri, viewWrapper) {
   }
 
   const messageService = MailServices.messageServiceFromURI(uri);
-  gMessage = messageService.messageURIToMsgHdr(uri);
   gFolder = gMessage.folder;
   initFolderDBListener();
 
@@ -595,10 +606,48 @@ var messageHistory = {
     if (this._currentIndex == targetIndex && gMessage) {
       return null;
     }
+    const entry = this._history[targetIndex];
+    if (!this.getHeaderForEntry(entry)) {
+      if (targetIndex >= 0) {
+        this._history.splice(targetIndex, 1);
+        if (targetIndex <= this._currentIndex) {
+          --this._currentIndex;
+        }
+      }
+      window.top.goUpdateCommand("cmd_goBack");
+      window.top.goUpdateCommand("cmd_goForward");
+      return null;
+    }
     this._currentIndex = targetIndex;
     window.top.goUpdateCommand("cmd_goBack");
     window.top.goUpdateCommand("cmd_goForward");
     return this._history[targetIndex];
+  },
+  /**
+   * Resolve an entry only while its message still belongs to the saved folder.
+   *
+   * @param {?MessageHistoryEntry} entry - The saved message and folder URIs.
+   * @returns {?nsIMsgDBHdr} The current physical header, or null for an absent,
+   *   moved, deleted, or mismatched entry.
+   */
+  getHeaderForEntry(entry) {
+    if (!entry?.messageURI || !entry.folderURI) {
+      return null;
+    }
+    try {
+      const header = MailServices.messageServiceFromURI(
+        entry.messageURI
+      ).messageURIToMsgHdr(entry.messageURI);
+      if (
+        header?.folder?.URI !== entry.folderURI ||
+        !header.folder.msgDatabase.containsKey(header.messageKey)
+      ) {
+        return null;
+      }
+      return header;
+    } catch {
+      return null;
+    }
   },
   /**
    * Get the current state of the message history.

@@ -13,6 +13,12 @@ const { MessageArchiver } = ChromeUtils.importESModule(
   "resource:///modules/MessageArchiver.sys.mjs"
 );
 
+const { PromiseTestUtils } = ChromeUtils.importESModule(
+  "resource://testing-common/mailnews/PromiseTestUtils.sys.mjs"
+);
+const { IMAP_RFC3501_handler } = ChromeUtils.importESModule(
+  "resource://testing-common/mailnews/Imapd.sys.mjs"
+);
 const { MessageGenerator } = ChromeUtils.importESModule(
   "resource://testing-common/mailnews/MessageGenerator.sys.mjs"
 );
@@ -22,6 +28,21 @@ const { ServerTestUtils } = ChromeUtils.importESModule(
 const { TestUtils } = ChromeUtils.importESModule(
   "resource://testing-common/TestUtils.sys.mjs"
 );
+
+add_setup(function setupArchiveBackend() {
+  const contract = Services.prefs.getCharPref(
+    "mail.serverDefaultStoreContractID"
+  );
+  Services.prefs.setCharPref("mail.server.default.storeContractID", contract);
+  const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIMsgDBService
+  );
+  Assert.equal(
+    "nsIDatabaseCore" in Ci && service instanceof Ci.nsIDatabaseCore,
+    Services.prefs.getBoolPref("mail.panorama.enabled", false),
+    "The archive uses the requested actual database backend"
+  );
+});
 
 const generator = new MessageGenerator();
 const synMessage1 = generator.makeMessage({
@@ -57,11 +78,15 @@ add_task(async function testImap() {
   const imapServer = await ServerTestUtils.createServer(
     ServerTestUtils.serverDefs.imap.plain
   );
-  imapServer.daemon.createMailbox("sourceFolder1", { subscribed: true });
+  imapServer.daemon.createMailbox("sourceFolder1", {
+    subscribed: true,
+    uidvalidity: 8101,
+  });
   // We have to already have an archives folder, or the local folders will be used.
   imapServer.daemon.createMailbox("Archives", {
     flags: ["\\Archive"],
     subscribed: true,
+    uidvalidity: 8102,
   });
 
   const account = MailServices.accounts.createAccount();
@@ -81,10 +106,25 @@ add_task(async function testImap() {
     rootFolder.subFolders.find(folder => folder.name == "sourceFolder1")
   );
   account.incomingServer.subscribeToFolder("sourceFolder1", true);
+  const archivesFolder = await TestUtils.waitForCondition(() =>
+    rootFolder.subFolders.find(folder => folder.name == "Archives")
+  );
+  await imapServer.addMessages(archivesFolder, [], true);
+  Assert.equal(
+    archivesFolder.msgDatabase.dBFolderInfo.imapUidValidity,
+    8102,
+    "SELECT records the archive mailbox epoch"
+  );
   await imapServer.addMessages(
     sourceFolder1,
     [synMessage1, synMessage2, synMessage3],
     true
+  );
+
+  Assert.equal(
+    sourceFolder1.msgDatabase.dBFolderInfo.imapUidValidity,
+    8101,
+    "SELECT records the source mailbox epoch"
   );
 
   await subtest(account);
@@ -94,7 +134,9 @@ add_task(async function testImap() {
 async function subtest(account) {
   const rootFolder = account.incomingServer.rootFolder;
   const sourceFolder1 = rootFolder.getChildNamed("sourceFolder1");
-  const [message1, message2, message3] = [...sourceFolder1.messages];
+  const headers = [...sourceFolder1.messages];
+  Assert.equal(headers.length, 3, "The source contains all three real headers");
+  const [message1, message2, message3] = headers;
 
   account.defaultIdentity.archiveGranularity =
     Ci.nsIMsgIdentity.perYearArchiveFolders;
@@ -102,7 +144,7 @@ async function subtest(account) {
   let deferred = Promise.withResolvers();
   let archiver = new MessageArchiver();
   archiver.oncomplete = deferred.resolve;
-  archiver.archiveMessages([message1]);
+  await archiver.archiveMessages([message1]);
   await deferred.promise;
   Assert.equal(sourceFolder1.getTotalMessages(false), 2);
 
@@ -121,7 +163,7 @@ async function subtest(account) {
   deferred = Promise.withResolvers();
   archiver = new MessageArchiver();
   archiver.oncomplete = deferred.resolve;
-  archiver.archiveMessages([message2, message3]);
+  await archiver.archiveMessages([message2, message3]);
   await deferred.promise;
   Assert.equal(sourceFolder1.getTotalMessages(false), 0);
 
@@ -170,7 +212,7 @@ async function subtestInboxStructure(account, imapServer) {
   const deferred = Promise.withResolvers();
   const archiver = new MessageArchiver();
   archiver.oncomplete = deferred.resolve;
-  archiver.archiveMessages([...inboxFolder.messages]);
+  await archiver.archiveMessages([...inboxFolder.messages]);
   await deferred.promise;
 
   const archivesFolder = rootFolder.getChildNamed("Archives");
@@ -337,4 +379,166 @@ add_task(async function testStartupFailureAllowsNextArchive() {
   await completed.promise;
   Assert.equal(completions, 1);
   Assert.equal(source.getTotalMessages(false), 0);
+});
+
+/**
+ * Create a real IMAP account with a selected physical mailbox for archiving.
+ *
+ * @param {string} username - Unique account and fake-server login.
+ * @param {string} mailbox - Existing mailbox to SELECT.
+ * @param {number} epoch - Positive mailbox UIDVALIDITY.
+ * @returns {Promise<{account: nsIMsgAccount, folder: nsIMsgFolder,
+ *   server: import("resource://testing-common/mailnews/IMAPServer.sys.mjs").IMAPServer}>} The account, selected folder and real test server.
+ */
+async function createArchiveAccount(username, mailbox, epoch) {
+  const server = await ServerTestUtils.createServer({
+    type: "imap",
+    options: { username },
+  });
+  server.daemon.createMailbox(mailbox, {
+    subscribed: true,
+    uidvalidity: epoch,
+    flags: mailbox == "Archives" ? ["\\Archive"] : [],
+  });
+  const account = MailServices.accounts.createAccount();
+  const incoming = MailServices.accounts.createIncomingServer(
+    username,
+    "localhost",
+    "imap"
+  );
+  incoming.port = server.port;
+  incoming.password = "password";
+  account.incomingServer = incoming;
+  const identity = MailServices.accounts.createIdentity();
+  identity.email = `${username}@example.invalid`;
+  account.addIdentity(identity);
+  registerCleanupFunction(() => {
+    incoming.shutdown();
+    MailServices.accounts.removeAccount(account, false);
+  });
+  const contract = Services.prefs.getCharPref(
+    "mail.serverDefaultStoreContractID"
+  );
+  Assert.equal(incoming.getStringValue("storeContractID"), contract);
+  const root = incoming.rootFolder;
+  const discovered = new PromiseTestUtils.PromiseUrlListener();
+  MailServices.imap.discoverAllFolders(root, discovered, null);
+  await discovered.promise;
+  const folder = root.getChildNamed(mailbox);
+  await server.addMessages(folder, [], true);
+  Assert.equal(folder.msgDatabase.dBFolderInfo.imapUidValidity, epoch);
+  return { account, folder, server };
+}
+
+add_task(async function testCrossServerArchiveFailureAndRetry() {
+  const proto = IMAP_RFC3501_handler.prototype;
+  const originalAppend = proto.APPEND;
+  const originalCreate = proto.CREATE;
+  let targetDaemon;
+  let rejectedCommand;
+  let refusals = 0;
+  proto.APPEND = function (args) {
+    if (this._daemon == targetDaemon && rejectedCommand == "APPEND") {
+      refusals++;
+      return "NO refused archive APPEND";
+    }
+    return originalAppend.call(this, args);
+  };
+  proto.CREATE = function (args) {
+    if (this._daemon == targetDaemon && rejectedCommand == "CREATE") {
+      refusals++;
+      return "NO refused archive CREATE";
+    }
+    return originalCreate.call(this, args);
+  };
+  registerCleanupFunction(() => {
+    proto.APPEND = originalAppend;
+    proto.CREATE = originalCreate;
+  });
+  const source = await createArchiveAccount("archiveSource", "source", 7301);
+  const destination = await createArchiveAccount(
+    "archiveDestination",
+    "Archives",
+    8401
+  );
+  targetDaemon = destination.server.daemon;
+  const identity = source.account.defaultIdentity;
+  identity.archiveFolder = destination.folder.URI;
+  identity.archiveEnabled = true;
+  const messages = [2030, 2031].map(year =>
+    generator.makeMessage({
+      date: new Date(year, 0, 1),
+      to: [["Archive source", identity.email]],
+      body: {
+        body: `<body bgcolor="#ffffff">${"line%25? #ffffff ".repeat(1400)}</body>\r\n`,
+      },
+    })
+  );
+  await source.server.addMessages(source.folder, messages, true);
+  const headers = [...source.folder.messages];
+  Assert.equal(headers.length, 2, "Two actual source headers exist");
+  for (const [index, command] of ["APPEND", "CREATE"].entries()) {
+    const header = headers[index];
+    const key = header.messageKey;
+    const messageId = header.messageId;
+    const sourceURI = source.folder.getUriForMsg(header);
+    identity.archiveGranularity =
+      command == "CREATE"
+        ? Ci.nsIMsgIdentity.perYearArchiveFolders
+        : Ci.nsIMsgIdentity.singleArchiveFolder;
+    rejectedCommand = command;
+    let completions = 0;
+    let done = Promise.withResolvers();
+    let archiver = new MessageArchiver();
+    archiver.oncomplete = status => {
+      completions++;
+      done.resolve(status);
+    };
+    await archiver.archiveMessages([header]);
+    const status = await done.promise;
+    Assert.ok(
+      !Components.isSuccessCode(status),
+      "The real protocol refusal is returned"
+    );
+    Assert.equal(completions, 1, "A failed archive completes once");
+    Assert.equal(refusals, index + 1, "The intended wire command was refused");
+    Assert.equal(source.folder.getTotalMessages(false), 2 - index);
+    Assert.equal(source.folder.GetMessageHeader(key).messageId, messageId);
+    Assert.equal(
+      source.folder.getUriForMsg(source.folder.GetMessageHeader(key)),
+      sourceURI
+    );
+    Assert.equal(destination.folder.getTotalMessages(true), index);
+    rejectedCommand = null;
+    done = Promise.withResolvers();
+    archiver = new MessageArchiver();
+    archiver.oncomplete = result => {
+      completions++;
+      done.resolve(result);
+    };
+    await archiver.archiveMessages([source.folder.GetMessageHeader(key)]);
+    Assert.ok(
+      Components.isSuccessCode(await done.promise),
+      "A fresh real retry succeeds"
+    );
+    Assert.equal(completions, 2, "The retry completes once");
+    Assert.equal(source.folder.getTotalMessages(false), 1 - index);
+    const target =
+      command == "CREATE"
+        ? destination.folder.getChildNamed("2031")
+        : destination.folder;
+    const archived = [...target.messages];
+    Assert.equal(archived.length, 1);
+    Assert.equal(archived[0].messageId, messageId);
+    Assert.equal(archived[0].folder.URI, target.URI);
+    const remote = targetDaemon.getMailbox(
+      command == "CREATE" ? "Archives/2031" : "Archives"
+    );
+    Assert.equal(remote._messages.length, 1);
+    Assert.equal(
+      remote._messages[0].getText(),
+      messages[index].toMessageString(),
+      "The complete archived bytes, including long #/% lines, survive APPEND and readback"
+    );
+  }
 });

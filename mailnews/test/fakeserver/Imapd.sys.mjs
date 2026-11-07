@@ -767,7 +767,8 @@ function formatArg(argument, spec) {
 // KNOWN DEVIATIONS FROM RFC 3501:
 // + The autologout timer is 3 minutes, not 30 minutes. A test with a logout
 //   of 30 minutes would take a very long time if it failed.
-// + SEARCH (except for UNDELETED) is not supported, nor is all of FETCH.
+// + SEARCH supports only UNDELETED, optionally with one HEADER criterion;
+//   not all of FETCH is supported.
 //   STARTTLS is only supported if the handler's supportsStartTLS is set and
 //   the server has a startTLSCert.
 // + Concurrent mailbox access is probably compliant with a rather liberal
@@ -1454,8 +1455,10 @@ export class IMAP_RFC3501_handler {
       date = Date.now();
       text = args[1];
     }
+    // Keep the literal bytes exactly: encodeURI leaves "#", which a data URI
+    // treats as a fragment and so truncates the stored message.
     var msg = new ImapMessage(
-      "data:text/plain," + encodeURI(text),
+      "data:text/plain;base64," + btoa(text),
       mailbox.uidnext++,
       flags
     );
@@ -1483,10 +1486,27 @@ export class IMAP_RFC3501_handler {
   }
   SEARCH(args) {
     if (args[0] == "UNDELETED") {
+      // RFC 3501 HEADER matches a case-insensitive substring of the field.
+      // Other criteria remain unsupported and still match every message.
+      const header = args.length == 4 && args[1].toUpperCase() == "HEADER";
+      const matches = message => {
+        if (!header) {
+          return true;
+        }
+        const headers = message.getPartHeaders("");
+        const name = args[2].toLowerCase();
+        const value = args[3].toLowerCase();
+        return (
+          headers.has(name) &&
+          headers
+            .getRawHeader(name)
+            .some(field => field.toLowerCase().includes(value))
+        );
+      };
       let response = "* SEARCH";
       const messages = this._selectedMailbox._messages;
       for (let i = 0; i < messages.length; i++) {
-        if (!messages[i].flags.includes("\\Deleted")) {
+        if (!messages[i].flags.includes("\\Deleted") && matches(messages[i])) {
           response += " " + messages[i].uid;
         }
       }

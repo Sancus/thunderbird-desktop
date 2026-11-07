@@ -921,19 +921,13 @@ var commandController = {
       } else if (noCurrentMessage) {
         relativePosition = 0;
       }
-      const newMessageURI = messageHistory.pop(relativePosition)?.messageURI;
-      if (!newMessageURI) {
-        return;
-      }
-      const msgHdr =
-        MailServices.messageServiceFromURI(newMessageURI).messageURIToMsgHdr(
-          newMessageURI
-        );
+      const entry = messageHistory.pop(relativePosition);
+      const msgHdr = messageHistory.getHeaderForEntry(entry);
       if (msgHdr) {
         if (window.threadPane) {
           window.selectMessage(msgHdr);
         } else {
-          window.displayMessage(newMessageURI);
+          window.displayMessage(entry.messageURI);
         }
       }
       return;

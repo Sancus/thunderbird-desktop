@@ -589,13 +589,8 @@ function messageHistoryMenu_init(popup) {
     }
 
     let menuText = "";
-    let msgHdr;
-    try {
-      msgHdr = MailServices.messageServiceFromURI(
-        entry.messageURI
-      ).messageURIToMsgHdr(entry.messageURI);
-    } catch (ex) {
-      // Let's just ignore this history entry.
+    const msgHdr = messageHistory.getHeaderForEntry(entry);
+    if (!msgHdr) {
       continue;
     }
     const messageSubject = msgHdr.mime2DecodedSubject;
@@ -659,6 +654,10 @@ function navigateToUri(target) {
     return;
   }
   const item = messageHistory.pop(historyIndex);
+  const msgHdr = messageHistory.getHeaderForEntry(item);
+  if (!msgHdr) {
+    return;
+  }
 
   if (
     currentWindow.displayFolder &&
@@ -667,9 +666,6 @@ function navigateToUri(target) {
     const folder = MailServices.folderLookup.getFolderForURL(item.folderURI);
     currentWindow.displayFolder(folder);
   }
-  const msgHdr = MailServices.messageServiceFromURI(
-    item.messageURI
-  ).messageURIToMsgHdr(item.messageURI);
   const index = currentWindow.gDBView.findIndexOfMsgHdr(msgHdr, true);
   if (index != nsMsgViewIndex_None) {
     currentWindow.gDBView.selection.select(index);

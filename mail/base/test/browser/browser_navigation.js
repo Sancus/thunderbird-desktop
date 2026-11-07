@@ -981,6 +981,127 @@ add_task(async function testMessageHistoryInAWindow() {
   await withMessageInAWindow(folderAMessages[0], subtestMessageHistory);
 });
 
+/**
+ * Check that stale history cannot display a valid message from another folder.
+ *
+ * @param {Window} win - The ordinary 3pane or message window.
+ * @param {Window} aboutMessage - Its message document.
+ * @param {boolean} [popup=false] - Also check the standalone history menu.
+ */
+async function subtestForeignHistory(win, aboutMessage, popup = false) {
+  const { messageHistory } = aboutMessage;
+  messageHistory.clear();
+  messageHistory.push(aboutMessage.gMessageURI);
+  win.goDoCommand("cmd_nextMsg");
+  await assertDisplayedMessage(aboutMessage, folderAMessages[1]);
+  const expectedURI = aboutMessage.gMessageURI;
+  const expectedBody =
+    aboutMessage.getMessagePaneBrowser().contentDocument.body.textContent;
+  messageHistory._history[0].folderURI = folderB.URI;
+  if (popup) {
+    const menu = win.document.createXULElement("menupopup");
+    win.messageHistoryMenu_init(menu);
+    Assert.equal(
+      menu.children.length,
+      1,
+      "The foreign entry is absent from the menu"
+    );
+  }
+  win.goDoCommand("cmd_goBack");
+  Assert.equal(
+    aboutMessage.gMessageURI,
+    expectedURI,
+    "A foreign folder entry must not display another physical message"
+  );
+  Assert.equal(aboutMessage.gMessage.messageKey, folderAMessages[1].messageKey);
+  Assert.equal(aboutMessage.gMessage.folder.URI, folderA.URI);
+  Assert.equal(
+    aboutMessage.getMessagePaneBrowser().contentDocument.body.textContent,
+    expectedBody
+  );
+  Assert.equal(
+    messageHistory.getHistory().entries.length,
+    1,
+    "The stale entry is pruned"
+  );
+  Assert.ok(!messageHistory.canPop(-1));
+}
+
+add_task(async function testHistoryRefusesForeignFolderInAbout3Pane() {
+  about3Pane.displayFolder(folderA.URI);
+  threadTree.selectedIndex = 0;
+  await assertDisplayedMessage(
+    messageBrowser.contentWindow,
+    folderAMessages[0]
+  );
+  await subtestForeignHistory(window, messageBrowser.contentWindow);
+});
+
+add_task(async function testHistoryRefusesForeignFolderInATab() {
+  await withMessageInATab(folderAMessages[0], subtestForeignHistory);
+});
+
+add_task(async function testHistoryRefusesForeignFolderInAWindow() {
+  await withMessageInAWindow(folderAMessages[0], (win, message) =>
+    subtestForeignHistory(win, message, true)
+  );
+});
+
+add_task(async function testHistoryPrunesDeletedAndReopensPhysicalMessage() {
+  const message = folderAMessages[0];
+  const key = message.messageKey;
+  const messageURI = folderA.getUriForMsg(message);
+  const loaded = BrowserTestUtils.waitForEvent(window, "MsgLoaded");
+  window.OpenMessageInNewTab(message, { background: false });
+  await loaded;
+  registerCleanupFunction(() => tabmail.closeOtherTabs(0));
+  const body =
+    tabmail.currentAboutMessage.getMessagePaneBrowser().contentDocument.body
+      .textContent;
+  tabmail.closeTab(tabmail.currentTabInfo);
+  const reopened = BrowserTestUtils.waitForEvent(window, "MsgLoaded");
+  tabmail.undoCloseTab();
+  await reopened;
+  Assert.equal(tabmail.currentAboutMessage.gMessageURI, messageURI);
+  Assert.equal(tabmail.currentAboutMessage.gMessage.messageKey, key);
+  Assert.equal(tabmail.currentAboutMessage.gMessage.folder.URI, folderA.URI);
+  Assert.equal(
+    tabmail.currentAboutMessage.getMessagePaneBrowser().contentDocument.body
+      .textContent,
+    body
+  );
+  tabmail.closeTab(tabmail.currentTabInfo);
+  about3Pane.displayFolder(folderA.URI);
+  threadTree.selectedIndex = 0;
+  await assertDisplayedMessage(messageBrowser.contentWindow, message);
+  const history = messageBrowser.contentWindow.messageHistory;
+  folderA.deleteMessages([message], null, true, false, null, false);
+  await TestUtils.waitForCondition(() => !folderA.msgDatabase.containsKey(key));
+  Assert.ok(
+    !history
+      .getHistory()
+      .entries.some(
+        entry =>
+          entry.messageURI == messageURI && entry.folderURI == folderA.URI
+      )
+  );
+  tabmail.undoCloseTab();
+  await TestUtils.waitForCondition(
+    () => tabmail.currentAboutMessage?.msgLoaded
+  );
+  Assert.equal(
+    tabmail.currentAboutMessage.gMessage,
+    null,
+    "A deleted tab cannot reopen an equal key from another folder"
+  );
+  Assert.equal(
+    tabmail.currentAboutMessage.getMessagePaneBrowser().currentURI.spec,
+    "about:blank"
+  );
+  Assert.ok(folderB.msgDatabase.containsKey(folderBMessages[0].messageKey));
+  tabmail.closeOtherTabs(0);
+});
+
 function assertSelectedFolder(expected) {
   Assert.equal(about3Pane.gFolder.URI, expected.URI, "selected folder");
 }
@@ -1022,6 +1143,16 @@ async function assertDisplayedMessage(aboutMessage, expected) {
     aboutMessage.gMessage.messageId,
     expected.messageId,
     "correct message loaded"
+  );
+  Assert.equal(
+    aboutMessage.gMessage.messageKey,
+    expected.messageKey,
+    "physical message key"
+  );
+  Assert.equal(
+    aboutMessage.gMessage.folder.URI,
+    expected.folder.URI,
+    "physical message folder"
   );
   Assert.equal(
     messagePaneBrowser.currentURI.spec,

@@ -10759,11 +10759,13 @@ nsresult DatabaseCore::BuildStartupFolders() {
       int32_t mailImported;
       MOZ_TRY(receipt->GetInt32(0, &mailImported));
       receipt = nullptr;
+      uint64_t messageCount;
+      MOZ_TRY(MessageDB().GetNumMessages(id, &messageCount));
       NS_ENSURE_TRUE(
           origin.birthSite ==
                   uint32_t(CacheDiscoveryFlagSite::LocalInitialChild) &&
               !origin.explicitMask && !imported && !mailImported &&
-              !MOZ_TRY(MessageDB().GetNumMessages(id)),
+              !messageCount,
           NS_ERROR_NOT_AVAILABLE);
       nsTArray<uint64_t> childIds =
           MOZ_TRY(mFolderDatabase->GetFolderChildren(id));

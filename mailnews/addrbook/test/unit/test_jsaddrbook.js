@@ -658,6 +658,8 @@ async function migrationPublicationInput() {
     byte.charCodeAt(0).toString(16).padStart(2, "0")
   ).join("");
   const target = do_get_profile().clone();
+  // The publication names its target below the canonical profile.
+  target.normalize();
   target.append("panorama-import-" + digest + ".sqlite");
   const pref = "ldap_2.servers.panorama_import_" + digest;
   const events = [];
@@ -1263,11 +1265,15 @@ add_task(
     const validate = input.SQLiteDirectory.validateMigrationBook;
     const retained = input.options.stageFile.clone();
     retained.leafName += ".retained";
+    // The validator receives the canonical stage; macOS profiles sit below the
+    // system /tmp link.
+    const stage = input.options.stageFile.clone();
+    stage.normalize();
     let validated = false;
     try {
       input.SQLiteDirectory.validateMigrationBook = function (...args) {
         const result = validate.apply(this, args);
-        if (args[0].equals(input.options.stageFile)) {
+        if (args[0].equals(stage)) {
           if (validated) {
             args[0].clone().moveTo(null, retained.leafName);
           }

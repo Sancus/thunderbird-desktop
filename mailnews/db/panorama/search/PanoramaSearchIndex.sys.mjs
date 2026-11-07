@@ -840,9 +840,12 @@ export class PanoramaSearchIndex {
         await this.#execute("DELETE FROM documents WHERE documentId=:id", {
           id: change.id,
         });
-        await this.#execute("DELETE FROM retained_bodies WHERE documentId=:id", {
-          id: change.id,
-        });
+        await this.#execute(
+          "DELETE FROM retained_bodies WHERE documentId=:id",
+          {
+            id: change.id,
+          }
+        );
       }
     }
     await this.#execute("DELETE FROM index_jobs WHERE documentId=:id", {

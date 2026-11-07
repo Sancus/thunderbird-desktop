@@ -42,63 +42,60 @@ const RECOVERED_BODY = "\uFEFFrecovered é 😀 body\0tail";
 // The later S717 phase creates these mutable cases after the sealed S716 run.
 // Keep expected text separate from values read back from native records/logs.
 const S717_CASES = {
-  "version": 1,
-  "mail": {
-    "edit": {
-      "messageId": "s717-edit@example.invalid",
-      "folder": "S717Edit",
-      "oldSubject": "s717oldsubject",
-      "newSubject": "s717newsubject",
-      "body": "s717editbody"
+  version: 1,
+  mail: {
+    edit: {
+      messageId: "s717-edit@example.invalid",
+      folder: "S717Edit",
+      oldSubject: "s717oldsubject",
+      newSubject: "s717newsubject",
+      body: "s717editbody",
     },
-    "deleted": {
-      "messageId": "s717-delete@example.invalid",
-      "folder": "S717Delete",
-      "subject": "s717deletesubject",
-      "body": "s717deletedbody"
+    deleted: {
+      messageId: "s717-delete@example.invalid",
+      folder: "S717Delete",
+      subject: "s717deletesubject",
+      body: "s717deletedbody",
     },
-    "excluded": {
-      "messageId": "s717-exclude@example.invalid",
-      "folder": "S717Exclude",
-      "subject": "s717excludesubject",
-      "body": "s717excludedbody"
+    excluded: {
+      messageId: "s717-exclude@example.invalid",
+      folder: "S717Exclude",
+      subject: "s717excludesubject",
+      body: "s717excludedbody",
     },
-    "open": {
-      "messageId": "s717-selected@example.invalid",
-      "folders": [
-        "S717Selected",
-        "S717OtherCopy"
-      ],
-      "subject": "s717selectedsubject",
-      "body": "s717selectedbody café é 😀"
-    }
+    open: {
+      messageId: "s717-selected@example.invalid",
+      folders: ["S717Selected", "S717OtherCopy"],
+      subject: "s717selectedsubject",
+      body: "s717selectedbody café é 😀",
+    },
   },
-  "chat": {
-    "account": "s717-policy",
-    "conversation": "buddy",
-    "edit": {
-      "remoteId": "edit",
-      "oldText": "s717chatoldneedle",
-      "newText": "s717chatnewneedle café é 😀"
+  chat: {
+    account: "s717-policy",
+    conversation: "buddy",
+    edit: {
+      remoteId: "edit",
+      oldText: "s717chatoldneedle",
+      newText: "s717chatnewneedle café é 😀",
     },
-    "deleted": {
-      "remoteId": "deleted",
-      "text": "s717chatdeletedneedle"
+    deleted: {
+      remoteId: "deleted",
+      text: "s717chatdeletedneedle",
     },
-    "noLog": {
-      "remoteId": "nolog",
-      "text": "s717chatnologneedle"
+    noLog: {
+      remoteId: "nolog",
+      text: "s717chatnologneedle",
     },
-    "redacted": {
-      "remoteId": "redacted",
-      "text": "s717chatredactedneedle"
+    redacted: {
+      remoteId: "redacted",
+      text: "s717chatredactedneedle",
     },
-    "keep": {
-      "remoteId": "keep",
-      "text": "s717chatkeepneedle café é 😀"
+    keep: {
+      remoteId: "keep",
+      text: "s717chatkeepneedle café é 😀",
     },
-    "otherPhysical": "s717otherphysicalneedle"
-  }
+    otherPhysical: "s717otherphysicalneedle",
+  },
 };
 
 /**

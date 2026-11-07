@@ -1114,7 +1114,10 @@ add_task(async function test_exclusionDropsCanonicalText() {
   );
   for (const job of await index.getPendingJobs()) {
     Assert.ok(
-      await index.finishJob(job, originals.find(source => source.id === job.id))
+      await index.finishJob(
+        job,
+        originals.find(source => source.id === job.id)
+      )
     );
   }
 
@@ -1128,7 +1131,9 @@ add_task(async function test_exclusionDropsCanonicalText() {
   }));
   await index.close();
   let connection = Services.storage.openUnsharedDatabase(fixture.file);
-  let statement = connection.createStatement("SELECT COUNT(*) FROM retained_bodies");
+  let statement = connection.createStatement(
+    "SELECT COUNT(*) FROM retained_bodies"
+  );
   try {
     Assert.ok(statement.executeStep());
     Assert.equal(statement.getInt64(0), 1, "The fixture retains the old body");
@@ -1164,11 +1169,27 @@ add_task(async function test_exclusionDropsCanonicalText() {
   );
   try {
     Assert.ok(statement.executeStep());
-    Assert.equal(statement.getInt64(0), 1, "Only the eligible peer keeps canonical text");
-    Assert.equal(statement.getInt64(1), 0, "Excluded retained bodies are removed");
-    Assert.equal(statement.getInt64(2), 1, "Only the eligible peer keeps FTS text");
+    Assert.equal(
+      statement.getInt64(0),
+      1,
+      "Only the eligible peer keeps canonical text"
+    );
+    Assert.equal(
+      statement.getInt64(1),
+      0,
+      "Excluded retained bodies are removed"
+    );
+    Assert.equal(
+      statement.getInt64(2),
+      1,
+      "Only the eligible peer keeps FTS text"
+    );
     Assert.equal(statement.getInt64(3), 2, "Both exclusions remain durable");
-    Assert.equal(statement.getInt64(4), 0, "Exclusion does not forge permanent erasure");
+    Assert.equal(
+      statement.getInt64(4),
+      0,
+      "Exclusion does not forge permanent erasure"
+    );
   } finally {
     statement.finalize();
     connection.close();

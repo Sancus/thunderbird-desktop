@@ -636,7 +636,7 @@ class DeliveryCoreReferences : public testing::Test {
           if (type != mozIStorageValueArray::VALUE_TYPE_NULL) {
             MOZ_TRY(stmt->GetUTF8String(column, value));
           }
-          facts.AppendInt(value.Length());
+          facts.AppendInt(static_cast<uint64_t>(value.Length()));
           facts.Append(':');
           facts.Append(value);
         }
@@ -812,7 +812,7 @@ class DeliveryCoreReferences : public testing::Test {
   nsresult InstallOnlineStatementFault(
       const nsACString& label, const nsACString& sql,
       nsCOMPtr<mozIStorageStatement>& previous) {
-    DatabaseCore::sStatements.Get(label, &previous);
+    (void)DatabaseCore::sStatements.Get(label, &previous);
     DatabaseCore::sStatements.Remove(label);
     nsCOMPtr<mozIStorageStatement> fault;
     return DatabaseCore::GetStatement(label, sql, getter_AddRefs(fault));

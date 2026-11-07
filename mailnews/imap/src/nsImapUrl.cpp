@@ -87,7 +87,7 @@ nsImapUrl::~nsImapUrl() {
     MutexAutoLock lock(mLock);
     for (const auto& input : mAcceptedAppendInputs) {
       // Comparison copies only; original provider-finished custody is retained.
-      nsresult rv = input.snapshot->Remove(false);
+      [[maybe_unused]] nsresult rv = input.snapshot->Remove(false);
       NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
                            "Accepted APPEND snapshot cleanup failed");
     }

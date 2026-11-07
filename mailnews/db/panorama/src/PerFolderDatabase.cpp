@@ -1279,6 +1279,7 @@ nsresult PerFolderDatabase::AttachNewsHdr(DetachedMsgHdr& draft, bool notify,
   MOZ_TRY(draft.CheckMutable());
   RefPtr<PerFolderDatabase> self(this);
   RefPtr<DetachedMsgHdr> pinned(&draft);
+  (void)pinned;
   nsresult rv = NS_OK;
   nsCOMPtr<nsIMsgFolderNotificationService> notifier;
   if (notify) {

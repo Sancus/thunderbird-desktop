@@ -2157,6 +2157,8 @@ add_task(
 /**
  * Initial physical New and later public words update each displayed member once.
  */
+let nativeLocalInjection;
+
 add_task(async function test_publicNewFlatUsesDisplayedState() {
   const { MessageInjection } = ChromeUtils.importESModule(
     "resource://testing-common/mailnews/MessageInjection.sys.mjs"
@@ -2164,7 +2166,9 @@ add_task(async function test_publicNewFlatUsesDisplayedState() {
   const { MessageGenerator, SyntheticMessageSet } = ChromeUtils.importESModule(
     "resource://testing-common/mailnews/MessageGenerator.sys.mjs"
   );
-  const injection = new MessageInjection({ mode: "local" });
+  const injection = (nativeLocalInjection = new MessageInjection({
+    mode: "local",
+  }));
   const generator = new MessageGenerator();
   const parent = generator.makeMessage({ subject: "projected-new-adapter" });
   const child = generator.makeMessage({ inReplyTo: parent });
@@ -2770,15 +2774,14 @@ add_task(async function test_nativeOrdinaryFlatBatchConsumerFailure() {
 });
 
 add_task(async function test_nativeOrdinaryFlatBatchPublicNewProjection() {
-  const { MessageInjection } = ChromeUtils.importESModule(
-    "resource://testing-common/mailnews/MessageInjection.sys.mjs"
-  );
   const { MessageGenerator, SyntheticMessageSet } = ChromeUtils.importESModule(
     "resource://testing-common/mailnews/MessageGenerator.sys.mjs"
   );
-  const injection = new MessageInjection({ mode: "local" });
+  const injection = nativeLocalInjection;
+  Assert.ok(injection, "Reuse the existing native Inbox/account lifetime");
   const generator = new MessageGenerator();
   const parent = generator.makeMessage({ subject: "ordinary-public-new" });
+  parent.messageId = "ordinary-public-new@flat.invalid";
   const folder = await injection.makeEmptyFolder("ordinary-batch-public-new");
   const set = new SyntheticMessageSet([parent]);
   await injection.addSetsToFolders([folder], [set]);
@@ -2797,9 +2800,9 @@ add_task(async function test_nativeOrdinaryFlatBatchPublicNewProjection() {
   const f = await ordinaryBatchAdapter([folderId]);
   try {
     Assert.equal(f.adapter.rowAt(0).message.flags, Ci.nsMsgMessageFlags.New);
-    const child = new SyntheticMessageSet([
-      generator.makeMessage({ inReplyTo: parent }),
-    ]);
+    const childMessage = generator.makeMessage({ inReplyTo: parent });
+    childMessage.messageId = "ordinary-public-new-child@flat.invalid";
+    const child = new SyntheticMessageSet([childMessage]);
     await injection.addSetsToFolders([folder], [child]);
     Assert.equal(
       f.payloads.length,

@@ -47,9 +47,10 @@ export class AttachmentInfo {
    * The stored parent selected when this attachment was parsed. Standalone and
    * external attachments keep their existing URL-based behavior.
    *
-   * @type {?{message: nsIMsgDBHdr, folder: nsIMsgFolder,
+   * @type {?{message: nsIMsgDBHdr,
+   *   inputMessage: (nsIMsgDBHdr|null|undefined), folder: nsIMsgFolder,
    *   database: nsIMsgDatabase, key: number, messageId: string, uri: string,
-   *   inputURI: string, url: string, part: ?string}}
+   *   inputURI: (string|null|undefined), url: string, part: ?string}}
    */
   #selection = null;
 
@@ -125,6 +126,7 @@ export class AttachmentInfo {
       const folder = message.folder;
       this.#selection = {
         message,
+        inputMessage: message,
         folder,
         database: folder.msgDatabase,
         key: message.messageKey,
@@ -158,7 +160,7 @@ export class AttachmentInfo {
       );
     };
     if (
-      this.message !== selected.message ||
+      this.message !== selected.inputMessage ||
       this.uri !== selected.inputURI ||
       this.url !== selected.url ||
       this.partID !== selected.part ||
@@ -982,6 +984,51 @@ export class AttachmentInfo {
     const database = folder.msgDatabase;
     const key = msgHdr.messageKey;
     const uri = folder.getUriForMsg(msgHdr);
+    // Ordinary MIME-parser callers supply a parent but no public header/URI.
+    // Bind only a part URL that proves membership in that exact physical parent.
+    for (const attachment of attachments) {
+      if (
+        !attachment.#selection &&
+        attachment.message == null &&
+        (attachment.uri == null || attachment.uri == uri)
+      ) {
+        const actual = URL.parse(attachment.url);
+        const expected = URL.parse(
+          MailServices.messageServiceFromURI(uri).getUrlForUri(uri).spec
+        );
+        if (
+          actual &&
+          expected &&
+          ["mailbox:", "imap:", "news:", "snews:"].includes(actual.protocol) &&
+          actual.protocol == expected.protocol &&
+          actual.username == expected.username &&
+          actual.host == expected.host &&
+          decodeURIComponent(actual.pathname) ==
+            decodeURIComponent(expected.pathname) &&
+          ["number", "group", "key"].every(
+            name =>
+              JSON.stringify(actual.searchParams.getAll(name)) ==
+              JSON.stringify(expected.searchParams.getAll(name))
+          ) &&
+          /^\d+(?:\.\d+)*$/.test(attachment.partID) &&
+          actual.searchParams.getAll("part").length == 1 &&
+          actual.searchParams.get("part") == attachment.partID
+        ) {
+          attachment.#selection = {
+            message: msgHdr,
+            inputMessage: attachment.message,
+            folder,
+            database,
+            key,
+            messageId: msgHdr.messageId,
+            uri,
+            inputURI: attachment.uri,
+            url: attachment.url,
+            part: attachment.partID,
+          };
+        }
+      }
+    }
     const selections = attachments.map(attachment => ({
       attachment,
       message: attachment.message,
@@ -1006,14 +1053,15 @@ export class AttachmentInfo {
       for (const selected of selections) {
         const { attachment } = selected;
         const selectedURI = attachment.#checkSelection();
+        const message = attachment.#selection?.message || attachment.message;
         if (
           attachment.message !== selected.message ||
           attachment.uri !== selected.uri ||
           attachment.url !== selected.url ||
           attachment.partID !== selected.part ||
-          !attachment.message?.isLive ||
-          attachment.message.folder?.URI !== folder.URI ||
-          attachment.message.messageKey !== key ||
+          !message?.isLive ||
+          message.folder?.URI !== folder.URI ||
+          message.messageKey !== key ||
           (selectedURI && selectedURI !== uri)
         ) {
           throw new Components.Exception(

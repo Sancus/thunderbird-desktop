@@ -1204,6 +1204,19 @@ add_task(async function test_modifyRejectsAnotherPhysicalParent() {
     ),
     error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
   );
+  const carrier = new AttachmentInfo({
+    contentType: first.attachment.contentType,
+    name: first.attachment.name,
+    url: first.attachment.url,
+  });
+  await Assert.rejects(
+    AttachmentInfo.deleteAttachments(other.header, [carrier]),
+    error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+  );
+  await Assert.rejects(
+    AttachmentInfo.detachAttachments(other.header, [carrier], directory),
+    error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+  );
   Assert.deepEqual(await IOUtils.getChildren(directory), []);
   Assert.ok(
     first.selectedFolder.msgDatabase.containsKey(first.header.messageKey)

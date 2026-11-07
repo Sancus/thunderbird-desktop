@@ -1604,3 +1604,131 @@ add_task(async function test_readsSelectedPhysicalContent() {
     cleanUpAccount(account);
   }
 });
+
+add_task(async function test_preservesEncodedMailboxStructure() {
+  const account = await createAccount();
+  const folder = await createSubfolder(
+    account.incomingServer.rootFolder,
+    "encodedMailboxStructure"
+  );
+  const raw = [
+    "From: =?UTF-8?Q?H=C3=B6rst=2C_Kenny?= <from@example.invalid>",
+    "To: =?ISO-8859-1?Q?R=F6mer=2C_To?= <to@example.invalid>",
+    "To: Plain To <to2@example.invalid>",
+    "Cc: =?UTF-8?Q?G=C3=B6mez=2C_Cc?= <cc@example.invalid>",
+    "Cc: Plain Cc <cc2@example.invalid>",
+    "Bcc: =?UTF-8?Q?K=C3=B6nig=2C_Bcc?= <bcc@example.invalid>",
+    "Bcc: Plain Bcc <bcc2@example.invalid>",
+    "Subject: =?UTF-8?Q?S378_=E2=98=83?=",
+    "Message-ID: <encoded-mailbox-structure@example.invalid>",
+    "MIME-Version: 1.0",
+    "Content-Type: text/plain; charset=utf-8",
+    "",
+    "Selected encoded mailbox bytes #%",
+    "",
+  ].join("\r\n");
+  await createMessageFromString(folder, raw);
+  Assert.equal(
+    [...folder.messages].length,
+    1,
+    "One physical message is published"
+  );
+  const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIMsgDBService
+  );
+  Assert.equal(
+    service instanceof Ci.nsIDatabaseCore,
+    Services.prefs.getBoolPref("mail.panorama.enabled"),
+    "The real database service matches the selected backend"
+  );
+  const extension = ExtensionTestUtils.loadExtension({
+    manifest: {
+      manifest_version: 2,
+      permissions: ["accountsRead", "messagesRead"],
+    },
+    background: async () => {
+      const [target] = await browser.folders.query({
+        name: "encodedMailboxStructure",
+      });
+      const listed = (await browser.messages.list(target.id)).messages;
+      browser.test.assertEq(1, listed.length);
+      const expected = {
+        author: '"Hörst, Kenny" <from@example.invalid>',
+        recipients: [
+          '"Römer, To" <to@example.invalid>',
+          "Plain To <to2@example.invalid>",
+        ],
+        ccList: [
+          '"Gömez, Cc" <cc@example.invalid>',
+          "Plain Cc <cc2@example.invalid>",
+        ],
+        bccList: [
+          '"König, Bcc" <bcc@example.invalid>',
+          "Plain Bcc <bcc2@example.invalid>",
+        ],
+        subject: "S378 ☃",
+      };
+      for (const message of [
+        listed[0],
+        await browser.messages.get(listed[0].id),
+      ]) {
+        browser.test.assertEq(target.id, message.folder.id);
+        for (const [field, value] of Object.entries(expected)) {
+          browser.test.assertEq(
+            JSON.stringify(value),
+            JSON.stringify(message[field]),
+            `${field} keeps decoded names, mailbox boundaries and order`
+          );
+        }
+        for (const field of ["recipients", "ccList", "bccList"]) {
+          browser.test.assertEq(
+            2,
+            message[field].length,
+            `${field} has two mailboxes`
+          );
+        }
+      }
+      const headers = await browser.messages.getHeaders(listed[0].id);
+      const full = await browser.messages.getFull(listed[0].id);
+      for (const actual of [headers, full.headers]) {
+        for (const [field, value] of Object.entries({
+          from: [expected.author],
+          to: expected.recipients,
+          cc: expected.ccList,
+          bcc: expected.bccList,
+          subject: [expected.subject],
+        })) {
+          browser.test.assertEq(
+            JSON.stringify(value),
+            JSON.stringify(actual[field]),
+            `${field} raw-derived and stored header results agree`
+          );
+        }
+      }
+      const stored = await browser.messages.getRaw(listed[0].id);
+      for (const fragment of [
+        "From: =?UTF-8?Q?H=C3=B6rst=2C_Kenny?= <from@example.invalid>",
+        "To: =?ISO-8859-1?Q?R=F6mer=2C_To?= <to@example.invalid>",
+        "To: Plain To <to2@example.invalid>",
+        "Cc: =?UTF-8?Q?G=C3=B6mez=2C_Cc?= <cc@example.invalid>",
+        "Cc: Plain Cc <cc2@example.invalid>",
+        "Bcc: =?UTF-8?Q?K=C3=B6nig=2C_Bcc?= <bcc@example.invalid>",
+        "Bcc: Plain Bcc <bcc2@example.invalid>",
+        "Selected encoded mailbox bytes #%",
+      ]) {
+        browser.test.assertTrue(
+          stored.includes(fragment),
+          "Original bytes are retained"
+        );
+      }
+      browser.test.notifyPass("encoded-mailbox-structure");
+    },
+  });
+  try {
+    await extension.startup();
+    await extension.awaitFinish("encoded-mailbox-structure");
+  } finally {
+    await extension.unload();
+    cleanUpAccount(account);
+  }
+});

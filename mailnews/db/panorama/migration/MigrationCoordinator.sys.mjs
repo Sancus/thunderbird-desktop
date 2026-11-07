@@ -393,11 +393,10 @@ export async function resumeMorkBookImportsAndPublish(
         const selected = publication.checkProfile();
         const current = Services.dirsvc.get("ProfD", Ci.nsIFile).clone();
         for (const file of [selected, current]) {
-          for (let parent = file; parent; parent = parent.parent) {
-            if (parent.isSymlink()) {
-              throw new Error("Book publication profile contains a link");
-            }
-          }
+          lazy.SQLiteDirectory.checkMigrationPathLinks(
+            file,
+            "Book publication profile contains a link"
+          );
           file.normalize();
         }
         if (

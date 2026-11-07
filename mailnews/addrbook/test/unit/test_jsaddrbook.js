@@ -621,13 +621,17 @@ async function migrationPublicationInput() {
   } finally {
     db.close();
   }
+  const canonicalStage = stageFile.clone();
+  canonicalStage.normalize();
   const receipt = {
     token: committed.sourceId,
     sourceId: "manager-source-" + serial,
     storageSourceId: committed.sourceId,
     sourceSha256: committed.sourceSha256,
     sourceSize: committed.sourceSize,
-    stagingPath: stageFile.path,
+    // Like the coordinator's journal, record the canonical stage path; macOS
+    // temporary profiles sit below the system /tmp link.
+    stagingPath: canonicalStage.path,
     cards: committed.cards,
     lists: committed.lists,
     // As the coordinator receipt does, retain the Windows stage identity.

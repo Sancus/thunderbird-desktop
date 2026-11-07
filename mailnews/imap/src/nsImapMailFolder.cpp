@@ -10800,6 +10800,13 @@ class nsImapFolderCopyState final : public nsIUrlListener,
   nsCOMPtr<nsIMsgFolder> m_origDestParent;
   nsCOMPtr<nsIMsgFolder> m_curDestParent;
   nsCOMPtr<nsIMsgFolder> m_curSrcFolder;
+  nsCOMPtr<nsIMsgFolder> m_messageSource;
+  nsCOMPtr<nsIMsgFolder> m_messageDestination;
+  nsCOMPtr<nsIMsgDatabase> m_messageDatabase;
+  nsTArray<nsCOMPtr<nsIMsgDBHdr>> m_messageOutputs;
+  nsTArray<nsMsgKey> m_messageKeys;
+  uint32_t m_messageCount = 0;
+  uint64_t m_messagePhase = 0;
   nsCString m_curFolderName;
   bool m_isMoveMessages;
   nsCOMPtr<nsIMsgWindow> m_msgWindow;
@@ -10844,6 +10851,12 @@ nsresult nsImapFolderCopyState::Finish(nsresult aStatus) {
   // if the partially created root has since been removed or reparented.
   m_completed = true;
   m_status = aStatus;
+  ++m_messagePhase;
+  m_messageSource = nullptr;
+  m_messageDestination = nullptr;
+  m_messageDatabase = nullptr;
+  m_messageOutputs.Clear();
+  m_messageKeys.Clear();
   nsCOMPtr<nsIMsgCopyService> copyService =
       mozilla::components::Copy::Service();
   (void)copyService->NotifyCompletion(m_origSrcFolder, completionFolder,
@@ -10881,6 +10894,10 @@ NS_IMETHODIMP
 nsImapFolderCopyState::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
   if (m_completed) return m_status;
   RefPtr<nsImapFolderCopyState> kungFuDeathGrip(this);
+#ifdef MOZ_PANORAMA
+  nsCOMPtr<nsIMsgFolder> phaseSource = m_curSrcFolder;
+  const uint64_t phase = m_messagePhase;
+#endif
   if (NS_FAILED(aExitCode)) return Finish(aExitCode);
   nsresult rv;
   nsCOMPtr<nsIImapUrl> imapUrl = do_QueryInterface(aUrl, &rv);
@@ -10945,6 +10962,26 @@ nsImapFolderCopyState::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
   if (messages.IsEmpty()) return AdvanceToNextFolder(NS_OK);
   if (WeAreOffline()) return Finish(NS_MSG_ERROR_OFFLINE);
 
+#ifdef MOZ_PANORAMA
+  if (mail_panorama_enabled_AtStartup()) {
+    nsCOMPtr<nsIMsgDatabase> database;
+    rv = newMsgFolder->GetMsgDatabase(getter_AddRefs(database));
+    if (NS_FAILED(rv)) return Finish(rv);
+    nsTArray<nsMsgKey> keys;
+    if (database) rv = database->ListAllKeys(keys);
+    if (NS_FAILED(rv)) return Finish(rv);
+    if (m_completed) return m_status;
+    if (!database || m_messageDestination || phase != m_messagePhase ||
+        phaseSource != m_curSrcFolder || parent != m_curDestParent)
+      return Finish(NS_ERROR_NOT_AVAILABLE);
+    m_messageSource = phaseSource;
+    m_messageDestination = newMsgFolder;
+    m_messageDatabase = database;
+    m_messageKeys = std::move(keys);
+    m_messageCount = messages.Length();
+    ++m_messagePhase;
+  }
+#endif
   // This is a private phase of the outer folder request, not a second copy
   // service request. Only our final subtree completion may settle that request.
   rv = newMsgFolder->CopyMessages(m_curSrcFolder, messages, m_isMoveMessages,
@@ -10960,7 +10997,36 @@ NS_IMETHODIMP nsImapFolderCopyState::OnProgress(uint32_t aProgress,
 }
 
 NS_IMETHODIMP nsImapFolderCopyState::SetMessageKey(nsMsgKey aKey) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  if (!m_messageDestination) return NS_ERROR_NOT_IMPLEMENTED;
+  RefPtr<nsImapFolderCopyState> kungFuDeathGrip(this);
+  nsCOMPtr<nsIMsgFolder> source = m_messageSource;
+  nsCOMPtr<nsIMsgFolder> destination = m_messageDestination;
+  nsCOMPtr<nsIMsgFolder> parent = m_curDestParent;
+  nsCOMPtr<nsIMsgDatabase> database = m_messageDatabase;
+  const uint64_t phase = m_messagePhase;
+  NS_ENSURE_TRUE(!m_completed && source && database &&
+                     source == m_curSrcFolder && aKey != nsMsgKey_None,
+                 NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<nsIMsgFolder> actualParent;
+  MOZ_TRY(destination->GetParent(getter_AddRefs(actualParent)));
+  nsCOMPtr<nsIMsgDatabase> current;
+  MOZ_TRY(destination->GetMsgDatabase(getter_AddRefs(current)));
+  NS_ENSURE_TRUE(current == database, NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<nsIMsgDBHdr> header;
+  // The captured facade checks current physical membership and database source,
+  // including a closed owner, before returning even a cached header.
+  MOZ_TRY(database->GetMsgHdrForKey(aKey, getter_AddRefs(header)));
+  NS_ENSURE_TRUE(header && !m_completed && phase == m_messagePhase &&
+                     source == m_messageSource && source == m_curSrcFolder &&
+                     destination == m_messageDestination &&
+                     database == m_messageDatabase &&
+                     parent == m_curDestParent && actualParent == parent &&
+                     !m_messageKeys.Contains(aKey) &&
+                     m_messageOutputs.Length() < m_messageCount,
+                 NS_ERROR_NOT_AVAILABLE);
+  m_messageKeys.AppendElement(aKey);
+  m_messageOutputs.AppendElement(header);
+  return NS_OK;
 }
 
 NS_IMETHODIMP nsImapFolderCopyState::GetMessageId(nsACString& messageId) {
@@ -10969,6 +11035,13 @@ NS_IMETHODIMP nsImapFolderCopyState::GetMessageId(nsACString& messageId) {
 
 NS_IMETHODIMP nsImapFolderCopyState::OnStopCopy(nsresult aStatus) {
   RefPtr<nsImapFolderCopyState> kungFuDeathGrip(this);
+  // Keep the phase owners and real outputs alive through completion reentry.
+  nsCOMPtr<nsIMsgFolder> source = std::move(m_messageSource);
+  nsCOMPtr<nsIMsgFolder> destination = std::move(m_messageDestination);
+  nsCOMPtr<nsIMsgDatabase> database = std::move(m_messageDatabase);
+  auto outputs = std::move(m_messageOutputs);
+  m_messageKeys.Clear();
+  ++m_messagePhase;
   return AdvanceToNextFolder(aStatus);
 }
 

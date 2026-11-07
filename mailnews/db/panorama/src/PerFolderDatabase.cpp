@@ -493,7 +493,7 @@ class OfflineOperation final : public nsIMsgOfflineImapOperation {
                                                         mKey, data);
   }
   template <typename T>
-  nsresult ReadNumber(uint32_t OfflineOperationData::*member, T* value) {
+  nsresult ReadNumber(uint32_t OfflineOperationData::* member, T* value) {
     NS_ENSURE_ARG_POINTER(value);
     OfflineOperationData data;
     MOZ_TRY(Read(data));
@@ -503,20 +503,20 @@ class OfflineOperation final : public nsIMsgOfflineImapOperation {
     return NS_OK;
   }
   template <typename T, typename U>
-  nsresult WriteField(T OfflineOperationData::*member, const U& value) {
+  nsresult WriteField(T OfflineOperationData::* member, const U& value) {
     return Update([&](auto& data) {
       data.*member = value;
       return NS_OK;
     });
   }
-  nsresult ReadString(nsCString OfflineOperationData::*member,
+  nsresult ReadString(nsCString OfflineOperationData::* member,
                       nsACString& value) {
     OfflineOperationData data;
     MOZ_TRY(Read(data));
     value = data.*member;
     return NS_OK;
   }
-  nsresult ReadCString(nsCString OfflineOperationData::*member, char** value) {
+  nsresult ReadCString(nsCString OfflineOperationData::* member, char** value) {
     NS_ENSURE_ARG_POINTER(value);
     *value = nullptr;
     OfflineOperationData data;
@@ -1410,7 +1410,7 @@ struct FolderRepair::Data {
 };
 
 FolderRepair::FolderRepair(PerFolderDatabase* owner)
-    : mOwner(owner), mData(new(fallible) Data()) {}
+    : mOwner(owner), mData(new (fallible) Data()) {}
 FolderRepair::~FolderRepair() = default;
 
 nsresult PerFolderDatabase::CheckFolderRepair(FolderRepair* repair) {

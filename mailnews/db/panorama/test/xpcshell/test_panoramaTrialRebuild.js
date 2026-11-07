@@ -477,7 +477,21 @@ async function planRetainedConversation(
     }[input.role];
     folder.setFlag(Ci.nsMsgFolderFlags.Mail | flag | Ci.nsMsgFolderFlags.Junk);
     Assert.ok(folderDB.getFolderFlags(folder.id) & Ci.nsMsgFolderFlags.Junk);
-    const plan = await readMorkFolderImport(folder, "s401-planning-only");
+    // Windows journals retain the original-path inventory of the actual copy.
+    const inventory =
+      AppConstants.platform == "win"
+        ? captureMorkFolderWindowsInventory(
+            new FileUtils.File(input.summaryFilePath),
+            lock.directory,
+            new FileUtils.File(input.mailFilePath),
+            lock.directory
+          )
+        : undefined;
+    const plan = await readMorkFolderImport(
+      folder,
+      "s401-planning-only",
+      inventory
+    );
     Assert.deepEqual(plan.source.messageKeys.toSorted(), [1, 3]);
     Assert.equal(
       folder.getTotalMessages(false),
@@ -490,6 +504,7 @@ async function planRetainedConversation(
       databaseSourceId: database.sourceId,
       ...plan.source,
       destinationFolderId: folder.id,
+      ...(inventory ? { inventory } : {}),
     });
   }
   const journalPath = PathUtils.join(backupRoot, "s401-journal.json");

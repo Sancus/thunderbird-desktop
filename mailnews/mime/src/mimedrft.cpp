@@ -459,6 +459,7 @@ static void mime_free_attachments(nsTArray<nsMsgAttachedFile*>& attachments) {
     }
     delete attachments[i];
   }
+  attachments.Clear();
 }
 
 // Read a body part temp file and return UTF-8 text using the part charset.
@@ -1656,13 +1657,15 @@ static void mime_parse_stream_complete(nsMIMESession* stream) {
 
   for (uint32_t i = 0; i < mdd->attachments.Length(); i++)
     mdd->attachments[i]->m_tmpFile = nullptr;
+  // Compose owns the transferred files, but not these original wrappers.
+  mime_free_attachments(mdd->attachments);
 
   PR_FREEIF(mdd->mailcharset);
 
   mdd->identity = nullptr;
   PR_Free(mdd->url_name);
   mdd->origMsgHdr = nullptr;
-  PR_Free(mdd);
+  delete mdd;
 
   PR_FREEIF(to_and_cc);
   PR_FREEIF(re_subject);
@@ -1717,12 +1720,18 @@ static void mime_parse_stream_abort(nsMIMESession* stream, int status) {
 
   if (mdd->headers) MimeHeaders_free(mdd->headers);
 
+  if (mdd->messageBody && mdd->messageBody->m_tmpFile) {
+    mdd->messageBody->m_tmpFile->Remove(false);
+  }
+  delete mdd->messageBody;
+
   mime_free_attachments(mdd->attachments);
   mime_free_attachments(mdd->appendedParts);
 
   PR_FREEIF(mdd->mailcharset);
+  PR_FREEIF(mdd->url_name);
 
-  PR_Free(mdd);
+  delete mdd;
 }
 
 static int make_mime_headers_copy(MimeClosure closure, MimeHeaders* headers) {

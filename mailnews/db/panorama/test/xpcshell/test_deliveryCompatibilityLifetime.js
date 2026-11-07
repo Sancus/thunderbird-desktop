@@ -306,3 +306,103 @@ add_task(function test_oldAnnouncerCannotDetachTheCurrentWrapper() {
   Assert.strictEqual(current.folder, folder);
   Assert.deepEqual(current.listAllKeys(), [key]);
 });
+
+add_task(function test_pseudoKeyCursorIsLocalAndDoesNotAllocatePhysicalKeys() {
+  const folder = root.createLocalSubfolder("pseudo-key-cursor");
+  const other = root.createLocalSubfolder("pseudo-key-other");
+  const db = folder.msgDatabase;
+  const otherDB = other.msgDatabase;
+  const first = addMessage({ folderId: folder.id });
+  Assert.equal(db.nextPseudoMsgKey, 0xfffffff0);
+  Assert.equal(db.nextPseudoMsgKey, 0xffffffef);
+  Assert.equal(otherDB.nextPseudoMsgKey, 0xfffffff0);
+  db.nextPseudoMsgKey = 42;
+  Assert.equal(db.nextPseudoMsgKey, 42);
+  db.close(false);
+  Assert.strictEqual(folder.msgDatabase, db);
+  Assert.equal(db.nextPseudoMsgKey, 41, "ordinary close keeps this cursor");
+  Assert.equal(otherDB.nextPseudoMsgKey, 0xffffffef);
+  db.nextPseudoMsgKey = 0;
+  Assert.equal(db.nextPseudoMsgKey, 0);
+  Assert.equal(db.nextPseudoMsgKey, 0xffffffff, "retain the unsigned cursor");
+  db.nextPseudoMsgKey = first;
+  Assert.equal(
+    db.nextPseudoMsgKey,
+    first,
+    "a cursor value is not a reservation"
+  );
+  Assert.deepEqual(db.listAllKeys(), [first]);
+  const second = addMessage({ folderId: folder.id });
+  Assert.equal(second, first + 1, "cursor access does not advance allocation");
+  db.forceClosed();
+  Assert.throws(() => db.nextPseudoMsgKey, /NS_ERROR_NOT_AVAILABLE/);
+  Assert.throws(() => {
+    db.nextPseudoMsgKey = 90;
+  }, /NS_ERROR_NOT_AVAILABLE/);
+  const replacement = folder.msgDatabase;
+  Assert.notStrictEqual(replacement, db);
+  Assert.equal(replacement.nextPseudoMsgKey, 0xfffffff0);
+  Assert.deepEqual(replacement.listAllKeys(), [first, second]);
+});
+
+add_task(function test_pseudoKeyFailuresPreserveCursorAndCallerTransaction() {
+  const folder = root.createLocalSubfolder("pseudo-key-source");
+  const db = folder.msgDatabase;
+  const id = folder.id;
+  const connection = database.connectionForTests;
+  db.nextPseudoMsgKey = 77;
+  connection.beginTransaction();
+  const update = connection.createStatement(
+    "UPDATE database_identity SET sourceId = :source"
+  );
+  try {
+    Assert.equal(db.nextPseudoMsgKey, 77);
+    db.nextPseudoMsgKey = 88;
+    update.params.source = Services.uuid.generateUUID().toString();
+    update.execute();
+    Assert.throws(() => db.nextPseudoMsgKey, /NS_ERROR_NOT_AVAILABLE/);
+    Assert.throws(() => {
+      db.nextPseudoMsgKey = 9;
+    }, /NS_ERROR_NOT_AVAILABLE/);
+    Assert.ok(connection.transactionInProgress);
+  } finally {
+    update.finalize();
+    connection.rollbackTransaction();
+  }
+  Assert.equal(
+    db.nextPseudoMsgKey,
+    88,
+    "failed reads/writes retain the cursor"
+  );
+  connection.beginTransaction();
+  const remove = connection.createStatement(
+    "DELETE FROM folders WHERE id = :id"
+  );
+  try {
+    remove.params.id = id;
+    remove.execute();
+    Assert.throws(() => db.nextPseudoMsgKey, /NS_ERROR_NOT_AVAILABLE/);
+    Assert.throws(() => {
+      db.nextPseudoMsgKey = 9;
+    }, /NS_ERROR_NOT_AVAILABLE/);
+    Assert.ok(connection.transactionInProgress);
+  } finally {
+    remove.finalize();
+    connection.rollbackTransaction();
+  }
+  Assert.equal(db.nextPseudoMsgKey, 87, "missing folder did not change state");
+  connection.executeSimpleSQL(
+    "ALTER TABLE database_identity RENAME TO unavailable_pseudo_identity"
+  );
+  try {
+    Assert.throws(() => db.nextPseudoMsgKey, /NS_ERROR_FAILURE/);
+    Assert.throws(() => {
+      db.nextPseudoMsgKey = 9;
+    }, /NS_ERROR_FAILURE/);
+  } finally {
+    connection.executeSimpleSQL(
+      "ALTER TABLE unavailable_pseudo_identity RENAME TO database_identity"
+    );
+  }
+  Assert.equal(db.nextPseudoMsgKey, 86, "storage errors do not consume state");
+});

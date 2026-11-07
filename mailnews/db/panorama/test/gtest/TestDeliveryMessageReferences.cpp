@@ -1207,6 +1207,71 @@ TEST_F(DeliveryHeaderProperties, DetachedUint32RetainsTypedStorage) {
             draft->GetUint32Property("delivery.number", nullptr));
 }
 
+TEST_F(DeliveryCompleteHeader, PendingAttributesKeepUint64AndStageComplete) {
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  nsCOMPtr<nsIMsgDBHdr> source, draft;
+  ASSERT_EQ(NS_OK, db->CreateNewHdr(getter_AddRefs(source)));
+  ASSERT_EQ(NS_OK, source->SetMessageId("pending-native@invalid"_ns));
+  ASSERT_EQ(NS_OK, source->SetReferences("<a@invalid> <a@invalid>"_ns));
+  ASSERT_EQ(NS_OK, db->CopyHdrForStore(source, false, getter_AddRefs(draft)));
+  ASSERT_EQ(NS_OK,
+            db->SetUint64AttributeOnPendingHdr(draft, "wide", UINT64_MAX));
+  ASSERT_EQ(NS_OK,
+            db->SetUint32AttributeOnPendingHdr(draft, "word", UINT32_MAX));
+  ASSERT_EQ(NS_OK, db->SetAttributeOnPendingHdr(draft, "empty", ""));
+  ASSERT_EQ(NS_OK,
+            db->SetAttributeOnPendingHdr(draft, "unicode", "雪 é exact"));
+  EXPECT_EQ(NS_ERROR_ILLEGAL_VALUE,
+            db->SetUint64AttributeOnPendingHdr(draft, "flags", UINT64_MAX));
+  nsMsgKey key = nsMsgKey_None;
+  ASSERT_EQ(NS_OK, db->StageHdrForOfflineCopy(draft, &key));
+  nsAutoCString text;
+  ASSERT_EQ(NS_OK, draft->GetStringProperty("wide", text));
+  EXPECT_EQ("ffffffffffffffff"_ns, text);
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            db->SetAttributeOnPendingHdr(draft, "wide", "too-late"));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, db->UpdatePendingAttributes(draft));
+  RefPtr<Message> live;
+  ASSERT_EQ(NS_OK,
+            db->PublishHdrForOfflineCopy(draft, false, getter_AddRefs(live)));
+  ASSERT_TRUE(live);
+  ASSERT_EQ(NS_OK, live->GetStringProperty("wide", text));
+  EXPECT_EQ("ffffffffffffffff"_ns, text);
+  ASSERT_EQ(NS_OK, live->GetStringProperty("unicode", text));
+  EXPECT_EQ("雪 é exact"_ns, text);
+  ASSERT_EQ(NS_OK, live->GetStringProperty("word", text));
+  EXPECT_EQ("ffffffff"_ns, text);
+  nsTArray<nsCString> names;
+  ASSERT_EQ(NS_OK, live->GetProperties(names));
+  EXPECT_TRUE(names.Contains("empty"_ns));
+  nsTArray<nsCString> references;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageReferences(key, references));
+  const nsTArray<nsCString> expected = {"a@invalid"_ns, "a@invalid"_ns};
+  EXPECT_EQ(expected, references);
+}
+
+TEST_F(DeliveryCompleteHeader, PendingAttributesRejectUnownedAndNullInputs) {
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  RefPtr<PerFolderDatabase> other = new PerFolderDatabase(mFolder, false);
+  nsCOMPtr<nsIMsgDBHdr> draft;
+  ASSERT_EQ(NS_OK, db->CreateNewHdr(getter_AddRefs(draft)));
+  RefPtr<DetachedMsgHdr> unowned = new DetachedMsgHdr(mFolder);
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db->UpdatePendingAttributes(unowned));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, other->UpdatePendingAttributes(draft));
+  EXPECT_EQ(NS_ERROR_INVALID_ARG, db->UpdatePendingAttributes(nullptr));
+  EXPECT_EQ(NS_ERROR_NULL_POINTER,
+            db->SetAttributeOnPendingHdr(draft, nullptr, "value"));
+  EXPECT_EQ(NS_ERROR_NULL_POINTER,
+            db->SetAttributeOnPendingHdr(draft, "name", nullptr));
+  EXPECT_EQ(NS_ERROR_NULL_POINTER,
+            db->SetUint64AttributeOnPendingHdr(draft, nullptr, UINT64_MAX));
+  ASSERT_EQ(NS_OK, db->SetAttributeOnPendingHdr(draft, "kept", "value"));
+  ASSERT_EQ(NS_OK, db->UpdatePendingAttributes(draft));
+  nsAutoCString text;
+  ASSERT_EQ(NS_OK, draft->GetStringProperty("kept", text));
+  EXPECT_EQ("value"_ns, text);
+}
+
 TEST_F(DeliveryCompleteHeader, LocalStoreCopyExcludesStoragePresence) {
   RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
   nsCOMPtr<nsIMsgDBHdr> source;

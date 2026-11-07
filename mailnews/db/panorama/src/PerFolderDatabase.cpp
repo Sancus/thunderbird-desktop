@@ -1181,8 +1181,13 @@ NS_IMETHODIMP PerFolderDatabase::ContainsKey(nsMsgKey key, bool* contains) {
 }
 NS_IMETHODIMP PerFolderDatabase::CreateNewHdr(nsIMsgDBHdr** aRetVal) {
   NS_ENSURE_ARG_POINTER(aRetVal);
+  *aRetVal = nullptr;
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
   RefPtr<DetachedMsgHdr> hdr = new DetachedMsgHdr(mFolderId);
   hdr->mParsedSourceId = mDatabaseSourceId;
+  hdr->mPendingOwner = this;
+  hdr->mPendingSourceId = mDatabaseSourceId;
   hdr.forget(aRetVal);
   return NS_OK;
 }
@@ -1372,6 +1377,9 @@ NS_IMETHODIMP PerFolderDatabase::AttachHdr(nsIMsgDBHdr* detachedHdr,
     return NS_OK;
   }
   MOZ_TRY(draft->CheckMutable());
+  if (!draft->mPendingAttributes.IsEmpty()) {
+    MOZ_TRY(UpdatePendingAttributes(draft));
+  }
   draft->mAttachState = DetachedMsgHdr::AttachState::Attaching;
   nsCOMPtr<nsIMsgDBHdr> live;
   rv = AddMsgHdr(&draft->mRaw, notify, getter_AddRefs(live));
@@ -2465,6 +2473,11 @@ NS_IMETHODIMP PerFolderDatabase::CopyHdrFromExistingHdr(
   if (selected) {
     MOZ_TRY(selected->Check());
   }
+  // Source getters may have reentered during collection.
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
+  draft->mPendingOwner = this;
+  draft->mPendingSourceId = mDatabaseSourceId;
   if (addHdrToDB) {
     return AttachHdr(draft, true, aRetVal);
   }
@@ -2524,6 +2537,7 @@ nsresult PerFolderDatabase::StageHdrForOfflineCopy(nsIMsgDBHdr* detached,
                      draft->mCopySourceId.Equals(mDatabaseSourceId),
                  NS_ERROR_NOT_AVAILABLE);
   MOZ_TRY(draft->CheckMutable());
+  MOZ_TRY(UpdatePendingAttributes(draft));
   // Initial queued copies have no inferred source-server UID binding.
   NS_ENSURE_FALSE(
       std::any_of(draft->mRaw.extras.begin(), draft->mRaw.extras.end(),
@@ -3628,28 +3642,128 @@ NS_IMETHODIMP PerFolderDatabase::ListAllOfflineMsgs(
   aRetVal = std::move(offline);
   return NS_OK;
 }
+nsresult PerFolderDatabase::GetPendingHdr(nsIMsgDBHdr* header,
+                                          RefPtr<DetachedMsgHdr>& draft) {
+  NS_ENSURE_ARG(header);
+  RefPtr<PerFolderDatabase> self(this);
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
+  RefPtr<DetachedMsgHdr> native = do_QueryObject(header);
+  // A foreign QueryInterface can run code. Recheck before admitting its result.
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
+  NS_ENSURE_TRUE(native && native->mFolderId == mFolderId &&
+                     native->mPendingOwner.get() == this &&
+                     native->mPendingSourceId == mDatabaseSourceId,
+                 NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(native->CheckMutable());
+  draft = std::move(native);
+  return NS_OK;
+}
+
+nsresult PerFolderDatabase::AppendPendingAttribute(
+    nsIMsgDBHdr* header, const PendingHeaderAttribute& attribute) {
+  RefPtr<DetachedMsgHdr> draft;
+  MOZ_TRY(GetPendingHdr(header, draft));
+  NS_ENSURE_FALSE(attribute.name.IsEmpty(), NS_ERROR_INVALID_ARG);
+  // These fields can only come from checked server confirmation or the actual
+  // destination provider's Finish receipt. The source header is not that proof.
+  if (attribute.name.EqualsLiteral("uidOnServer") ||
+      attribute.name.EqualsLiteral("storeToken") ||
+      attribute.name.EqualsLiteral("messageSize") ||
+      attribute.name.EqualsLiteral("offlineMsgSize") ||
+      attribute.name.EqualsLiteral("offlineMessageSize") ||
+      attribute.name.EqualsLiteral("lineCount")) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+  if (attribute.name.EqualsLiteral("flags")) {
+    NS_ENSURE_TRUE(attribute.integer && *attribute.integer <= UINT32_MAX,
+                   NS_ERROR_ILLEGAL_VALUE);
+    NS_ENSURE_FALSE(*attribute.integer & nsMsgMessageFlags::Offline,
+                    NS_ERROR_NOT_AVAILABLE);
+  }
+  if (attribute.name.EqualsLiteral("priority")) {
+    if (attribute.integer) {
+      NS_ENSURE_TRUE(*attribute.integer <= nsMsgPriority::highest,
+                     NS_ERROR_ILLEGAL_VALUE);
+    } else {
+      NS_ENSURE_TRUE(attribute.text.Length() == 1 && attribute.text[0] >= '0' &&
+                         attribute.text[0] <= '6',
+                     NS_ERROR_INVALID_ARG);
+    }
+  }
+  draft->mPendingAttributes.AppendElement(attribute);
+  return NS_OK;
+}
+
 NS_IMETHODIMP PerFolderDatabase::SetAttributeOnPendingHdr(
     nsIMsgDBHdr* pendingHdr, const char* property, const char* propertyVal) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  NS_ENSURE_ARG_POINTER(property);
+  NS_ENSURE_ARG_POINTER(propertyVal);
+  return AppendPendingAttribute(
+      pendingHdr, {nsCString(property), nsCString(propertyVal), Nothing()});
 }
 NS_IMETHODIMP PerFolderDatabase::SetUint32AttributeOnPendingHdr(
     nsIMsgDBHdr* pendingHdr, const char* property, uint32_t propertyVal) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  return SetUint64AttributeOnPendingHdr(pendingHdr, property, propertyVal);
 }
 NS_IMETHODIMP PerFolderDatabase::SetUint64AttributeOnPendingHdr(
-    nsIMsgDBHdr* aPendingHdr, const char* aProperty, uint64_t aPropertyVal) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+    nsIMsgDBHdr* pendingHdr, const char* property, uint64_t propertyVal) {
+  NS_ENSURE_ARG_POINTER(property);
+  return AppendPendingAttribute(
+      pendingHdr, {nsCString(property), nsCString(), Some(propertyVal)});
 }
-NS_IMETHODIMP PerFolderDatabase::UpdatePendingAttributes(nsIMsgDBHdr* aNewHdr) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+NS_IMETHODIMP PerFolderDatabase::UpdatePendingAttributes(nsIMsgDBHdr* header) {
+  RefPtr<DetachedMsgHdr> draft;
+  MOZ_TRY(GetPendingHdr(header, draft));
+  // Prepare the whole ordered batch before replacing metadata or consuming it.
+  auto extras = draft->mRaw.extras.Clone();
+  nsCString keywords = draft->mRaw.keywords;
+  auto priority = draft->mRaw.priority;
+  uint32_t flags = draft->mRaw.flags;
+  for (const auto& attribute : draft->mPendingAttributes) {
+    if (attribute.name.EqualsLiteral("flags")) {
+      flags |= static_cast<uint32_t>(*attribute.integer);
+    } else if (attribute.name.EqualsLiteral("priority")) {
+      priority = static_cast<nsMsgPriorityValue>(
+          attribute.integer ? *attribute.integer : attribute.text[0] - '0');
+    } else {
+      nsAutoCString text;
+      if (attribute.integer) {
+        text.AppendInt(*attribute.integer, 16);
+      } else {
+        text = attribute.text;
+      }
+      if (attribute.name.EqualsLiteral("keywords")) {
+        keywords = text;
+      } else {
+        extras.AppendElement(RawHdr::kv{attribute.name, text});
+        continue;
+      }
+    }
+    extras.RemoveElementsBy(
+        [&](const auto& extra) { return extra.k == attribute.name; });
+  }
+  draft->mRaw.extras = std::move(extras);
+  draft->mRaw.keywords = std::move(keywords);
+  draft->mRaw.priority = priority;
+  draft->mRaw.flags = flags;
+  draft->mPendingAttributes.Clear();
+  return NS_OK;
 }
-NS_IMETHODIMP PerFolderDatabase::GetNextPseudoMsgKey(
-    nsMsgKey* aNextPseudoMsgKey) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+NS_IMETHODIMP PerFolderDatabase::GetNextPseudoMsgKey(nsMsgKey* key) {
+  NS_ENSURE_ARG_POINTER(key);
+  *key = nsMsgKey_None;
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
+  *key = mNextPseudoMsgKey--;
+  return NS_OK;
 }
-NS_IMETHODIMP PerFolderDatabase::SetNextPseudoMsgKey(
-    nsMsgKey aNextPseudoMsgKey) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+NS_IMETHODIMP PerFolderDatabase::SetNextPseudoMsgKey(nsMsgKey key) {
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
+  mNextPseudoMsgKey = key;
+  return NS_OK;
 }
 NS_IMETHODIMP PerFolderDatabase::GetNextFakeOfflineMsgKey(nsMsgKey* key) {
   NS_ENSURE_ARG_POINTER(key);

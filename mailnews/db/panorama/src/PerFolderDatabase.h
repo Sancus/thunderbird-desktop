@@ -309,6 +309,9 @@ class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
                           uint32_t& status) const;
   nsresult CheckFolderExists() const;
   nsresult CaptureDatabaseSourceId();
+  nsresult GetPendingHdr(nsIMsgDBHdr* header, RefPtr<DetachedMsgHdr>& draft);
+  nsresult AppendPendingAttribute(nsIMsgDBHdr* header,
+                                  const PendingHeaderAttribute& attribute);
   nsresult CheckDatabaseSource() const;
   nsresult CacheHeader(nsMsgKey key, nsIMsgDBHdr* header);
   nsresult CheckEnumerationState(uint64_t generation) const;
@@ -337,6 +340,9 @@ class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
   uint64_t mEnumeratorGeneration = 0;
   bool mForceClosed = false;
   bool mNotifyingGoingAway = false;
+  // Legacy pending-operation cursor, independent of physical/operation keys
+  // and server UIDs. Ordinary Close retains it; a new wrapper starts fresh.
+  nsMsgKey mNextPseudoMsgKey = 0xfffffff0;
   nsTArray<nsMsgKey> mNewList;
   // Only pending publication callbacks for explicitly not-New parsed headers.
   // Entries are consumed before legacy fanout, or removed on failure/close.

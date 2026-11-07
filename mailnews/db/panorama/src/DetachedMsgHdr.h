@@ -8,6 +8,7 @@
 #include "MailNewsTypes.h"
 #include "Message.h"
 #include "MessageDatabase.h"
+#include "mozilla/WeakPtr.h"
 #include "nsCOMPtr.h"
 #include "nsIMsgDatabase.h"  // For struct RawHdr
 #include "nsIMsgHdr.h"
@@ -54,6 +55,12 @@ class DetachedMsgHdr : public DecodedSubjectHdr {
   AttachState mAttachState = AttachState::Editable;
   nsresult mAttachError = NS_OK;
   nsCOMPtr<nsIMsgDBHdr> mAttachedHeader;
+
+  // Pending values belong to this exact unpublished destination and creator.
+  // They never identify another header by Message-ID, URI, key or server UID.
+  WeakPtr<PerFolderDatabase> mPendingOwner;
+  nsCString mPendingSourceId;
+  nsTArray<PendingHeaderAttribute> mPendingAttributes;
 
   // Opaque common-copy provenance and its one unpublished physical member.
   // Origin of a newly created native parser draft, separate from copy custody.

@@ -634,3 +634,207 @@ add_task(function test_headerLivenessPreservesStorageErrors() {
   }
   Assert.ok(header.isLive);
 });
+
+add_task(function test_pendingAttributesBelongToExactUnpublishedDestination() {
+  const first = root.createLocalSubfolder("pending-first").msgDatabase;
+  const second = root.createLocalSubfolder("pending-second").msgDatabase;
+  const a = makeDraft(first, "same@pending.invalid");
+  const b = makeDraft(first, "same@pending.invalid");
+  const foreign = makeDraft(second, "same@pending.invalid");
+  first.updatePendingAttributes(a);
+  a.subject = "mutable after empty pending flush";
+  Assert.equal(a.subject, "mutable after empty pending flush");
+  first.setAttributeOnPendingHdr(a, "Case", "00042");
+  // The unchanged IDL `string` parameter takes 8-bit UTF-8 bytes, as native
+  // nsCString callers supply. The public header getter returns Unicode.
+  first.setAttributeOnPendingHdr(a, "case", "\xe9\x9b\xaa \xc3\xa9 exact");
+  first.setAttributeOnPendingHdr(a, "pending.empty", "");
+  first.setUint32AttributeOnPendingHdr(a, "pending.max", 0xffffffff);
+  first.setUint64AttributeOnPendingHdr(a, "pending.wide", 0x1fffffffffffff);
+  first.setAttributeOnPendingHdr(b, "Case", "other-copy");
+  Assert.ok(
+    !a.properties.includes("Case"),
+    "values remain pending before flush"
+  );
+  Assert.deepEqual(first.listAllKeys(), []);
+  Assert.throws(
+    () => second.setAttributeOnPendingHdr(a, "Case", "foreign"),
+    /NS_ERROR_NOT_AVAILABLE/
+  );
+  Assert.throws(
+    () => first.updatePendingAttributes(foreign),
+    /NS_ERROR_NOT_AVAILABLE/
+  );
+  first.updatePendingAttributes(a);
+  Assert.equal(a.getStringProperty("Case"), "00042");
+  Assert.equal(a.getStringProperty("case"), "雪 é exact");
+  Assert.equal(a.getStringProperty("pending.empty"), "");
+  Assert.ok(a.properties.includes("pending.empty"));
+  Assert.equal(a.getStringProperty("pending.max"), "ffffffff");
+  Assert.equal(a.getStringProperty("pending.wide"), "1fffffffffffff");
+  Assert.ok(
+    !b.properties.includes("Case"),
+    "same Message-ID is not an association"
+  );
+  first.updatePendingAttributes(b);
+  Assert.equal(b.getStringProperty("Case"), "other-copy");
+  b.subject = "mutable after pending values";
+  Assert.equal(b.subject, "mutable after pending values");
+  Assert.equal(foreign.getStringProperty("Case"), "");
+  first.updatePendingAttributes(a);
+  Assert.equal(
+    a.getStringProperty("Case"),
+    "00042",
+    "empty second flush is harmless"
+  );
+});
+
+add_task(function test_pendingAttributesAreCompleteAtFirstPublication() {
+  const db = root.createLocalSubfolder("pending-publication").msgDatabase;
+  const draft = makeDraft(db, "publish@pending.invalid");
+  db.setAttributeOnPendingHdr(draft, "ordered", "first");
+  db.setAttributeOnPendingHdr(draft, "ordered", "last");
+  db.setUint32AttributeOnPendingHdr(draft, "flags", Ci.nsMsgMessageFlags.HasRe);
+  db.setUint32AttributeOnPendingHdr(
+    draft,
+    "flags",
+    Ci.nsMsgMessageFlags.Marked
+  );
+  db.setAttributeOnPendingHdr(draft, "priority", "6");
+  db.setAttributeOnPendingHdr(draft, "keywords", "tag3 tag4");
+  let calls = 0;
+  const listener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onHdrAdded(header) {
+      ++calls;
+      Assert.equal(header.getStringProperty("ordered"), "last");
+      Assert.equal(header.getStringProperty("keywords"), "tag3 tag4");
+      Assert.equal(header.priority, Ci.nsMsgPriority.highest);
+      Assert.equal(
+        header.flags,
+        Ci.nsMsgMessageFlags.Read |
+          Ci.nsMsgMessageFlags.HasRe |
+          Ci.nsMsgMessageFlags.Marked
+      );
+    },
+  };
+  db.addListener(listener);
+  try {
+    const live = db.attachHdr(draft, true);
+    Assert.equal(calls, 1);
+    Assert.equal(live.getStringProperty("ordered"), "last");
+    Assert.throws(
+      () => db.setAttributeOnPendingHdr(live, "ordered", "late"),
+      /NS_ERROR_NOT_AVAILABLE/
+    );
+    Assert.throws(
+      () => db.setAttributeOnPendingHdr(draft, "ordered", "late"),
+      /NS_ERROR_ALREADY_INITIALIZED/
+    );
+    Assert.throws(
+      () => db.updatePendingAttributes(draft),
+      /NS_ERROR_ALREADY_INITIALIZED/
+    );
+    Assert.equal(live.getStringProperty("ordered"), "last");
+  } finally {
+    db.removeListener(listener);
+  }
+});
+
+add_task(
+  function test_pendingAttributesRefuseUnprovenStorageAndInvalidTypedValues() {
+    const db = root.createLocalSubfolder("pending-invalid").msgDatabase;
+    const draft = makeDraft(db, "invalid@pending.invalid");
+    db.setAttributeOnPendingHdr(draft, "kept", "before-error");
+    for (const name of [
+      "storeToken",
+      "uidOnServer",
+      "messageSize",
+      "offlineMsgSize",
+      "offlineMessageSize",
+      "lineCount",
+    ]) {
+      Assert.throws(
+        () => db.setAttributeOnPendingHdr(draft, name, "source-value"),
+        /NS_ERROR_NOT_AVAILABLE/
+      );
+      Assert.throws(
+        () => db.setUint32AttributeOnPendingHdr(draft, name, 0),
+        /NS_ERROR_NOT_AVAILABLE/
+      );
+    }
+    Assert.throws(
+      () =>
+        db.setUint32AttributeOnPendingHdr(
+          draft,
+          "flags",
+          Ci.nsMsgMessageFlags.Offline
+        ),
+      /NS_ERROR_NOT_AVAILABLE/
+    );
+    Assert.throws(
+      () => db.setAttributeOnPendingHdr(draft, "flags", "1"),
+      /NS_ERROR_ILLEGAL_VALUE/
+    );
+    Assert.throws(
+      () => db.setAttributeOnPendingHdr(draft, "priority", "60"),
+      error => error.result === Cr.NS_ERROR_INVALID_ARG
+    );
+    Assert.throws(
+      () => db.setUint32AttributeOnPendingHdr(draft, "priority", 7),
+      /NS_ERROR_ILLEGAL_VALUE/
+    );
+    Assert.throws(
+      () => db.setAttributeOnPendingHdr(draft, "", "missing-name"),
+      error => error.result === Cr.NS_ERROR_INVALID_ARG
+    );
+    db.updatePendingAttributes(draft);
+    Assert.equal(draft.getStringProperty("kept"), "before-error");
+    Assert.equal(draft.flags, Ci.nsMsgMessageFlags.Read);
+    Assert.equal(draft.priority, Ci.nsMsgPriority.high);
+  }
+);
+
+add_task(function test_pendingFailureKeepsValuesAndDoesNotRebindAReplacement() {
+  const folder = root.createLocalSubfolder("pending-lifetime");
+  const db = folder.msgDatabase;
+  const draft = makeDraft(db, "lifetime@pending.invalid");
+  db.setAttributeOnPendingHdr(draft, "pending", "retained");
+  const connection = database.connectionForTests;
+  connection.beginTransaction();
+  const update = connection.createStatement(
+    "UPDATE database_identity SET sourceId = :source"
+  );
+  try {
+    update.params.source = Services.uuid.generateUUID().toString();
+    update.execute();
+    Assert.throws(
+      () => db.updatePendingAttributes(draft),
+      /NS_ERROR_NOT_AVAILABLE/
+    );
+    Assert.throws(
+      () => db.setAttributeOnPendingHdr(draft, "pending", "lost"),
+      /NS_ERROR_NOT_AVAILABLE/
+    );
+    Assert.ok(connection.transactionInProgress);
+    Assert.ok(!draft.properties.includes("pending"));
+  } finally {
+    update.finalize();
+    connection.rollbackTransaction();
+  }
+  db.updatePendingAttributes(draft);
+  Assert.equal(draft.getStringProperty("pending"), "retained");
+  db.setAttributeOnPendingHdr(draft, "pending", "still-unpublished");
+  db.forceClosed();
+  const replacement = folder.msgDatabase;
+  Assert.throws(
+    () => db.updatePendingAttributes(draft),
+    /NS_ERROR_NOT_AVAILABLE/
+  );
+  Assert.throws(
+    () => replacement.updatePendingAttributes(draft),
+    /NS_ERROR_NOT_AVAILABLE/
+  );
+  Assert.equal(draft.getStringProperty("pending"), "retained");
+  Assert.deepEqual(replacement.listAllKeys(), []);
+});

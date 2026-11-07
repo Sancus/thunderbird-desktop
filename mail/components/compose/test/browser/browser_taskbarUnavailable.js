@@ -13,6 +13,7 @@ add_task(function testUnavailableTaskbarProgressIsOptional() {
   Assert.equal(TaskbarProgress.getTaskbarProgress({ docShell: null }), null);
   const cid = MockRegistrar.register("@mozilla.org/windows-taskbar;1", {
     QueryInterface: ChromeUtils.generateQI(["nsIWinTaskbar"]),
+    available: true,
     getTaskbarProgress() {
       Components.returnCode = Cr.NS_ERROR_NOT_AVAILABLE;
       return null;
@@ -31,6 +32,7 @@ add_task(function testUnexpectedTaskbarProgressErrorIsPreserved() {
   );
   const cid = MockRegistrar.register("@mozilla.org/windows-taskbar;1", {
     QueryInterface: ChromeUtils.generateQI(["nsIWinTaskbar"]),
+    available: true,
     getTaskbarProgress() {
       Components.returnCode = Cr.NS_ERROR_FAILURE;
       return null;
@@ -41,6 +43,27 @@ add_task(function testUnexpectedTaskbarProgressErrorIsPreserved() {
       () => TaskbarProgress.getTaskbarProgress(window),
       /NS_ERROR_FAILURE/
     );
+  } finally {
+    MockRegistrar.unregister(cid);
+  }
+});
+
+add_task(function testUnavailableTaskbarIsNotQueried() {
+  const { TaskbarProgress } = ChromeUtils.importESModule(
+    "resource:///modules/TaskbarProgress.sys.mjs"
+  );
+  let queried = false;
+  const cid = MockRegistrar.register("@mozilla.org/windows-taskbar;1", {
+    QueryInterface: ChromeUtils.generateQI(["nsIWinTaskbar"]),
+    available: false,
+    getTaskbarProgress() {
+      queried = true;
+      return null;
+    },
+  });
+  try {
+    Assert.equal(TaskbarProgress.getTaskbarProgress(window), null);
+    Assert.ok(!queried, "An unavailable taskbar is never asked for progress");
   } finally {
     MockRegistrar.unregister(cid);
   }

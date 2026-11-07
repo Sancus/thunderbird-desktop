@@ -2589,18 +2589,33 @@ add_task(
     const folders = ordinaryBatchFolders("reentry");
     const early = new LiveView();
     early.initWithFolders(folders);
+    let f;
     let nested = false;
+    let cancel = false;
     early.setListener({
+      onMessageRemoved() {},
+      onMessageFlagsChanged() {},
+      onMessageTagsChanged() {},
       onMessageAdded(message) {
+        if (cancel) {
+          cancel = false;
+          f.view.clearListener();
+          f.view.setListener(f.adapter._queryListener);
+          return;
+        }
         if (nested) {
           return;
         }
         nested = true;
         messageDB.getMessage(message.id).orFlags(Ci.nsMsgMessageFlags.Marked);
+        messageDB
+          .getMessage(message.id)
+          .setStringProperty("keywords", "queued-opaque");
         addMessage({ folderId: folders[1], messageId: "queued-next" });
+        messageDB.removeMessage(message.id);
       },
     });
-    const f = await ordinaryBatchAdapter(folders);
+    f = await ordinaryBatchAdapter(folders);
     try {
       const added = addMessage({
         folderId: folders[0],
@@ -2620,22 +2635,40 @@ add_task(
         "First facts precede reentry"
       );
       Assert.equal(f.payloads[0].rows.at(-1).after.tags, "opaque");
-      Assert.equal(
-        f.adapter._rowMap.find(row => row.message.id == added).message.flags,
-        Ci.nsMsgMessageFlags.Marked
+      const historical = f.payloads[1].beforeView.roots.find(
+        row => row.message.id == added
+      ).message;
+      Assert.equal(historical.flags, Ci.nsMsgMessageFlags.Marked);
+      Assert.equal(historical.tags, "queued-opaque");
+      Assert.ok(
+        !f.adapter._rowMap.some(row => row.message.id == added),
+        "Queued removal follows its captured publication"
       );
+      Assert.deepEqual(f.events, [
+        ["reset"],
+        ["row", 0],
+        ["reset"],
+        ["count", 0, -1],
+      ]);
       Assert.greater(
         BigInt(f.payloads[1].batchId),
         BigInt(f.payloads[0].batchId)
       );
       Assert.equal(f.events.filter(event => event[0] == "reset").length, 2);
       const count = f.payloads.length;
-      f.view.clearListener();
+      cancel = true;
       addMessage({ folderId: folders[0], messageId: "detached" });
       Assert.equal(
         f.payloads.length,
         count,
-        "Removed registration cannot receive a queued form"
+        "Removed/re-enrolled registration cannot receive an old queued form"
+      );
+      await f.adapter.sortBy("date", "ascending");
+      addMessage({ folderId: folders[0], messageId: "fresh-registration" });
+      Assert.equal(
+        f.payloads.length,
+        count + 1,
+        "Fresh registration receives its own new operation once"
       );
     } finally {
       early.clearListener();

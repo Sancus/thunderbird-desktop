@@ -1983,6 +1983,9 @@ export class LiveViewDataAdapter extends TreeDataAdapter {
    * @param {Error} [error] - The reported consumer failure.
    */
   _invalidateThreadBatch(error) {
+    if (!this._liveView) {
+      return;
+    }
     this._queryGeneration++;
     this._viewGeneration++;
     this._liveView?.clearListener(this._queryListener ?? this);
@@ -2073,9 +2076,14 @@ export class LiveViewDataAdapter extends TreeDataAdapter {
   }
 
   onMessageFlagsChanged(message, oldFlags) {
-    // Hope _flatRowCache exists.
+    // A settled batch invalidates the flattened cache. Materialize it through
+    // the ordinary row-count getter before applying a queued metadata change.
+    if (!this.rowCount) {
+      return;
+    }
     const index = this._flatRowCache.findIndex(
-      r => r.message?.id == message.id
+      r =>
+        r?.message?.id == message.id && r.message.folderId == message.folderId
     );
     if (index == -1) {
       return;
@@ -2092,7 +2100,16 @@ export class LiveViewDataAdapter extends TreeDataAdapter {
   }
 
   onMessageTagsChanged(message, _oldTags) {
-    const index = this._flatRowCache.findIndex(r => r.message.id == message.id);
+    if (!this.rowCount) {
+      return;
+    }
+    const index = this._flatRowCache.findIndex(
+      r =>
+        r?.message?.id == message.id && r.message.folderId == message.folderId
+    );
+    if (index == -1) {
+      return;
+    }
     const row = this._flatRowCache[index];
     row._initFromMessage(message);
     this._tree?.invalidateRow(index);

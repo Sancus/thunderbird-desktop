@@ -2111,6 +2111,12 @@ add_task(async function test_searchThreadDateErrorPreservesVisibleOrder() {
 });
 
 add_task(async function test_newHeaderDateErrorPreservesView() {
+  if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    info(
+      "Native-only SQLite fault control; the existing ordinary Mork cases remain unchanged"
+    );
+    return;
+  }
   const core = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
     Ci.nsIDatabaseCore
   );

@@ -1,4 +1,5 @@
 [DEFAULT]
+dupe-manifest = true
 prefs = [
   "datareporting.policy.dataSubmissionPolicyBypassNotification=true",
   "mail.account.account1.server=server1",
@@ -19,7 +20,3 @@ subsuite = "thunderbird"
 support-files = ["data/**"]
 
 ["browser_feedCommandLine.js"]
-
-["browser_feedDisplay.js"]
-
-["browser_opmlImport.js"]

@@ -518,7 +518,6 @@ nsImapIncomingServer::GetImapConnectionAndLoadUrl(nsIImapUrl* aImapUrl,
     PR_CEnterMonitor(this);
     m_urlQueue.AppendObject(aImapUrl);
     m_urlConsumers.AppendElement(aConsumer);
-    NS_IF_ADDREF(aConsumer);
     PR_CExitMonitor(this);
     // let's try running it now - maybe the connection is free now.
     bool urlRun;
@@ -596,8 +595,7 @@ nsImapIncomingServer::LoadNextQueuedUrl(nsIImapProtocol* aProtocol,
       NS_ENSURE_SUCCESS(rv, rv);
       // if we didn't doom the url, lets run it.
       if (!removeUrlFromQueue) {
-        nsISupports* aConsumer = m_urlConsumers.ElementAt(0);
-        NS_IF_ADDREF(aConsumer);
+        nsCOMPtr<nsISupports> aConsumer = m_urlConsumers.ElementAt(0);
 
         nsImapProtocol::LogImapUrl(
             "creating protocol instance to play queued url", aImapUrl);
@@ -622,7 +620,6 @@ nsImapIncomingServer::LoadNextQueuedUrl(nsIImapProtocol* aProtocol,
               "failed creating protocol instance to play queued url", aImapUrl);
           keepGoing = false;
         }
-        NS_IF_RELEASE(aConsumer);
       }
       if (removeUrlFromQueue) {
         // Adopt the queue's reference until both parallel entries are removed.
@@ -1090,7 +1087,9 @@ NS_IMETHODIMP nsImapIncomingServer::PossibleImapMailbox(
 
   nsAutoCString uri;
   nsCString serverUri;
-  GetServerURI(serverUri);
+  // Discovery must use the URI of the existing physical root. Account settings
+  // can change after that root was created; rebuilding its URI loses children.
+  MOZ_TRY(rootFolder->GetURI(serverUri));
   uri.Assign(serverUri);
   int32_t leafPos = folderName.RFindChar('/');
   nsAutoCString parentName(folderName);

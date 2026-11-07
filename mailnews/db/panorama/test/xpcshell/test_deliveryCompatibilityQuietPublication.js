@@ -18,11 +18,14 @@ add_task(async function test_quietAttachStillPublishesToLiveView() {
   draft.subject = "Quiet draft";
   draft.storeToken = "metadata-token";
   draft.messageSize = 11;
-  const view = Cc["@mozilla.org/mailnews/live-view;1"].createInstance(
+  let view = Cc["@mozilla.org/mailnews/live-view;1"].createInstance(
     Ci.nsILiveView
   );
   view.initWithFolder(folder.id);
-  registerCleanupFunction(() => view.clearListener());
+  registerCleanupFunction(() => {
+    view.clearListener();
+    view = null;
+  });
   const internal = [];
   view.setListener({
     onMessageAdded(message) {

@@ -51,6 +51,8 @@ function tree(name) {
   const branch = insert("branch", [head.messageId], 0);
   const leaf = insert("leaf", [head.messageId, branch.messageId], 0);
   const sibling = insert("sibling", [head.messageId], 0);
+  // Exercise raw read/flag transitions without the separate New-list status.
+  db.clearNewList(false);
   Assert.equal(branch.threadId, head.messageKey);
   Assert.equal(branch.threadParent, head.messageKey);
   Assert.equal(leaf.threadParent, branch.messageKey);

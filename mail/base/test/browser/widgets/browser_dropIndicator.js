@@ -16,6 +16,11 @@ add_setup(async function () {
     url: "chrome://mochitests/content/browser/comm/mail/base/test/browser/widgets/files/dropIndicator.xhtml",
   });
 
+  registerCleanupFunction(() => {
+    tabmail.closeOtherTabs(tabmail.tabInfo[0]);
+    window.restore();
+  });
+
   info("Loading tab...");
   await BrowserTestUtils.browserLoaded(tab.browser);
   tab.browser.focus();
@@ -27,10 +32,12 @@ add_setup(async function () {
 
   // Run this tests at full screen to avoid threshold visibility issues.
   if (window.windowState != window.STATE_MAXIMIZED) {
-    const resizePromise = BrowserTestUtils.waitForEvent(window, "resize");
     window.maximize();
     info("Maximizing window...");
-    await resizePromise;
+    await TestUtils.waitForCondition(
+      () => window.windowState == window.STATE_MAXIMIZED,
+      "The window should finish maximizing before drag geometry is measured"
+    );
   } else {
     info("Nothing to maximize");
   }
@@ -45,11 +52,6 @@ add_setup(async function () {
     doc.querySelector(`[is="drop-indicator"]`),
     "the drop indicator should exist"
   );
-
-  registerCleanupFunction(() => {
-    tabmail.closeOtherTabs(tabmail.tabInfo[0]);
-    window.restore();
-  });
 });
 
 async function simulateDragAndDrop(element, target, indicator) {

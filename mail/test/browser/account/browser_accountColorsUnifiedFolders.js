@@ -188,6 +188,9 @@ add_task(async function test_custom_account_colors_in_message_list() {
   let row = await TestUtils.waitForCondition(() =>
     about3Pane.threadTree.getRowAtIndex(0)
   );
+  // Row elements are inserted before TreeViewTableRow fills their content.
+  await new Promise(resolve => about3Pane.requestAnimationFrame(resolve));
+  row = about3Pane.threadTree.getRowAtIndex(0);
   EventUtils.synthesizeMouseAtCenter(row, {}, about3Pane);
 
   info("Test first message without any custom color");

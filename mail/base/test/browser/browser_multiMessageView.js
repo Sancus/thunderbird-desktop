@@ -991,6 +991,8 @@ function createSummaryLocationFixture() {
   info(`Summary100 actual startup native=${native}`);
   return {
     ...fixture,
+    // The source header is removed by the real move. Retain its known identity.
+    rootMessageId: a.messageId,
     destination,
     collision,
     names,
@@ -1013,7 +1015,7 @@ function createSummaryLocationFixture() {
  * @returns {Promise<HTMLLIElement>} The displayed row for the known root ID.
  */
 async function showSummaryLocationMembers(fixture, headers, onSelect) {
-  const { view, summary, win, a } = fixture;
+  const { view, summary, win, rootMessageId } = fixture;
   const notify = view.QueryInterface(Ci.nsIMsgSearchNotify);
   notify.onNewSearch();
   for (const header of headers) {
@@ -1028,7 +1030,7 @@ async function showSummaryLocationMembers(fixture, headers, onSelect) {
     "The real stored MIME summaries have loaded"
   );
   const row = [...list.children].find(
-    node => node.dataset.messageId == a.messageId
+    node => node.dataset.messageId == rootMessageId
   );
   Assert.ok(row, "The known selected root has a summary row");
   Assert.equal(

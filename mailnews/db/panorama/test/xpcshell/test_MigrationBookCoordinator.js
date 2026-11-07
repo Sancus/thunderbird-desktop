@@ -1650,7 +1650,11 @@ add_task(
       input.profile,
       async publication => {
         released = publication;
-        Assert.equal(publication.checkProfile().path, input.profilePath);
+        // The publication returns the canonical profile; macOS temporary
+        // profiles sit below the system /tmp link.
+        const expected = new FileUtils.File(input.profilePath);
+        expected.normalize();
+        Assert.equal(publication.checkProfile().path, expected.path);
       }
     );
     // Settling a publication must not release the startup owner's native lock.

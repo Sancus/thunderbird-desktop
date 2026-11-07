@@ -16,6 +16,7 @@
 #include "nsMsgUtils.h"
 #include "nsIMsgSearchSession.h"
 #include "nsIMsgSearchTerm.h"
+#include "nsMsgFolderFlags.h"
 #include "nsMsgMessageFlags.h"
 #include "nsServiceManagerUtils.h"
 

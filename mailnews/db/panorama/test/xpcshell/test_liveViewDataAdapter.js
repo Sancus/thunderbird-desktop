@@ -2779,7 +2779,7 @@ add_task(async function test_nativeOrdinaryFlatBatchPublicNewProjection() {
   const injection = new MessageInjection({ mode: "local" });
   const generator = new MessageGenerator();
   const parent = generator.makeMessage({ subject: "ordinary-public-new" });
-  const folder = await injection.makeEmptyFolder();
+  const folder = await injection.makeEmptyFolder("ordinary-batch-public-new");
   const set = new SyntheticMessageSet([parent]);
   await injection.addSetsToFolders([folder], [set]);
   const root = set.msgHdrList[0];

@@ -557,6 +557,7 @@ add_task(
  */
 function bookCommitChildArguments(input) {
   return [
+    ...(mozinfo.msix ? ["--xpcshell"] : []),
     "-g",
     Services.dirsvc.get("GreD", Ci.nsIFile).path,
     "-a",
@@ -1492,6 +1493,7 @@ async function runPublicationChild(code) {
     child = await Subprocess.call({
       command: Services.dirsvc.get("XREExeF", Ci.nsIFile).path,
       arguments: [
+        ...(mozinfo.msix ? ["--xpcshell"] : []),
         "-g",
         Services.dirsvc.get("GreD", Ci.nsIFile).path,
         "-a",

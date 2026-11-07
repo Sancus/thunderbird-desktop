@@ -7294,7 +7294,14 @@ nsresult CheckCacheProjectionProof(
                  NS_ERROR_NOT_AVAILABLE);
   MOZ_TRY(ImportMember(cx, object, "version", &value));
   int64_t number;
-  MOZ_TRY(ImportNumber(value, 1, 1, number));
+  // Selected startup has already authenticated its version-3 backup. Keep that
+  // format scoped to its native publication check above; an unselected import
+  // still requires the original version-1 proof.
+  if (exists && value.isNumber() && value.toNumber() == 3) {
+    MOZ_TRY(ImportNumber(value, 3, 3, number));
+  } else {
+    MOZ_TRY(ImportNumber(value, 1, 1, number));
+  }
   MOZ_TRY(ImportMember(cx, object, "roots", &value));
   uint32_t rootCount;
   MOZ_TRY(ImportArray(cx, value, &roots, rootCount));

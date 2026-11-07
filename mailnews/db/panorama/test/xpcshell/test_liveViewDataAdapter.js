@@ -2773,6 +2773,25 @@ add_task(async function test_nativeOrdinaryFlatBatchConsumerFailure() {
   );
 });
 
+/**
+ * Reads the storage word independently of the profile-backed public header.
+ *
+ * @param {number} key - The exact native physical key.
+ * @returns {number} The stored flags, without the per-folder New-list overlay.
+ */
+function ordinaryBatchRawFlags(key) {
+  const statement = database.connectionForTests.createStatement(
+    "SELECT flags FROM messages WHERE id = :key"
+  );
+  try {
+    statement.params.key = key;
+    Assert.ok(statement.executeStep(), "Exact physical source row exists");
+    return statement.row.flags;
+  } finally {
+    statement.finalize();
+  }
+}
+
 add_task(async function test_nativeOrdinaryFlatBatchPublicNewProjection() {
   const { MessageGenerator, SyntheticMessageSet } = ChromeUtils.importESModule(
     "resource://testing-common/mailnews/MessageGenerator.sys.mjs"
@@ -2793,7 +2812,7 @@ add_task(async function test_nativeOrdinaryFlatBatchPublicNewProjection() {
   );
   Assert.greater(folderId, 0);
   Assert.equal(
-    messageDB.getMessage(root.messageKey).flags,
+    ordinaryBatchRawFlags(root.messageKey),
     0,
     "Native raw word stays zero"
   );
@@ -2830,7 +2849,7 @@ add_task(async function test_nativeOrdinaryFlatBatchPublicNewProjection() {
       [["reset"]]
     );
     Assert.equal(
-      messageDB.getMessage(root.messageKey).flags,
+      ordinaryBatchRawFlags(root.messageKey),
       0,
       "Projection never writes the native source word"
     );

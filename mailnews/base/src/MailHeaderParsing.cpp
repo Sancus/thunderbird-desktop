@@ -15,12 +15,12 @@
 #include "nsMsgMessageFlags.h"
 #include "nsMsgUtils.h"
 #include "nsReadableUtils.h"
-#include "nsURLHelper.h" // For net_ParseContentType().
+#include "nsURLHelper.h"  // For net_ParseContentType().
 
 // Attempt to extract a timestamp from a "Received:" header value, e.g:
 // "from bar.com by foo.com ; Thu, 21 May 1998 05:33:29 -0700".
 // Returns 0 if no timestamp could be extracted.
-static PRTime TimestampFromReceived(nsACString const &received) {
+static PRTime TimestampFromReceived(nsACString const& received) {
   int32_t sep = received.RFindChar(';');
   if (sep == kNotFound) {
     return 0;
@@ -53,15 +53,15 @@ RawHdr ParseRawMailHeaders(mozilla::Span<const char> raw) {
 
   // RFC5322 says 0 or 1 occurrences for each of "To:" and "Cc:", but we'll
   // aggregate multiple.
-  AutoTArray<nsCString, 1> toValues;  // Collect "To:" values.
-  AutoTArray<nsCString, 1> ccValues;  // Collect "Cc:" values.
-  AutoTArray<nsCString, 1> bccValues; // Collect "Bcc:" values.
-  nsAutoCString newsgroups;           // "Newsgroups:" value.
+  AutoTArray<nsCString, 1> toValues;   // Collect "To:" values.
+  AutoTArray<nsCString, 1> ccValues;   // Collect "Cc:" values.
+  AutoTArray<nsCString, 1> bccValues;  // Collect "Bcc:" values.
+  nsAutoCString newsgroups;            // "Newsgroups:" value.
   nsAutoCString mozstatus;
   nsAutoCString mozstatus2;
-  nsAutoCString status; // "Status:" value
-  rdr.Parse(raw, [&](HeaderReader::Hdr const &hdr) -> bool {
-    auto const &n = hdr.Name(raw);
+  nsAutoCString status;  // "Status:" value
+  rdr.Parse(raw, [&](HeaderReader::Hdr const& hdr) -> bool {
+    auto const& n = hdr.Name(raw);
     // Alphabetical, because why not?
     if (n.LowerCaseEqualsLiteral("bcc")) {
       // Collect multiple "Bcc:" values.
@@ -159,7 +159,7 @@ RawHdr ParseRawMailHeaders(mozilla::Span<const char> raw) {
     } else {
       // TODO: check custom keys.
     }
-    return true; // Keep going.
+    return true;  // Keep going.
   });
 
   nsCOMPtr<nsIMimeConverter> mimeConverter;
@@ -170,7 +170,7 @@ RawHdr ParseRawMailHeaders(mozilla::Span<const char> raw) {
   NS_ENSURE_TRUE(headerParser, out);
   // Parse address structure before decoding display names. Decoding a comma
   // inside an encoded word first would turn one mailbox into two addresses.
-  auto decodeAddresses = [&](nsCString &header) -> nsresult {
+  auto decodeAddresses = [&](nsCString& header) -> nsresult {
     nsTArray<RefPtr<msgIAddressObject>> addresses;
     nsresult rv = headerParser->ParseEncodedHeader(header, out.charset.get(),
                                                    true, addresses);
@@ -255,7 +255,7 @@ RawHdr ParseRawMailHeaders(mozilla::Span<const char> raw) {
   return out;
 }
 
-RawHdr ParseHeaderBlock(IHeaderBlock *headers) {
+RawHdr ParseHeaderBlock(IHeaderBlock* headers) {
   // Implementation Note:
   // This is a wrapper around ParseRawMailHeaders(), but it's really a
   // little inside-out. ParseRawMailHeaders() should really just wrap the raw
@@ -267,7 +267,7 @@ RawHdr ParseHeaderBlock(IHeaderBlock *headers) {
   if (NS_FAILED(rv)) {
     // Should never happen, but XPCOM doesn't really do infallible methods :-(
     NS_WARNING("IHeaderBlock.asRaw() failed.");
-    return RawHdr{}; // Blank.
+    return RawHdr{};  // Blank.
   }
   return ParseRawMailHeaders(raw);
 }

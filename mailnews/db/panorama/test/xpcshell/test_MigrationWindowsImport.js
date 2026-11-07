@@ -1033,9 +1033,10 @@ add_task(async function test_genuineImapUnitRetainsWindowsPhysicalAdmission() {
     const source = input.journal.state.sources.find(
       value => value.id == member.sourceId
     );
+    // The native receipt adds the measured canonical identities.
     Assert.deepEqual(
       member.windowsAdmission,
-      source.inventory.windowsAdmission
+      Reader.validateMorkFolderWindowsInventory(source.inventory)
     );
     Assert.deepEqual(member.sourcePhysicalIdentity, source.physicalIdentity);
   }

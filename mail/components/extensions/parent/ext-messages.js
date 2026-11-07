@@ -53,6 +53,7 @@ class MsgOperationWrapper {
     this.savedMessages = [];
     this.headerMessageId = null;
     this.classifiedMessages = new Map();
+    this.savedMessageBaselines = new Map();
   }
 
   // Implementation for nsIMsgSendListener.
@@ -75,7 +76,17 @@ class MsgOperationWrapper {
     // Only called for save operations and sendLater. Collect messageIds and
     // folders of saved messages.
     const headerMessageId = msgID.replace(/^<|>$/g, "");
-    this.savedMessages.push(JSON.stringify({ headerMessageId, folderURI }));
+    const key = JSON.stringify({ headerMessageId, folderURI });
+    if (!this.savedMessages.includes(key)) {
+      const folder = MailUtils.getExistingFolder(folderURI);
+      this.savedMessageBaselines.set(
+        key,
+        new Set(
+          folder ? getMessagesInFolder(folder).map(hdr => hdr.messageKey) : []
+        )
+      );
+      this.savedMessages.push(key);
+    }
   }
   onSendNotPerformed(_msgID, _status) {}
   onTransportSecurityError(_msgID, _status, _secInfo, _location) {}
@@ -87,13 +98,38 @@ class MsgOperationWrapper {
     for (const msgHdr of msgs) {
       const cachedMsgHdr = new CachedMsgHeader(messageTracker, msgHdr);
       const key = JSON.stringify({
-        headerMessageId: cachedMsgHdr.messageId,
+        messageKey: cachedMsgHdr.messageKey,
         folderURI: cachedMsgHdr.folder.URI,
       });
       if (!this.classifiedMessages.has(key)) {
         this.classifiedMessages.set(key, cachedMsgHdr);
       }
     }
+  }
+
+  /**
+   * Resolve destination hints against newly classified physical headers.
+   *
+   * @returns {CachedMsgHeader[]} Saved messages in destination hint order.
+   * @throws {ExtensionError} If publication is missing or ambiguous.
+   */
+  getSavedMessages() {
+    return this.savedMessages.map(hint => {
+      const { headerMessageId, folderURI } = JSON.parse(hint);
+      const baseline = this.savedMessageBaselines.get(hint);
+      const matches = [...this.classifiedMessages.values()].filter(
+        message =>
+          message.messageId == headerMessageId &&
+          message.folder.URI == folderURI &&
+          !baseline.has(message.messageKey)
+      );
+      if (matches.length != 1) {
+        throw new ExtensionError(
+          "Saved message publication is missing or ambiguous"
+        );
+      }
+      return matches[0];
+    });
   }
 
   async doMsgOperation(details, sendMode) {
@@ -375,15 +411,22 @@ class MsgOperationWrapper {
       // window-less caller. Skip the additional copy when it would target the
       // FCC folder again.
       // Note: In save modes the additionalFccFolder is ignored.
-      const [primaryCached] = this.classifiedMessages.values();
+      const [primaryCached] = this.getSavedMessages();
       if (
         additionalFccFolder &&
         primaryCached &&
         primaryCached.folder.URI != additionalFccFolder.URI
       ) {
-        const primaryHdr = primaryCached.folder.GetMessageHeader(
-          primaryCached.messageKey
+        const primaryHdr = messageTracker.getMessage(primaryCached.id);
+        if (!primaryHdr) {
+          throw new ExtensionError(
+            "The primary FCC message is no longer available"
+          );
+        }
+        const additionalBaseline = new Set(
+          getMessagesInFolder(additionalFccFolder).map(hdr => hdr.messageKey)
         );
+        let additionalKey = null;
         await new Promise((resolve, reject) => {
           MailServices.copy.copyMessages(
             primaryCached.folder,
@@ -396,7 +439,9 @@ class MsgOperationWrapper {
               ]),
               onStartCopy() {},
               onProgress() {},
-              setMessageKey() {},
+              setMessageKey(key) {
+                additionalKey = key;
+              },
               getMessageId() {
                 return null;
               },
@@ -416,32 +461,42 @@ class MsgOperationWrapper {
             false
           );
         });
-        // FCC2 is delivered via copyMessages(), which does not return a handle
-        // for the created message, so it is looked up here directly via its
-        // Message-ID.
-        const newHdr = additionalFccFolder.msgDatabase.getMsgHdrForMessageID(
-          primaryCached.messageId
-        );
-        if (newHdr) {
-          const newCached = new CachedMsgHeader(messageTracker, newHdr);
-          const key = JSON.stringify({
-            headerMessageId: newCached.messageId,
-            folderURI: newCached.folder.URI,
-          });
-          this.classifiedMessages.set(key, newCached);
-          this.savedMessages.push(key);
+        // Select the copy service's actual destination key, never an older
+        // message that happens to have the same Message-ID.
+        const newHdr =
+          additionalKey === null
+            ? null
+            : additionalFccFolder.msgDatabase.getMsgHdrForKey(additionalKey);
+        if (
+          !newHdr ||
+          additionalBaseline.has(additionalKey) ||
+          newHdr.folder.URI != additionalFccFolder.URI ||
+          newHdr.messageId != primaryCached.messageId
+        ) {
+          throw new ExtensionError("Additional FCC publication is missing");
+        }
+        const newCached = new CachedMsgHeader(messageTracker, newHdr);
+        const physical = JSON.stringify({
+          messageKey: newCached.messageKey,
+          folderURI: newCached.folder.URI,
+        });
+        this.classifiedMessages.set(physical, newCached);
+        const hint = JSON.stringify({
+          headerMessageId: newCached.messageId,
+          folderURI: newCached.folder.URI,
+        });
+        this.savedMessageBaselines.set(hint, additionalBaseline);
+        if (!this.savedMessages.includes(hint)) {
+          this.savedMessages.push(hint);
         }
       }
 
       return {
         mode: sendMode,
-        messages: this.savedMessages
-          .map(m => this.classifiedMessages.get(m))
-          .filter(Boolean)
-          .flatMap(cachedMsgHdr => {
-            const msg = this.extension.messageManager?.convert(cachedMsgHdr);
-            return msg ? [msg] : [];
-          }),
+        messages: this.getSavedMessages().flatMap(cachedMsgHdr => {
+          const msg = this.extension.messageManager?.convert(cachedMsgHdr);
+          return msg ? [msg] : [];
+        }),
         headerMessageId: this.headerMessageId,
       };
     } finally {
@@ -1807,9 +1862,8 @@ this.messages = class extends ExtensionAPIPersistent {
             );
           }
 
-          let tempFile, messageId;
+          let messageId;
           try {
-            tempFile = await getRealFileForFile(file);
             const headers = MimeParser.extractHeaders(await file.text());
             messageId = headers.has("Message-ID")
               ? headers.get("Message-ID").replace(/^<|>$/g, "")
@@ -1848,18 +1902,104 @@ this.messages = class extends ExtensionAPIPersistent {
           flags |= wantRead ? Ci.nsMsgMessageFlags.Read : 0;
           flags |= wantFlagged ? Ci.nsMsgMessageFlags.Marked : 0;
 
-          const copyFileMessageOperation = Promise.withResolvers();
-          const importOperation = Promise.withResolvers();
-
-          const handleAddedMessage = msgHdr => {
-            if (
-              msgHdr.folder.URI != destinationFolder.URI ||
-              (newKey && msgHdr.messageKey != newKey) ||
-              (!newKey && msgHdr.messageId != messageId)
-            ) {
-              return;
+          const addedMessages = new Map();
+          const folderListener = {
+            msgAdded(msgHdr) {
+              if (msgHdr.folder.URI == destinationFolder.URI) {
+                addedMessages.set(msgHdr.messageKey, msgHdr);
+              }
+            },
+            onMessageAdded(parentItem, msgHdr) {
+              this.msgAdded(msgHdr);
+            },
+            onFolderAdded() {},
+          };
+          const offlineFolderListenerType = Services.io.offline;
+          const database = destinationFolder.msgDatabase;
+          const epoch =
+            serverType == "imap" ? database.dBFolderInfo.imapUidValidity : null;
+          let tempFile;
+          let registered = false;
+          let operationError;
+          try {
+            tempFile = await getRealFileForFile(file);
+            if (offlineFolderListenerType) {
+              MailServices.mailSession.AddFolderListener(
+                folderListener,
+                Ci.nsIFolderListener.added
+              );
+            } else {
+              MailServices.mfn.addListener(
+                folderListener,
+                MailServices.mfn.msgAdded
+              );
             }
-
+            registered = true;
+            // The Promise executor also captures synchronous copy-start errors.
+            await new Promise((resolve, reject) => {
+              MailServices.copy.copyFileMessage(
+                tempFile,
+                destinationFolder,
+                null,
+                false,
+                flags,
+                tags,
+                {
+                  onStartCopy() {},
+                  onProgress() {},
+                  setMessageKey(key) {
+                    newKey = key;
+                  },
+                  getMessageId() {
+                    return null;
+                  },
+                  onStopCopy(status) {
+                    if (Components.isSuccessCode(status)) {
+                      resolve();
+                    } else {
+                      reject(new Error(`Aborted with status: ${status}`));
+                    }
+                  },
+                },
+                null
+              );
+            });
+            if (newKey === null) {
+              throw new Error("Copy completed without a destination key");
+            }
+            let msgHdr =
+              addedMessages.get(newKey) || database.getMsgHdrForKey(newKey);
+            if (!msgHdr && serverType == "imap" && !offlineFolderListenerType) {
+              await new Promise((resolve, reject) => {
+                destinationFolder
+                  .QueryInterface(Ci.nsIMsgImapMailFolder)
+                  .updateFolderWithListener(null, {
+                    OnStartRunningUrl() {},
+                    OnStopRunningUrl(url, status) {
+                      if (Components.isSuccessCode(status)) {
+                        resolve();
+                      } else {
+                        reject(new Error(`Folder update failed: ${status}`));
+                      }
+                    },
+                  });
+              });
+              msgHdr =
+                addedMessages.get(newKey) || database.getMsgHdrForKey(newKey);
+            }
+            if (
+              destinationFolder.msgDatabase !== database ||
+              (serverType == "imap" &&
+                database.dBFolderInfo.imapUidValidity !== epoch) ||
+              !msgHdr?.isLive ||
+              msgHdr.messageKey != newKey ||
+              msgHdr.folder.URI != destinationFolder.URI ||
+              (messageId && msgHdr.messageId != messageId)
+            ) {
+              throw new Error(
+                "Imported physical message is no longer available"
+              );
+            }
             // FIXME: Update msgHdr, if it does not match the requested
             //        flags and tags. The protocol implementation of
             //        copyFileMessage() should handle this correctly.
@@ -1889,98 +2029,32 @@ this.messages = class extends ExtensionAPIPersistent {
                 missingTags.join(" ")
               );
             }
-            importOperation.resolve(
+            return context.extension.messageManager.convert(
               new CachedMsgHeader(messageTracker, msgHdr)
             );
-          };
-
-          const folderListener = {
-            // Implements nsIMsgFolderListener.
-            msgAdded(msgHdr) {
-              handleAddedMessage(msgHdr);
-            },
-            // Implements nsIFolderListener.
-            onMessageAdded(parentItem, msgHdr) {
-              handleAddedMessage(msgHdr);
-            },
-            onFolderAdded() {},
-          };
-
-          const offlineFolderListenerType = Services.io.offline;
-          if (offlineFolderListenerType) {
-            // IMAP: Fires too early if online, message is added to the database,
-            // but not yet to the folder.
-            MailServices.mailSession.AddFolderListener(
-              folderListener,
-              Ci.nsIFolderListener.added
-            );
-          } else {
-            // IMAP: Fires after the message is truly added to the server, but
-            // does not fire if offline.
-            MailServices.mfn.addListener(
-              folderListener,
-              MailServices.mfn.msgAdded
-            );
-          }
-
-          MailServices.copy.copyFileMessage(
-            tempFile,
-            destinationFolder,
-            /* msgToReplace */ null,
-            /* isDraftOrTemplate */ false,
-            /* aMsgFlags */ flags,
-            /* aMsgKeywords */ tags,
-            /** @implements {nsIMsgCopyServiceListener} */
-            {
-              onStartCopy() {},
-              onProgress() {},
-              setMessageKey(aKey) {
-                newKey = aKey;
-              },
-              getMessageId() {
-                return null;
-              },
-              onStopCopy(status) {
-                if (status == Cr.NS_OK) {
-                  destinationFolder.updateFolder(null);
-                  copyFileMessageOperation.resolve();
-                } else {
-                  copyFileMessageOperation.reject(
-                    new Error(`Aborted with status: ${status}`)
-                  );
-                }
-              },
-            },
-            /* msgWindow */ null
-          );
-
-          let cachedMsgHeader, errorMessage;
-          try {
-            await copyFileMessageOperation.promise;
-            cachedMsgHeader = await importOperation.promise;
           } catch (ex) {
+            operationError = ex;
             console.error(ex);
-            errorMessage = ex.message;
+            throw new ExtensionError(`Error importing message: ${ex.message}`);
+          } finally {
+            if (registered) {
+              if (offlineFolderListenerType) {
+                MailServices.mailSession.RemoveFolderListener(folderListener);
+              } else {
+                MailServices.mfn.removeListener(folderListener);
+              }
+            }
+            if (tempFile && !file.mozFullPath) {
+              try {
+                await IOUtils.remove(tempFile.path);
+              } catch (ex) {
+                if (!operationError) {
+                  throw ex;
+                }
+                console.error(ex);
+              }
+            }
           }
-
-          if (offlineFolderListenerType) {
-            MailServices.mailSession.RemoveFolderListener(folderListener);
-          } else {
-            MailServices.mfn.removeListener(folderListener);
-          }
-
-          // Do not wait till the temp file is removed on app shutdown. However, skip deletion if
-          // the provided DOM File was already linked to a real file.
-          if (!file.mozFullPath) {
-            await IOUtils.remove(tempFile.path);
-          }
-
-          if (errorMessage) {
-            throw new ExtensionError(
-              `Error importing message: ${errorMessage}`
-            );
-          }
-          return context.extension.messageManager.convert(cachedMsgHeader);
         },
         async archive(messageIds) {
           try {

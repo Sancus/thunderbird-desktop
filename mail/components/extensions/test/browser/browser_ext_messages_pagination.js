@@ -1425,3 +1425,74 @@ add_task(async function test_abortListStopsPendingPage() {
   await checkAbortPendingPage(true);
   await checkAbortPendingPage(false);
 });
+
+add_task(async function test_folderEnumerationErrorAndCancelledRead() {
+  const { getMessagesInFolder } = ChromeUtils.importESModule(
+    "resource:///modules/ExtensionMessages.sys.mjs"
+  );
+  const failure = new Error("S378 folder enumeration failure");
+  const actual = subFolders.test1;
+  const broken = new Proxy(actual, {
+    get(target, property) {
+      if (property == "messages") {
+        throw failure;
+      }
+      const value = Reflect.get(target, property, target);
+      return typeof value == "function" ? value.bind(target) : value;
+    },
+  });
+  Assert.throws(
+    () => getMessagesInFolder(broken),
+    error => error === failure,
+    "A real folder enumeration error is not an empty successful list"
+  );
+  Assert.equal(
+    getMessagesInFolder(actual).length,
+    99,
+    "The unchanged physical folder remains readable"
+  );
+  const {
+    Management: {
+      global: { messageListTracker },
+    },
+  } = ChromeUtils.importESModule("resource://gre/modules/Extension.sys.mjs");
+  const extension = ExtensionTestUtils.loadExtension({
+    manifest: { permissions: ["messagesRead"] },
+    background() {
+      browser.test.sendMessage("cancel-ready");
+    },
+  });
+  try {
+    await extension.startup();
+    await extension.awaitMessage("cancel-ready");
+    const list = messageListTracker.createList(extension.extension);
+    let reads = 0;
+    const headers = [...actual.messages];
+    await messageListTracker._addMessages(
+      {
+        hasMoreElements() {
+          return reads < headers.length;
+        },
+        getNext() {
+          const header = headers[reads++];
+          list.done();
+          return header;
+        },
+      },
+      list
+    );
+    Assert.equal(
+      reads,
+      1,
+      "Cancellation stops the actual producer before another header is read"
+    );
+    const page = await messageListTracker.getNextPage(list);
+    Assert.equal(
+      page.messages.length,
+      0,
+      "No message is published after cancellation"
+    );
+  } finally {
+    await extension.unload();
+  }
+});

@@ -155,3 +155,103 @@ add_task(async function test_import() {
 
   cleanUpAccount(_account);
 });
+
+add_task(
+  { skip_if: () => IS_NNTP },
+  async function test_importPublishesExactBytesAndRecovers() {
+    const account = await createAccount(undefined, {
+      extensions: ["RFC2195", "RFC4315"],
+    });
+    const folder = await createSubfolder(
+      account.incomingServer.rootFolder,
+      "physicalImport"
+    );
+    await createMessageFromString(
+      folder,
+      [
+        "From: old@example.invalid",
+        "Subject: Existing physical message",
+        "Message-ID: <outside-import@example.invalid>",
+        "",
+        "Unrelated stored bytes",
+        "",
+      ].join("\r\n")
+    );
+    const extension = ExtensionTestUtils.loadExtension({
+      manifest: {
+        manifest_version: 2,
+        permissions: ["accountsRead", "messagesRead", "messagesImport"],
+      },
+      background: async () => {
+        const [folder] = await browser.folders.query({
+          name: "physicalImport",
+        });
+        const before = (await browser.messages.list(folder.id)).messages[0];
+        const raw = [
+          "From: sender@example.invalid",
+          "To: recipient@example.invalid",
+          "Subject: Imported literal bytes",
+          "Message-ID: <selected-import@example.invalid>",
+          "",
+          "Literal body # retains %23 and the final suffix",
+          "",
+        ].join("\r\n");
+        const file = new File([raw], "physical-import.eml");
+        const imported = await browser.messages.import(file, folder.id, {
+          read: true,
+          flagged: true,
+        });
+        browser.test.assertTrue(imported.id != before.id);
+        browser.test.assertEq(folder.id, imported.folder.id);
+        browser.test.assertEq(
+          "selected-import@example.invalid",
+          imported.headerMessageId
+        );
+        browser.test.assertTrue(imported.read && imported.flagged);
+        browser.test.assertTrue(
+          (await browser.messages.getRaw(imported.id)).includes(
+            "Literal body # retains %23 and the final suffix"
+          ),
+          "Actual APPEND readback preserves bytes after # and percent characters"
+        );
+        await browser.test.assertRejects(
+          browser.messages.import(file, folder.id),
+          /already contains a message/,
+          "Duplicate import preserves its actual error"
+        );
+        browser.test.assertEq(
+          2,
+          (await browser.messages.list(folder.id)).messages.length,
+          "Failed import adds no extra physical message"
+        );
+        const next = new File(
+          [raw.replaceAll("selected-import", "recovered-import")],
+          "recovered.eml"
+        );
+        const recovered = await browser.messages.import(next, folder.id);
+        browser.test.assertTrue(recovered.id != imported.id);
+        browser.test.assertEq(
+          "recovered-import@example.invalid",
+          recovered.headerMessageId
+        );
+        browser.test.assertEq(
+          3,
+          (await browser.messages.list(folder.id)).messages.length
+        );
+        browser.test.assertTrue(
+          (await browser.messages.getRaw(before.id)).includes(
+            "Unrelated stored bytes"
+          )
+        );
+        browser.test.notifyPass("physical-import");
+      },
+    });
+    try {
+      await extension.startup();
+      await extension.awaitFinish("physical-import");
+    } finally {
+      await extension.unload();
+      cleanUpAccount(account);
+    }
+  }
+);

@@ -307,3 +307,86 @@ add_task(
     await extension.unload();
   }
 );
+
+add_task(
+  { skip_if: () => IS_NNTP },
+  async function test_rejectsReusedPhysicalSource() {
+    const { MessageTracker } = ChromeUtils.importESModule(
+      "resource:///modules/ExtensionMessages.sys.mjs"
+    );
+    const account = await createAccount();
+    const folder = await createSubfolder(
+      account.incomingServer.rootFolder,
+      "physicalIdentity"
+    );
+    await createMessages(folder, 2);
+    const headers = [...folder.messages];
+    Assert.equal(
+      headers.length,
+      2,
+      "The actual folder publishes two physical headers"
+    );
+    const native = Services.prefs.getBoolPref("mail.panorama.enabled");
+    const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+      Ci.nsIMsgDBService
+    );
+    Assert.equal(
+      service instanceof Ci.nsIDatabaseCore,
+      native,
+      "The actual database service matches the selected backend"
+    );
+    const tracker = new MessageTracker(null);
+    try {
+      const first = tracker.getId(headers[0]);
+      const second = tracker.getId(headers[1]);
+      Assert.notEqual(
+        first,
+        second,
+        "Different physical headers have distinct IDs"
+      );
+      Assert.equal(tracker.getMessage(first).messageId, headers[0].messageId);
+      const retained = tracker.getIdentifier(headers[0]);
+      if (IS_IMAP) {
+        const info = folder.msgDatabase.dBFolderInfo;
+        const epoch = info.imapUidValidity;
+        Assert.greater(epoch, 0, "The real IMAP folder has an accepted epoch");
+        try {
+          info.imapUidValidity = epoch + 1;
+          Assert.equal(
+            tracker.getMessage(first),
+            null,
+            "An old ID cannot resolve a reused key in another epoch"
+          );
+          const replacement = tracker.getId(headers[0]);
+          Assert.notEqual(replacement, first);
+          tracker._remove(retained);
+          Assert.equal(
+            tracker.getMessage(replacement).messageId,
+            headers[0].messageId,
+            "A late old removal preserves the new mapping"
+          );
+        } finally {
+          info.imapUidValidity = epoch;
+        }
+      } else {
+        folder.ForceDBClosed();
+        Assert.equal(
+          tracker.getMessage(first),
+          null,
+          "An old ID cannot resolve through a replacement database facade"
+        );
+        const current = [...folder.messages][0];
+        const replacement = tracker.getId(current);
+        Assert.notEqual(replacement, first);
+        tracker._remove(retained);
+        Assert.equal(
+          tracker.getMessage(replacement).messageId,
+          current.messageId
+        );
+      }
+    } finally {
+      tracker.cleanup();
+      cleanUpAccount(account);
+    }
+  }
+);

@@ -278,3 +278,72 @@ add_task(async function test_onNewMailReceived_custom() {
 
   cleanUpAccount(account);
 });
+
+add_task(async function test_newMailKeepsDistinctPhysicalCopies() {
+  await AddonTestUtils.promiseStartupManager();
+  const account = await createAccount();
+  const folders = [];
+  for (const label of ["A", "B"]) {
+    folders.push(
+      await createSubfolder(
+        account.incomingServer.rootFolder,
+        `physicalNew${label}`
+      )
+    );
+  }
+  const extension = ExtensionTestUtils.loadExtension({
+    manifest: { permissions: ["accountsRead", "messagesRead"] },
+    background: async () => {
+      const received = [];
+      browser.messages.onNewMailReceived.addListener((folder, page) => {
+        if (!folder.name.startsWith("physicalNew")) {
+          return;
+        }
+        received.push(...page.messages);
+        if (received.length == 2) {
+          browser.test.assertTrue(
+            received[0].id != received[1].id,
+            "Each physical new message is reported"
+          );
+          browser.test.assertTrue(
+            received[0].folder.id != received[1].folder.id
+          );
+          browser.test.assertEq(
+            received[0].headerMessageId,
+            received[1].headerMessageId
+          );
+          browser.test.sendMessage("physical-new-received");
+        }
+      }, true);
+      browser.test.sendMessage("physical-new-ready");
+    },
+  });
+  try {
+    await extension.startup();
+    await extension.awaitMessage("physical-new-ready");
+    for (const [index, folder] of folders.entries()) {
+      await createMessageFromString(
+        folder,
+        [
+          "From: sender@example.invalid",
+          "To: recipient@example.invalid",
+          `Subject: Physical new ${index}`,
+          "Message-ID: <same-new-physical@example.invalid>",
+          "",
+          `Physical new body ${index}`,
+          "",
+        ].join("\r\n")
+      );
+      folder.hasNewMessages = true;
+      folder.setNumNewMessages(1);
+      folder.biffState = Ci.nsIMsgFolder.nsMsgBiffState_NewMail;
+    }
+    await extension.awaitMessage("physical-new-received");
+    Assert.equal(folders[0].getTotalMessages(false), 1);
+    Assert.equal(folders[1].getTotalMessages(false), 1);
+  } finally {
+    await extension.unload();
+    cleanUpAccount(account);
+    await AddonTestUtils.promiseShutdownManager();
+  }
+});

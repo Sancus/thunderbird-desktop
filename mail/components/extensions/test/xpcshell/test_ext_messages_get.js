@@ -1503,3 +1503,104 @@ add_task(async function test_get_deleted_messages() {
 
   cleanUpAccount(_account);
 });
+
+add_task(async function test_readsSelectedPhysicalContent() {
+  const account = await createAccount();
+  const root = account.incomingServer.rootFolder;
+  const first = await createSubfolder(root, "selectedContentA");
+  const second = await createSubfolder(root, "selectedContentB");
+  for (const [folder, label] of [
+    [first, "A"],
+    [second, "B"],
+  ]) {
+    await createMessageFromString(
+      folder,
+      [
+        "From: sender@example.invalid",
+        "To: recipient@example.invalid",
+        `Subject: Selected content ${label}`,
+        "Message-ID: <same-selected-content@example.invalid>",
+        "MIME-Version: 1.0",
+        "Content-Type: multipart/mixed; boundary=s378-content",
+        "",
+        "--s378-content",
+        "Content-Type: text/plain; charset=utf-8",
+        "",
+        `Selected body ${label}#%`,
+        "--s378-content",
+        'Content-Type: text/plain; name="owned.txt"',
+        'Content-Disposition: attachment; filename="owned.txt"',
+        "Content-Transfer-Encoding: base64",
+        "",
+        btoa(`Attachment ${label}#%`),
+        "--s378-content--",
+        "",
+      ].join("\r\n")
+    );
+  }
+  const extension = ExtensionTestUtils.loadExtension({
+    manifest: {
+      manifest_version: 2,
+      permissions: ["accountsRead", "messagesRead"],
+    },
+    background: async () => {
+      const ids = [];
+      for (const label of ["A", "B"]) {
+        const [folder] = await browser.folders.query({
+          name: `selectedContent${label}`,
+        });
+        const { messages } = await browser.messages.list(folder.id);
+        browser.test.assertEq(1, messages.length);
+        const selected = messages[0];
+        ids.push(selected.id);
+        browser.test.assertEq(
+          folder.id,
+          (await browser.messages.get(selected.id)).folder.id
+        );
+        const raw = await browser.messages.getRaw(selected.id);
+        browser.test.assertTrue(
+          raw.includes(`Selected body ${label}#%`),
+          "Raw bytes belong to the selected physical message"
+        );
+        const full = await browser.messages.getFull(selected.id);
+        browser.test.assertTrue(
+          JSON.stringify(full).includes(`Selected body ${label}#%`)
+        );
+        const headers = await browser.messages.getHeaders(selected.id);
+        browser.test.assertEq(`Selected content ${label}`, headers.subject[0]);
+        if (
+          folder.accountId &&
+          (await browser.accounts.get(folder.accountId)).type == "none"
+        ) {
+          const attachments = await browser.messages.listAttachments(
+            selected.id
+          );
+          browser.test.assertEq(1, attachments.length);
+          const file = await browser.messages.getAttachmentFile(
+            selected.id,
+            attachments[0].partName
+          );
+          browser.test.assertEq(`Attachment ${label}#%`, await file.text());
+          const parts = await browser.messages.listInlineTextParts(selected.id);
+          browser.test.assertTrue(
+            parts.some(part =>
+              part.content.includes(`Selected body ${label}#%`)
+            )
+          );
+        }
+      }
+      browser.test.assertTrue(
+        ids[0] != ids[1],
+        "Equal Message-IDs in different folders remain distinct"
+      );
+      browser.test.notifyPass("selected-content");
+    },
+  });
+  try {
+    await extension.startup();
+    await extension.awaitFinish("selected-content");
+  } finally {
+    await extension.unload();
+    cleanUpAccount(account);
+  }
+});

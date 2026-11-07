@@ -1319,6 +1319,7 @@ export class AttachmentInfo {
       0o600
     );
     let copyError;
+    let cleanupError;
     try {
       await IOUtils.write(
         msgFilePath,
@@ -1373,11 +1374,15 @@ export class AttachmentInfo {
       try {
         await IOUtils.remove(msgFilePath);
       } catch (error) {
-        if (!copyError) {
-          throw error;
+        if (copyError) {
+          console.error(error);
+        } else {
+          cleanupError = error;
         }
-        console.error(error);
       }
+    }
+    if (cleanupError) {
+      throw cleanupError;
     }
   }
 

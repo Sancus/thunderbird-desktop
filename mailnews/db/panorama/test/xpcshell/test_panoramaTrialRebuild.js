@@ -18,9 +18,13 @@ const { MigrationJournal } = ChromeUtils.importESModule(
 const { createMigrationBackup } = ChromeUtils.importESModule(
   "resource:///modules/panorama/MigrationBackup.sys.mjs"
 );
-const { readMorkFolderImport } = ChromeUtils.importESModule(
-  "resource:///modules/panorama/MorkFolderImport.sys.mjs"
+const { AppConstants } = ChromeUtils.importESModule(
+  "resource://gre/modules/AppConstants.sys.mjs"
 );
+const { readMorkFolderImport, captureMorkFolderWindowsInventory } =
+  ChromeUtils.importESModule(
+    "resource:///modules/panorama/MorkFolderImport.sys.mjs"
+  );
 const { createPanoramaMigrationTarget, resumeMorkImports } =
   ChromeUtils.importESModule(
     "resource:///modules/panorama/MigrationCoordinator.sys.mjs"
@@ -595,8 +599,24 @@ add_task(async function test_createRetainedNativeRebuildTrial() {
     const creator = new ProfileCreator(profile);
     const server = creator.addLocalServer();
     const names = ["RecoveredInbox", "RecoveredCopy"];
+    const inventories = new Map();
     for (const name of names) {
-      await server.rootFolder.addMailFolder(name, { summary, mbox: body });
+      const files = await server.rootFolder.addMailFolder(name, {
+        summary,
+        mbox: body,
+      });
+      if (AppConstants.platform == "win") {
+        // Windows journals retain the original-path inventory captured here.
+        inventories.set(
+          name,
+          captureMorkFolderWindowsInventory(
+            new FileUtils.File(files.summaryFilePath),
+            lock.directory,
+            new FileUtils.File(files.mailFilePath),
+            lock.directory
+          )
+        );
+      }
     }
     const conversationInputs = [];
     for (const role of ["Inbox", "Sent", "Archive"]) {
@@ -643,7 +663,12 @@ add_task(async function test_createRetainedNativeRebuildTrial() {
       const folder = root.getChildNamed(name);
       folder.setFlag(Ci.nsMsgFolderFlags.Mail);
       Assert.ok(folderDB.getFolderFlags(folder.id) & Ci.nsMsgFolderFlags.Mail);
-      const input = await readMorkFolderImport(folder, "planning-only");
+      const inventory = inventories.get(name);
+      const input = await readMorkFolderImport(
+        folder,
+        "planning-only",
+        inventory
+      );
       Assert.deepEqual(input.source.messageKeys.toSorted(), [1, 3]);
       folders.set(name, folder);
       sources.push({
@@ -651,6 +676,7 @@ add_task(async function test_createRetainedNativeRebuildTrial() {
         databaseSourceId: database.sourceId,
         ...input.source,
         destinationFolderId: folder.id,
+        ...(inventory ? { inventory } : {}),
       });
     }
     const journalPath = PathUtils.join(backupRoot, "journal.json");

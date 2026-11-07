@@ -9712,9 +9712,12 @@ nsresult StartupServerSummaryInput(JSContext* cx, JS::Handle<JSObject*> source,
   return StartupCheckHash(retained, output.hash, output.size);
 }
 
-nsresult StartupServer(JSContext* cx, JS::Handle<JSObject*> source,
-                       ProfileStartupOperation& operation,
-                       StartupMailSource& output) {
+}  // namespace
+
+nsresult DatabaseCore::ReadStartupMailSource(JSContext* cx,
+                                             JS::Handle<JSObject*> source,
+                                             ProfileStartupOperation& operation,
+                                             StartupMailSource& output) {
   for (auto entry : {std::pair{"id", &output.id},
                      {"path", &output.path},
                      {"sha256", &output.hash},
@@ -9778,19 +9781,9 @@ nsresult StartupServer(JSContext* cx, JS::Handle<JSObject*> source,
                      (contract == "@mozilla.org/msgstore/berkeleystore;1"_ns ||
                       contract == "@mozilla.org/msgstore/maildirstore;1"_ns),
                  NS_ERROR_NOT_AVAILABLE);
-  nsCOMPtr<nsIFile> store;
-  MOZ_TRY(NS_NewNativeLocalFile(output.storePath, getter_AddRefs(store)));
-  bool directory = contract == "@mozilla.org/msgstore/maildirstore;1"_ns;
-  bool linked, exists;
-  MOZ_TRY(store->IsSymlink(&linked));
-  NS_ENSURE_FALSE(linked, NS_ERROR_FILE_ACCESS_DENIED);
-  MOZ_TRY(store->Exists(&exists));
-  if (exists) {
-    MOZ_TRY(store->IsDirectory(&directory));
-    NS_ENSURE_TRUE(
-        directory == (contract == "@mozilla.org/msgstore/maildirstore;1"_ns),
-        NS_ERROR_NOT_AVAILABLE);
-  }
+  MOZ_TRY(
+      CheckStartupMailStore(output.storePath, contract, protocol == "imap"_ns));
+  const bool directory = contract == "@mozilla.org/msgstore/maildirstore;1"_ns;
   nsCString storeType;
   MOZ_TRY(StartupText(cx, source, "storeType", storeType));
   NS_ENSURE_TRUE(storeType == (directory ? "maildir"_ns : "mbox"_ns),
@@ -9995,8 +9988,6 @@ nsresult StartupServer(JSContext* cx, JS::Handle<JSObject*> source,
   NS_ENSURE_TRUE(expectedStore == output.storePath, NS_ERROR_NOT_IMPLEMENTED);
   return NS_OK;
 }
-
-}  // namespace
 
 // Decode a retained dbfolderinfo name from byte-string Mork cells. This is
 // source parsing only; publication additionally requires actual store
@@ -10266,6 +10257,46 @@ nsresult DatabaseCore::DescribeProfileStartup(
   return NS_OK;
 }
 
+nsresult DatabaseCore::CheckStartupMailStore(const nsACString& path,
+                                             const nsACString& contract,
+                                             bool remote) {
+  NS_ENSURE_TRUE(contract == "@mozilla.org/msgstore/berkeleystore;1"_ns ||
+                     contract == "@mozilla.org/msgstore/maildirstore;1"_ns,
+                 NS_ERROR_NOT_IMPLEMENTED);
+  nsCOMPtr<nsIFile> store;
+  MOZ_TRY(NS_NewNativeLocalFile(path, getter_AddRefs(store)));
+  // IsSymlink uses lstat on Unix and fails when no offline body exists. A real
+  // metadata-only IMAP summary need not have created that body file yet. Still
+  // lstat first: Exists follows links and would hide a dangling symlink.
+  bool linked = false;
+  nsresult linkStatus = store->IsSymlink(&linked);
+  NS_ENSURE_TRUE(NS_SUCCEEDED(linkStatus) ||
+                     (remote && linkStatus == NS_ERROR_FILE_NOT_FOUND),
+                 linkStatus);
+  NS_ENSURE_FALSE(linked, NS_ERROR_FILE_ACCESS_DENIED);
+  bool exists;
+  MOZ_TRY(store->Exists(&exists));
+  if (!exists) {
+    NS_ENSURE_TRUE(remote && linkStatus == NS_ERROR_FILE_NOT_FOUND,
+                   NS_ERROR_NOT_AVAILABLE);
+    return NS_OK;
+  }
+  // A failed lstat followed by an existing path is a changed input, not a
+  // missing-body allowance. All other real file/directory errors propagate.
+  MOZ_TRY(linkStatus);
+  bool directory;
+  MOZ_TRY(store->IsDirectory(&directory));
+  NS_ENSURE_TRUE(
+      directory == (contract == "@mozilla.org/msgstore/maildirstore;1"_ns),
+      NS_ERROR_NOT_AVAILABLE);
+  if (!directory) {
+    bool regular;
+    MOZ_TRY(store->IsFile(&regular));
+    NS_ENSURE_TRUE(regular, NS_ERROR_NOT_AVAILABLE);
+  }
+  return NS_OK;
+}
+
 nsresult DatabaseCore::OpenProfileStartup(JSContext* cx,
                                           JS::Handle<JS::Value> input) {
   MOZ_TRY(CheckProfileStartup(ProfileStartupToken()));
@@ -10391,7 +10422,7 @@ nsresult DatabaseCore::OpenProfileStartup(JSContext* cx,
         JS::Rooted<JSObject*> source(cx);
         MOZ_TRY(StartupItem(cx, sources, i, &source));
         StartupMailSource native;
-        MOZ_TRY(StartupServer(cx, source, operation, native));
+        MOZ_TRY(ReadStartupMailSource(cx, source, operation, native));
         if (native.protocol == "none"_ns)
           MOZ_TRY(BindStartupLocalNames(cx, native));
         auto archived = operation.backupFiles.Lookup(native.path);

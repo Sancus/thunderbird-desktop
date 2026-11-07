@@ -2289,6 +2289,55 @@ nsMsgAccountManager::FindAccountForServer(nsIMsgIncomingServer* server,
   rv = server->GetKey(key);
   NS_ENSURE_SUCCESS(rv, rv);
 
+#ifdef MOZ_PANORAMA
+  if (NS_FAILED(CheckSelectedAccountStartup())) {
+    // Pre-ready message projection needs the persisted account key, not normal
+    // account loading (which starts biff/purge and rewrites account prefs).
+    // Only the exact server retained by native startup may use this metadata
+    // read.
+    *aResult = nullptr;
+    MOZ_TRY(CheckSelectedAccountStartup(true, &key));
+    nsCOMPtr<nsIMsgIncomingServer> retained;
+    m_incomingServers.Get(key, getter_AddRefs(retained));
+    NS_ENSURE_TRUE(retained == server, NS_ERROR_NOT_AVAILABLE);
+    nsCString accountList;
+    MOZ_TRY(Preferences::GetCString(PREF_MAIL_ACCOUNTMANAGER_ACCOUNTS,
+                                    accountList));
+    nsTArray<nsCString> accounts;
+    ParseString(accountList, ACCOUNT_DELIMITER, accounts);
+    for (const auto& accountKey : accounts) {
+      nsCString pref("mail.account."_ns + accountKey + ".server"_ns);
+      nsCString serverKey;
+      // Match LoadAccounts' first persisted account for this server, including
+      // its treatment of missing server prefs and duplicate account entries.
+      if (NS_FAILED(Preferences::GetCString(pref.get(), serverKey)) ||
+          serverKey != key)
+        continue;
+      nsCOMPtr<nsIMsgAccount> account =
+          do_CreateInstance("@mozilla.org/messenger/account;1", &rv);
+      MOZ_TRY(rv);
+      MOZ_TRY(account->SetKey(accountKey));
+      // SetKey reads identities only. Do not CreateServer, SetIncomingServer,
+      // append to m_accounts or mark accounts loaded: ordinary loading must
+      // still perform its existing activation after the whole target is ready.
+      MOZ_TRY(CheckSelectedAccountStartup(true, &key));
+      nsCString currentList, currentServer;
+      MOZ_TRY(Preferences::GetCString(PREF_MAIL_ACCOUNTMANAGER_ACCOUNTS,
+                                      currentList));
+      MOZ_TRY(Preferences::GetCString(pref.get(), currentServer));
+      NS_ENSURE_TRUE(currentList == accountList && currentServer == key,
+                     NS_ERROR_NOT_AVAILABLE);
+      nsCOMPtr<nsIMsgIncomingServer> current;
+      m_incomingServers.Get(key, getter_AddRefs(current));
+      NS_ENSURE_TRUE(current == server, NS_ERROR_NOT_AVAILABLE);
+      account.forget(aResult);
+      return NS_OK;
+    }
+    // This is not an empty-key fallback. A missing persisted mapping must
+    // propagate an error before Message::GetAccountKey can dereference it.
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+#endif
   findAccountByServerKey(key, aResult);
   return NS_OK;
 }

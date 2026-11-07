@@ -342,6 +342,13 @@ class DatabaseCore : public nsIDatabaseCore,
                                   JS::MutableHandle<JS::Value> output);
   nsresult OpenProfileStartup(JSContext* cx, JS::Handle<JS::Value> plan);
   nsresult BuildStartupFolders();
+  static nsresult ReadStartupMailSource(JSContext* cx,
+                                        JS::Handle<JSObject*> source,
+                                        ProfileStartupOperation& operation,
+                                        StartupMailSource& output);
+  static nsresult CheckStartupMailStore(const nsACString& path,
+                                        const nsACString& contract,
+                                        bool remote);
   static nsresult ReadStartupSummaryName(JSContext* cx, nsIFile* file,
                                          const nsACString& expected,
                                          Maybe<nsCString>& output);

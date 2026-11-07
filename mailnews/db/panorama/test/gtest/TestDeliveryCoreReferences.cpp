@@ -15,6 +15,7 @@
 #include "nsIXULAppInfo.h"
 #ifndef XP_WIN
 #  include "../../../../../../toolkit/xre/nsAppRunner.h"
+#  include <unistd.h>
 #endif
 #include "FolderDatabase.h"
 #include "js/JSON.h"
@@ -58,6 +59,7 @@
 #include "prio.h"
 #include "nsIInterfaceRequestorUtils.h"
 #include "nsIMsgAccountManager.h"
+#include "nsIMsgAccount.h"
 #include "nsIMsgDatabase.h"
 #include "nsIDBFolderInfo.h"
 #include "nsIMsgFolder.h"
@@ -3534,6 +3536,17 @@ class DeliveryCoreReferences : public testing::Test {
     }
     return NS_OK;
   }
+  static nsresult StartupStoreCheck(nsIFile* file, bool remote,
+                                    bool maildir = false) {
+    nsCString path;
+    MOZ_TRY(file->GetNativePath(path));
+    return DatabaseCore::CheckStartupMailStore(
+        path,
+        maildir ? "@mozilla.org/msgstore/maildirstore;1"_ns
+                : "@mozilla.org/msgstore/berkeleystore;1"_ns,
+        remote);
+  }
+
   nsresult StartupSummaryName(nsIFile* file, const nsACString& hash,
                               Maybe<nsCString>& output) {
     dom::AutoJSAPI jsapi;
@@ -4506,6 +4519,197 @@ class DeliveryCoreReferences : public testing::Test {
       info = nullptr;
       ASSERT_EQ(NS_OK, folder->ForceDBClosed());
     });
+  }
+
+  // A real selected migration target with a retained native IMAP root. Its
+  // original cache bytes and every physical file have an actual verified copy;
+  // no account list is loaded and no readiness/activation receipt is invented.
+  void WithPreReadyStartupAccount(
+      const std::function<void(nsIMsgAccountManager*, nsIMsgIncomingServer*,
+                               Message*, nsIPrefBranch*, const nsCString&)>&
+          action) {
+    nsCOMPtr<nsIMsgAccountManager> manager =
+        do_GetService("@mozilla.org/messenger/account-manager;1");
+    ASSERT_TRUE(manager);
+    ASSERT_EQ(NS_OK, manager->UnloadAccounts());
+    (void)StaticPrefs::mail_panorama_enabled_AtStartup();
+    AutoRestore<bool> native(
+        StaticPrefs::sMirror_mail_panorama_enabled_AtStartup);
+    StaticPrefs::sMirror_mail_panorama_enabled_AtStartup = true;
+    nsCOMPtr<nsIPrefBranch> prefs =
+        do_GetService("@mozilla.org/preferences-service;1");
+    ASSERT_TRUE(prefs);
+    bool hadList;
+    ASSERT_EQ(NS_OK, prefs->PrefHasUserValue("mail.accountmanager.accounts",
+                                             &hadList));
+    nsCString oldList;
+    (void)prefs->GetCharPref("mail.accountmanager.accounts", oldList);
+    nsCString leaf;
+    ASSERT_EQ(NS_OK, mProfile->GetNativeLeafName(leaf));
+    const nsCString serverKey("startupServer-"_ns + leaf);
+    const nsCString accountKey("startupAccount-"_ns + leaf);
+    const nsCString serverPrefix("mail.server."_ns + serverKey + "."_ns);
+    const nsCString accountPrefix("mail.account."_ns + accountKey + "."_ns);
+    auto restorePrefs = MakeScopeExit([&] {
+      EXPECT_EQ(NS_OK, prefs->DeleteBranch(serverPrefix.get()));
+      EXPECT_EQ(NS_OK, prefs->DeleteBranch(accountPrefix.get()));
+      if (hadList)
+        EXPECT_EQ(NS_OK,
+                  prefs->SetCharPref("mail.accountmanager.accounts", oldList));
+      else
+        EXPECT_EQ(NS_OK, prefs->ClearUserPref("mail.accountmanager.accounts"));
+    });
+    nsCOMPtr<nsIFile> rootPath, summary;
+    ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(rootPath)));
+    ASSERT_EQ(NS_OK, rootPath->AppendNative("startup-account-store"_ns));
+    ASSERT_EQ(NS_OK, rootPath->Create(nsIFile::DIRECTORY_TYPE, 0700));
+    ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(summary)));
+    ASSERT_EQ(NS_OK, summary->AppendNative("startup-account-store.msf"_ns));
+    auto set = [&](const char* name, const nsACString& value) {
+      return prefs->SetCharPref(
+          nsCString(serverPrefix + nsDependentCString(name)).get(), value);
+    };
+    ASSERT_EQ(NS_OK, set("type", "imap"_ns));
+    ASSERT_EQ(NS_OK, set("userName", "startup-account"_ns));
+    ASSERT_EQ(NS_OK, set("hostname", "localhost"_ns));
+    ASSERT_EQ(NS_OK, set("storeContractID",
+                         "@mozilla.org/msgstore/berkeleystore;1"_ns));
+    ASSERT_EQ(NS_OK, prefs->SetComplexValue(
+                         nsCString(serverPrefix + "directory"_ns).get(),
+                         NS_GET_IID(nsIFile), rootPath));
+    ASSERT_EQ(NS_OK,
+              prefs->SetCharPref(nsCString(accountPrefix + "server"_ns).get(),
+                                 serverKey));
+    ASSERT_EQ(NS_OK,
+              prefs->SetCharPref("mail.accountmanager.accounts", accountKey));
+    dom::AutoJSAPI jsapi;
+    ASSERT_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()));
+    JSContext* cx = jsapi.cx();
+    nsCString descriptor, quoted, raw;
+    ASSERT_EQ(NS_OK, summary->GetPersistentDescriptor(descriptor));
+    ASSERT_EQ(NS_OK, JSONCacheQuote(cx, descriptor, quoted));
+    raw = "{"_ns + quoted + ":{\"flags\":0}}"_ns;
+    ASSERT_EQ(NS_OK, WriteStartupFile("folderCache.json", raw));
+    nsCOMPtr<nsIComponentRegistrar> registrar;
+    ASSERT_EQ(NS_OK, NS_GetComponentRegistrar(getter_AddRefs(registrar)));
+    constexpr auto contract = "@mozilla.org/msgDatabase/msgDBService;1";
+    nsCID* previous = nullptr;
+    ASSERT_EQ(NS_OK, registrar->ContractIDToCID(contract, &previous));
+    ASSERT_TRUE(previous);
+    const nsCID oldCID = *previous;
+    std::free(previous);
+    const nsCID nativeCID = nsID::GenerateUUID();
+    RefPtr<GenericFactory> factory =
+        new GenericFactory([](const nsIID& iid, void** output) -> nsresult {
+          RefPtr<DatabaseCore> core = DatabaseCore::GetInstanceForService();
+          return core->QueryInterface(iid, output);
+        });
+    ASSERT_EQ(NS_OK,
+              registrar->RegisterFactory(nativeCID, "", contract, factory));
+    auto restoreService = MakeScopeExit([&] {
+      EXPECT_EQ(NS_OK, manager->UnloadAccounts());
+      EXPECT_EQ(NS_OK,
+                registrar->RegisterFactory(oldCID, "", contract, nullptr));
+      EXPECT_EQ(NS_OK, registrar->UnregisterFactory(nativeCID, factory));
+    });
+    ASSERT_EQ(NS_OK, ArmSelectedStartup());
+    nsCString selected;
+    ASSERT_EQ(NS_OK, DescribeStartup(selected));
+    ASSERT_NE(kNotFound, selected.Find("\"mode\":\"migrate\""));
+    nsCOMPtr<nsIFile> work, copy, manifest, journal, cache;
+    ASSERT_EQ(NS_OK, mProfile->GetParent(getter_AddRefs(work)));
+    ASSERT_EQ(NS_OK, work->AppendNative("panorama-migration-"_ns + leaf));
+    ASSERT_EQ(NS_OK, work->Create(nsIFile::DIRECTORY_TYPE, 0700));
+    mStartupFixtureWork = work;
+    ASSERT_EQ(NS_OK, work->Clone(getter_AddRefs(copy)));
+    ASSERT_EQ(NS_OK, copy->AppendNative("root-0"_ns));
+    ASSERT_EQ(NS_OK, copy->Create(nsIFile::DIRECTORY_TYPE, 0700));
+    nsTArray<nsCString> parts;
+    nsCString entries;
+    bool first = true;
+    ASSERT_EQ(NS_OK,
+              JSONCacheCopyTree(cx, mProfile, copy, parts, entries, first));
+    ASSERT_EQ(NS_OK, work->Clone(getter_AddRefs(manifest)));
+    ASSERT_EQ(NS_OK, manifest->AppendNative("manifest.json"_ns));
+    ASSERT_EQ(NS_OK, work->Clone(getter_AddRefs(journal)));
+    ASSERT_EQ(NS_OK, journal->AppendNative("journal.json"_ns));
+    ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(cache)));
+    ASSERT_EQ(NS_OK, cache->AppendNative("folderCache.json"_ns));
+    auto document = [&](const nsACString& json, nsACString& bytes) -> nsresult {
+      JS::Rooted<JS::Value> value(cx);
+      MOZ_TRY(StartupDocument(cx, json, &value));
+      return StartupJSONValue(cx, value, bytes);
+    };
+    nsCString bytes, digest, backup, journalPath, cachePath;
+    ASSERT_EQ(
+        NS_OK,
+        document(
+            "{\"version\":3,\"complete\":true,\"roots\":[{\"source\":@PROFILE@,\"directory\":\"root-0\",\"entries\":["_ns +
+                entries + "]}]}"_ns,
+            bytes));
+    ASSERT_EQ(NS_OK, StartupWriteControl(manifest, bytes));
+    ASSERT_EQ(NS_OK, StartupHashControl(bytes, digest));
+    ASSERT_EQ(NS_OK, manifest->GetNativePath(quoted));
+    ASSERT_EQ(NS_OK, JSONCacheQuote(cx, quoted, backup));
+    backup = "{\"path\":"_ns + backup + ",\"sha256\":\""_ns + digest + "\"}"_ns;
+    ASSERT_EQ(NS_OK, journal->GetNativePath(quoted));
+    ASSERT_EQ(NS_OK, JSONCacheQuote(cx, quoted, journalPath));
+    ASSERT_EQ(
+        NS_OK,
+        document(
+            "{\"version\":7,\"profilePath\":@PROFILE@,\"cancelled\":false,\"stage\":\"backup\",\"startup\":{\"inventory\":{\"sources\":[]}}}"_ns,
+            bytes));
+    ASSERT_EQ(NS_OK, StartupWriteControl(journal, bytes));
+    nsCOMPtr<nsIXULAppInfo> app = do_GetService("@mozilla.org/xre/app-info;1");
+    ASSERT_TRUE(app);
+    nsCString version, build;
+    ASSERT_EQ(NS_OK, app->GetVersion(quoted));
+    ASSERT_EQ(NS_OK, JSONCacheQuote(cx, quoted, version));
+    ASSERT_EQ(NS_OK, app->GetAppBuildID(quoted));
+    ASSERT_EQ(NS_OK, JSONCacheQuote(cx, quoted, build));
+    ASSERT_EQ(
+        NS_OK,
+        document(
+            "{\"formatVersion\":2,\"backend\":\"panorama\",\"origin\":\"migrated\",\"state\":\"prepared\",\"application\":{\"version\":"_ns +
+                version + ",\"buildId\":"_ns + build +
+                "},\"identity\":{\"profilePath\":@PROFILE@,\"journalPath\":"_ns +
+                journalPath + ",\"backup\":"_ns + backup + "}}"_ns,
+            bytes));
+    ASSERT_EQ(NS_OK, WriteStartupFile("panorama-profile.json", bytes));
+    ASSERT_EQ(NS_OK, cache->GetNativePath(quoted));
+    ASSERT_EQ(NS_OK, JSONCacheQuote(cx, quoted, cachePath));
+    ASSERT_EQ(NS_OK, StartupHashControl(raw, digest));
+    const nsCString plan(
+        "{\"profilePath\":@PROFILE@,\"mode\":\"migrate\",\"sources\":[],\"caches\":[{\"path\":"_ns +
+        cachePath + ",\"sha256\":\""_ns + digest + "\"}],\"backup\":"_ns +
+        backup + ",\"journalPath\":"_ns + journalPath + "}"_ns);
+    JS::Rooted<JS::Value> input(cx), output(cx);
+    ASSERT_EQ(NS_OK, StartupDocument(cx, plan, &input));
+    ASSERT_EQ(NS_OK, mCore->OpenProfileStartupTarget(
+                         mCore->ProfileStartupToken(), input, cx, &output));
+    mConnection = Connection();
+    ASSERT_TRUE(mConnection);
+    nsCOMPtr<nsIMsgIncomingServer> server;
+    ASSERT_EQ(NS_OK,
+              manager->GetIncomingServer(serverKey, getter_AddRefs(server)));
+    ASSERT_TRUE(server);
+    nsCOMPtr<nsIMsgFolder> root;
+    ASSERT_EQ(NS_OK, server->GetRootFolder(getter_AddRefs(root)));
+    uint64_t rootId;
+    ASSERT_EQ(NS_OK, root->GetId(&rootId));
+    // No account source cell is supplied: this public getter must derive the
+    // real persisted account from the actual native root's server key.
+    RawHdr rawHeader;
+    rawHeader.messageId = "startup-account-fallback@example.invalid"_ns;
+    nsMsgKey key;
+    ASSERT_EQ(NS_OK,
+              mCore->MessageDB().AddMessage(rootId, rawHeader, true, &key));
+    RefPtr<Message> message;
+    ASSERT_EQ(NS_OK,
+              mCore->MessageDB().GetMessage(key, getter_AddRefs(message)));
+    ASSERT_TRUE(message);
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DatabaseCore::CheckAccountStartup());
+    action(manager, server, message, prefs, accountKey);
   }
 
   void CheckObservedStartupFailure() {
@@ -24428,6 +24632,184 @@ TEST_F(DeliveryCoreReferences, StartupLegacyModeRejectsUnboundServerSummary) {
 
 TEST_F(DeliveryCoreReferences, StartupServerSummariesRequireArray) {
   CheckStartupServerSummaryRefusal("initialize", "{}"_ns, NS_ERROR_INVALID_ARG);
+}
+
+TEST_F(DeliveryCoreReferences, StartupImapMissingOfflineBodyIsNotAFileError) {
+  nsCOMPtr<nsIFile> store;
+  ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(store)));
+  ASSERT_EQ(NS_OK, store->AppendNative("uncached-imap-body"_ns));
+  bool linked = false, exists = true;
+  EXPECT_EQ(NS_ERROR_FILE_NOT_FOUND, store->IsSymlink(&linked));
+  EXPECT_EQ(NS_OK, StartupStoreCheck(store, true));
+  EXPECT_EQ(NS_OK, StartupStoreCheck(store, true, true));
+  ASSERT_EQ(NS_OK, store->Exists(&exists));
+  EXPECT_FALSE(exists);
+  EXPECT_FALSE(Connection());
+}
+
+TEST_F(DeliveryCoreReferences, StartupLocalMissingStoreRemainsAnError) {
+  nsCOMPtr<nsIFile> store;
+  ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(store)));
+  ASSERT_EQ(NS_OK, store->AppendNative("missing-local-store"_ns));
+  EXPECT_EQ(NS_ERROR_FILE_NOT_FOUND, StartupStoreCheck(store, false));
+  EXPECT_EQ(NS_ERROR_FILE_NOT_FOUND, StartupStoreCheck(store, false, true));
+  bool exists = true;
+  ASSERT_EQ(NS_OK, store->Exists(&exists));
+  EXPECT_FALSE(exists);
+  EXPECT_FALSE(Connection());
+}
+
+TEST_F(DeliveryCoreReferences,
+       StartupExistingStoreRetainsContractTypeAndBytes) {
+  ASSERT_EQ(NS_OK, WriteStartupFile("typed-store", "original body bytes"_ns));
+  nsCOMPtr<nsIFile> file, directory;
+  ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(file)));
+  ASSERT_EQ(NS_OK, file->AppendNative("typed-store"_ns));
+  EXPECT_EQ(NS_OK, StartupStoreCheck(file, true));
+  EXPECT_EQ(NS_OK, StartupStoreCheck(file, false));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, StartupStoreCheck(file, true, true));
+  ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(directory)));
+  ASSERT_EQ(NS_OK, directory->AppendNative("typed-maildir"_ns));
+  ASSERT_EQ(NS_OK, directory->Create(nsIFile::DIRECTORY_TYPE, 0700));
+  EXPECT_EQ(NS_OK, StartupStoreCheck(directory, true, true));
+  EXPECT_EQ(NS_OK, StartupStoreCheck(directory, false, true));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, StartupStoreCheck(directory, true));
+  nsCString bytes;
+  ASSERT_EQ(NS_OK, JSONCacheReadFile(file, bytes));
+  EXPECT_EQ("original body bytes"_ns, bytes);
+  EXPECT_FALSE(Connection());
+}
+
+TEST_F(DeliveryCoreReferences, StartupImapDanglingAndExistingLinksStillRefuse) {
+  nsCOMPtr<nsIFile> target, link;
+  ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(target)));
+  ASSERT_EQ(NS_OK, target->AppendNative("link-body-target"_ns));
+  ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(link)));
+  ASSERT_EQ(NS_OK, link->AppendNative("linked-imap-body"_ns));
+  nsCString targetPath, linkPath;
+  ASSERT_EQ(NS_OK, target->GetNativePath(targetPath));
+  ASSERT_EQ(NS_OK, link->GetNativePath(linkPath));
+  ASSERT_EQ(0, symlink(targetPath.get(), linkPath.get()));
+  bool exists = true, linked = false;
+  ASSERT_EQ(NS_OK, link->Exists(&exists));
+  EXPECT_FALSE(exists);
+  ASSERT_EQ(NS_OK, link->IsSymlink(&linked));
+  EXPECT_TRUE(linked);
+  EXPECT_EQ(NS_ERROR_FILE_ACCESS_DENIED, StartupStoreCheck(link, true));
+  EXPECT_EQ(NS_ERROR_FILE_ACCESS_DENIED, StartupStoreCheck(link, true, true));
+  ASSERT_EQ(NS_OK, WriteStartupFile("link-body-target", "retained target"_ns));
+  EXPECT_EQ(NS_ERROR_FILE_ACCESS_DENIED, StartupStoreCheck(link, true));
+  EXPECT_EQ(NS_ERROR_FILE_ACCESS_DENIED, StartupStoreCheck(link, false));
+  nsCString bytes;
+  ASSERT_EQ(NS_OK, JSONCacheReadFile(target, bytes));
+  EXPECT_EQ("retained target"_ns, bytes);
+  EXPECT_FALSE(Connection());
+}
+
+TEST_F(DeliveryCoreReferences, StartupPublicAccountFallbackReadsBoundMetadata) {
+  WithPreReadyStartupAccount([&](nsIMsgAccountManager* manager,
+                                 nsIMsgIncomingServer* server, Message* message,
+                                 nsIPrefBranch* prefs, const nsCString& key) {
+    nsCString actual;
+    ASSERT_EQ(NS_OK, message->GetAccountKey(actual));
+    EXPECT_EQ(key, actual);
+    nsTArray<nsCString> properties;
+    ASSERT_EQ(NS_OK, message->GetProperties(properties));
+    EXPECT_FALSE(properties.Contains("account"_ns));
+    nsCOMPtr<nsIMsgAccount> account;
+    ASSERT_EQ(NS_OK,
+              manager->FindAccountForServer(server, getter_AddRefs(account)));
+    ASSERT_TRUE(account);
+    ASSERT_EQ(NS_OK, account->GetKey(actual));
+    EXPECT_EQ(key, actual);
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              manager->GetAccount(key, getter_AddRefs(account)));
+    EXPECT_FALSE(account);
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              manager->CreateAccount(getter_AddRefs(account)));
+    EXPECT_FALSE(account);
+    nsCOMPtr<nsIMsgIncomingServer> forbidden;
+    EXPECT_EQ(
+        NS_ERROR_NOT_AVAILABLE,
+        manager->CreateIncomingServer("writer"_ns, "writer.invalid"_ns,
+                                      "imap"_ns, getter_AddRefs(forbidden)));
+    EXPECT_FALSE(forbidden);
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DatabaseCore::CheckAccountStartup());
+    ASSERT_EQ(NS_OK,
+              prefs->GetCharPref("mail.accountmanager.accounts", actual));
+    EXPECT_EQ(key, actual);
+    ASSERT_EQ(NS_OK, message->GetAccountKey(actual));
+    EXPECT_EQ(key, actual);
+  });
+}
+
+TEST_F(DeliveryCoreReferences, StartupMissingAccountBindingIsAnErrorNotNull) {
+  WithPreReadyStartupAccount([&](nsIMsgAccountManager* manager,
+                                 nsIMsgIncomingServer* server, Message* message,
+                                 nsIPrefBranch* prefs, const nsCString& key) {
+    ASSERT_EQ(NS_OK, prefs->SetCharPref("mail.accountmanager.accounts", ""_ns));
+    nsCOMPtr<nsIMsgAccount> account;
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              manager->FindAccountForServer(server, getter_AddRefs(account)));
+    EXPECT_FALSE(account);
+    nsCString actual("unchanged-account");
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, message->GetAccountKey(actual));
+    EXPECT_EQ("unchanged-account"_ns, actual);
+    ASSERT_EQ(NS_OK, prefs->SetCharPref("mail.accountmanager.accounts", key));
+    ASSERT_EQ(NS_OK, message->GetAccountKey(actual));
+    EXPECT_EQ(key, actual);
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DatabaseCore::CheckAccountStartup());
+  });
+}
+
+TEST_F(DeliveryCoreReferences,
+       StartupExplicitAccountPropertyStillPrecedesFallback) {
+  WithPreReadyStartupAccount([&](nsIMsgAccountManager*, nsIMsgIncomingServer*,
+                                 Message* message, nsIPrefBranch* prefs,
+                                 const nsCString&) {
+    ASSERT_EQ(NS_OK, prefs->SetCharPref("mail.accountmanager.accounts", ""_ns));
+    ASSERT_EQ(NS_OK, message->SetAccountKey(""_ns));
+    nsCString actual("unchanged-account");
+    ASSERT_EQ(NS_OK, message->GetAccountKey(actual));
+    EXPECT_TRUE(actual.IsEmpty());
+    ASSERT_EQ(NS_OK, message->SetAccountKey("explicit-original-account"_ns));
+    ASSERT_EQ(NS_OK, message->GetAccountKey(actual));
+    EXPECT_EQ("explicit-original-account"_ns, actual);
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DatabaseCore::CheckAccountStartup());
+  });
+}
+
+TEST_F(DeliveryCoreReferences,
+       StartupAccountMetadataKeepsOrderAndFirstFailure) {
+  WithPreReadyStartupAccount([&](nsIMsgAccountManager* manager,
+                                 nsIMsgIncomingServer* server, Message* message,
+                                 nsIPrefBranch* prefs, const nsCString& key) {
+    const nsCString firstKey(key + "-first"_ns);
+    const nsCString branch("mail.account."_ns + firstKey + "."_ns);
+    auto clear = MakeScopeExit(
+        [&] { EXPECT_EQ(NS_OK, prefs->DeleteBranch(branch.get())); });
+    nsCString serverKey;
+    ASSERT_EQ(NS_OK, server->GetKey(serverKey));
+    ASSERT_EQ(NS_OK, prefs->SetCharPref(nsCString(branch + "server"_ns).get(),
+                                        serverKey));
+    const nsCString list(firstKey + ","_ns + firstKey + ","_ns + key);
+    ASSERT_EQ(NS_OK, prefs->SetCharPref("mail.accountmanager.accounts", list));
+    nsCString actual;
+    ASSERT_EQ(NS_OK, message->GetAccountKey(actual));
+    EXPECT_EQ(firstKey, actual);
+    ASSERT_EQ(NS_OK,
+              prefs->GetCharPref("mail.accountmanager.accounts", actual));
+    EXPECT_EQ(list, actual);
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DatabaseCore::CheckAccountStartup());
+    // Close real roots before native SQL settlement. The subsequent metadata
+    // lookup must retain the first failure, not return a cached account/key.
+    ASSERT_EQ(NS_OK, manager->UnloadAccounts());
+    ASSERT_EQ(NS_OK, StartupClose(NS_ERROR_FILE_ACCESS_DENIED));
+    nsCOMPtr<nsIMsgAccount> account;
+    EXPECT_EQ(NS_ERROR_FILE_ACCESS_DENIED,
+              manager->FindAccountForServer(server, getter_AddRefs(account)));
+    EXPECT_FALSE(account);
+  });
 }
 
 TEST_F(DeliveryCoreReferences, StartupBeginPreservesSettledParserFailure) {

@@ -147,11 +147,12 @@ export function parseJSONFolderCache(bytes) {
       // The current JSON producer writes userSortOrder as uint32. Historical
       // Mork conversion retains its original text projection for this property.
       const unsigned = UNSIGNED32.has(name) || name === "userSortOrder";
-      const width = SIGNED64.has(name)
-        ? 64
-        : SIGNED32.has(name) || unsigned
-          ? 32
-          : 0;
+      let width = 0;
+      if (SIGNED64.has(name)) {
+        width = 64;
+      } else if (SIGNED32.has(name) || unsigned) {
+        width = 32;
+      }
       let cell;
       if (width) {
         const minimum = unsigned ? 0 : -(2 ** (width - 1));
@@ -537,14 +538,15 @@ export function getMorkFolderCacheCells(folders) {
 export function validateMorkFolderCacheReceipt(unit, receipt) {
   const expected = createMorkFolderCacheRequest(unit);
   const identity = receipt?.identity;
+  let policy = "native-authoritative-v1";
+  if (expected.version === 3) {
+    policy = "native-reconciled-json-v3";
+  } else if (expected.version === 2) {
+    policy = "native-reconciled-selected-v2";
+  }
   if (
     identity?.version !== expected.version ||
-    identity.policy !==
-      (expected.version === 3
-        ? "native-reconciled-json-v3"
-        : expected.version === 2
-          ? "native-reconciled-selected-v2"
-          : "native-authoritative-v1") ||
+    identity.policy !== policy ||
     (expected.version === 3 && identity.sourceFormat !== "json") ||
     identity.token !== unit.token ||
     identity.sourceId !== unit.id ||

@@ -707,425 +707,522 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
             const [f, phase, retained] = arguments;
             const done = arguments[arguments.length - 1];
             (async () => {
-                const { FileUtils } = ChromeUtils.importESModule('resource://gre/modules/FileUtils.sys.mjs');
-                const { TestUtils } = ChromeUtils.importESModule('resource://testing-common/TestUtils.sys.mjs');
-                const { MailServices } = ChromeUtils.importESModule('resource:///modules/MailServices.sys.mjs');
-                const { IMServices } = ChromeUtils.importESModule('resource:///modules/IMServices.sys.mjs');
-                const { MailConsts } = ChromeUtils.importESModule('resource:///modules/MailConsts.sys.mjs');
-                const { MailSearchService } = ChromeUtils.importESModule('resource:///modules/panorama/MailSearchService.sys.mjs');
-                const { mailPolicyRevision } = ChromeUtils.importESModule('resource:///modules/panorama/MailSearchSource.sys.mjs');
-                const { ChatSearchProvider, chatSearchDocumentId } = ChromeUtils.importESModule('resource:///modules/panorama/ChatSearchProvider.sys.mjs');
-                const { getChatSearchService, closeChatSearch } = ChromeUtils.importESModule('resource:///modules/panorama/ChatSearchService.sys.mjs');
-                const logger = ChromeUtils.importESModule('resource:///modules/logger.sys.mjs');
-                const protocol = ChromeUtils.importESModule('resource://testing-common/TestProtocol.sys.mjs');
                 const root = Services.wm.getMostRecentWindow('mail:3pane');
-                const tabmail = root.document.getElementById('tabmail');
-                const core = Cc['@mozilla.org/mailnews/database-core;1'].getService(Ci.nsIDatabaseCore);
-                const c = f.s717;
-                const require = (condition, message) => {
-                    if (!condition) { throw new Error('S717: ' + message); }
-                };
-                require(c?.version === 1 && c.mail && c.chat && c.recovered, 'admitted descriptor');
-                require(core.sourceId === f.sourceId, 'original native incarnation');
-                const selectedProfile = Services.dirsvc.get('ProfD', Ci.nsIFile);
-                selectedProfile.normalize();
-                require(selectedProfile.path === retained.profile, 'same actual ProfD');
-                require(Services.prefs.getBoolPref('mail.panorama.enabled') &&
-                    Services.prefs.getBoolPref('mailnews.database.global.indexer.enabled'), 'ordinary initialized native process');
-                let s = root.__s717PolicyTrial;
-                if (!s) {
-                    require(['inputs', 'resumed', 'cleanup'].includes(phase), 'owned state must survive within its process');
-                    s = {owner: f.mailSidecar, data: retained, tabs: [...tabmail.tabInfo],
-                         conversations: [], registered: false, prefs: []};
-                    root.__s717PolicyTrial = s;
-                }
-                require(s.owner === f.mailSidecar, 'never borrow another owner');
-                const d = s.data;
-                let mail, provider, value, failure;
-                const failures = [];
+                const handler = Services.io.getProtocolHandler('resource').QueryInterface(Ci.nsIResProtocolHandler);
+                const currentModules = () => handler.hasSubstitution('testing-common')
+                    ? handler.getSubstitution('testing-common') : null;
+                const sameURI = (left, right) => left === null ? right === null : right !== null && left.equals(right);
                 /**
-                 * Read current native tokens without the old S716 policy oracle.
-                 * @returns {object} Actual profile, PID, source and typed physical members.
+                 * Restore this process's prior testing-common substitution.
+                 * Refuse an unrelated writer's replacement and retain custody on failure.
+                 * @throws {Error} If the owner, process or current substitution changed.
                  */
-                function identity() {
-                    const ids = [...f.mail.map(row => row.id), ...Object.values(d.mail || {}).map(row => row.id)];
-                    return {profile: PathUtils.profileDir, sourceId: core.sourceId, pid: Services.appinfo.processID,
-                        members: ids.map(id => {
-                            const state = core.messageDB.getSearchState(Number(id));
-                            return state ? {id, folderId: state.folderId, folderFlags: state.folderFlags,
-                                generation: state.generation, contentRevision: state.contentRevision,
-                                rawPolicyRevision: state.policyRevision, policyRevision: mailPolicyRevision(state.policyRevision)}
-                                : {id, deleted: true};
-                        })};
+                function restoreModules() {
+                    const custody = root.__s717TestModules;
+                    if (!custody) { return; }
+                    if (custody.owner !== f.mailSidecar || custody.pid !== Services.appinfo.processID) {
+                        throw new Error('S717 test-module custody belongs to another owner/process');
+                    }
+                    const current = currentModules();
+                    if (sameURI(current, custody.installed)) {
+                        if (!sameURI(custody.installed, custody.previous)) {
+                            handler.setSubstitution('testing-common', custody.previous);
+                        }
+                    } else if (!sameURI(current, custody.previous)) {
+                        throw new Error('S717 cannot restore a foreign test-module substitution');
+                    }
+                    if (!sameURI(currentModules(), custody.previous)) {
+                        throw new Error('S717 previous test-module substitution was not restored');
+                    }
+                    delete root.__s717TestModules;
                 }
                 /**
-                 * Read persisted scoped exclusions without authorizing unknown history.
-                 * @returns {Promise<object>} Nonempty receipts for the owned erased versions.
+                 * Register the ordinary installed modules used by this application test.
+                 * Follow send_later.js's bounded GreD/_tests|tests ancestor lookup.
+                 * @throws {Error} For missing installed files or changed module custody.
                  */
-                async function privacy() {
-                    const state = await logger.getChatPrivacyState();
-                    require(state.historyKnown === false, 'unknown historical logging remains unknown');
-                    const parts = JSON.stringify(JSON.parse(d.chat.id.slice(5)));
-                    const receipts = [...state.pending, ...state.completed].filter(receipt =>
-                        receipt.targets.some(target => JSON.stringify(target.relativePath) === parts));
-                    for (const name of ['deleted', 'noLog', 'redacted']) {
-                        const matches = receipts.filter(receipt => receipt.remoteId === c.chat[name].remoteId);
-                        require(matches.length > 0 && matches.every(receipt => receipt.targets.some(target =>
-                            JSON.stringify(target.relativePath) === parts && target.records.length > 0)),
-                            'durable scoped privacy receipt for ' + name);
+                function registerModules() {
+                    const custody = root.__s717TestModules;
+                    if (custody) {
+                        if (custody.owner !== f.mailSidecar || custody.pid !== Services.appinfo.processID ||
+                            !sameURI(currentModules(), custody.installed)) {
+                            throw new Error('S717 installed test-module custody changed');
+                        }
+                        return;
                     }
-                    return {historyKnown: state.historyKnown, receipts};
-                }
-                /**
-                 * Search through the retained toolbar and actual native result view.
-                 * @param {string} text - Literal query from the fixed case descriptor.
-                 * @returns {Promise<object>} Real tab, frame and native FacetContext.
-                 */
-                async function query(text) {
-                    const input = root.document.querySelector('#unifiedToolbarContent global-search-bar');
-                    require(input, 'retained global search bar');
-                    input.popup.selectedIndex = -1;
-                    input.dispatchEvent(new root.CustomEvent('search', {detail: text}));
-                    const tab = tabmail.currentTabInfo;
-                    require(tab.mode.name === 'glodaFacet', 'real native result tab');
-                    await TestUtils.waitForCondition(() => tab.searchPromise, 'native query started');
-                    require(await tab.searchPromise, 'native query completed');
-                    const win = tab.browser.contentWindow;
-                    require(win.FacetContext.chatSearchResultSet, 'current chat result set');
-                    return {tab, win, context: win.FacetContext};
-                }
-                /**
-                 * Drain every owned writer, tab and preference after any earlier failure.
-                 * @returns {Promise<void>} All errors are retained in one AggregateError.
-                 */
-                async function closeLive() {
-                    const errors = [];
-                    for (const conv of s.conversations) {
-                        try { conv.close(); } catch (error) { errors.push(error); }
-                        try { logger.closeLogWriter(conv); } catch (error) { errors.push(error); }
-                    }
-                    s.conversations = [];
-                    for (const path of [d.chat?.path, d.chat?.otherPath].filter(Boolean)) {
-                        try { await logger.gFilePromises.get(path); } catch (error) { errors.push(error); }
-                    }
-                    try { await closeChatSearch(); } catch (error) { errors.push(error); }
-                    if (s.account) {
-                        try {
-                            if (s.account.connected || s.account.connecting) { s.account.disconnect(); }
-                            IMServices.accounts.deleteAccount(s.account.id);
-                            s.account = null;
-                        } catch (error) { errors.push(error); }
-                    }
-                    if (s.registered) {
-                        try { protocol.unregisterTestProtocol(); s.registered = false; }
-                        catch (error) { errors.push(error); }
-                    }
-                    for (const tab of [...tabmail.tabInfo]) {
-                        if (!s.tabs.includes(tab)) {
-                            try { tabmail.closeTab(tab); } catch (error) { errors.push(error); }
+                    let rootDir = Services.dirsvc.get('GreD', Ci.nsIFile);
+                    for (let depth = 0; rootDir && depth < 5; depth++, rootDir = rootDir.parent) {
+                        for (const layout of ['_tests', 'tests']) {
+                            const modules = rootDir.clone();
+                            modules.append(layout);
+                            modules.append('modules');
+                            const hasModule = name => {
+                                const file = modules.clone();
+                                file.append(name);
+                                return file.exists() && file.isFile();
+                            };
+                            if (!['TestUtils.sys.mjs', 'TestProtocol.sys.mjs'].every(hasModule)) { continue; }
+                            // These are the pinned modules' production dependencies, not copied test logic.
+                            for (const uri of ['resource://gre/modules/Timer.sys.mjs',
+                                'resource:///modules/jsProtoHelper.sys.mjs', 'resource:///modules/imCore.sys.mjs',
+                                'resource:///modules/imXPCOMUtils.sys.mjs']) {
+                                ChromeUtils.importESModule(uri);
+                            }
+                            const previous = currentModules();
+                            const installed = Services.io.newFileURI(modules);
+                            root.__s717TestModules = {owner: f.mailSidecar, pid: Services.appinfo.processID, previous, installed};
+                            if (!sameURI(previous, installed)) {
+                                handler.setSubstitution('testing-common', installed);
+                            }
+                            if (!sameURI(currentModules(), installed)) {
+                                throw new Error('S717 installed test-module substitution was not selected');
+                            }
+                            return;
                         }
                     }
-                    for (const pref of s.prefs) {
-                        try {
-                            if (pref.hadValue) { Services.prefs.setIntPref(pref.name, pref.value); }
-                            else { Services.prefs.clearUserPref(pref.name); }
-                        } catch (error) { errors.push(error); }
-                    }
-                    s.prefs = [];
-                    if (errors.length) { throw new AggregateError(errors, 'S717 owned live cleanup'); }
+                    throw new Error('S717 ordinary installed modules/TestUtils.sys.mjs and TestProtocol.sys.mjs are missing');
                 }
+                let intakeFailed = false, intakeError;
                 try {
-                    if (phase === 'inputs' || phase === 'resumed') {
-                        const name = 'mail.openMessageBehavior';
-                        s.prefs.push({name, hadValue: Services.prefs.prefHasUserValue(name), value: Services.prefs.getIntPref(name)});
-                        Services.prefs.setIntPref(name, MailConsts.OpenMessageBehavior.NEW_TAB);
+                    if (phase === 'cleanup' && !root.__s717PolicyTrial && !retained.mail) {
+                        // Intake failed before any S717-owned MIME or logger mutation.
+                        // The outer finally still restores any partially installed mapping.
+                        return {ownedStateAbsent: true};
                     }
-                    if (phase === 'inputs') {
-                        require(!d.mail && !d.chat, 'fresh inputs only after the S716 prefix');
-                        d.mail = {};
-                        d.factorySidecar = PathUtils.join(PathUtils.profileDir, 'panorama-chat-search.sqlite');
-                        require(d.factorySidecar !== f.chatSidecar, 'factory and retained sidecar remain distinct');
-                        const parent = MailServices.accounts.localFoldersServer.rootFolder;
-                        for (const [name, item] of Object.entries(c.mail)) {
-                            const folders = item.folders || [item.folder];
-                            for (const [i, folderName] of folders.entries()) {
-                                require(!parent.containsChildNamed(folderName), 'do not overwrite an existing target folder');
-                                const folder = parent.createLocalSubfolder(folderName).QueryInterface(Ci.nsIMsgLocalMailFolder);
-                                const raw = ['From: Trial Sender <sender@example.invalid>',
-                                    'To: Trial Recipient <recipient@example.invalid>', 'Date: Tue, 01 Jan 2019 00:00:00 +0000',
-                                    `Message-ID: <${item.messageId}>`, `Subject: ${item.oldSubject || item.subject}`,
-                                    'Content-Type: text/plain; charset=utf-8', '', item.body, ''].join('\r\n');
-                                const header = folder.addMessage(Array.from(new TextEncoder().encode(raw), byte => String.fromCharCode(byte)).join(''));
-                                require(header && header.folder.id === folder.id && header.messageId === item.messageId, 'real physical MIME delivery');
-                                const key = name === 'open' ? (i === 0 ? 'selected' : 'other') : name;
-                                d.mail[key] = {id: String(header.messageKey), folderId: folder.id,
-                                    folderURI: folder.URI, messageId: header.messageId};
-                            }
+                    registerModules();
+                    const { FileUtils } = ChromeUtils.importESModule('resource://gre/modules/FileUtils.sys.mjs');
+                    const { TestUtils } = ChromeUtils.importESModule('resource://testing-common/TestUtils.sys.mjs');
+                    const { MailServices } = ChromeUtils.importESModule('resource:///modules/MailServices.sys.mjs');
+                    const { IMServices } = ChromeUtils.importESModule('resource:///modules/IMServices.sys.mjs');
+                    const { MailConsts } = ChromeUtils.importESModule('resource:///modules/MailConsts.sys.mjs');
+                    const { MailSearchService } = ChromeUtils.importESModule('resource:///modules/panorama/MailSearchService.sys.mjs');
+                    const { mailPolicyRevision } = ChromeUtils.importESModule('resource:///modules/panorama/MailSearchSource.sys.mjs');
+                    const { ChatSearchProvider, chatSearchDocumentId } = ChromeUtils.importESModule('resource:///modules/panorama/ChatSearchProvider.sys.mjs');
+                    const { getChatSearchService, closeChatSearch } = ChromeUtils.importESModule('resource:///modules/panorama/ChatSearchService.sys.mjs');
+                    const logger = ChromeUtils.importESModule('resource:///modules/logger.sys.mjs');
+                    const protocol = ChromeUtils.importESModule('resource://testing-common/TestProtocol.sys.mjs');
+                    const tabmail = root.document.getElementById('tabmail');
+                    const core = Cc['@mozilla.org/mailnews/database-core;1'].getService(Ci.nsIDatabaseCore);
+                    const c = f.s717;
+                    const require = (condition, message) => {
+                        if (!condition) { throw new Error('S717: ' + message); }
+                    };
+                    require(c?.version === 1 && c.mail && c.chat && c.recovered, 'admitted descriptor');
+                    require(core.sourceId === f.sourceId, 'original native incarnation');
+                    const selectedProfile = Services.dirsvc.get('ProfD', Ci.nsIFile);
+                    selectedProfile.normalize();
+                    require(selectedProfile.path === retained.profile, 'same actual ProfD');
+                    require(Services.prefs.getBoolPref('mail.panorama.enabled') &&
+                        Services.prefs.getBoolPref('mailnews.database.global.indexer.enabled'), 'ordinary initialized native process');
+                    let s = root.__s717PolicyTrial;
+                    if (!s) {
+                        require(['inputs', 'resumed', 'cleanup'].includes(phase), 'owned state must survive within its process');
+                        s = {owner: f.mailSidecar, data: retained, tabs: [...tabmail.tabInfo],
+                             conversations: [], registered: false, prefs: []};
+                        root.__s717PolicyTrial = s;
+                    }
+                    require(s.owner === f.mailSidecar, 'never borrow another owner');
+                    const d = s.data;
+                    let mail, provider, value, failure;
+                    const failures = [];
+                    /**
+                     * Read current native tokens without the old S716 policy oracle.
+                     * @returns {object} Actual profile, PID, source and typed physical members.
+                     */
+                    function identity() {
+                        const ids = [...f.mail.map(row => row.id), ...Object.values(d.mail || {}).map(row => row.id)];
+                        return {profile: PathUtils.profileDir, sourceId: core.sourceId, pid: Services.appinfo.processID,
+                            members: ids.map(id => {
+                                const state = core.messageDB.getSearchState(Number(id));
+                                return state ? {id, folderId: state.folderId, folderFlags: state.folderFlags,
+                                    generation: state.generation, contentRevision: state.contentRevision,
+                                    rawPolicyRevision: state.policyRevision, policyRevision: mailPolicyRevision(state.policyRevision)}
+                                    : {id, deleted: true};
+                            })};
+                    }
+                    /**
+                     * Read persisted scoped exclusions without authorizing unknown history.
+                     * @returns {Promise<object>} Nonempty receipts for the owned erased versions.
+                     */
+                    async function privacy() {
+                        const state = await logger.getChatPrivacyState();
+                        require(state.historyKnown === false, 'unknown historical logging remains unknown');
+                        const parts = JSON.stringify(JSON.parse(d.chat.id.slice(5)));
+                        const receipts = [...state.pending, ...state.completed].filter(receipt =>
+                            receipt.targets.some(target => JSON.stringify(target.relativePath) === parts));
+                        for (const name of ['deleted', 'noLog', 'redacted']) {
+                            const matches = receipts.filter(receipt => receipt.remoteId === c.chat[name].remoteId);
+                            require(matches.length > 0 && matches.every(receipt => receipt.targets.some(target =>
+                                JSON.stringify(target.relativePath) === parts && target.records.length > 0)),
+                                'durable scoped privacy receipt for ' + name);
                         }
-                        require(d.mail.selected.id !== d.mail.other.id, 'equal Message-ID copies have distinct physical keys');
-                        d.excludedFlags = core.folderDB.getFolderFlags(d.mail.excluded.folderId);
-                        require(!(d.excludedFlags & Ci.nsMsgFolderFlags.Junk), 'fresh exclusion target starts eligible');
-                        require(c.recovered.id === f.recovered.id && c.recovered.body === f.recovered.body, 'original recovered survivor');
-                        IMServices.core.init();
-                        if (!IMServices.core.getProtocols().some(item => item.id === 'prpl-mochitest')) {
-                            protocol.registerTestProtocol(); s.registered = true;
+                        return {historyKnown: state.historyKnown, receipts};
+                    }
+                    /**
+                     * Search through the retained toolbar and actual native result view.
+                     * @param {string} text - Literal query from the fixed case descriptor.
+                     * @returns {Promise<object>} Real tab, frame and native FacetContext.
+                     */
+                    async function query(text) {
+                        const input = root.document.querySelector('#unifiedToolbarContent global-search-bar');
+                        require(input, 'retained global search bar');
+                        input.popup.selectedIndex = -1;
+                        input.dispatchEvent(new root.CustomEvent('search', {detail: text}));
+                        const tab = tabmail.currentTabInfo;
+                        require(tab.mode.name === 'glodaFacet', 'real native result tab');
+                        await TestUtils.waitForCondition(() => tab.searchPromise, 'native query started');
+                        require(await tab.searchPromise, 'native query completed');
+                        const win = tab.browser.contentWindow;
+                        require(win.FacetContext.chatSearchResultSet, 'current chat result set');
+                        return {tab, win, context: win.FacetContext};
+                    }
+                    /**
+                     * Drain every owned writer, tab and preference after any earlier failure.
+                     * @returns {Promise<void>} All errors are retained in one AggregateError.
+                     */
+                    async function closeLive() {
+                        const errors = [];
+                        for (const conv of s.conversations) {
+                            try { conv.close(); } catch (error) { errors.push(error); }
+                            try { logger.closeLogWriter(conv); } catch (error) { errors.push(error); }
                         }
-                        require(!IMServices.accounts.getAccounts().some(account => account.name === c.chat.account), 'fresh protocol account');
-                        s.account = IMServices.accounts.createAccount(c.chat.account, 'prpl-mochitest');
-                        const updated = TestUtils.topicObserved('account-updated', subject => subject === s.account);
-                        s.account.password = 'S717 owned logger fixture';
-                        await updated;
-                        s.account.connect();
-                        const chat = await getChatSearchService();
-                        const conv = s.account.prplAccount.wrappedJSObject.makeDM(c.chat.conversation);
-                        s.conversations.push(conv);
-                        for (const name of ['edit', 'deleted', 'noLog', 'redacted', 'keep']) {
-                            const item = c.chat[name];
-                            conv.writeMessage('NativeSpeaker', item.oldText || item.text, {incoming: true, remoteId: item.remoteId});
+                        s.conversations = [];
+                        for (const path of [d.chat?.path, d.chat?.otherPath].filter(Boolean)) {
+                            try { await logger.gFilePromises.get(path); } catch (error) { errors.push(error); }
                         }
-                        const other = s.account.prplAccount.wrappedJSObject.makeDM(c.chat.conversation + '-other');
-                        s.conversations.push(other);
-                        other.writeMessage('OtherSpeaker', c.chat.otherPhysical, {incoming: true, remoteId: c.chat.keep.remoteId});
-                        await chat.flush();
-                        const path = logger.getLogWriter(conv).currentPath;
-                        const otherPath = logger.getLogWriter(other).currentPath;
-                        d.chat = {path, id: chatSearchDocumentId(path), otherPath, otherId: chatSearchDocumentId(otherPath)};
-                        require(d.chat.id !== d.chat.otherId, 'equal remote ID never groups physical logs');
-                        s.oldView = await query(c.chat.edit.oldText);
-                        d.oldItem = s.oldView.context.chatSearchResultSet.items.find(item => item.hit.id === d.chat.id);
-                        require(d.oldItem?.document.body.includes(c.chat.edit.oldText), 'actual captured pre-edit result');
-                        mail = await MailSearchService.open(new FileUtils.File(f.mailSidecar), core.sourceId, core.messageDB);
-                        await mail.rebuild();
-                        value = {inputs: d, identity: identity()};
-                    } else if (phase === 'identity' || phase === 'resumed') {
-                        value = {identity: identity()};
-                        if (phase === 'resumed') { value.privacy = await privacy(); }
-                    } else if (phase === 'update' || phase === 'cancel') {
-                        mail = await MailSearchService.open(new FileUtils.File(f.mailSidecar), core.sourceId, core.messageDB);
-                        if (phase === 'update') {
-                            value = {progress: await mail.update({limit: 2}), identity: identity()};
-                        } else {
-                            const controller = new AbortController();
-                            const reason = new Error('S717 pending mail cancellation');
-                            let settled = false;
-                            const pending = mail.update({limit: 2, signal: controller.signal});
-                            const observed = pending.then(() => { settled = true; return null; }, error => { settled = true; return error; });
+                        try { await closeChatSearch(); } catch (error) { errors.push(error); }
+                        if (s.account) {
                             try {
-                                await Promise.resolve();
-                                require(!controller.signal.aborted && !settled, 'a real non-preaborted update remains pending');
-                                controller.abort(reason);
-                                require(await observed === reason, 'original pending cancellation reason');
-                                value = {cancelled: true, reason: reason.message, identity: identity()};
-                            } finally {
-                                if (!controller.signal.aborted) { controller.abort(reason); }
-                                await observed;
+                                if (s.account.connected || s.account.connecting) { s.account.disconnect(); }
+                                IMServices.accounts.deleteAccount(s.account.id);
+                                s.account = null;
+                            } catch (error) { errors.push(error); }
+                        }
+                        if (s.registered) {
+                            try { protocol.unregisterTestProtocol(); s.registered = false; }
+                            catch (error) { errors.push(error); }
+                        }
+                        for (const tab of [...tabmail.tabInfo]) {
+                            if (!s.tabs.includes(tab)) {
+                                try { tabmail.closeTab(tab); } catch (error) { errors.push(error); }
                             }
                         }
-                    } else if (phase === 'mutations') {
-                        core.messageDB.getMessage(Number(d.mail.edit.id)).subject = c.mail.edit.newSubject;
-                        core.messageDB.removeMessage(Number(d.mail.deleted.id));
-                        // Dedicated negative removes ONLY this exclusion operation.
-                        core.folderDB.updateFlags(d.mail.excluded.folderId, d.excludedFlags | Ci.nsMsgFolderFlags.Junk);
-                        const conv = s.conversations[0];
-                        conv.updateMessage('NativeSpeaker', c.chat.edit.newText, {incoming: true, remoteId: c.chat.edit.remoteId});
-                        conv.updateMessage('NativeSpeaker', '', {incoming: true, remoteId: c.chat.deleted.remoteId, deleted: true});
-                        conv.updateMessage('NativeSpeaker', '', {incoming: true, remoteId: c.chat.noLog.remoteId, noLog: true});
-                        const redaction = conv.createMessage('NativeSpeaker', '', {incoming: true, remoteId: c.chat.redacted.remoteId, deleted: true});
-                        conv.notifyObservers(redaction, 'update-text');
-                        const chat = await getChatSearchService();
-                        await chat.flush();
-                        const tabs = tabmail.tabInfo.length;
-                        require(await s.oldView.context.openChatSearchConversation(d.oldItem) === null, 'retired pre-edit result refuses delivery');
-                        require(tabmail.tabInfo.length === tabs, 'stale opening adds no reader');
-                        const text = await chat.getText(d.chat.id);
-                        require(text?.body.includes(c.chat.edit.newText) && text.body.includes(c.chat.keep.text), 'current kept Unicode text');
-                        for (const term of [c.chat.edit.oldText, c.chat.deleted.text, c.chat.noLog.text, c.chat.redacted.text]) {
-                            require((await chat.search(term)).items.length === 0 && !text.body.includes(term), 'suppressed chat text: ' + term);
+                        for (const pref of s.prefs) {
+                            try {
+                                if (pref.hadValue) { Services.prefs.setIntPref(pref.name, pref.value); }
+                                else { Services.prefs.clearUserPref(pref.name); }
+                            } catch (error) { errors.push(error); }
                         }
-                        const cancelPath = PathUtils.join(retained.work, 's717-cancel.sqlite');
-                        require(!await IOUtils.exists(cancelPath), 'do not overwrite an existing cancellation artifact');
-                        provider = await ChatSearchProvider.open(new FileUtils.File(cancelPath));
-                        const entered = Promise.withResolvers();
-                        const gate = Promise.withResolvers();
-                        const held = logger.queueFileOperation(d.chat.path, async () => { entered.resolve(); await gate.promise; });
-                        const controller = new AbortController();
-                        const reason = new Error('S717 queued log read cancellation');
-                        let observed;
-                        try {
-                            await entered.promise;
-                            const pending = provider.refreshLog(d.chat.path, {signal: controller.signal});
-                            observed = pending.then(() => null, error => error);
-                            await TestUtils.waitForCondition(() => logger.gFilePromises.get(d.chat.path) !== held,
-                                'real provider read queued behind owned source operation');
-                            controller.abort(reason);
-                            gate.resolve();
-                            require(await observed === reason, 'queued source read preserves original reason');
-                        } finally {
-                            controller.abort(reason);
-                            gate.resolve();
-                            await held;
-                            if (observed) { await observed; }
+                        s.prefs = [];
+                        if (errors.length) { throw new AggregateError(errors, 'S717 owned live cleanup'); }
+                    }
+                    try {
+                        if (phase === 'inputs' || phase === 'resumed') {
+                            const name = 'mail.openMessageBehavior';
+                            s.prefs.push({name, hadValue: Services.prefs.prefHasUserValue(name), value: Services.prefs.getIntPref(name)});
+                            Services.prefs.setIntPref(name, MailConsts.OpenMessageBehavior.NEW_TAB);
                         }
-                        value = {identity: identity(), privacy: await privacy(), chatText: text,
-                            junkFlag: Ci.nsMsgFolderFlags.Junk, staleRefused: true, queuedReadCancelled: true};
-                    } else if (phase === 'close') {
-                        await closeLive();
-                        value = {identity: identity(), privacy: await privacy()};
-                    } else if (phase === 'mail-final') {
-                        mail = await MailSearchService.open(new FileUtils.File(f.mailSidecar), core.sourceId, core.messageDB);
-                        const expected = new Map([
-                            [c.mail.edit.oldSubject, []], [c.mail.edit.newSubject, [d.mail.edit.id]],
-                            [c.mail.deleted.body, []], [c.mail.excluded.body, []],
-                            [c.mail.open.body.split(' ')[0], [d.mail.selected.id, d.mail.other.id]],
-                            ['recovered', [f.recovered.id]], ['quarantineneedle', []],
-                            ['oldaggregateneedle', []], ['ghost-id', []], ['deleted-id', []],
-                        ]);
-                        const queries = {};
-                        for (const [term, ids] of expected) {
-                            const page = await mail.search(term, {limit: 100});
-                            require(!page.cursor && JSON.stringify(page.items.map(hit => hit.id).sort()) === JSON.stringify([...ids].sort()),
-                                'exact physical query results: ' + term);
-                            for (const hit of page.items) {
-                                const text = await mail.getText(hit.id);
-                                const state = core.messageDB.getSearchState(Number(hit.id));
-                                require(state && text, 'current native query text');
-                                for (const key of ['generation', 'contentRevision', 'policyRevision', 'textRevision']) {
-                                    require(hit[key] === text[key], 'current mail hit/text ' + key);
+                        if (phase === 'inputs') {
+                            require(!d.mail && !d.chat, 'fresh inputs only after the S716 prefix');
+                            d.mail = {};
+                            d.factorySidecar = PathUtils.join(PathUtils.profileDir, 'panorama-chat-search.sqlite');
+                            require(d.factorySidecar !== f.chatSidecar, 'factory and retained sidecar remain distinct');
+                            const parent = MailServices.accounts.localFoldersServer.rootFolder;
+                            for (const [name, item] of Object.entries(c.mail)) {
+                                const folders = item.folders || [item.folder];
+                                for (const [i, folderName] of folders.entries()) {
+                                    require(!parent.containsChildNamed(folderName), 'do not overwrite an existing target folder');
+                                    const folder = parent.createLocalSubfolder(folderName).QueryInterface(Ci.nsIMsgLocalMailFolder);
+                                    const raw = ['From: Trial Sender <sender@example.invalid>',
+                                        'To: Trial Recipient <recipient@example.invalid>', 'Date: Tue, 01 Jan 2019 00:00:00 +0000',
+                                        `Message-ID: <${item.messageId}>`, `Subject: ${item.oldSubject || item.subject}`,
+                                        'Content-Type: text/plain; charset=utf-8', '', item.body, ''].join('\r\n');
+                                    const header = folder.addMessage(Array.from(new TextEncoder().encode(raw), byte => String.fromCharCode(byte)).join(''));
+                                    require(header && header.folder.id === folder.id && header.messageId === item.messageId, 'real physical MIME delivery');
+                                    const key = name === 'open' ? (i === 0 ? 'selected' : 'other') : name;
+                                    d.mail[key] = {id: String(header.messageKey), folderId: folder.id,
+                                        folderURI: folder.URI, messageId: header.messageId};
                                 }
-                                require(text.generation === state.generation && text.contentRevision === state.contentRevision &&
-                                    text.policyRevision === mailPolicyRevision(state.policyRevision), 'current native policy/content tokens');
                             }
-                            queries[term] = page.items;
-                        }
-                        const recovered = await mail.getText(f.recovered.id);
-                        require(recovered?.body === f.recovered.body, 'eligible recovery survives policy/restart/rebuild');
-                        const records = await mail.getRecoveryRecords();
-                        const retainedRecord = records.find(row => row.documentId === f.recovered.id);
-                        require(records.length === 6 && retainedRecord.payload.message.text.body === f.recovered.body,
-                            'recovery record/provenance retained');
-                        require(retainedRecord.payload.provenance.importReceipt.databaseSourceId === f.sourceId,
-                            'original recovery source mapping');
-                        const tabs = tabmail.tabInfo.length;
-                        for (const [id, status] of [[d.mail.deleted.id, 'deleted'], [d.mail.excluded.id, 'ineligible'], [f.recovered.id, 'unavailable']]) {
-                            require((await mail.openResult(id, {tabmail})).status === status, 'negative mail open: ' + status);
-                            require(tabmail.tabInfo.length === tabs, 'negative mail open adds no substitute reader');
-                        }
-                        const controller = new AbortController();
-                        const reason = new Error('S717 cancelled mail opening');
-                        controller.abort(reason);
-                        let refusal;
-                        try { await mail.openResult(d.mail.selected.id, {tabmail, signal: controller.signal}); }
-                        catch (error) { refusal = error; }
-                        require(refusal === reason && tabmail.tabInfo.length === tabs, 'cancelled open never dispatches another copy');
-                        const opened = await mail.openResult(d.mail.selected.id, {tabmail});
-                        require(opened.status === 'ready' && String(opened.header.messageKey) === d.mail.selected.id &&
-                            opened.header.folder.URI === d.mail.selected.folderURI, 'real selected physical mail open');
-                        const reader = tabmail.currentTabInfo;
-                        require(reader.mode.name === 'mailMessageTab', 'normal mail reader tab');
-                        await TestUtils.waitForCondition(() => reader.message && reader.browser?.contentDocument?.body?.textContent.includes(c.mail.open.body),
-                            'selected physical MIME text loaded in actual reader');
-                        require(String(reader.message.messageKey) === d.mail.selected.id && reader.message.folder.URI === d.mail.selected.folderURI,
-                            'reader selected exact key/folder, not Message-ID peer');
-                        value = {queries, recovered, records, selected: d.mail.selected,
-                            reader: {id: String(reader.message.messageKey), folderURI: reader.message.folder.URI,
-                                body: reader.browser.contentDocument.body.textContent}, identity: identity()};
-                    } else if (phase === 'chat-final') {
-                        const chat = await getChatSearchService();
-                        await chat.flush();
-                        const document = await chat.getText(d.chat.id);
-                        require(document?.body.includes(c.chat.edit.newText) && document.body.includes(c.chat.keep.text), 'current selected transcript');
-                        require(!document.body.includes(c.chat.otherPhysical), 'equal logical ID never merges physical source');
-                        for (const term of [c.chat.edit.oldText, c.chat.deleted.text, c.chat.noLog.text, c.chat.redacted.text]) {
-                            require((await chat.search(term)).items.length === 0 && !document.body.includes(term), 'no privacy revival: ' + term);
-                        }
-                        const staleView = await query(c.chat.keep.text.split(' ')[0]);
-                        const count = tabmail.tabInfo.length;
-                        require(await staleView.context.openChatSearchConversation(d.oldItem) === null && tabmail.tabInfo.length === count,
-                            'pre-edit tokens refused after real process restart');
-                        const item = staleView.context.chatSearchResultSet.items.find(row => row.hit.id === d.chat.id);
-                        require(item && item.hit.contentRevision === document.contentRevision && item.hit.textRevision === document.textRevision,
-                            'rendered current hit revisions');
-                        const entered = Promise.withResolvers();
-                        const gate = Promise.withResolvers();
-                        const held = logger.queueFileOperation(d.chat.path, async () => { entered.resolve(); await gate.promise; });
-                        let observed, settled = false;
-                        try {
-                            await entered.promise;
-                            const ownerSignal = staleView.tab.mailSearchController.signal;
-                            const opening = staleView.context.openChatSearchConversation(item);
-                            observed = opening.then(() => { settled = true; return null; }, error => { settled = true; return error; });
-                            tabmail.closeTab(staleView.tab);
-                            // A bounded semantic wait still reaches finally if abort delivery is broken.
-                            await TestUtils.waitForCondition(() => settled, 'retired reader open settles while source I/O remains held');
-                            const error = await observed;
-                            require(ownerSignal.aborted && error === ownerSignal.reason && error?.name === 'AbortError',
-                                'closing real result view preserves its parent-owned abort reason');
-                            require(tabmail.currentTabInfo.mode.name !== 'chat', 'retired view never dispatches reader');
-                        } finally {
-                            gate.resolve();
-                            await held;
-                            if (observed) { await observed; }
-                        }
-                        const view = await query(c.chat.keep.text.split(' ')[0]);
-                        const current = view.context.chatSearchResultSet.items.find(row => row.hit.id === d.chat.id);
-                        require(current && current.hit.id !== d.chat.otherId, 'fresh physical result after cancelled delivery');
-                        const row = [...view.win.document.querySelectorAll('.native-chat-result')].find(node => node.dataset.id === d.chat.id);
-                        require(row?.querySelector('button'), 'rendered ordinary result button');
-                        const browser = root.document.getElementById('conv-log-browser');
-                        let loaded = false, displayed = false;
-                        const observer = subject => { if (subject === browser) { loaded = true; } };
-                        const onDisplayed = () => { displayed = true; };
-                        Services.obs.addObserver(observer, 'conversation-loaded');
-                        browser.addEventListener('MessagesDisplayed', onDisplayed);
-                        try {
-                            row.querySelector('button').click();
-                            await TestUtils.waitForCondition(() => loaded && displayed && view.tab.chatSearchOpenPromise,
-                                'real conversation-loaded and MessagesDisplayed');
-                            await view.tab.chatSearchOpenPromise;
-                            require(tabmail.currentTabInfo.mode.name === 'chat', 'actual chat reader');
-                            const resolved = root.document.getElementById('searchResultConv').nativeChatLog.resolved;
-                            require(resolved.id === d.chat.id && resolved.contentRevision === current.hit.contentRevision &&
-                                resolved.textRevision === current.hit.textRevision, 'selected physical log and current tokens');
-                            const messages = browser._conv.getMessages();
-                            const body = messages.map(message => message.message).join('\n');
-                            require(messages.some(message => message.who === 'NativeSpeaker' && message.message.includes(c.chat.keep.text)),
-                                'physical reader retains the current speaker and text');
-                            const rendered = browser.contentDocument.body.textContent;
-                            require(rendered.includes('NativeSpeaker') && rendered.includes(c.chat.keep.text.split(' ')[0]),
-                                'actual rendered speaker and selected body');
-                            require(body.includes(c.chat.edit.newText) && body.includes(c.chat.keep.text) && !body.includes(c.chat.otherPhysical),
-                                'actual reader displays selected Unicode text and no peer payload');
-                            require(document.body.includes('NativeSpeaker'), 'semantic speaker text retained');
-                            if (current.snippet.firstMatchText) {
-                                await TestUtils.waitForCondition(() => browser.contentWindow.getSelection().toString() === current.snippet.firstMatchText,
-                                    'real findbar selects captured snippet');
+                            require(d.mail.selected.id !== d.mail.other.id, 'equal Message-ID copies have distinct physical keys');
+                            d.excludedFlags = core.folderDB.getFolderFlags(d.mail.excluded.folderId);
+                            require(!(d.excludedFlags & Ci.nsMsgFolderFlags.Junk), 'fresh exclusion target starts eligible');
+                            require(c.recovered.id === f.recovered.id && c.recovered.body === f.recovered.body, 'original recovered survivor');
+                            IMServices.core.init();
+                            if (!IMServices.core.getProtocols().some(item => item.id === 'prpl-mochitest')) {
+                                protocol.registerTestProtocol(); s.registered = true;
                             }
-                            value = {factorySidecar: d.factorySidecar, originalSidecar: f.chatSidecar,
-                                hit: current.hit, document, resolved: {id: resolved.id, contentRevision: resolved.contentRevision,
-                                    textRevision: resolved.textRevision}, body, rendered, loaded, displayed, privacy: await privacy()};
-                        } finally {
-                            Services.obs.removeObserver(observer, 'conversation-loaded');
-                            browser.removeEventListener('MessagesDisplayed', onDisplayed);
-                        }
-                    } else if (phase === 'cleanup') {
-                        let closeError;
-                        try { await closeLive(); } catch (error) { closeError = error; }
-                        try {
-                            if (d.mail?.excluded && Number.isInteger(d.excludedFlags)) {
-                                core.folderDB.updateFlags(d.mail.excluded.folderId, d.excludedFlags);
+                            require(!IMServices.accounts.getAccounts().some(account => account.name === c.chat.account), 'fresh protocol account');
+                            s.account = IMServices.accounts.createAccount(c.chat.account, 'prpl-mochitest');
+                            const updated = TestUtils.topicObserved('account-updated', subject => subject === s.account);
+                            s.account.password = 'S717 owned logger fixture';
+                            await updated;
+                            s.account.connect();
+                            const chat = await getChatSearchService();
+                            const conv = s.account.prplAccount.wrappedJSObject.makeDM(c.chat.conversation);
+                            s.conversations.push(conv);
+                            for (const name of ['edit', 'deleted', 'noLog', 'redacted', 'keep']) {
+                                const item = c.chat[name];
+                                conv.writeMessage('NativeSpeaker', item.oldText || item.text, {incoming: true, remoteId: item.remoteId});
                             }
-                        } catch (error) { failures.push(error); }
-                        delete root.__s717PolicyTrial;
-                        if (closeError) { throw closeError; }
-                        value = {closed: true, privacyRetained: true};
-                    } else { throw new Error('Unknown S717 phase: ' + phase); }
-                } catch (error) { failure = error; }
-                for (const result of await Promise.allSettled([mail?.close(), provider?.close()])) {
-                    if (result.status === 'rejected') { failures.push(result.reason); }
+                            const other = s.account.prplAccount.wrappedJSObject.makeDM(c.chat.conversation + '-other');
+                            s.conversations.push(other);
+                            other.writeMessage('OtherSpeaker', c.chat.otherPhysical, {incoming: true, remoteId: c.chat.keep.remoteId});
+                            await chat.flush();
+                            const path = logger.getLogWriter(conv).currentPath;
+                            const otherPath = logger.getLogWriter(other).currentPath;
+                            d.chat = {path, id: chatSearchDocumentId(path), otherPath, otherId: chatSearchDocumentId(otherPath)};
+                            require(d.chat.id !== d.chat.otherId, 'equal remote ID never groups physical logs');
+                            s.oldView = await query(c.chat.edit.oldText);
+                            d.oldItem = s.oldView.context.chatSearchResultSet.items.find(item => item.hit.id === d.chat.id);
+                            require(d.oldItem?.document.body.includes(c.chat.edit.oldText), 'actual captured pre-edit result');
+                            mail = await MailSearchService.open(new FileUtils.File(f.mailSidecar), core.sourceId, core.messageDB);
+                            await mail.rebuild();
+                            value = {inputs: d, identity: identity()};
+                        } else if (phase === 'identity' || phase === 'resumed') {
+                            value = {identity: identity()};
+                            if (phase === 'resumed') { value.privacy = await privacy(); }
+                        } else if (phase === 'update' || phase === 'cancel') {
+                            mail = await MailSearchService.open(new FileUtils.File(f.mailSidecar), core.sourceId, core.messageDB);
+                            if (phase === 'update') {
+                                value = {progress: await mail.update({limit: 2}), identity: identity()};
+                            } else {
+                                const controller = new AbortController();
+                                const reason = new Error('S717 pending mail cancellation');
+                                let settled = false;
+                                const pending = mail.update({limit: 2, signal: controller.signal});
+                                const observed = pending.then(() => { settled = true; return null; }, error => { settled = true; return error; });
+                                try {
+                                    await Promise.resolve();
+                                    require(!controller.signal.aborted && !settled, 'a real non-preaborted update remains pending');
+                                    controller.abort(reason);
+                                    require(await observed === reason, 'original pending cancellation reason');
+                                    value = {cancelled: true, reason: reason.message, identity: identity()};
+                                } finally {
+                                    if (!controller.signal.aborted) { controller.abort(reason); }
+                                    await observed;
+                                }
+                            }
+                        } else if (phase === 'mutations') {
+                            core.messageDB.getMessage(Number(d.mail.edit.id)).subject = c.mail.edit.newSubject;
+                            core.messageDB.removeMessage(Number(d.mail.deleted.id));
+                            // Dedicated negative removes ONLY this exclusion operation.
+                            core.folderDB.updateFlags(d.mail.excluded.folderId, d.excludedFlags | Ci.nsMsgFolderFlags.Junk);
+                            const conv = s.conversations[0];
+                            conv.updateMessage('NativeSpeaker', c.chat.edit.newText, {incoming: true, remoteId: c.chat.edit.remoteId});
+                            conv.updateMessage('NativeSpeaker', '', {incoming: true, remoteId: c.chat.deleted.remoteId, deleted: true});
+                            conv.updateMessage('NativeSpeaker', '', {incoming: true, remoteId: c.chat.noLog.remoteId, noLog: true});
+                            const redaction = conv.createMessage('NativeSpeaker', '', {incoming: true, remoteId: c.chat.redacted.remoteId, deleted: true});
+                            conv.notifyObservers(redaction, 'update-text');
+                            const chat = await getChatSearchService();
+                            await chat.flush();
+                            const tabs = tabmail.tabInfo.length;
+                            require(await s.oldView.context.openChatSearchConversation(d.oldItem) === null, 'retired pre-edit result refuses delivery');
+                            require(tabmail.tabInfo.length === tabs, 'stale opening adds no reader');
+                            const text = await chat.getText(d.chat.id);
+                            require(text?.body.includes(c.chat.edit.newText) && text.body.includes(c.chat.keep.text), 'current kept Unicode text');
+                            for (const term of [c.chat.edit.oldText, c.chat.deleted.text, c.chat.noLog.text, c.chat.redacted.text]) {
+                                require((await chat.search(term)).items.length === 0 && !text.body.includes(term), 'suppressed chat text: ' + term);
+                            }
+                            const cancelPath = PathUtils.join(retained.work, 's717-cancel.sqlite');
+                            require(!await IOUtils.exists(cancelPath), 'do not overwrite an existing cancellation artifact');
+                            provider = await ChatSearchProvider.open(new FileUtils.File(cancelPath));
+                            const entered = Promise.withResolvers();
+                            const gate = Promise.withResolvers();
+                            const held = logger.queueFileOperation(d.chat.path, async () => { entered.resolve(); await gate.promise; });
+                            const controller = new AbortController();
+                            const reason = new Error('S717 queued log read cancellation');
+                            let observed;
+                            try {
+                                await entered.promise;
+                                const pending = provider.refreshLog(d.chat.path, {signal: controller.signal});
+                                observed = pending.then(() => null, error => error);
+                                await TestUtils.waitForCondition(() => logger.gFilePromises.get(d.chat.path) !== held,
+                                    'real provider read queued behind owned source operation');
+                                controller.abort(reason);
+                                gate.resolve();
+                                require(await observed === reason, 'queued source read preserves original reason');
+                            } finally {
+                                controller.abort(reason);
+                                gate.resolve();
+                                await held;
+                                if (observed) { await observed; }
+                            }
+                            value = {identity: identity(), privacy: await privacy(), chatText: text,
+                                junkFlag: Ci.nsMsgFolderFlags.Junk, staleRefused: true, queuedReadCancelled: true};
+                        } else if (phase === 'close') {
+                            await closeLive();
+                            value = {identity: identity(), privacy: await privacy()};
+                        } else if (phase === 'mail-final') {
+                            mail = await MailSearchService.open(new FileUtils.File(f.mailSidecar), core.sourceId, core.messageDB);
+                            const expected = new Map([
+                                [c.mail.edit.oldSubject, []], [c.mail.edit.newSubject, [d.mail.edit.id]],
+                                [c.mail.deleted.body, []], [c.mail.excluded.body, []],
+                                [c.mail.open.body.split(' ')[0], [d.mail.selected.id, d.mail.other.id]],
+                                ['recovered', [f.recovered.id]], ['quarantineneedle', []],
+                                ['oldaggregateneedle', []], ['ghost-id', []], ['deleted-id', []],
+                            ]);
+                            const queries = {};
+                            for (const [term, ids] of expected) {
+                                const page = await mail.search(term, {limit: 100});
+                                require(!page.cursor && JSON.stringify(page.items.map(hit => hit.id).sort()) === JSON.stringify([...ids].sort()),
+                                    'exact physical query results: ' + term);
+                                for (const hit of page.items) {
+                                    const text = await mail.getText(hit.id);
+                                    const state = core.messageDB.getSearchState(Number(hit.id));
+                                    require(state && text, 'current native query text');
+                                    for (const key of ['generation', 'contentRevision', 'policyRevision', 'textRevision']) {
+                                        require(hit[key] === text[key], 'current mail hit/text ' + key);
+                                    }
+                                    require(text.generation === state.generation && text.contentRevision === state.contentRevision &&
+                                        text.policyRevision === mailPolicyRevision(state.policyRevision), 'current native policy/content tokens');
+                                }
+                                queries[term] = page.items;
+                            }
+                            const recovered = await mail.getText(f.recovered.id);
+                            require(recovered?.body === f.recovered.body, 'eligible recovery survives policy/restart/rebuild');
+                            const records = await mail.getRecoveryRecords();
+                            const retainedRecord = records.find(row => row.documentId === f.recovered.id);
+                            require(records.length === 6 && retainedRecord.payload.message.text.body === f.recovered.body,
+                                'recovery record/provenance retained');
+                            require(retainedRecord.payload.provenance.importReceipt.databaseSourceId === f.sourceId,
+                                'original recovery source mapping');
+                            const tabs = tabmail.tabInfo.length;
+                            for (const [id, status] of [[d.mail.deleted.id, 'deleted'], [d.mail.excluded.id, 'ineligible'], [f.recovered.id, 'unavailable']]) {
+                                require((await mail.openResult(id, {tabmail})).status === status, 'negative mail open: ' + status);
+                                require(tabmail.tabInfo.length === tabs, 'negative mail open adds no substitute reader');
+                            }
+                            const controller = new AbortController();
+                            const reason = new Error('S717 cancelled mail opening');
+                            controller.abort(reason);
+                            let refusal;
+                            try { await mail.openResult(d.mail.selected.id, {tabmail, signal: controller.signal}); }
+                            catch (error) { refusal = error; }
+                            require(refusal === reason && tabmail.tabInfo.length === tabs, 'cancelled open never dispatches another copy');
+                            const opened = await mail.openResult(d.mail.selected.id, {tabmail});
+                            require(opened.status === 'ready' && String(opened.header.messageKey) === d.mail.selected.id &&
+                                opened.header.folder.URI === d.mail.selected.folderURI, 'real selected physical mail open');
+                            const reader = tabmail.currentTabInfo;
+                            require(reader.mode.name === 'mailMessageTab', 'normal mail reader tab');
+                            await TestUtils.waitForCondition(() => reader.message && reader.browser?.contentDocument?.body?.textContent.includes(c.mail.open.body),
+                                'selected physical MIME text loaded in actual reader');
+                            require(String(reader.message.messageKey) === d.mail.selected.id && reader.message.folder.URI === d.mail.selected.folderURI,
+                                'reader selected exact key/folder, not Message-ID peer');
+                            value = {queries, recovered, records, selected: d.mail.selected,
+                                reader: {id: String(reader.message.messageKey), folderURI: reader.message.folder.URI,
+                                    body: reader.browser.contentDocument.body.textContent}, identity: identity()};
+                        } else if (phase === 'chat-final') {
+                            const chat = await getChatSearchService();
+                            await chat.flush();
+                            const document = await chat.getText(d.chat.id);
+                            require(document?.body.includes(c.chat.edit.newText) && document.body.includes(c.chat.keep.text), 'current selected transcript');
+                            require(!document.body.includes(c.chat.otherPhysical), 'equal logical ID never merges physical source');
+                            for (const term of [c.chat.edit.oldText, c.chat.deleted.text, c.chat.noLog.text, c.chat.redacted.text]) {
+                                require((await chat.search(term)).items.length === 0 && !document.body.includes(term), 'no privacy revival: ' + term);
+                            }
+                            const staleView = await query(c.chat.keep.text.split(' ')[0]);
+                            const count = tabmail.tabInfo.length;
+                            require(await staleView.context.openChatSearchConversation(d.oldItem) === null && tabmail.tabInfo.length === count,
+                                'pre-edit tokens refused after real process restart');
+                            const item = staleView.context.chatSearchResultSet.items.find(row => row.hit.id === d.chat.id);
+                            require(item && item.hit.contentRevision === document.contentRevision && item.hit.textRevision === document.textRevision,
+                                'rendered current hit revisions');
+                            const entered = Promise.withResolvers();
+                            const gate = Promise.withResolvers();
+                            const held = logger.queueFileOperation(d.chat.path, async () => { entered.resolve(); await gate.promise; });
+                            let observed, settled = false;
+                            try {
+                                await entered.promise;
+                                const ownerSignal = staleView.tab.mailSearchController.signal;
+                                const opening = staleView.context.openChatSearchConversation(item);
+                                observed = opening.then(() => { settled = true; return null; }, error => { settled = true; return error; });
+                                tabmail.closeTab(staleView.tab);
+                                // A bounded semantic wait still reaches finally if abort delivery is broken.
+                                await TestUtils.waitForCondition(() => settled, 'retired reader open settles while source I/O remains held');
+                                const error = await observed;
+                                require(ownerSignal.aborted && error === ownerSignal.reason && error?.name === 'AbortError',
+                                    'closing real result view preserves its parent-owned abort reason');
+                                require(tabmail.currentTabInfo.mode.name !== 'chat', 'retired view never dispatches reader');
+                            } finally {
+                                gate.resolve();
+                                await held;
+                                if (observed) { await observed; }
+                            }
+                            const view = await query(c.chat.keep.text.split(' ')[0]);
+                            const current = view.context.chatSearchResultSet.items.find(row => row.hit.id === d.chat.id);
+                            require(current && current.hit.id !== d.chat.otherId, 'fresh physical result after cancelled delivery');
+                            const row = [...view.win.document.querySelectorAll('.native-chat-result')].find(node => node.dataset.id === d.chat.id);
+                            require(row?.querySelector('button'), 'rendered ordinary result button');
+                            const browser = root.document.getElementById('conv-log-browser');
+                            let loaded = false, displayed = false;
+                            const observer = subject => { if (subject === browser) { loaded = true; } };
+                            const onDisplayed = () => { displayed = true; };
+                            Services.obs.addObserver(observer, 'conversation-loaded');
+                            browser.addEventListener('MessagesDisplayed', onDisplayed);
+                            try {
+                                row.querySelector('button').click();
+                                await TestUtils.waitForCondition(() => loaded && displayed && view.tab.chatSearchOpenPromise,
+                                    'real conversation-loaded and MessagesDisplayed');
+                                await view.tab.chatSearchOpenPromise;
+                                require(tabmail.currentTabInfo.mode.name === 'chat', 'actual chat reader');
+                                const resolved = root.document.getElementById('searchResultConv').nativeChatLog.resolved;
+                                require(resolved.id === d.chat.id && resolved.contentRevision === current.hit.contentRevision &&
+                                    resolved.textRevision === current.hit.textRevision, 'selected physical log and current tokens');
+                                const messages = browser._conv.getMessages();
+                                const body = messages.map(message => message.message).join('\n');
+                                require(messages.some(message => message.who === 'NativeSpeaker' && message.message.includes(c.chat.keep.text)),
+                                    'physical reader retains the current speaker and text');
+                                const rendered = browser.contentDocument.body.textContent;
+                                require(rendered.includes('NativeSpeaker') && rendered.includes(c.chat.keep.text.split(' ')[0]),
+                                    'actual rendered speaker and selected body');
+                                require(body.includes(c.chat.edit.newText) && body.includes(c.chat.keep.text) && !body.includes(c.chat.otherPhysical),
+                                    'actual reader displays selected Unicode text and no peer payload');
+                                require(document.body.includes('NativeSpeaker'), 'semantic speaker text retained');
+                                if (current.snippet.firstMatchText) {
+                                    await TestUtils.waitForCondition(() => browser.contentWindow.getSelection().toString() === current.snippet.firstMatchText,
+                                        'real findbar selects captured snippet');
+                                }
+                                value = {factorySidecar: d.factorySidecar, originalSidecar: f.chatSidecar,
+                                    hit: current.hit, document, resolved: {id: resolved.id, contentRevision: resolved.contentRevision,
+                                        textRevision: resolved.textRevision}, body, rendered, loaded, displayed, privacy: await privacy()};
+                            } finally {
+                                Services.obs.removeObserver(observer, 'conversation-loaded');
+                                browser.removeEventListener('MessagesDisplayed', onDisplayed);
+                            }
+                        } else if (phase === 'cleanup') {
+                            let closeError;
+                            try { await closeLive(); } catch (error) { closeError = error; }
+                            try {
+                                if (d.mail?.excluded && Number.isInteger(d.excludedFlags)) {
+                                    core.folderDB.updateFlags(d.mail.excluded.folderId, d.excludedFlags);
+                                }
+                            } catch (error) { failures.push(error); }
+                            delete root.__s717PolicyTrial;
+                            if (closeError) { throw closeError; }
+                            value = {closed: true, privacyRetained: true};
+                        } else { throw new Error('Unknown S717 phase: ' + phase); }
+                    } catch (error) { failure = error; }
+                    for (const result of await Promise.allSettled([mail?.close(), provider?.close()])) {
+                        if (result.status === 'rejected') { failures.push(result.reason); }
+                    }
+                    if (failure) { failures.unshift(failure); }
+                    if (failures.length) { throw new AggregateError(failures, 'S717 operation/close failed'); }
+                    return value;
+                } catch (error) {
+                    intakeFailed = true;
+                    intakeError = error;
+                    throw error;
+                } finally {
+                    if (intakeFailed || phase === 'close' || phase === 'cleanup') {
+                        try { restoreModules(); }
+                        catch (error) {
+                            if (intakeFailed) {
+                                throw new AggregateError([intakeError, error], 'S717 operation and test-module restoration failed');
+                            }
+                            throw error;
+                        }
+                    }
                 }
-                if (failure) { failures.unshift(failure); }
-                if (failures.length) { throw new AggregateError(failures, 'S717 operation/close failed'); }
-                return value;
             })().then(value => done({value}), error => {
                 const describe = item => ({name: item.name, message: item.message, result: item.result,
                     stack: item.stack, errors: item.errors?.map(describe)});

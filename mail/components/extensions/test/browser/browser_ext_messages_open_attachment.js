@@ -60,14 +60,20 @@ add_task(async function testOpenAttachment() {
       // Test using a content tab.
       const contentTab = await browser.tabs.create({ url: "test.html" });
       await testTab(contentTab);
+      browser.test.log("S376 phase: before content-tab removal");
       await browser.tabs.remove(contentTab.id);
+      browser.test.log("S376 phase: after content-tab removal");
 
       // Test using a content window.
+      browser.test.log("S376 phase: before popup creation");
       const contentWindow = await browser.windows.create({
         type: "popup",
         url: "test.html",
       });
+      browser.test.log("S376 phase: after popup creation");
+      browser.test.log("S376 phase: before popup attachment");
       await testTab(contentWindow.tabs[0]);
+      browser.test.log("S376 phase: after popup attachment");
       await browser.windows.remove(contentWindow.id);
 
       // Test using a message tab.

@@ -1617,8 +1617,8 @@ add_task(async function test_preservesEncodedMailboxStructure() {
     "To: Plain To <to2@example.invalid>",
     "Cc: =?UTF-8?Q?G=C3=B6mez=2C_Cc?= <cc@example.invalid>",
     "Cc: Plain Cc <cc2@example.invalid>",
-    "Bcc: =?UTF-8?Q?K=C3=B6nig=2C_Bcc?= <bcc@example.invalid>",
-    "Bcc: Plain Bcc <bcc2@example.invalid>",
+    // The shared legacy control stores one Bcc field; both mailboxes stay required.
+    "Bcc: =?UTF-8?Q?K=C3=B6nig=2C_Bcc?= <bcc@example.invalid>, Plain Bcc <bcc2@example.invalid>",
     "Subject: =?UTF-8?Q?S378_=E2=98=83?=",
     "Message-ID: <encoded-mailbox-structure@example.invalid>",
     "MIME-Version: 1.0",
@@ -1695,7 +1695,7 @@ add_task(async function test_preservesEncodedMailboxStructure() {
           from: [expected.author],
           to: expected.recipients,
           cc: expected.ccList,
-          bcc: expected.bccList,
+          bcc: [expected.bccList.join(", ")],
           subject: [expected.subject],
         })) {
           browser.test.assertEq(
@@ -1713,7 +1713,7 @@ add_task(async function test_preservesEncodedMailboxStructure() {
         "Cc: =?UTF-8?Q?G=C3=B6mez=2C_Cc?= <cc@example.invalid>",
         "Cc: Plain Cc <cc2@example.invalid>",
         "Bcc: =?UTF-8?Q?K=C3=B6nig=2C_Bcc?= <bcc@example.invalid>",
-        "Bcc: Plain Bcc <bcc2@example.invalid>",
+        "Plain Bcc <bcc2@example.invalid>",
         "Selected encoded mailbox bytes #%",
       ]) {
         browser.test.assertTrue(
@@ -1732,3 +1732,88 @@ add_task(async function test_preservesEncodedMailboxStructure() {
     cleanUpAccount(account);
   }
 });
+
+// Repeated Bcc aggregation is an additional native producer contract. The shared
+// case above still checks both Bcc mailboxes on every supported backend.
+add_task(
+  { skip_if: () => !Services.prefs.getBoolPref("mail.panorama.enabled") },
+  async function test_preservesRepeatedBccMailboxStructure() {
+    const account = await createAccount();
+    const folder = await createSubfolder(
+      account.incomingServer.rootFolder,
+      "repeatedBccMailboxStructure"
+    );
+    const raw = [
+      "From: Sender <from@example.invalid>",
+      "Bcc: =?UTF-8?Q?K=C3=B6nig=2C_Bcc?= <bcc@example.invalid>",
+      "Bcc: Plain Bcc <bcc2@example.invalid>",
+      "Subject: Repeated Bcc physical message",
+      "Message-ID: <repeated-bcc-structure@example.invalid>",
+      "",
+      "Repeated Bcc bytes #%",
+      "",
+    ].join("\r\n");
+    await createMessageFromString(folder, raw);
+    Assert.equal([...folder.messages].length, 1, "One physical message exists");
+    Assert.ok(
+      Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+        Ci.nsIMsgDBService
+      ) instanceof Ci.nsIDatabaseCore,
+      "Repeated-field coverage uses the real native database service"
+    );
+    const extension = ExtensionTestUtils.loadExtension({
+      manifest: {
+        manifest_version: 2,
+        permissions: ["accountsRead", "messagesRead"],
+      },
+      background: async () => {
+        const [target] = await browser.folders.query({
+          name: "repeatedBccMailboxStructure",
+        });
+        const listed = (await browser.messages.list(target.id)).messages;
+        browser.test.assertEq(1, listed.length);
+        const expected = [
+          '"König, Bcc" <bcc@example.invalid>',
+          "Plain Bcc <bcc2@example.invalid>",
+        ];
+        for (const message of [
+          listed[0],
+          await browser.messages.get(listed[0].id),
+        ]) {
+          browser.test.assertEq(target.id, message.folder.id);
+          browser.test.assertEq(2, message.bccList.length);
+          browser.test.assertEq(
+            JSON.stringify(expected),
+            JSON.stringify(message.bccList),
+            "Repeated native Bcc fields preserve both mailbox boundaries and names"
+          );
+        }
+        const headers = await browser.messages.getHeaders(listed[0].id);
+        const full = await browser.messages.getFull(listed[0].id);
+        for (const actual of [headers, full.headers]) {
+          browser.test.assertEq(2, actual.bcc.length);
+          browser.test.assertEq(
+            JSON.stringify(expected),
+            JSON.stringify(actual.bcc)
+          );
+        }
+        const stored = await browser.messages.getRaw(listed[0].id);
+        for (const fragment of [
+          "Bcc: =?UTF-8?Q?K=C3=B6nig=2C_Bcc?= <bcc@example.invalid>",
+          "Bcc: Plain Bcc <bcc2@example.invalid>",
+          "Repeated Bcc bytes #%",
+        ]) {
+          browser.test.assertTrue(stored.includes(fragment));
+        }
+        browser.test.notifyPass("repeated-bcc-mailbox-structure");
+      },
+    });
+    try {
+      await extension.startup();
+      await extension.awaitFinish("repeated-bcc-mailbox-structure");
+    } finally {
+      await extension.unload();
+      cleanUpAccount(account);
+    }
+  }
+);

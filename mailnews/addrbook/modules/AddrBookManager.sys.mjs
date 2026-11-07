@@ -710,7 +710,10 @@ async function adoptMigrationAddressBook(
           target,
           bytes,
           expected.storageSourceId,
-          { requireClosed: false }
+          {
+            requireClosed: false,
+            stageIdentity: expected.stagePhysicalIdentity,
+          }
         ),
         expected
       );
@@ -796,7 +799,10 @@ async function adoptMigrationAddressBook(
               target,
               bytes,
               expected.storageSourceId,
-              { requireClosed: false }
+              {
+                requireClosed: false,
+                stageIdentity: expected.stagePhysicalIdentity,
+              }
             ),
             expected
           );
@@ -884,7 +890,10 @@ async function adoptMigrationAddressBook(
           migrationBookFile(temporary),
           bytes,
           expected.storageSourceId,
-          { requireClosed: true }
+          {
+            requireClosed: true,
+            stageIdentity: expected.stagePhysicalIdentity,
+          }
         ),
         expected
       );
@@ -905,7 +914,10 @@ async function adoptMigrationAddressBook(
         target,
         bytes,
         expected.storageSourceId,
-        { requireClosed: false }
+        {
+          requireClosed: false,
+          stageIdentity: expected.stagePhysicalIdentity,
+        }
       ),
       expected
     );
@@ -955,7 +967,10 @@ async function adoptMigrationAddressBook(
             target,
             bytes,
             expected.storageSourceId,
-            { requireClosed: false }
+            {
+              requireClosed: false,
+              stageIdentity: expected.stagePhysicalIdentity,
+            }
           ),
           expected
         );

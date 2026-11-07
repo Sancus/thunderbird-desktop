@@ -630,6 +630,10 @@ async function migrationPublicationInput() {
     stagingPath: stageFile.path,
     cards: committed.cards,
     lists: committed.lists,
+    // As the coordinator receipt does, retain the Windows stage identity.
+    ...(committed.stagePhysicalIdentity
+      ? { stagePhysicalIdentity: committed.stagePhysicalIdentity }
+      : {}),
   };
   const options = {
     stageFile,

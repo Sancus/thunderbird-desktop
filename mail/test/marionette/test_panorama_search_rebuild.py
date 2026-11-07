@@ -1119,7 +1119,7 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
                             let observed;
                             try {
                                 await entered.promise;
-                                const pending = provider.refreshLog(d.chat.path, {signal: controller.signal});
+                                const pending = provider.resolveDocument(d.chat.id, {signal: controller.signal});
                                 observed = pending.then(() => null, error => error);
                                 await TestUtils.waitForCondition(() => logger.gFilePromises.get(d.chat.path) !== held,
                                     'real provider read queued behind owned source operation');
@@ -1315,8 +1315,10 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
                     }
                 }
             })().then(value => done({value}), error => {
-                const describe = item => ({name: item.name, message: item.message, result: item.result,
-                    stack: item.stack, errors: item.errors?.map(describe)});
+                const describe = item => item === null || !['object', 'function'].includes(typeof item)
+                    ? {type: typeof item, value: String(item)}
+                    : {name: item.name, message: item.message, result: item.result,
+                        stack: item.stack, errors: item.errors?.map(describe)};
                 done({error: describe(error)});
             });
             """,

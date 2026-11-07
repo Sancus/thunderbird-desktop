@@ -1606,7 +1606,9 @@ add_task(async function test_readsSelectedPhysicalContent() {
 });
 
 add_task(async function test_preservesEncodedMailboxStructure() {
-  const account = await createAccount();
+  // Mail address headers require a real mail account. An NNTP overview does not
+  // publish To/Cc/Bcc; the original news tests above keep their protocol setup.
+  const account = await createAccount("none");
   const folder = await createSubfolder(
     account.incomingServer.rootFolder,
     "encodedMailboxStructure"
@@ -1738,7 +1740,7 @@ add_task(async function test_preservesEncodedMailboxStructure() {
 add_task(
   { skip_if: () => !Services.prefs.getBoolPref("mail.panorama.enabled") },
   async function test_preservesRepeatedBccMailboxStructure() {
-    const account = await createAccount();
+    const account = await createAccount("none");
     const folder = await createSubfolder(
       account.incomingServer.rootFolder,
       "repeatedBccMailboxStructure"

@@ -927,7 +927,7 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
                             d.mail = {};
                             d.factorySidecar = PathUtils.join(PathUtils.profileDir, 'panorama-chat-search.sqlite');
                             require(d.factorySidecar !== f.chatSidecar, 'factory and retained sidecar remain distinct');
-                            const parent = MailServices.accounts.localFoldersServer.rootFolder;
+                            const parent = MailServices.accounts.localFoldersServer.rootFolder.QueryInterface(Ci.nsIMsgLocalMailFolder);
                             for (const [name, item] of Object.entries(c.mail)) {
                                 const folders = item.folders || [item.folder];
                                 for (const [i, folderName] of folders.entries()) {

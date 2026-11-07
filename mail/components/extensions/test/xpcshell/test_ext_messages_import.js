@@ -162,12 +162,12 @@ add_task(
     const account = await createAccount(undefined, {
       extensions: ["RFC2195", "RFC4315"],
     });
-    const folder = await createSubfolder(
+    const nativeFolder = await createSubfolder(
       account.incomingServer.rootFolder,
       "physicalImport"
     );
     await createMessageFromString(
-      folder,
+      nativeFolder,
       [
         "From: old@example.invalid",
         "Subject: Existing physical message",

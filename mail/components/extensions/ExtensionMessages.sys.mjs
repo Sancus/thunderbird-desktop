@@ -1077,7 +1077,7 @@ export class CachedMsgHeader {
  * @property {string} [folderURI] - folder URI of the real message
  * @property {nsIMsgDatabase} [database] - Database that supplied the header.
  * @property {string} [headerMessageId] - Captured Message-ID consistency check.
- * @property {integer} [uidValidity] - Captured IMAP folder epoch.
+ * @property {?integer} [uidValidity] - Captured IMAP folder epoch.
  * @property {integer} [trackerId] - ID associated with this stored identifier.
  * @property {integer} [messageKey] - messageKey of the real message
  * @property {string}  [dummyMsgUrl] - dummyMsgUrl of the dummy message (mostly

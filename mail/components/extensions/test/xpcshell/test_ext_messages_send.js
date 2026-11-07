@@ -1244,22 +1244,22 @@ add_task(async function test_content_language_suppressed() {
 add_task(async function test_additionalFccReportsNewPhysicalCopy() {
   clearTestFolders();
   const root = gLocalAccount.incomingServer.rootFolder;
-  const sent = root.getChildNamed("Sent");
-  const drafts = root.getChildNamed("Drafts");
+  const nativeSent = root.getChildNamed("Sent");
+  const nativeDrafts = root.getChildNamed("Drafts");
   let injected = false;
   let oldKey;
   const observer = {
     msgsClassified(messages) {
       const primary = messages.find(
         message =>
-          message.folder.URI == sent.URI &&
+          message.folder.URI == nativeSent.URI &&
           message.mime2DecodedSubject == "S378 physical FCC"
       );
       if (!primary || injected) {
         return;
       }
       injected = true;
-      drafts
+      nativeDrafts
         .QueryInterface(Ci.nsIMsgLocalMailFolder)
         .addMessage(
           [
@@ -1272,7 +1272,7 @@ add_task(async function test_additionalFccReportsNewPhysicalCopy() {
             "",
           ].join("\r\n")
         );
-      oldKey = [...drafts.messages].find(
+      oldKey = [...nativeDrafts.messages].find(
         message => message.mime2DecodedSubject == "Older physical FCC copy"
       ).messageKey;
     },
@@ -1343,16 +1343,16 @@ add_task(async function test_additionalFccReportsNewPhysicalCopy() {
       "The real primary classification created the older same-ID destination copy"
     );
     Assert.ok(
-      drafts.msgDatabase.containsKey(oldKey),
+      nativeDrafts.msgDatabase.containsKey(oldKey),
       "The preexisting physical row remains"
     );
     Assert.equal(
-      sent.getTotalMessages(false),
+      nativeSent.getTotalMessages(false),
       1,
       "Sending publishes the primary once"
     );
     Assert.equal(
-      drafts.getTotalMessages(false),
+      nativeDrafts.getTotalMessages(false),
       2,
       "FCC2 adds only one physical row"
     );

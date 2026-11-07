@@ -1921,6 +1921,8 @@ this.messages = class extends ExtensionAPIPersistent {
           let tempFile;
           let registered = false;
           let operationError;
+          let cleanupError;
+          let importedMessage;
           try {
             tempFile = await getRealFileForFile(file);
             if (offlineFolderListenerType) {
@@ -2029,32 +2031,41 @@ this.messages = class extends ExtensionAPIPersistent {
                 missingTags.join(" ")
               );
             }
-            return context.extension.messageManager.convert(
+            importedMessage = context.extension.messageManager.convert(
               new CachedMsgHeader(messageTracker, msgHdr)
             );
           } catch (ex) {
             operationError = ex;
             console.error(ex);
-            throw new ExtensionError(`Error importing message: ${ex.message}`);
           } finally {
-            if (registered) {
-              if (offlineFolderListenerType) {
-                MailServices.mailSession.RemoveFolderListener(folderListener);
-              } else {
-                MailServices.mfn.removeListener(folderListener);
+            try {
+              if (registered) {
+                if (offlineFolderListenerType) {
+                  MailServices.mailSession.RemoveFolderListener(folderListener);
+                } else {
+                  MailServices.mfn.removeListener(folderListener);
+                }
               }
+            } catch (ex) {
+              cleanupError = ex;
+              console.error(ex);
             }
             if (tempFile && !file.mozFullPath) {
               try {
                 await IOUtils.remove(tempFile.path);
               } catch (ex) {
-                if (!operationError) {
-                  throw ex;
-                }
+                cleanupError ??= ex;
                 console.error(ex);
               }
             }
           }
+          const failure = operationError || cleanupError;
+          if (failure) {
+            throw new ExtensionError(
+              `Error importing message: ${failure.message}`
+            );
+          }
+          return importedMessage;
         },
         async archive(messageIds) {
           try {

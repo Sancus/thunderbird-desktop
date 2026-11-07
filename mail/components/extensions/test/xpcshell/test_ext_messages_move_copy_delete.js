@@ -1137,12 +1137,15 @@ add_task(
       extensions: ["RFC2195", "RFC4315"],
     });
     const root = account.incomingServer.rootFolder;
-    const source = await createSubfolder(root, "physicalCopySource");
-    const destination = await createSubfolder(root, "physicalCopyDestination");
+    const nativeSource = await createSubfolder(root, "physicalCopySource");
+    const nativeDestination = await createSubfolder(
+      root,
+      "physicalCopyDestination"
+    );
     for (const [folder, body] of [
-      [source, "Selected A"],
-      [source, "Selected B"],
-      [destination, "Existing outside copy"],
+      [nativeSource, "Selected A"],
+      [nativeSource, "Selected B"],
+      [nativeDestination, "Existing outside copy"],
     ]) {
       await createMessageFromString(
         folder,

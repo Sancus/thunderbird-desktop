@@ -2507,7 +2507,7 @@ nsresult DatabaseCore::ImportFolderSnapshotFromFile(
 namespace {
 
 void ImapImportFrame(nsACString& output, const nsACString& value) {
-  output.AppendInt(value.Length());
+  output.AppendInt(static_cast<uint64_t>(value.Length()));
   output.Append(':');
   output.Append(value);
 }

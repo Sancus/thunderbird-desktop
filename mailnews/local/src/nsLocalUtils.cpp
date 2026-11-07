@@ -523,7 +523,7 @@ nsresult LoadPurge(PurgeCustody& custody) {
 
 nsresult PurgeBodyFile(PurgeCustody& custody, size_t index, nsIFile** result) {
   nsAutoCString leaf;
-  leaf.AppendInt(index);
+  leaf.AppendInt(static_cast<uint64_t>(index));
   leaf.AppendLiteral(".eml");
   return PurgeChild(custody.directory, leaf, result);
 }

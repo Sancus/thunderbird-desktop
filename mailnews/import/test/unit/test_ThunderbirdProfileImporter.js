@@ -468,16 +468,11 @@ add_task(async function test_importAddressBooks() {
     );
   };
   const factories = [
-    MockRegistrar.registerEx(
+    MockRegistrar.register(
       "@mozilla.org/import/import-ab-file;1?type=mab",
-      { shouldCreateInstance: false },
       refusedMork
     ),
-    MockRegistrar.registerEx(
-      "@mozilla.org/db/mork;1",
-      { shouldCreateInstance: false },
-      refusedMork
-    ),
+    MockRegistrar.register("@mozilla.org/db/mork;1", refusedMork),
   ];
   const importer = new ThunderbirdProfileImporter();
   try {

@@ -348,9 +348,9 @@ export class AddrBookFileImporter {
    *   Target failures retain earlier successful writes, without final progress.
    */
   async _importMabFile() {
-    const { book } = await lazy.readMorkAddressBookSource(
-      this._sourceFile.path
-    );
+    const sourceFile = this._sourceFile.clone();
+    sourceFile.normalize();
+    const { book } = await lazy.readMorkAddressBookSource(sourceFile.path);
     const cards = new Map();
     const uids = new Set();
     for (const source of book.cards) {

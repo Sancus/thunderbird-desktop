@@ -199,16 +199,11 @@ add_task(async function test_importMabWithoutRuntimeFactory() {
     );
   };
   const factories = [
-    MockRegistrar.registerEx(
+    MockRegistrar.register(
       "@mozilla.org/import/import-ab-file;1?type=mab",
-      { shouldCreateInstance: false },
       refusedMork
     ),
-    MockRegistrar.registerEx(
-      "@mozilla.org/db/mork;1",
-      { shouldCreateInstance: false },
-      refusedMork
-    ),
+    MockRegistrar.register("@mozilla.org/db/mork;1", refusedMork),
   ];
   try {
     await input.importer.startImport(input.file, input.target);
@@ -328,7 +323,7 @@ add_task(async function test_importMabWithEmptyBookAndMissingSource() {
   input.file.remove(false);
   await Assert.rejects(
     input.importer.startImport(input.file, input.target),
-    error => error.name == "NotFoundError"
+    error => error.result == Cr.NS_ERROR_FILE_NOT_FOUND
   );
   Assert.equal(input.target.childCardCount, 0);
   Assert.equal(input.target.childNodes.length, 0);

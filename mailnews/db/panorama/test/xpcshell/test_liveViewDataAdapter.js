@@ -289,6 +289,8 @@ function threadBatchFixture(messages, Adapter = LiveViewDataAdapter) {
   adapter.sortColumn =
     Adapter == LiveViewGroupedDataAdapter ? "subject" : "date";
   adapter.sortDirection = "ascending";
+  // This synthetic fixture represents a completed query, including empty.
+  adapter._flatQueryKnown = true;
   adapter.onSelectedChunk(messages, 0, messages.length - 1);
   const tree = {
     resets: [],

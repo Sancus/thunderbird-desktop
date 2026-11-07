@@ -75,6 +75,7 @@ class LiveViewBatchCapability final {
   JS::PersistentRooted<JS::Value> invalidator;
   const uint64_t generation;
   bool enabled = true;
+  uint64_t configuration = 0;
 
  private:
   ~LiveViewBatchCapability() = default;
@@ -2307,6 +2308,7 @@ NS_IMETHODIMP LiveView::SetListener(nsILiveViewListener* aListener) {
       capability->object.get() == mBatchCapability->object.get() &&
       capability->owner.get() == mBatchCapability->owner.get() &&
       capability->generation == mBatchCapability->generation &&
+      mBatchCapability->configuration == mConfigurationGeneration &&
       &capability->invalidator.get().toObject() ==
           &mBatchCapability->invalidator.get().toObject()) {
     // Only enrollment changed on this exact listener. Preserve outstanding
@@ -2333,6 +2335,7 @@ NS_IMETHODIMP LiveView::SetListener(nsILiveViewListener* aListener) {
   bool hadListener = mListener;
   mListener = aListener;
   mBatchCapability = capability;
+  if (capability) capability->configuration = mConfigurationGeneration;
   ++mAttachmentGeneration;
   if (!hadListener && aListener) MessageDB().AddMessageListener(this);
   if (hadListener && !aListener) MessageDB().RemoveMessageListener(this);

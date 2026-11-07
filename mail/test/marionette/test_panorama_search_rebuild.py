@@ -877,11 +877,31 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
                         return {tab, win, context: win.FacetContext};
                     }
                     /**
+                     * Retain the actual pending setup step across a Marionette timeout.
+                     * A late operation may settle, but must not resume fixture mutation after cleanup.
+                     * @param {string} name - Non-sensitive setup operation name.
+                     * @param {Function} operation - The ordinary public operation to await.
+                     * @returns {Promise<*>} The actual result, with the original rejection preserved.
+                     */
+                    async function inputStep(name, operation) {
+                        require(!s.inputSetup.cancelled, 'input setup was cancelled by owned cleanup');
+                        s.inputSetup.waiting = name;
+                        dump('S717 input setup waiting: ' + name + '\n');
+                        const result = await operation();
+                        require(!s.inputSetup.cancelled, 'input setup settled after owned cleanup');
+                        s.inputSetup.completed.push(name);
+                        s.inputSetup.waiting = null;
+                        dump('S717 input setup completed: ' + name + '\n');
+                        return result;
+                    }
+                    /**
                      * Drain every owned writer, tab and preference after any earlier failure.
                      * @returns {Promise<void>} All errors are retained in one AggregateError.
                      */
                     async function closeLive() {
                         const errors = [];
+                        if (s.inputSetup) { s.inputSetup.cancelled = true; }
+                        try { s.cancelAccountUpdate?.(); } catch (error) { errors.push(error); }
                         for (const conv of s.conversations) {
                             try { conv.close(); } catch (error) { errors.push(error); }
                             try { logger.closeLogWriter(conv); } catch (error) { errors.push(error); }
@@ -924,6 +944,7 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
                         }
                         if (phase === 'inputs') {
                             require(!d.mail && !d.chat, 'fresh inputs only after the S716 prefix');
+                            s.inputSetup = {waiting: null, completed: [], cancelled: false, accountUpdated: false};
                             d.mail = {};
                             d.factorySidecar = PathUtils.join(PathUtils.profileDir, 'panorama-chat-search.sqlite');
                             require(d.factorySidecar !== f.chatSidecar, 'factory and retained sidecar remain distinct');
@@ -953,12 +974,49 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
                                 protocol.registerTestProtocol(); s.registered = true;
                             }
                             require(!IMServices.accounts.getAccounts().some(account => account.name === c.chat.account), 'fresh protocol account');
+                            await inputStep('login-manager-initialization', () => Services.logins.initializationPromise);
                             s.account = IMServices.accounts.createAccount(c.chat.account, 'prpl-mochitest');
-                            const updated = TestUtils.topicObserved('account-updated', subject => subject === s.account);
-                            s.account.password = 'S717 owned logger fixture';
-                            await updated;
+                            const accountId = s.account.id;
+                            s.inputSetup.accountId = accountId;
+                            // The public setter is asynchronous and exposes completion only by notification.
+                            // Own the observer so timeout cleanup can remove it and reject the pending wait.
+                            let resolveUpdate, rejectUpdate;
+                            const updated = new Promise((resolve, reject) => { resolveUpdate = resolve; rejectUpdate = reject; });
+                            updated.catch(() => {}); // The awaited promise below still retains every rejection.
+                            let observing = false;
+                            const removeUpdateObserver = () => {
+                                if (observing) {
+                                    Services.obs.removeObserver(observer, 'account-updated');
+                                    observing = false;
+                                }
+                            };
+                            const observer = subject => {
+                                try {
+                                    if (subject.QueryInterface(Ci.imIAccount).id !== accountId) { return; }
+                                    removeUpdateObserver();
+                                    s.inputSetup.accountUpdated = true;
+                                    resolveUpdate();
+                                } catch (error) {
+                                    removeUpdateObserver();
+                                    rejectUpdate(error);
+                                }
+                            };
+                            Services.obs.addObserver(observer, 'account-updated');
+                            observing = true;
+                            s.cancelAccountUpdate = () => {
+                                removeUpdateObserver();
+                                rejectUpdate(new Error('S717 owned account update wait cancelled'));
+                            };
+                            try {
+                                s.account.password = 'S717 owned logger fixture';
+                                await inputStep('account-updated', () => updated);
+                            } finally {
+                                s.cancelAccountUpdate();
+                                delete s.cancelAccountUpdate;
+                            }
                             s.account.connect();
-                            const chat = await getChatSearchService();
+                            require(s.account.connected, 'ordinary test protocol reported connected');
+                            const chat = await inputStep('chat-factory-open', () => getChatSearchService());
                             const conv = s.account.prplAccount.wrappedJSObject.makeDM(c.chat.conversation);
                             s.conversations.push(conv);
                             for (const name of ['edit', 'deleted', 'noLog', 'redacted', 'keep']) {
@@ -968,17 +1026,18 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
                             const other = s.account.prplAccount.wrappedJSObject.makeDM(c.chat.conversation + '-other');
                             s.conversations.push(other);
                             other.writeMessage('OtherSpeaker', c.chat.otherPhysical, {incoming: true, remoteId: c.chat.keep.remoteId});
-                            await chat.flush();
                             const path = logger.getLogWriter(conv).currentPath;
                             const otherPath = logger.getLogWriter(other).currentPath;
                             d.chat = {path, id: chatSearchDocumentId(path), otherPath, otherId: chatSearchDocumentId(otherPath)};
                             require(d.chat.id !== d.chat.otherId, 'equal remote ID never groups physical logs');
-                            s.oldView = await query(c.chat.edit.oldText);
+                            await inputStep('chat-logger-factory-flush', () => chat.flush());
+                            s.oldView = await inputStep('pre-edit-native-query', () => query(c.chat.edit.oldText));
                             d.oldItem = s.oldView.context.chatSearchResultSet.items.find(item => item.hit.id === d.chat.id);
                             require(d.oldItem?.document.body.includes(c.chat.edit.oldText), 'actual captured pre-edit result');
-                            mail = await MailSearchService.open(new FileUtils.File(f.mailSidecar), core.sourceId, core.messageDB);
-                            await mail.rebuild();
-                            value = {inputs: d, identity: identity()};
+                            mail = await inputStep('mail-service-open', () =>
+                                MailSearchService.open(new FileUtils.File(f.mailSidecar), core.sourceId, core.messageDB));
+                            await inputStep('mail-rebuild', () => mail.rebuild());
+                            value = {inputs: d, identity: identity(), inputSetup: s.inputSetup};
                         } else if (phase === 'identity' || phase === 'resumed') {
                             value = {identity: identity()};
                             if (phase === 'resumed') { value.privacy = await privacy(); }
@@ -1199,7 +1258,7 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
                             } catch (error) { failures.push(error); }
                             delete root.__s717PolicyTrial;
                             if (closeError) { throw closeError; }
-                            value = {closed: true, privacyRetained: true};
+                            value = {closed: true, privacyRetained: true, inputSetup: s.inputSetup};
                         } else { throw new Error('Unknown S717 phase: ' + phase); }
                     } catch (error) { failure = error; }
                     for (const result of await Promise.allSettled([mail?.close(), provider?.close()])) {

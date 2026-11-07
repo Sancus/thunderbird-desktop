@@ -151,7 +151,8 @@ export class NntpService {
     if (consumer instanceof Ci.nsIStreamListener) {
       streamListener = consumer;
       const pipe = Cc["@mozilla.org/pipe;1"].createInstance(Ci.nsIPipe);
-      pipe.init(true, true, 0, 0);
+      // A server chunk can exceed the default pipe size; never truncate it.
+      pipe.init(true, true, 0, 0xffffffff);
       inputStream = pipe.inputStream;
       outputStream = pipe.outputStream;
     }

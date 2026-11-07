@@ -2288,7 +2288,7 @@ function ordinaryBatchFolders(name) {
  * @returns {Promise<object>} The adapter, view, selection, payloads and tree.
  */
 async function ordinaryBatchAdapter(folders, initialize) {
-  const view = new LiveView();
+  let view = new LiveView();
   view.initWithFolders(folders);
   initialize?.(view);
   const adapter = new LiveViewDataAdapter(view);
@@ -2311,7 +2311,21 @@ async function ordinaryBatchAdapter(folders, initialize) {
   adapter.setTree(tree);
   adapter.selection = new TreeSelection(null);
   adapter.selection._view = adapter;
-  registerCleanupFunction(() => adapter.setTree(null));
+  const fixture = {
+    view,
+    adapter,
+    selection: adapter.selection,
+    tree,
+    events,
+    payloads,
+  };
+  registerCleanupFunction(() => {
+    adapter.setTree(null);
+    // Recorder/failure callback scopes can retain this fixture through cleanup.
+    // Release both owned native references before head.js forces GC and closes.
+    fixture.view = null;
+    view = null;
+  });
   const receive = adapter.onMessageAdded.bind(adapter);
   adapter.onMessageAdded = value => {
     payloads.push(value);
@@ -2324,14 +2338,7 @@ async function ordinaryBatchAdapter(folders, initialize) {
     1,
     "Real completed flat query"
   );
-  return {
-    view,
-    adapter,
-    selection: adapter.selection,
-    tree,
-    events,
-    payloads,
-  };
+  return fixture;
 }
 
 /**

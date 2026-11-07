@@ -473,7 +473,6 @@ add_task(function test_attachmentPartIdentityAcrossMessageUrls() {
   }
 });
 
-
 add_task(async function test_selectedPhysicalMimePartsRetainNamesAndSizes() {
   const copies = [];
   try {
@@ -498,7 +497,9 @@ add_task(async function test_selectedPhysicalMimePartsRetainNamesAndSizes() {
       }
       const expectedStore = Services.prefs
         .getStringPref("mail.serverDefaultStoreContractID")
-        .includes("maildirstore") ? "maildir" : "mbox";
+        .includes("maildirstore")
+        ? "maildir"
+        : "mbox";
       Assert.equal(selectedFolder.msgStore.storeType, expectedStore);
       await be_in_folder(selectedFolder);
       await select_click_row(0);

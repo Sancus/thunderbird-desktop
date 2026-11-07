@@ -199,7 +199,8 @@ export class AttachmentInfo {
         decodeURIComponent(actual.pathname) !==
           decodeURIComponent(expected.pathname) ||
         ["number", "group", "key"].some(
-          name => actual.searchParams.get(name) !== expected.searchParams.get(name)
+          name =>
+            actual.searchParams.get(name) !== expected.searchParams.get(name)
         )
       ) {
         unavailable();
@@ -453,9 +454,9 @@ export class AttachmentInfo {
               return;
             }
             try {
-              const binary = Cc["@mozilla.org/binaryinputstream;1"].createInstance(
-                Ci.nsIBinaryInputStream
-              );
+              const binary = Cc[
+                "@mozilla.org/binaryinputstream;1"
+              ].createInstance(Ci.nsIBinaryInputStream);
               binary.setInputStream(stream);
               const chunk = binary.readByteArray(count);
               chunks.push(chunk);
@@ -472,7 +473,9 @@ export class AttachmentInfo {
             }
             settled = true;
             if (!Components.isSuccessCode(status)) {
-              reject(new Components.Exception(`Failed to fetch ${url}`, status));
+              reject(
+                new Components.Exception(`Failed to fetch ${url}`, status)
+              );
               return;
             }
             try {
@@ -489,13 +492,15 @@ export class AttachmentInfo {
             }
           },
         };
-        service.QueryInterface(Ci.nsIMsgMessageFetchPartService).fetchMimePart(
-          service.getUrlForUri(messageURI),
-          `${messageURI}?${parameters}`,
-          listener,
-          null,
-          null
-        );
+        service
+          .QueryInterface(Ci.nsIMsgMessageFetchPartService)
+          .fetchMimePart(
+            service.getUrlForUri(messageURI),
+            `${messageURI}?${parameters}`,
+            listener,
+            null,
+            null
+          );
       });
     }
     const buffer = await new Promise((resolve, reject) => {

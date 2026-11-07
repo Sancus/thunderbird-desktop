@@ -762,7 +762,6 @@ add_task(async function filenameSanitisedOpen() {
   await deleteAttachmentFile(attachmentFile);
 });
 
-
 const { MailServices } = ChromeUtils.importESModule(
   "resource:///modules/MailServices.sys.mjs"
 );
@@ -779,7 +778,11 @@ let s376News;
  * @param {string} [name] - Attachment name.
  * @returns {Promise<object>} Selected folder, header and actual reader attachment.
  */
-async function s376LocalAttachment(body, contentType = "text/plain", name = "selected.txt") {
+async function s376LocalAttachment(
+  body,
+  contentType = "text/plain",
+  name = "selected.txt"
+) {
   const selectedFolder = await create_folder(`S376Open${s376FolderNumber++}`);
   registerCleanupFunction(async () => {
     await be_in_folder(folder);
@@ -792,16 +795,23 @@ async function s376LocalAttachment(body, contentType = "text/plain", name = "sel
   const [header] = [...selectedFolder.messages];
   await be_in_folder(selectedFolder);
   await select_click_row(0);
-  await TestUtils.waitForCondition(() => aboutMessage.currentAttachments.length == 1);
+  await TestUtils.waitForCondition(
+    () => aboutMessage.currentAttachments.length == 1
+  );
   const [attachment] = aboutMessage.currentAttachments;
   Assert.equal(attachment.message.messageKey, header.messageKey);
   Assert.equal(attachment.message.folder.URI, selectedFolder.URI);
   const expectedStore = Services.prefs
     .getStringPref("mail.serverDefaultStoreContractID")
-    .includes("maildirstore") ? "maildir" : "mbox";
+    .includes("maildirstore")
+    ? "maildir"
+    : "mbox";
   Assert.equal(selectedFolder.msgStore.storeType, expectedStore);
   if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
-    Assert.ok(Cc["@mozilla.org/mailnews/database-core;1"].getService(Ci.nsIDatabaseCore).sourceId);
+    Assert.ok(
+      Cc["@mozilla.org/mailnews/database-core;1"].getService(Ci.nsIDatabaseCore)
+        .sourceId
+    );
   }
   return { selectedFolder, header, attachment };
 }
@@ -813,7 +823,9 @@ async function s376LocalAttachment(body, contentType = "text/plain", name = "sel
  * @returns {AttachmentInfo} Existing ordinary attachment caller.
  */
 function s376UnfetchedAttachment(header) {
-  const { AttachmentInfo } = ChromeUtils.importESModule("resource:///modules/AttachmentInfo.sys.mjs");
+  const { AttachmentInfo } = ChromeUtils.importESModule(
+    "resource:///modules/AttachmentInfo.sys.mjs"
+  );
   const uri = header.folder.getUriForMsg(header);
   const url = MailServices.messageServiceFromURI(uri).getUrlForUri(uri).spec;
   return new AttachmentInfo({
@@ -832,9 +844,14 @@ function s376UnfetchedAttachment(header) {
  * @returns {Promise<string>} Unique owned directory.
  */
 async function s376SaveDirectory() {
-  const path = await IOUtils.createUniqueDirectory(PathUtils.tempDir, "s376-attachment");
+  const path = await IOUtils.createUniqueDirectory(
+    PathUtils.tempDir,
+    "s376-attachment"
+  );
   registerCleanupFunction(async () => {
-    const { Downloads } = ChromeUtils.importESModule("resource://gre/modules/Downloads.sys.mjs");
+    const { Downloads } = ChromeUtils.importESModule(
+      "resource://gre/modules/Downloads.sys.mjs"
+    );
     const list = await Downloads.getList(Downloads.ALL);
     for (const download of await list.getAll()) {
       if (PathUtils.parent(download.target.path) == path) {
@@ -852,23 +869,37 @@ add_task(async function test_selectedLocalAttachmentBytesAndSavedTarget() {
   const { attachment } = await s376LocalAttachment(body);
   const directory = await s376SaveDirectory();
   const target = PathUtils.join(directory, "selected.txt");
-  Assert.equal(new TextDecoder().decode(await attachment.fetchAttachment()), body);
+  Assert.equal(
+    new TextDecoder().decode(await attachment.fetchAttachment()),
+    body
+  );
   await attachment.saveToFile(target);
   Assert.equal(await IOUtils.readUTF8(target), body);
   Assert.deepEqual(await IOUtils.getChildren(directory), [target]);
 });
 
 add_task(async function test_imapAttachmentRetainsPhysicalSourceAndPart() {
-  const { IMAPServer } = ChromeUtils.importESModule("resource://testing-common/mailnews/IMAPServer.sys.mjs");
-  const { MessageGenerator } = ChromeUtils.importESModule("resource://testing-common/mailnews/MessageGenerator.sys.mjs");
-  const { PromiseTestUtils } = ChromeUtils.importESModule("resource://testing-common/mailnews/PromiseTestUtils.sys.mjs");
+  const { IMAPServer } = ChromeUtils.importESModule(
+    "resource://testing-common/mailnews/IMAPServer.sys.mjs"
+  );
+  const { MessageGenerator } = ChromeUtils.importESModule(
+    "resource://testing-common/mailnews/MessageGenerator.sys.mjs"
+  );
+  const { PromiseTestUtils } = ChromeUtils.importESModule(
+    "resource://testing-common/mailnews/PromiseTestUtils.sys.mjs"
+  );
   const server = new IMAPServer({ extensions: ["RFC4315"] });
   const account = MailServices.accounts.createAccount();
-  const incoming = MailServices.accounts.createIncomingServer("user", "localhost", "imap");
+  const incoming = MailServices.accounts.createIncomingServer(
+    "user",
+    "localhost",
+    "imap"
+  );
   account.incomingServer = incoming;
   incoming.port = server.port;
   incoming.password = "password";
-  incoming.QueryInterface(Ci.nsIImapIncomingServer).maximumConnectionsNumber = 1;
+  incoming.QueryInterface(Ci.nsIImapIncomingServer).maximumConnectionsNumber =
+    1;
   incoming.useIdle = false;
   incoming.setBoolValue("autosync_offline_stores", false);
   registerCleanupFunction(async () => {
@@ -886,7 +917,9 @@ add_task(async function test_imapAttachmentRetainsPhysicalSourceAndPart() {
   const discovery = new PromiseTestUtils.PromiseUrlListener();
   MailServices.imap.discoverAllFolders(incoming.rootFolder, discovery, null);
   await discovery.promise;
-  const folders = ["INBOX", "S376Other"].map(name => incoming.rootFolder.getChildNamed(name));
+  const folders = ["INBOX", "S376Other"].map(name =>
+    incoming.rootFolder.getChildNamed(name)
+  );
   const generator = new MessageGenerator();
   for (const [index, selectedFolder] of folders.entries()) {
     const body = `S376 IMAP physical part ${index}`;
@@ -897,7 +930,11 @@ add_task(async function test_imapAttachmentRetainsPhysicalSourceAndPart() {
     await server.addMessages(selectedFolder, [message]);
     const [header] = [...selectedFolder.messages];
     if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
-      Assert.notEqual(header.messageKey, 5101, "the physical key is not the wire UID");
+      Assert.notEqual(
+        header.messageKey,
+        5101,
+        "the physical key is not the wire UID"
+      );
     }
     await be_in_folder(selectedFolder);
     await select_click_row(0);
@@ -906,10 +943,16 @@ add_task(async function test_imapAttachmentRetainsPhysicalSourceAndPart() {
     Assert.equal(attachment.partID, "1.2");
     Assert.equal(attachment.message.folder.URI, selectedFolder.URI);
     Assert.equal(attachment.message.messageKey, header.messageKey);
-    Assert.equal(new TextDecoder().decode(await attachment.fetchAttachment()), body);
+    Assert.equal(
+      new TextDecoder().decode(await attachment.fetchAttachment()),
+      body
+    );
     incoming.closeCachedConnections();
-    Assert.equal(new TextDecoder().decode(await attachment.fetchAttachment()), body,
-      "reconnect/cache reuse still names the selected physical part");
+    Assert.equal(
+      new TextDecoder().decode(await attachment.fetchAttachment()),
+      body,
+      "reconnect/cache reuse still names the selected physical part"
+    );
   }
   // A MIME-supplied decoded file remains a file, even when its selected
   // parent is IMAP. This checks the carrier contract, not crypto decryption.
@@ -939,23 +982,43 @@ add_task(async function test_imapAttachmentRetainsPhysicalSourceAndPart() {
 
 add_task(async function test_nntpAttachmentRetainsPhysicalSourceAndPart() {
   await SpecialPowers.pushPrefEnv({ set: [["mail.strict_threading", true]] });
-  const helpers = ChromeUtils.importESModule("resource://testing-common/mail/NNTPHelpers.sys.mjs");
-  const { NewsArticle } = ChromeUtils.importESModule("resource://testing-common/mailnews/Nntpd.sys.mjs");
-  const { MessageGenerator } = ChromeUtils.importESModule("resource://testing-common/mailnews/MessageGenerator.sys.mjs");
-  const { PromiseTestUtils } = ChromeUtils.importESModule("resource://testing-common/mailnews/PromiseTestUtils.sys.mjs");
+  const helpers = ChromeUtils.importESModule(
+    "resource://testing-common/mail/NNTPHelpers.sys.mjs"
+  );
+  const { NewsArticle } = ChromeUtils.importESModule(
+    "resource://testing-common/mailnews/Nntpd.sys.mjs"
+  );
+  const { MessageGenerator } = ChromeUtils.importESModule(
+    "resource://testing-common/mailnews/MessageGenerator.sys.mjs"
+  );
+  const { PromiseTestUtils } = ChromeUtils.importESModule(
+    "resource://testing-common/mailnews/PromiseTestUtils.sys.mjs"
+  );
   const daemon = helpers.setupNNTPDaemon();
   const names = ["test.filter", "test.subscribe.empty"];
   const generator = new MessageGenerator();
   for (const [index, name] of names.entries()) {
     const message = generator.makeMessage({
-      attachments: [{ body: `S376 NNTP physical part ${index}`, filename: "selected.txt", format: "" }],
+      attachments: [
+        {
+          body: `S376 NNTP physical part ${index}`,
+          filename: "selected.txt",
+          format: "",
+        },
+      ],
     });
     message.messageId = "s376-overlapping-news@example.invalid";
-    daemon.addArticleToGroup(new NewsArticle(message.toMessageString()), name, 101);
+    daemon.addArticleToGroup(
+      new NewsArticle(message.toMessageString()),
+      name,
+      101
+    );
   }
   const server = helpers.startupNNTPServer(daemon, helpers.NNTP_PORT);
   const incoming = helpers.setupLocalServer(helpers.NNTP_PORT);
-  const account = [...MailServices.accounts.accounts].find(a => a.incomingServer == incoming);
+  const account = [...MailServices.accounts.accounts].find(
+    a => a.incomingServer == incoming
+  );
   registerCleanupFunction(async () => {
     await be_in_folder(folder);
     incoming.closeCachedConnections();
@@ -977,23 +1040,55 @@ add_task(async function test_nntpAttachmentRetainsPhysicalSourceAndPart() {
     Assert.equal(attachment.message.folder.URI, selectedFolder.URI);
     Assert.equal(attachment.message.messageKey, header.messageKey);
     Assert.equal(attachment.partID, "1.2");
-    Assert.equal(new TextDecoder().decode(await attachment.fetchAttachment()), `S376 NNTP physical part ${index}`);
-    Assert.equal(reader.CanDetachAttachments(), false, "NNTP detachment stays unavailable");
+    Assert.equal(
+      new TextDecoder().decode(await attachment.fetchAttachment()),
+      `S376 NNTP physical part ${index}`
+    );
+    Assert.equal(
+      reader.CanDetachAttachments(),
+      false,
+      "NNTP detachment stays unavailable"
+    );
   }
-  s376News = { server, incoming, folders, names, daemon, generator, NewsArticle, PromiseTestUtils };
+  s376News = {
+    server,
+    incoming,
+    folders,
+    names,
+    daemon,
+    generator,
+    NewsArticle,
+    PromiseTestUtils,
+  };
 });
 
 add_task(async function test_attachmentStaleSelectionRejectsBeforeOpening() {
-  const { selectedFolder, header, attachment } = await s376LocalAttachment("stale selected body", "application/pdf", "selected.pdf");
+  const { selectedFolder, header, attachment } = await s376LocalAttachment(
+    "stale selected body",
+    "application/pdf",
+    "selected.pdf"
+  );
   const key = header.messageKey;
   const tabmail = document.getElementById("tabmail");
   const beforeTabs = tabmail.tabInfo.length;
   await be_in_folder(folder);
   selectedFolder.deleteMessages([header], null, true, false, null, false);
-  await TestUtils.waitForCondition(() => !selectedFolder.msgDatabase.containsKey(key));
-  await Assert.rejects(attachment.fetchAttachment(), e => e.result == Cr.NS_ERROR_NOT_AVAILABLE);
-  await Assert.rejects(attachment.open(window.browsingContext), e => e.result == Cr.NS_ERROR_NOT_AVAILABLE);
-  Assert.equal(tabmail.tabInfo.length, beforeTabs, "stale PDF selection opens no tab");
+  await TestUtils.waitForCondition(
+    () => !selectedFolder.msgDatabase.containsKey(key)
+  );
+  await Assert.rejects(
+    attachment.fetchAttachment(),
+    e => e.result == Cr.NS_ERROR_NOT_AVAILABLE
+  );
+  await Assert.rejects(
+    attachment.open(window.browsingContext),
+    e => e.result == Cr.NS_ERROR_NOT_AVAILABLE
+  );
+  Assert.equal(
+    tabmail.tabInfo.length,
+    beforeTabs,
+    "stale PDF selection opens no tab"
+  );
 });
 
 add_task(async function test_attachmentRetrievalFailureHasNoSideEffects() {
@@ -1001,51 +1096,86 @@ add_task(async function test_attachmentRetrievalFailureHasNoSideEffects() {
   const directory = await s376SaveDirectory();
   const { server, folders, generator } = s376Imap;
   const message = generator.makeMessage({
-    attachments: [{ body: "IMAP failure source", filename: "selected.txt", format: "" }],
+    attachments: [
+      { body: "IMAP failure source", filename: "selected.txt", format: "" },
+    ],
   });
   await server.addMessages(folders[0], [message]);
-  const header = [...folders[0].messages].find(h => h.messageId == message.messageId);
+  const header = [...folders[0].messages].find(
+    h => h.messageId == message.messageId
+  );
   Assert.ok(header);
   const key = header.messageKey;
   const imapPart = s376UnfetchedAttachment(header);
   const imapTarget = PathUtils.join(directory, "imap-failed.txt");
   server.daemon.commandToFail = "FETCH";
   try {
-    await Assert.rejects(imapPart.saveToFile(imapTarget),
-      e => e.result == Cr.NS_MSG_ERROR_IMAP_COMMAND_FAILED);
+    await Assert.rejects(
+      imapPart.saveToFile(imapTarget),
+      e => e.result == Cr.NS_MSG_ERROR_IMAP_COMMAND_FAILED
+    );
   } finally {
     server.daemon.commandToFail = null;
   }
   Assert.equal(await IOUtils.exists(imapTarget), false);
-  Assert.ok(folders[0].msgDatabase.containsKey(key), "failed FETCH retains the selected header");
+  Assert.ok(
+    folders[0].msgDatabase.containsKey(key),
+    "failed FETCH retains the selected header"
+  );
 
   const news = s376News;
   for (const [index, name] of news.names.entries()) {
     const article = news.generator.makeMessage({
-      attachments: [{ body: `NNTP failure control ${index}`, filename: "selected.txt", format: "" }],
+      attachments: [
+        {
+          body: `NNTP failure control ${index}`,
+          filename: "selected.txt",
+          format: "",
+        },
+      ],
     });
     article.messageId = "s376-failed-news-part@example.invalid";
-    news.daemon.addArticleToGroup(new news.NewsArticle(article.toMessageString()), name, 202);
+    news.daemon.addArticleToGroup(
+      new news.NewsArticle(article.toMessageString()),
+      name,
+      202
+    );
     const listener = new news.PromiseTestUtils.PromiseUrlListener();
     news.folders[index].getNewMessages(null, listener);
     await listener.promise;
   }
-  const newsHeader = [...news.folders[0].messages].find(h => h.messageId == "s376-failed-news-part@example.invalid");
+  const newsHeader = [...news.folders[0].messages].find(
+    h => h.messageId == "s376-failed-news-part@example.invalid"
+  );
   Assert.ok(newsHeader);
   const newsKey = newsHeader.messageKey;
   const newsPart = s376UnfetchedAttachment(newsHeader);
   news.daemon.removeArticleFromGroup(news.names[0], 202);
   const newsTarget = PathUtils.join(directory, "news-failed.txt");
-  await Assert.rejects(newsPart.saveToFile(newsTarget), e => e.result == Cr.NS_ERROR_FAILURE);
+  await Assert.rejects(
+    newsPart.saveToFile(newsTarget),
+    e => e.result == Cr.NS_ERROR_FAILURE
+  );
   Assert.equal(await IOUtils.exists(newsTarget), false);
   Assert.ok(news.folders[0].msgDatabase.containsKey(newsKey));
-  Assert.deepEqual(await IOUtils.getChildren(directory), [], "no failed retrieval publishes output");
+  Assert.deepEqual(
+    await IOUtils.getChildren(directory),
+    [],
+    "no failed retrieval publishes output"
+  );
 });
 
 add_task(async function test_attachmentCachedTempFileDoesNotOutliveSelection() {
-  const inner = "From: inner@example.invalid\r\nMessage-ID: <s376-inner@example.invalid>\r\nSubject: selected inner message\r\n\r\nOnly this selected inner body.\r\n";
-  const { selectedFolder, header, attachment } = await s376LocalAttachment(inner, "message/rfc822", "selected.eml");
-  const { MailUtils } = ChromeUtils.importESModule("resource:///modules/MailUtils.sys.mjs");
+  const inner =
+    "From: inner@example.invalid\r\nMessage-ID: <s376-inner@example.invalid>\r\nSubject: selected inner message\r\n\r\nOnly this selected inner body.\r\n";
+  const { selectedFolder, header, attachment } = await s376LocalAttachment(
+    inner,
+    "message/rfc822",
+    "selected.eml"
+  );
+  const { MailUtils } = ChromeUtils.importESModule(
+    "resource:///modules/MailUtils.sys.mjs"
+  );
   const originalOpen = MailUtils.openEMLFile;
   const originalFetch = attachment.fetchAttachment;
   const opened = [];
@@ -1059,7 +1189,11 @@ add_task(async function test_attachmentCachedTempFileDoesNotOutliveSelection() {
     await attachment.open(window.browsingContext);
     await attachment.open(window.browsingContext);
     Assert.equal(opened.length, 2);
-    Assert.equal(fetches, 1, "an unchanged selected parent reuses its owned temporary file");
+    Assert.equal(
+      fetches,
+      1,
+      "an unchanged selected parent reuses its owned temporary file"
+    );
     Assert.equal(opened[0].path, opened[1].path);
     const raw = await IOUtils.readUTF8(opened[0].path);
     Assert.ok(raw.includes("Message-ID: <s376-inner@example.invalid>"));
@@ -1067,9 +1201,18 @@ add_task(async function test_attachmentCachedTempFileDoesNotOutliveSelection() {
     const key = header.messageKey;
     await be_in_folder(folder);
     selectedFolder.deleteMessages([header], null, true, false, null, false);
-    await TestUtils.waitForCondition(() => !selectedFolder.msgDatabase.containsKey(key));
-    await Assert.rejects(attachment.open(window.browsingContext), e => e.result == Cr.NS_ERROR_NOT_AVAILABLE);
-    Assert.equal(opened.length, 2, "stale selection does not reopen a retained temporary file");
+    await TestUtils.waitForCondition(
+      () => !selectedFolder.msgDatabase.containsKey(key)
+    );
+    await Assert.rejects(
+      attachment.open(window.browsingContext),
+      e => e.result == Cr.NS_ERROR_NOT_AVAILABLE
+    );
+    Assert.equal(
+      opened.length,
+      2,
+      "stale selection does not reopen a retained temporary file"
+    );
   } finally {
     MailUtils.openEMLFile = originalOpen;
     attachment.fetchAttachment = originalFetch;

@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "DatabaseCore.h"
+#include "mozilla/StackWalk.h"
 #include "DatabaseUtils.h"
 #include "DetachedMsgHdr.h"
 #include "Message.h"
@@ -9205,6 +9206,18 @@ nsresult RollbackMessageChange(mozIStorageConnection* connection,
 
 nsresult MessageDatabase::SetMessageFlags(nsMsgKey key, uint32_t newFlags) {
   MOZ_TRY(RequireCommittedSearchRead());
+  {
+    // DIAG-007: report every Read->unread transition with its native stack.
+    CachedMsg diagPrevious;
+    if (NS_SUCCEEDED(FetchMsg(key, diagPrevious)) &&
+        (diagPrevious.flags & nsMsgMessageFlags::Read) &&
+        !(newFlags & nsMsgMessageFlags::Read)) {
+      printf_stderr("DIAG-007 read-cleared key=%u old=0x%x new=0x%x
+", key,
+                    diagPrevious.flags, newFlags);
+      MozWalkTheStack(stderr);
+    }
+  }
   bool staged;
   MOZ_TRY(IsMessageStaged(key, staged));
   if (staged) {

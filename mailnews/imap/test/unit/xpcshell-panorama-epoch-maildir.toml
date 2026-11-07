@@ -15,5 +15,6 @@ tags = ["panorama-delivery"]
 ["test_imapUidValidityReset.js"]
 
 ["test_migrationPendingOperations.js"]
+prefs = ["logging.IMAP=4"]
 
 ["test_panoramaDeliveryUidValidity.js"]

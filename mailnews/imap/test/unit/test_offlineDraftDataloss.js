@@ -112,7 +112,9 @@ add_task(async function goOffline() {
   while (thread.hasPendingEvents()) {
     thread.processNextEvent(true);
   }
-  IMAPPump.server.stop();
+  // stop() is asynchronous: it closes each existing reader after a delay, and
+  // an unfinished stop would also close the connection made after restarting.
+  await IMAPPump.server.stop();
   Services.io.offline = true;
 });
 

@@ -894,6 +894,7 @@ async function checkRetentionProcessRestart(store) {
     const child = await Subprocess.call({
       command: Services.dirsvc.get("XREExeF", Ci.nsIFile).path,
       arguments: [
+        ...(mozinfo.msix ? ["--xpcshell"] : []),
         "-g",
         Services.dirsvc.get("GreD", Ci.nsIFile).path,
         "-a",

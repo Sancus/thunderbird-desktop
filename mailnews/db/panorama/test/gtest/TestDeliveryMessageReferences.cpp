@@ -3620,9 +3620,9 @@ class PartialDraftObserver final : public MessageListener {
 };
 NS_IMPL_ISUPPORTS(PartialDraftObserver, nsISupports)
 
-using DISABLED_DeliveryPartialHeader = DeliveryMessageReferences;
+using DeliveryPartialHeader = DeliveryMessageReferences;
 
-TEST_F(DISABLED_DeliveryPartialHeader, CompletesSameKeyAndConsumesParsedDraft) {
+TEST_F(DeliveryPartialHeader, CompletesSameKeyAndConsumesParsedDraft) {
   ASSERT_NO_FATAL_FAILURE(Create({"old@invalid"_ns}));
   ASSERT_EQ(NS_OK, mHeader->SetFlags(nsMsgMessageFlags::Read |
                                      nsMsgMessageFlags::Partial));
@@ -3708,7 +3708,7 @@ TEST_F(DISABLED_DeliveryPartialHeader, CompletesSameKeyAndConsumesParsedDraft) {
   EXPECT_EQ((nsTArray<nsMsgKey>{mKey}), keys);
 }
 
-TEST_F(DISABLED_DeliveryPartialHeader, StorageFailureSealsDraftAndKeepsSource) {
+TEST_F(DeliveryPartialHeader, StorageFailureSealsDraftAndKeepsSource) {
   ASSERT_NO_FATAL_FAILURE(Create({"old@invalid"_ns}));
   ASSERT_EQ(NS_OK, mHeader->SetFlags(nsMsgMessageFlags::Partial));
   MessageBodyState expected;
@@ -3758,8 +3758,7 @@ TEST_F(DISABLED_DeliveryPartialHeader, StorageFailureSealsDraftAndKeepsSource) {
   EXPECT_EQ((nsTArray<nsMsgKey>{mKey}), keys);
 }
 
-TEST_F(DISABLED_DeliveryPartialHeader,
-       RejectsAnotherPhysicalFolderBeforeClaim) {
+TEST_F(DeliveryPartialHeader, RejectsAnotherPhysicalFolderBeforeClaim) {
   ASSERT_NO_FATAL_FAILURE(Create({}));
   ASSERT_EQ(NS_OK, mHeader->SetFlags(nsMsgMessageFlags::Partial));
   MessageBodyState expected;

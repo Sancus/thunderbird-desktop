@@ -38,12 +38,14 @@ class SaveAttachmentCallbackListener {
 
 const gCallbackObject = new SaveAttachmentCallbackListener();
 
-add_setup(function () {
-  setupIMAPPump();
-
+add_setup(async function () {
   registerCleanupFunction(() => {
     teardownIMAPPump();
   });
+
+  // The original and modified messages coexist until copy completion. UIDPLUS
+  // gives the replacement APPEND an unambiguous server identity.
+  await setupIMAPPump("RFC2195,RFC4315", { awaitInbox: true });
 });
 
 add_task(async function testImapAttachmentDetac() {

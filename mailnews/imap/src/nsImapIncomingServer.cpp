@@ -625,6 +625,9 @@ nsImapIncomingServer::LoadNextQueuedUrl(nsIImapProtocol* aProtocol,
         NS_IF_RELEASE(aConsumer);
       }
       if (removeUrlFromQueue) {
+        // Adopt the queue's reference until both parallel entries are removed.
+        nsCOMPtr<nsISupports> consumer =
+            dont_AddRef(m_urlConsumers.ElementAt(0));
         m_urlQueue.RemoveObjectAt(0);
         m_urlConsumers.RemoveElementAt(0);
       }
@@ -651,6 +654,9 @@ nsImapIncomingServer::AbortQueuedUrls() {
       rv = DoomUrlIfChannelHasError(aImapUrl, &removeUrlFromQueue);
       NS_ENSURE_SUCCESS(rv, rv);
       if (removeUrlFromQueue) {
+        // Adopt the queue's reference until both parallel entries are removed.
+        nsCOMPtr<nsISupports> consumer =
+            dont_AddRef(m_urlConsumers.ElementAt(cnt - 1));
         m_urlQueue.RemoveObjectAt(cnt - 1);
         m_urlConsumers.RemoveElementAt(cnt - 1);
       }

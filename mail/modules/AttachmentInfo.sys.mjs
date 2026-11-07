@@ -36,12 +36,23 @@ ChromeUtils.defineLazyGetter(
  */
 export class AttachmentInfo {
   /**
-   * A cache of message/rfc822 attachments saved to temporary files for display.
+   * A cache of message/rfc822 and selected PDF attachments saved for display.
    * Saving the same attachment again is avoided.
    *
-   * @type {Map<string, nsIFile>}
+   * @type {Map<string, {file: nsIFile, bodyIdentity: ?string}>}
    */
   #temporaryFiles = new Map();
+
+  /**
+   * The stored parent selected when this attachment was parsed. Standalone and
+   * external attachments keep their existing URL-based behavior.
+   *
+   * @type {?{message: nsIMsgDBHdr,
+   *   inputMessage: (nsIMsgDBHdr|null|undefined), folder: nsIMsgFolder,
+   *   database: nsIMsgDatabase, key: number, messageId: string, uri: string,
+   *   inputURI: (string|null|undefined), url: string, part: ?string}}
+   */
+  #selection = null;
 
   /**
    * A function to call when checking to see if an attachment exists or not, so
@@ -110,6 +121,112 @@ export class AttachmentInfo {
       const match = lazy.MIME_PART_RE.exec(url);
       this.partID = match && match[1];
     }
+
+    if (!isExternalAttachment && message?.folder) {
+      const folder = message.folder;
+      this.#selection = {
+        message,
+        inputMessage: message,
+        folder,
+        database: folder.msgDatabase,
+        key: message.messageKey,
+        messageId: message.messageId,
+        uri: folder.getUriForMsg(message),
+        inputURI: uri,
+        url: this.url,
+        part: this.partID,
+      };
+    }
+  }
+
+  /**
+   * Recheck the retained physical parent before a command or asynchronous
+   * completion. An old database facade must not resolve a reused key in a new
+   * source. Message-ID is only a consistency check, never a lookup key.
+   *
+   * @returns {?string} Current physical message URI, or null for a standalone
+   *   or external attachment.
+   * @throws {Components.Exception} If the selected parent or part changed.
+   */
+  #checkSelection() {
+    const selected = this.#selection;
+    if (!selected) {
+      return null;
+    }
+    const unavailable = () => {
+      throw new Components.Exception(
+        "The selected attachment is no longer available",
+        Cr.NS_ERROR_NOT_AVAILABLE
+      );
+    };
+    if (
+      this.message !== selected.inputMessage ||
+      this.uri !== selected.inputURI ||
+      this.url !== selected.url ||
+      this.partID !== selected.part ||
+      (selected.part && !/^\d+(?:\.\d+)*$/.test(selected.part)) ||
+      selected.folder.msgDatabase !== selected.database ||
+      !selected.database.containsKey(selected.key) ||
+      !selected.message.isLive
+    ) {
+      unavailable();
+    }
+    const current = selected.database.getMsgHdrForKey(selected.key);
+    if (
+      !current ||
+      current.messageKey !== selected.key ||
+      current.folder?.URI !== selected.folder.URI ||
+      current.messageId !== selected.messageId ||
+      selected.message.messageKey !== selected.key ||
+      selected.message.folder?.URI !== selected.folder.URI
+    ) {
+      unavailable();
+    }
+    const uri = selected.folder.getUriForMsg(current);
+    if (
+      /^(mailbox|imap|news)-message:/.test(selected.inputURI) &&
+      selected.inputURI.split("?")[0] !== selected.uri
+    ) {
+      unavailable();
+    }
+
+    const actual = new URL(this.url);
+    if (["mailbox:", "imap:", "news:", "snews:"].includes(actual.protocol)) {
+      const expected = new URL(
+        MailServices.messageServiceFromURI(uri).getUrlForUri(uri).spec
+      );
+      if (
+        actual.protocol !== expected.protocol ||
+        actual.username !== expected.username ||
+        actual.host !== expected.host ||
+        decodeURIComponent(actual.pathname) !==
+          decodeURIComponent(expected.pathname) ||
+        ["number", "group", "key"].some(
+          name =>
+            actual.searchParams.get(name) !== expected.searchParams.get(name)
+        )
+      ) {
+        unavailable();
+      }
+    }
+    return uri;
+  }
+
+  /**
+   * @returns {?string} Stored body identity used only to invalidate a temporary
+   *   file after its physical parent or stored bytes change.
+   */
+  #temporaryBodyIdentity() {
+    if (!this.#selection) {
+      return null;
+    }
+    const { message } = this.#selection;
+    return JSON.stringify([
+      this.#checkSelection(),
+      message.storeToken,
+      message.messageSize,
+      message.offlineMessageSize,
+    ]);
   }
 
   /**
@@ -161,9 +278,11 @@ export class AttachmentInfo {
    * @param {BrowsingContext} browsingContext - The browsing context to use.
    * @param {string} [fpDialogTitle] - File picker dialog title, to override
    *   the default "save attachment" title.
-   * @returns {?string} the path of the saved attachment. null if not saved.
+   * @returns {Promise<?string>} Saved path, or null for an empty part or cancellation.
+   * @throws {Components.Exception} If the selected stored part cannot be read.
    */
   async save(browsingContext, fpDialogTitle) {
+    this.#checkSelection();
     if (!this.hasFile) {
       return null;
     }
@@ -196,6 +315,7 @@ export class AttachmentInfo {
     } catch (e) {} // Pref may not be set, yet.
 
     const result = await new Promise(resolve => fp.open(resolve));
+    this.#checkSelection();
     if (result == Ci.nsIFilePicker.returnCancel) {
       return null;
     }
@@ -206,9 +326,13 @@ export class AttachmentInfo {
       fp.file.parent
     );
     const path = fp.file.path;
+    const buffer = await this.fetchAttachment();
     try {
-      await this.saveToFile(path);
+      await this.#saveBuffer(buffer, path, false);
     } catch (e) {
+      // A stale selection must still reject instead of retrying a different
+      // physical part. Ordinary local write failures retain the save prompt.
+      this.#checkSelection();
       console.warn(`Saving ${this.name} to ${path} FAILED.`, e);
       Services.prompt.alert(
         null,
@@ -230,10 +354,13 @@ export class AttachmentInfo {
    * @param {BrowsingContext} browsingContext - The browsing context to use.
    * @param {string} [fpDialogTitle] - File picker dialog title, to override
    *   the default "save attachment" title.
-   * @returns {?string} the dir path of the saved attachments. null if not saved.
+   * @returns {Promise<?string>} Saved directory, or null for an empty part or cancellation.
+   * @throws {Components.Exception} If a selected stored part cannot be read.
    */
   static async saveAttachments(attachments, browsingContext, fpDialogTitle) {
+    attachments = [...attachments];
     for (const attachment of attachments) {
+      attachment.#checkSelection();
       if (!attachment.hasFile) {
         return null;
       }
@@ -256,6 +383,9 @@ export class AttachmentInfo {
     } catch (e) {} // Pref may not be set, yet.
 
     const result = await new Promise(resolve => fp.open(resolve));
+    for (const attachment of attachments) {
+      attachment.#checkSelection();
+    }
     if (result == Ci.nsIFilePicker.returnCancel) {
       return null;
     }
@@ -263,8 +393,10 @@ export class AttachmentInfo {
     Services.prefs.setComplexValue("messenger.save.dir", Ci.nsIFile, fp.file);
 
     const filenames = AttachmentInfo.#uniqueFilenames(attachments);
-    try {
-      for (const attachment of attachments) {
+    for (const attachment of attachments) {
+      // Retrieval and selection failures must propagate before local I/O.
+      const buffer = await attachment.fetchAttachment();
+      try {
         const filename = filenames.get(attachment.url);
         const path = PathUtils.join(fp.file.path, filename);
         if (await IOUtils.exists(path)) {
@@ -277,16 +409,17 @@ export class AttachmentInfo {
             continue;
           }
         }
-        await attachment.saveToFile(path);
+        await attachment.#saveBuffer(buffer, path, false);
+      } catch (e) {
+        attachment.#checkSelection();
+        console.warn(`Saving attachments to ${fp.file.path} FAILED.`, e);
+        Services.prompt.alert(
+          browsingContext.window,
+          title,
+          await lazy.l10n.formatValue("attachment-save-failed")
+        );
+        return null;
       }
-    } catch (e) {
-      console.warn(`Saving attachments to ${fp.file.path} FAILED.`, e);
-      Services.prompt.alert(
-        browsingContext.window,
-        title,
-        await lazy.l10n.formatValue("attachment-save-failed")
-      );
-      return null;
     }
     browsingContext.window.dispatchEvent(
       new CustomEvent("attachmentsSaved", { detail: { path: fp.file.path } })
@@ -295,9 +428,11 @@ export class AttachmentInfo {
   }
 
   /**
-   * Fetch the attachment.
+   * Fetch the attachment bytes and recheck the selected stored parent before
+   * returning them. Preserve failed stream completion as an exception.
    *
-   * @returns {ArrayBuffer} the attachment data.
+   * @returns {Promise<ArrayBuffer>} Successfully retrieved attachment data.
+   * @throws {Components.Exception} For a changed selection or failed retrieval.
    */
   async fetchAttachment() {
     let url = this.url;
@@ -310,7 +445,83 @@ export class AttachmentInfo {
     ) {
       url += url.includes("?") ? "&outputformat=raw" : "?outputformat=raw";
     }
+    const messageURI = this.#checkSelection();
     const sourceURI = Services.io.newURI(url);
+    if (
+      messageURI &&
+      sourceURI.schemeIs("imap") &&
+      this.#selection.folder.server.type == "imap" &&
+      this.partID
+    ) {
+      const service = MailServices.messageServiceFromURI(messageURI);
+      const parameters = new URLSearchParams({ part: this.partID });
+      for (const name of ["type", "filename", "header", "outputformat"]) {
+        const value = new URL(url).searchParams.get(name);
+        if (value !== null) {
+          parameters.set(name, value);
+        }
+      }
+      return new Promise((resolve, reject) => {
+        const chunks = [];
+        let length = 0;
+        let settled = false;
+        const listener = {
+          QueryInterface: ChromeUtils.generateQI(["nsIStreamListener"]),
+          onStartRequest() {},
+          onDataAvailable(request, stream, _offset, count) {
+            if (settled) {
+              return;
+            }
+            try {
+              const binary = Cc[
+                "@mozilla.org/binaryinputstream;1"
+              ].createInstance(Ci.nsIBinaryInputStream);
+              binary.setInputStream(stream);
+              const chunk = binary.readByteArray(count);
+              chunks.push(chunk);
+              length += chunk.length;
+            } catch (error) {
+              settled = true;
+              reject(error);
+              request.cancel(error.result || Cr.NS_ERROR_FAILURE);
+            }
+          },
+          onStopRequest: (_request, status) => {
+            if (settled) {
+              return;
+            }
+            settled = true;
+            if (!Components.isSuccessCode(status)) {
+              reject(
+                new Components.Exception(`Failed to fetch ${url}`, status)
+              );
+              return;
+            }
+            try {
+              this.#checkSelection();
+              const bytes = new Uint8Array(length);
+              let offset = 0;
+              for (const chunk of chunks) {
+                bytes.set(chunk, offset);
+                offset += chunk.length;
+              }
+              resolve(bytes.buffer);
+            } catch (error) {
+              reject(error);
+            }
+          },
+        };
+        service
+          .QueryInterface(Ci.nsIMsgMessageFetchPartService)
+          .fetchMimePart(
+            service.getUrlForUri(messageURI),
+            `${messageURI}?${parameters}`,
+            listener,
+            null,
+            null
+          );
+      });
+    }
     const buffer = await new Promise((resolve, reject) => {
       lazy.NetUtil.asyncFetch(
         {
@@ -318,14 +529,32 @@ export class AttachmentInfo {
           loadUsingSystemPrincipal: true,
         },
         (inputStream, status) => {
-          if (Components.isSuccessCode(status)) {
-            resolve(lazy.NetUtil.readInputStream(inputStream));
+          let data;
+          let failure;
+          try {
+            if (!Components.isSuccessCode(status)) {
+              throw new Components.Exception(`Failed to fetch ${url}`, status);
+            }
+            data = lazy.NetUtil.readInputStream(inputStream);
+          } catch (error) {
+            failure = error;
+          }
+          // NetUtil closes the pipe's output, leaving its input to the caller.
+          // Release it before publishing bytes and retain the first failure.
+          try {
+            inputStream.close();
+          } catch (error) {
+            failure ??= error;
+          }
+          if (failure) {
+            reject(failure);
           } else {
-            reject(new Components.Exception(`Failed to fetch ${url}`, status));
+            resolve(data);
           }
         }
       );
     });
+    this.#checkSelection();
     return buffer;
   }
 
@@ -334,9 +563,24 @@ export class AttachmentInfo {
    *
    * @param {string} target - Path to save to.
    * @param {boolean} [isTmp=false] - Treat it as a temporary file.
+   * @returns {Promise<void>} Resolves after the file has been saved.
    */
   async saveToFile(target, isTmp = false) {
     const buffer = await this.fetchAttachment();
+    await this.#saveBuffer(buffer, target, isTmp);
+  }
+
+  /**
+   * Save bytes whose successful retrieval belongs to this selected attachment.
+   * Recheck after any intervening file picker or handler dialog.
+   *
+   * @param {ArrayBuffer} buffer - Successfully retrieved attachment bytes.
+   * @param {string} target - Destination file path.
+   * @param {boolean} isTmp - Do not add temporary files to saved downloads.
+   * @returns {Promise<void>} Resolves after the file has been saved.
+   */
+  async #saveBuffer(buffer, target, isTmp) {
+    this.#checkSelection();
     const blob = new Blob([new Uint8Array(buffer)], {
       type: "application/octet-stream",
     });
@@ -349,6 +593,7 @@ export class AttachmentInfo {
         target,
         startTime: new Date(),
       });
+      this.#checkSelection();
       await download.start();
       if (!isTmp) {
         const list = await lazy.Downloads.getList(lazy.Downloads.ALL);
@@ -427,14 +672,44 @@ export class AttachmentInfo {
    *
    * @param {BrowsingContext} browsingContext - The browsingContext of the
    *   browser that this attachment is being opened from.
+   * @returns {Promise<void>} Resolves after dispatch to the existing opener or
+   *   handler dialog. Stored-part retrieval must succeed before that dispatch.
+   * @throws {Components.Exception} For a changed selection or failed retrieval.
    */
   async open(browsingContext) {
+    this.#checkSelection();
     if (!this.hasFile) {
       return;
     }
 
     const win = browsingContext.topChromeWindow;
-    const empty = await this.isEmpty();
+    const isPDF =
+      this.contentType == "application/pdf" || /\.pdf$/i.test(this.name);
+    const cached = this.#temporaryFiles.get(this.url);
+    const reuseTemporaryFile =
+      (this.contentType == "message/rfc822" || (this.#selection && isPDF)) &&
+      cached?.file.exists() &&
+      cached.bodyIdentity === this.#temporaryBodyIdentity();
+    const buffer =
+      this.#selection && !reuseTemporaryFile
+        ? await this.fetchAttachment()
+        : null;
+    let empty;
+    if (buffer) {
+      empty = buffer.byteLength == 0;
+    } else if (this.#selection && reuseTemporaryFile) {
+      empty = false;
+    } else {
+      empty = await this.isEmpty();
+    }
+    this.#checkSelection();
+    const saveAttachment = async (target, isTmp = false) => {
+      if (buffer) {
+        await this.#saveBuffer(buffer, target, isTmp);
+      } else {
+        await this.saveToFile(target, isTmp);
+      }
+    };
     if (empty) {
       const prompt = await lazy.l10n.formatValue(
         this.isExternalAttachment
@@ -463,6 +738,30 @@ export class AttachmentInfo {
         // dialog. For most attachments the MIME code has already put it in the
         // URL, but not for external attachments.
         let url = this.url;
+        if (this.#selection) {
+          // A transport URL can be reused for a different IMAP physical source.
+          // Hand PDF.js the checked bytes, never another transport retrieval.
+          let tempFile = reuseTemporaryFile ? cached.file : null;
+          if (!tempFile) {
+            const filename = /\.pdf$/i.test(this.#filename)
+              ? this.#filename
+              : `${this.#filename}.pdf`;
+            tempFile = await this.setupTempFile(filename);
+            try {
+              await saveAttachment(tempFile.path, true);
+              this.#checkSelection();
+            } catch (error) {
+              await IOUtils.remove(tempFile.path);
+              throw error;
+            }
+            this.#temporaryFiles.set(this.url, {
+              file: tempFile,
+              bodyIdentity: this.#temporaryBodyIdentity(),
+            });
+          }
+          this.#checkSelection();
+          url = Services.io.newFileURI(tempFile).spec;
+        }
         const parsedURL = URL.parse(url);
         if (parsedURL && !parsedURL.searchParams.has("type")) {
           parsedURL.searchParams.set("type", "application/pdf");
@@ -489,8 +788,11 @@ export class AttachmentInfo {
     }
 
     if (this.contentType == "message/rfc822") {
-      let tempFile = this.#temporaryFiles.get(this.url);
-      if (!tempFile?.exists()) {
+      let tempFile = cached?.file;
+      if (
+        !tempFile?.exists() ||
+        cached.bodyIdentity !== this.#temporaryBodyIdentity()
+      ) {
         // Try to use the name of the attachment for the temporary file, so
         // that the name is included in the URI of the message that is
         // opened, and possibly saved as a file later by the user.
@@ -501,11 +803,15 @@ export class AttachmentInfo {
           sanitizedName += ".eml";
         }
         tempFile = await this.setupTempFile(sanitizedName);
-        await this.saveToFile(tempFile.path, true);
+        await saveAttachment(tempFile.path, true);
 
-        this.#temporaryFiles.set(this.url, tempFile);
+        this.#temporaryFiles.set(this.url, {
+          file: tempFile,
+          bodyIdentity: this.#temporaryBodyIdentity(),
+        });
       }
 
+      this.#checkSelection();
       lazy.MailUtils.openEMLFile(
         win,
         tempFile,
@@ -543,10 +849,11 @@ export class AttachmentInfo {
     const createTemporaryFileAndOpen = async fileMimeInfo => {
       const tempFile = await this.setupTempFile(name);
 
-      await this.saveToFile(tempFile.path, true);
+      await saveAttachment(tempFile.path, true);
       // Before opening from the temp dir, make the file read-only so that
       // users don't edit and lose their edits...
       await IOUtils.setPermissions(tempFile.path, 0o400); // Set read-only
+      this.#checkSelection();
       this._openFile(fileMimeInfo, tempFile);
     };
 
@@ -576,7 +883,7 @@ export class AttachmentInfo {
             destFile.append(name);
             destFile.createUnique(Ci.nsIFile.NORMAL_FILE_TYPE, 0o755);
             destFile.remove(false);
-            await this.saveToFile(destFile.path);
+            await saveAttachment(destFile.path);
           } else {
             const filePicker = Cc["@mozilla.org/filepicker;1"].createInstance(
               Ci.nsIFilePicker
@@ -590,7 +897,7 @@ export class AttachmentInfo {
             );
             const rv = await new Promise(resolve => filePicker.open(resolve));
             if (rv != Ci.nsIFilePicker.returnCancel) {
-              await this.saveToFile(filePicker.file.path);
+              await saveAttachment(filePicker.file.path);
             }
           }
           return;
@@ -613,7 +920,6 @@ export class AttachmentInfo {
       "@mozilla.org/helperapplauncherdialog;1"
     ].createInstance(Ci.nsIHelperAppLauncherDialog);
 
-    const attachment = this;
     appLauncherDialog.show(
       {
         QueryInterface: ChromeUtils.generateQI(["nsIHelperAppLauncher"]),
@@ -639,7 +945,7 @@ export class AttachmentInfo {
         /** @param {nsIFile} file */
         async saveDestinationAvailable(file) {
           if (file) {
-            await attachment.saveToFile(file.path);
+            await saveAttachment(file.path);
           }
         },
         setWebProgressListener() {},
@@ -665,6 +971,112 @@ export class AttachmentInfo {
   }
 
   /**
+   * Capture and recheck the physical parent of a modifying command. The caller's
+   * header must name the same selected message as every attachment, including
+   * after confirmation, retrieval and replacement staging.
+   *
+   * @param {nsIMsgDBHdr} msgHdr - The message to modify.
+   * @param {AttachmentInfo[]} attachments - The selected parts.
+   * @returns {function(): void} Rechecks the captured parent and parts.
+   * @throws {Components.Exception} For an unavailable or mismatched parent.
+   */
+  static #modificationGuard(msgHdr, attachments) {
+    const folder = msgHdr.folder;
+    const database = folder.msgDatabase;
+    const key = msgHdr.messageKey;
+    const uri = folder.getUriForMsg(msgHdr);
+    // Ordinary MIME-parser callers supply a parent but no public header/URI.
+    // Bind only a part URL that proves membership in that exact physical parent.
+    for (const attachment of attachments) {
+      if (
+        !attachment.#selection &&
+        attachment.message == null &&
+        (attachment.uri == null || attachment.uri == uri)
+      ) {
+        const actual = URL.parse(attachment.url);
+        const expected = URL.parse(
+          MailServices.messageServiceFromURI(uri).getUrlForUri(uri).spec
+        );
+        if (
+          actual &&
+          expected &&
+          ["mailbox:", "imap:", "news:", "snews:"].includes(actual.protocol) &&
+          actual.protocol == expected.protocol &&
+          actual.username == expected.username &&
+          actual.host == expected.host &&
+          decodeURIComponent(actual.pathname) ==
+            decodeURIComponent(expected.pathname) &&
+          ["number", "group", "key"].every(
+            name =>
+              JSON.stringify(actual.searchParams.getAll(name)) ==
+              JSON.stringify(expected.searchParams.getAll(name))
+          ) &&
+          /^\d+(?:\.\d+)*$/.test(attachment.partID) &&
+          actual.searchParams.getAll("part").length == 1 &&
+          actual.searchParams.get("part") == attachment.partID
+        ) {
+          attachment.#selection = {
+            message: msgHdr,
+            inputMessage: attachment.message,
+            folder,
+            database,
+            key,
+            messageId: msgHdr.messageId,
+            uri,
+            inputURI: attachment.uri,
+            url: attachment.url,
+            part: attachment.partID,
+          };
+        }
+      }
+    }
+    const selections = attachments.map(attachment => ({
+      attachment,
+      message: attachment.message,
+      uri: attachment.uri,
+      url: attachment.url,
+      part: attachment.partID,
+    }));
+    const check = () => {
+      if (
+        !msgHdr.isLive ||
+        folder.msgDatabase !== database ||
+        !database.containsKey(key) ||
+        msgHdr.folder?.URI !== folder.URI ||
+        msgHdr.messageKey !== key ||
+        folder.getUriForMsg(msgHdr) !== uri
+      ) {
+        throw new Components.Exception(
+          "The message selected for attachment modification changed",
+          Cr.NS_ERROR_NOT_AVAILABLE
+        );
+      }
+      for (const selected of selections) {
+        const { attachment } = selected;
+        const selectedURI = attachment.#checkSelection();
+        const message = attachment.#selection?.message || attachment.message;
+        if (
+          attachment.message !== selected.message ||
+          attachment.uri !== selected.uri ||
+          attachment.url !== selected.url ||
+          attachment.partID !== selected.part ||
+          !message?.isLive ||
+          message.folder?.URI !== folder.URI ||
+          message.messageKey !== key ||
+          (selectedURI && selectedURI !== uri)
+        ) {
+          throw new Components.Exception(
+            "The attachment does not belong to the selected physical message",
+            Cr.NS_ERROR_NOT_AVAILABLE
+          );
+        }
+      }
+    };
+    check();
+    return check;
+  }
+
+  /**
    * Delete this attachment from the message. Deleting removes the attachment
    * from the message, leavning only a placeholder noting that the message used
    * to contain an attachment.
@@ -683,9 +1095,14 @@ export class AttachmentInfo {
    * @param {boolean} [silent=true] - If true, ask for confirmation to proceed.
    */
   static async deleteAttachments(msgHdr, attachments, silent = true) {
+    attachments = [...attachments];
     if (attachments.some(a => a.contentType == "text/x-moz-deleted")) {
       throw new Error(`An attachment was already deleted.`);
     }
+    const checkSelection = AttachmentInfo.#modificationGuard(
+      msgHdr,
+      attachments
+    );
     if (!silent) {
       // Confirm to proceed.
       const message = await lazy.l10n.formatValue("attachment-delete-confirm", {
@@ -696,7 +1113,13 @@ export class AttachmentInfo {
       }
     }
     const attachmentsMap = new Map(attachments.map(a => [a.url, null]));
-    await AttachmentInfo.#modifyMessage(msgHdr, attachmentsMap, "DELETE");
+    checkSelection();
+    await AttachmentInfo.#modifyMessage(
+      msgHdr,
+      attachmentsMap,
+      "DELETE",
+      checkSelection
+    );
   }
 
   /**
@@ -707,14 +1130,17 @@ export class AttachmentInfo {
    * @param {BrowsingContext} browsingContext - The browsing context to use.
    */
   async detachFromMessage(browsingContext) {
+    const msgHdr = this.message;
     if (this.contentType == "text/x-moz-deleted") {
       throw new Error(`${this.name} was already deleted.`);
     }
+    const checkSelection = AttachmentInfo.#modificationGuard(msgHdr, [this]);
     // Ask where to save.
     const fpDialogTitle = await lazy.l10n.formatValue(
       "attachment-detach-dialog-title"
     );
     const path = await this.save(browsingContext, fpDialogTitle);
+    checkSelection();
     if (!path) {
       return;
     }
@@ -725,10 +1151,12 @@ export class AttachmentInfo {
     if (!Services.prompt.confirm(browsingContext.window, null, message)) {
       return;
     }
+    checkSelection();
     await AttachmentInfo.#modifyMessage(
-      this.message,
+      msgHdr,
       new Map([[this.url, path]]),
-      "DETACH"
+      "DETACH",
+      checkSelection
     );
   }
 
@@ -749,9 +1177,14 @@ export class AttachmentInfo {
     detachDir = null,
     browsingContext = null
   ) {
+    attachments = [...attachments];
     if (attachments.some(a => a.contentType == "text/x-moz-deleted")) {
       throw new Error(`An attachment was already deleted.`);
     }
+    const checkSelection = AttachmentInfo.#modificationGuard(
+      msgHdr,
+      attachments
+    );
     const silent = !!detachDir;
     if (!silent) {
       // Non-silent mode. No dir provided - need to ask for dir where to save.
@@ -787,7 +1220,13 @@ export class AttachmentInfo {
         return;
       }
     }
-    await AttachmentInfo.#modifyMessage(msgHdr, attachmentsMap, "DETACH");
+    checkSelection();
+    await AttachmentInfo.#modifyMessage(
+      msgHdr,
+      attachmentsMap,
+      "DETACH",
+      checkSelection
+    );
   }
 
   /**
@@ -800,8 +1239,15 @@ export class AttachmentInfo {
    *   full path were each attachment has been stored.
    *   For deletion, paths will be null.
    * @param {"DELETE"|"DETACH"} operation - Delete or detach.
+   * @param {function(): void} checkSelection - Recheck the retained operation parent.
    */
-  static async #modifyMessage(msgHdr, attachmentsMap, operation) {
+  static async #modifyMessage(
+    msgHdr,
+    attachmentsMap,
+    operation,
+    checkSelection
+  ) {
+    checkSelection();
     const data = await AttachmentInfo.stripAttachments(
       msgHdr,
       attachmentsMap,
@@ -811,7 +1257,13 @@ export class AttachmentInfo {
       return;
     }
 
-    await AttachmentInfo.#copyMessageToOriginalFolder(data, msgHdr);
+    checkSelection();
+    await AttachmentInfo.#copyMessageToOriginalFolder(
+      data,
+      msgHdr,
+      checkSelection
+    );
+    checkSelection();
     await AttachmentInfo.#deleteOriginal(msgHdr);
     await AttachmentInfo.#updateFolder(msgHdr.folder);
   }
@@ -890,7 +1342,7 @@ export class AttachmentInfo {
       onStopRequest(_request, statusCode) {
         if (!Components.isSuccessCode(statusCode)) {
           reject(
-            new Error(`${operation} - strip FAILED: ${statusCode.toString(16)}`)
+            new Components.Exception(`${operation} - strip FAILED`, statusCode)
           );
           return;
         }
@@ -926,59 +1378,80 @@ export class AttachmentInfo {
    *
    * @param {string} data - The modified message data.
    * @param {nsIMsgDBHdr} msgHdr - The message to replace.
+   * @param {function(): void} checkSelection - Recheck immediately before copying.
    */
-  static async #copyMessageToOriginalFolder(data, msgHdr) {
+  static async #copyMessageToOriginalFolder(data, msgHdr, checkSelection) {
     const msgFilePath = await IOUtils.createUniqueFile(
       PathUtils.tempDir,
       "tmp-msg.eml",
       0o600
     );
-    await IOUtils.write(
-      msgFilePath,
-      lazy.MailStringUtils.byteStringToUint8Array(data)
-    );
-    const msgFile = await IOUtils.getFile(msgFilePath);
+    let copyError;
+    let cleanupError;
+    try {
+      await IOUtils.write(
+        msgFilePath,
+        lazy.MailStringUtils.byteStringToUint8Array(data)
+      );
+      const msgFile = await IOUtils.getFile(msgFilePath);
 
-    const { promise, resolve, reject } = Promise.withResolvers();
-    /** @implements {nsIMsgCopyServiceListener} */
-    const copyServiceListener = {
-      onStartCopy() {},
-      onProgress() {},
-      setMessageKey(key) {
-        Services.obs.notifyObservers(
-          null,
-          "attachment-delete-msgkey-changed",
-          JSON.stringify({
-            oldMessageKey: msgHdr.messageKey,
-            newMessageKey: key,
-            folderURI: msgHdr.folder.URI,
-          })
-        );
-      },
-      getMessageId() {
-        return null;
-      },
-      onStopCopy(statusCode) {
-        if (!Components.isSuccessCode(statusCode)) {
-          reject(new Error(`Copy FAILED: ${statusCode.toString(16)}`));
-          return;
+      const { promise, resolve, reject } = Promise.withResolvers();
+      /** @implements {nsIMsgCopyServiceListener} */
+      const copyServiceListener = {
+        onStartCopy() {},
+        onProgress() {},
+        setMessageKey(key) {
+          Services.obs.notifyObservers(
+            null,
+            "attachment-delete-msgkey-changed",
+            JSON.stringify({
+              oldMessageKey: msgHdr.messageKey,
+              newMessageKey: key,
+              folderURI: msgHdr.folder.URI,
+            })
+          );
+        },
+        getMessageId() {
+          return null;
+        },
+        onStopCopy(statusCode) {
+          if (!Components.isSuccessCode(statusCode)) {
+            reject(new Components.Exception("Copy FAILED", statusCode));
+            return;
+          }
+          resolve();
+        },
+      };
+
+      checkSelection();
+      MailServices.copy.copyFileMessage(
+        msgFile,
+        msgHdr.folder,
+        msgHdr,
+        false,
+        msgHdr.flags,
+        msgHdr.getStringProperty("keywords"),
+        copyServiceListener,
+        null
+      );
+      await promise;
+    } catch (error) {
+      copyError = error;
+      throw error;
+    } finally {
+      try {
+        await IOUtils.remove(msgFilePath);
+      } catch (error) {
+        if (copyError) {
+          console.error(error);
+        } else {
+          cleanupError = error;
         }
-        resolve();
-      },
-    };
-
-    MailServices.copy.copyFileMessage(
-      msgFile,
-      msgHdr.folder,
-      msgHdr,
-      false,
-      msgHdr.flags,
-      msgHdr.getStringProperty("keywords"),
-      copyServiceListener,
-      null
-    );
-    await promise;
-    await IOUtils.remove(msgFilePath); // Cleanup.
+      }
+    }
+    if (cleanupError) {
+      throw cleanupError;
+    }
   }
 
   /**
@@ -999,7 +1472,7 @@ export class AttachmentInfo {
       onStopCopy(statusCode) {
         if (!Components.isSuccessCode(statusCode)) {
           reject(
-            new Error(`Delete original FAILED: ${statusCode.toString(16)}`)
+            new Components.Exception("Delete original FAILED", statusCode)
           );
           return;
         }
@@ -1033,7 +1506,7 @@ export class AttachmentInfo {
       OnStartRunningUrl() {},
       OnStopRunningUrl(url, statusCode) {
         if (!Components.isSuccessCode(statusCode)) {
-          reject(new Error(`Update folder FAILED: ${statusCode}`));
+          reject(new Components.Exception("Update folder FAILED", statusCode));
           return;
         }
         resolve();
@@ -1154,7 +1627,8 @@ export class AttachmentInfo {
    * is accessible. For http and file urls, fetch() will have the size
    * in the content-length header.
    *
-   * @returns {boolean} true if the attachment is empty or error.
+   * @returns {Promise<boolean>} True for an empty part or an unavailable external URL.
+   * @throws {Components.Exception} If a selected stored part cannot be read.
    */
   async isEmpty() {
     if (this.isDeleted) {
@@ -1169,6 +1643,16 @@ export class AttachmentInfo {
       const uri = Services.io.newURI(url);
       return !(uri.username || uri.userPass);
     };
+
+    this.#checkSelection();
+    if (this.#selection && !this.sizeResolved) {
+      // Stored parts must reach a successful terminal result. A failed body
+      // read is an error, not an empty attachment or a cancelled save picker.
+      const buffer = await this.fetchAttachment();
+      this.size = buffer.byteLength;
+      this.sizeResolved = true;
+      return this.size == 0;
+    }
 
     // We have a resolved size.
     if (this.sizeResolved) {

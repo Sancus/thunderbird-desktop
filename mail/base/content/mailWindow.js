@@ -344,6 +344,7 @@ function nsMsgStatusFeedback() {
   );
   this._throbber = document.getElementById("throbber-box");
   this._activeProcesses = [];
+  this._busyProcesses = new Set();
   this._statusQueue = [];
 
   // make sure the stop button is accurate from the get-go
@@ -388,6 +389,7 @@ nsMsgStatusFeedback.prototype = {
   _meteorsSpinning: false,
   _progressBarVisible: false,
   _activeProcesses: null,
+  _busyProcesses: null,
   _statusFeedbackProgress: -1,
   _statusLastShown: 0,
   _statusQueue: null,
@@ -688,7 +690,7 @@ nsMsgStatusFeedback.prototype = {
     } else if (activity instanceof Ci.nsIActivityProcess) {
       this._activeProcesses.push(activity);
       activity.addListener(this);
-      this.startMeteors();
+      this.onStateChanged(activity, Ci.nsIActivityProcess.STATE_NOTSTARTED);
     }
   },
 
@@ -700,35 +702,56 @@ nsMsgStatusFeedback.prototype = {
   },
 
   /**
-   * Balance the startMeteors() call we made for this process in
-   * onAddedActivity(), at most once per process.
+   * Release this feedback object's request and listener for a process.
    *
-   * @param {nsIActivityProcess} process
+   * @param {nsIActivityProcess} process - The tracked process to release.
+   * @param {boolean} [deferListenerRemoval=false] - Defer removal while the
+   *   process is notifying its listeners, so other windows receive the state.
    */
-  _releaseProcess(process) {
+  _releaseProcess(process, deferListenerRemoval = false) {
     const index = this._activeProcesses.indexOf(process);
     if (index < 0) {
       return;
     }
     this._activeProcesses.splice(index, 1);
-    process.removeListener(this);
-    this.stopMeteors();
+    if (deferListenerRemoval) {
+      queueMicrotask(() => process.removeListener(this));
+    } else {
+      process.removeListener(this);
+    }
+    // State may already be terminal if another listener prevented our state
+    // callback. Balance the request we actually own, regardless of current state.
+    if (this._busyProcesses.delete(process)) {
+      this.stopMeteors();
+    }
   },
 
   // nsIActivityListener
-  onStateChanged(aActivity) {
-    // Each activity module is individually responsible for calling
-    // removeActivity() once its process is done, and the activity manager only
-    // prunes finished processes when the user clears the Activity Manager
-    // list. A module that forgets would otherwise leave the progress meter
-    // spinning -- and repainting -- for the lifetime of the window, so stop
-    // tracking a process as soon as it reaches a state it cannot leave.
+  onStateChanged(aActivity, aOldState) {
+    if (!this._activeProcesses.includes(aActivity)) {
+      return;
+    }
+    // Paused and waiting processes remain tracked so they can resume, but only
+    // running processes contribute a busy request.
+    if (aActivity.state != aOldState) {
+      if (aActivity.state == Ci.nsIActivityProcess.STATE_INPROGRESS) {
+        if (!this._busyProcesses.has(aActivity)) {
+          this._busyProcesses.add(aActivity);
+          this.startMeteors();
+        }
+      } else if (this._busyProcesses.delete(aActivity)) {
+        this.stopMeteors();
+      }
+    }
+    // The activity iterates its live listener array. Defer removing our listener
+    // until all windows have received this terminal notification.
     if (
       aActivity.state == Ci.nsIActivityProcess.STATE_COMPLETED ||
       aActivity.state == Ci.nsIActivityProcess.STATE_CANCELED
     ) {
-      this._releaseProcess(aActivity);
+      this._releaseProcess(aActivity, true);
     }
+    this.updateProgress();
   },
 
   onProgressChanged(aActivity, aStatusText) {

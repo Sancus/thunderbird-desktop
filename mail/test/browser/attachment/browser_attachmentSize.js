@@ -472,3 +472,74 @@ add_task(function test_attachmentPartIdentityAcrossMessageUrls() {
     Assert.equal(attachment.url, expectedUrl, `Reader URL for ${url}`);
   }
 });
+
+add_task(async function test_selectedPhysicalMimePartsRetainNamesAndSizes() {
+  const copies = [];
+  try {
+    for (let index = 0; index < 2; index++) {
+      const selectedFolder = await create_folder(`S376MimeParts${index}`);
+      copies.push(selectedFolder);
+      const body = `The physical attachment in folder ${index}.`;
+      const name = `selected-${index}-\u{1F98A}.txt`;
+      const message = create_message({
+        attachments: [
+          {
+            body,
+            disposition: `attachment; filename*=UTF-8''${encodeURIComponent(name)}`,
+            format: "",
+          },
+        ],
+      });
+      message.messageId = "s376-repeated-mime@example.invalid";
+      await add_message_to_folder([selectedFolder], message);
+      const [header] = [...selectedFolder.messages];
+      Assert.equal(selectedFolder.getTotalMessages(false), 1);
+      const expectedKey = header.messageKey;
+      if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+        const core = Cc["@mozilla.org/mailnews/database-core;1"].getService(
+          Ci.nsIDatabaseCore
+        );
+        Assert.ok(core.sourceId, "The actual native database is active");
+      }
+      const expectedStore = Services.prefs
+        .getStringPref("mail.serverDefaultStoreContractID")
+        .includes("maildirstore")
+        ? "maildir"
+        : "mbox";
+      Assert.equal(selectedFolder.msgStore.storeType, expectedStore);
+      await be_in_folder(selectedFolder);
+      await select_click_row(0);
+      const reader = get_about_message();
+      await TestUtils.waitForCondition(
+        () => reader.currentAttachments.length == 1,
+        "the selected stored message supplies its MIME part"
+      );
+      const [attachment] = reader.currentAttachments;
+      await TestUtils.waitForCondition(() => attachment.sizeResolved);
+      Assert.equal(reader.gMessage.folder.URI, selectedFolder.URI);
+      Assert.equal(reader.gMessage.messageKey, expectedKey);
+      Assert.equal(attachment.message.folder.URI, selectedFolder.URI);
+      Assert.equal(attachment.message.messageKey, expectedKey);
+      Assert.equal(attachment.name, name);
+      Assert.equal(attachment.size, body.length);
+      Assert.equal(attachment.partID, "1.2");
+      Assert.equal(
+        new TextDecoder().decode(await attachment.fetchAttachment()),
+        body,
+        "part bytes belong to this physical copy despite repeated Message-ID"
+      );
+    }
+    const [first] = [...copies[0].messages];
+    const [second] = [...copies[1].messages];
+    Assert.equal(first.messageId, second.messageId);
+    Assert.notEqual(first.folder.URI, second.folder.URI);
+    if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+      Assert.notEqual(first.messageKey, second.messageKey);
+    }
+  } finally {
+    await be_in_folder(folder);
+    for (const selectedFolder of copies) {
+      selectedFolder.deleteSelf(null);
+    }
+  }
+});

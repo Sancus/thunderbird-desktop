@@ -768,19 +768,22 @@ nsresult nsMsgThreadedDBView::RemoveByIndex(nsMsgViewIndex index) {
     });
 
     // Scrub stale children natively.
-    CollapseByIndex(index, nullptr);
-    nsresult rv = nsMsgDBView::RemoveByIndex(index);
+    nsresult rv = CollapseByIndex(index, nullptr);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = nsMsgDBView::RemoveByIndex(index);
     NS_ENSURE_SUCCESS(rv, rv);
 
     // Add newly promoted root and let Mork natively calculate the layout and
     // indentation.
     nsCOMPtr<nsIMsgDBHdr> newRootHdr;
-    threadHdr->GetChildHdrAt(0, getter_AddRefs(newRootHdr));
+    rv = threadHdr->GetChildHdrAt(0, getter_AddRefs(newRootHdr));
+    NS_ENSURE_SUCCESS(rv, rv);
     if (!newRootHdr) {
       return NS_ERROR_UNEXPECTED;
     }
     nsMsgViewIndex newIndex = nsMsgViewIndex_None;
-    nsMsgDBView::AddHdr(newRootHdr, &newIndex);
+    rv = nsMsgDBView::AddHdr(newRootHdr, &newIndex);
+    NS_ENSURE_SUCCESS(rv, rv);
     if (newIndex != nsMsgViewIndex_None) {
       m_flags[newIndex] |= MSG_VIEW_FLAG_ISTHREAD;
       if (numThreadChildren > 1) {

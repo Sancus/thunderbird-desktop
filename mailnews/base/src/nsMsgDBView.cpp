@@ -4941,7 +4941,113 @@ nsMsgDBView::OnHdrDeleted(nsIMsgDBHdr* aHdrChanged, nsMsgKey aParentKey,
       if (isMsgSelected) commandUpdater->UpdateNextMessageAfterDelete();
     }
 
-    RemoveByIndex(deletedIndex);
+    // A committed deletion cannot look up its old root through the database.
+    // Resolve the surviving thread from a live displayed child, using the
+    // notification's exact folder and thread identity only as custody context.
+    auto removeRow = [&]() -> nsresult {
+      const uint32_t flags = m_flags[deletedIndex];
+      if (!m_db || !m_folder || GetFolders() ||
+          !(m_viewFlags & nsMsgViewFlagsType::kThreadedDisplay) ||
+          (m_viewFlags & nsMsgViewFlagsType::kGroupBySort) ||
+          !(flags & MSG_VIEW_FLAG_ISTHREAD) ||
+          !(flags & MSG_VIEW_FLAG_HASCHILDREN) ||
+          (flags & nsMsgMessageFlags::Elided)) {
+        return RemoveByIndex(deletedIndex);
+      }
+
+      nsCOMPtr<nsIMsgFolder> removedFolder;
+      nsresult rv = aHdrChanged->GetFolder(getter_AddRefs(removedFolder));
+      NS_ENSURE_SUCCESS(rv, rv);
+      NS_ENSURE_TRUE(removedFolder == m_folder, NS_ERROR_ILLEGAL_VALUE);
+      nsMsgKey removedThreadId;
+      rv = aHdrChanged->GetThreadId(&removedThreadId);
+      NS_ENSURE_SUCCESS(rv, rv);
+      nsCOMPtr<nsIMsgThread> thread;
+      for (nsMsgViewIndex childIndex = deletedIndex + 1;
+           childIndex < GetSize() && m_levels[childIndex] > m_levels[deletedIndex];
+           ++childIndex) {
+        bool exists;
+        rv = m_db->ContainsKey(m_keys[childIndex], &exists);
+        NS_ENSURE_SUCCESS(rv, rv);
+        if (!exists) {
+          // A batch may have committed several removals before notifying us.
+          continue;
+        }
+        nsCOMPtr<nsIMsgDBHdr> child;
+        rv = m_db->GetMsgHdrForKey(m_keys[childIndex], getter_AddRefs(child));
+        NS_ENSURE_SUCCESS(rv, rv);
+        nsCOMPtr<nsIMsgFolder> childFolder;
+        rv = child->GetFolder(getter_AddRefs(childFolder));
+        NS_ENSURE_SUCCESS(rv, rv);
+        nsMsgKey childThreadId;
+        rv = child->GetThreadId(&childThreadId);
+        NS_ENSURE_SUCCESS(rv, rv);
+        NS_ENSURE_TRUE(childFolder == removedFolder &&
+                           childThreadId == removedThreadId,
+                       NS_ERROR_ILLEGAL_VALUE);
+        rv = m_db->GetThreadContainingMsgHdr(child, getter_AddRefs(thread));
+        NS_ENSURE_SUCCESS(rv, rv);
+        break;
+      }
+
+      nsCOMPtr<nsIMsgDBHdr> newRoot;
+      uint32_t numChildren = 0;
+      if (thread) {
+        rv = thread->GetNumChildren(&numChildren);
+        NS_ENSURE_SUCCESS(rv, rv);
+        if (numChildren) {
+          rv = thread->GetChildHdrAt(0, getter_AddRefs(newRoot));
+          NS_ENSURE_SUCCESS(rv, rv);
+          NS_ENSURE_TRUE(newRoot, NS_ERROR_UNEXPECTED);
+        }
+      }
+      nsMsgKey currentKey = nsMsgKey_None;
+      AutoTArray<nsMsgKey, 1> selectedKeys;
+      const bool hasSelection = !!mTreeSelection;
+      if (hasSelection) {
+        rv = SaveAndClearSelection(&currentKey, selectedKeys);
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
+      const bool changesDisabled = mSuppressChangeNotification;
+      SetSuppressChangeNotifications(true);
+      auto restore = mozilla::MakeScopeExit([&] {
+        ClearHdrCache();
+        if (hasSelection) {
+          RestoreSelection(currentKey, selectedKeys);
+        }
+        SetSuppressChangeNotifications(changesDisabled);
+        if (!changesDisabled) {
+          if (mTree) {
+            mTree->Invalidate();
+          }
+          if (mJSTree && GetSize()) {
+            mJSTree->InvalidateRange(0, GetSize() - 1);
+          }
+        }
+      });
+      // Collapse only the retained row layout; no deleted header is fetched.
+      rv = CollapseByIndex(deletedIndex, nullptr);
+      NS_ENSURE_SUCCESS(rv, rv);
+      rv = nsMsgDBView::RemoveByIndex(deletedIndex);
+      NS_ENSURE_SUCCESS(rv, rv);
+      ClearHdrCache();
+      if (newRoot) {
+        nsMsgViewIndex newIndex = nsMsgViewIndex_None;
+        rv = nsMsgDBView::AddHdr(newRoot, &newIndex);
+        NS_ENSURE_SUCCESS(rv, rv);
+        NS_ENSURE_TRUE(IsValidIndex(newIndex), NS_ERROR_UNEXPECTED);
+        m_flags[newIndex] |= MSG_VIEW_FLAG_ISTHREAD;
+        if (numChildren > 1) {
+          m_flags[newIndex] |=
+              MSG_VIEW_FLAG_HASCHILDREN | nsMsgMessageFlags::Elided;
+          rv = ExpandByIndex(newIndex, nullptr);
+          NS_ENSURE_SUCCESS(rv, rv);
+        }
+      }
+      return NS_OK;
+    };
+    nsresult rv = removeRow();
+    NS_ENSURE_SUCCESS(rv, rv);
 
     if (isMsgSelected) {
       // Now tell the front end that the delete happened.

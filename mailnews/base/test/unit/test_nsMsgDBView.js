@@ -2485,3 +2485,99 @@ add_task(async function test_physical_lookup_null_getter_errors_and_key_miss() {
     view.close();
   }
 });
+
+add_task(
+  async function test_committed_expanded_root_preserves_physical_child() {
+    const { PromiseTestUtils } = ChromeUtils.importESModule(
+      "resource://testing-common/mailnews/PromiseTestUtils.sys.mjs"
+    );
+    const folder = await messageInjection.makeEmptyFolder();
+    const foreignFolder = await messageInjection.makeEmptyFolder();
+    const set = new SyntheticMessageSet(gScenarioFactory.directReply(3));
+    const foreignSet = new SyntheticMessageSet([
+      gMessageGenerator.makeMessage(),
+    ]);
+    await messageInjection.addSetsToFolders([folder], [set]);
+    await messageInjection.addSetsToFolders([foreignFolder], [foreignSet]);
+    assertDeclaredPhysicalStore(folder);
+    const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+      Ci.nsIDatabaseCore
+    );
+    Assert.ok(service instanceof Ci.nsIDatabaseCore);
+    const [root, firstChild, selectedChild] = set.msgHdrList;
+    const [foreign] = foreignSet.msgHdrList;
+    const expectedSelection = physicalIdentity(selectedChild);
+    const view = Cc[
+      "@mozilla.org/messenger/msgdbview;1?type=threaded"
+    ].createInstance(Ci.nsIMsgDBView);
+    const selection = new TreeSelection(null);
+    try {
+      view.init(null, null);
+      view.open(
+        folder,
+        Ci.nsMsgViewSortType.byDate,
+        Ci.nsMsgViewSortOrder.ascending,
+        Ci.nsMsgViewFlagsType.kThreadedDisplay |
+          Ci.nsMsgViewFlagsType.kExpandAll
+      );
+      const tree = view.QueryInterface(Ci.nsITreeView);
+      tree.selection = selection;
+      selection.view = tree;
+      Assert.equal(tree.rowCount, 3);
+      selection.select(view.findIndexOfMsgHdr(selectedChild, false));
+      const db = folder.msgDatabase;
+      for (const [removed, remaining] of [
+        [root, [firstChild, selectedChild]],
+        [firstChild, [selectedChild]],
+      ]) {
+        const removedKey = removed.messageKey;
+        const expectedRows = remaining.map(physicalIdentity);
+        const listener = new PromiseTestUtils.PromiseCopyListener();
+        folder.deleteMessages([removed], null, true, false, listener, false);
+        await listener.promise;
+        Assert.ok(!db.containsKey(removedKey), "The root removal is committed");
+        Assert.equal(
+          tree.rowCount,
+          remaining.length,
+          "No stale root row remains"
+        );
+        Assert.deepEqual(
+          Array.from({ length: tree.rowCount }, (_, i) =>
+            physicalIdentity(view.getMsgHdrAt(i))
+          ),
+          expectedRows,
+          "Promotion retains exactly the live physical children in order"
+        );
+        Assert.deepEqual(
+          view.getSelectedMsgHdrs().map(physicalIdentity),
+          [expectedSelection],
+          "Committed root deletion preserves the exact selected physical child"
+        );
+        Assert.equal(tree.getLevel(0), 0, "The surviving root is promoted");
+        Assert.throws(
+          () => db.getMsgHdrForKey(removedKey),
+          error => error.result === Cr.NS_ERROR_ILLEGAL_VALUE,
+          "Internal view repair never resurrects deleted membership"
+        );
+        Assert.throws(
+          () => db.getThreadContainingMsgHdr(removed),
+          error => error.result === Cr.NS_ERROR_ILLEGAL_VALUE,
+          "A removed header is still refused by the public thread getter"
+        );
+        Assert.throws(
+          () => db.getThreadContainingMsgHdr(foreign),
+          error => error.result === Cr.NS_ERROR_ILLEGAL_VALUE,
+          "A real foreign folder header is still refused"
+        );
+        Assert.equal(
+          view.findIndexOfMsgHdr(foreign, false),
+          0xffffffff,
+          "A foreign physical message never replaces the deleted root"
+        );
+      }
+    } finally {
+      selection.view = null;
+      view.close();
+    }
+  }
+);

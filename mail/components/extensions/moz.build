@@ -29,6 +29,7 @@ TESTING_JS_MODULES += [
 ]
 
 BROWSER_CHROME_MANIFESTS += [
+    "test/browser/browser-panorama.toml",
     "test/browser/browser1.toml",
     "test/browser/browser2.toml",
     "test/browser/browser3.toml",

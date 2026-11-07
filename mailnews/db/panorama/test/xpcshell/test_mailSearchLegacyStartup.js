@@ -43,6 +43,7 @@ add_task(async function test_legacyStartupLoadsOnlyTheRetainedIndexer() {
   const { GlodaIndexer } = ChromeUtils.importESModule(
     "resource:///modules/gloda/GlodaIndexer.sys.mjs"
   );
+  registerCleanupFunction(() => GlodaIndexer._shutdown());
   Assert.equal(GlodaIndexer.enabled, false, "The indexing preference survives");
   Assert.equal(glue._mailSearchShutdownBlocker, null);
   const closing = glue._shutdownMailSearch();

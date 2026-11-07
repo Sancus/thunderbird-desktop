@@ -1880,12 +1880,17 @@ nsresult MessageDatabase::CompleteFolderRepair(
   RefPtr<MessageDatabase> self(this);
   nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
   nsTArray<RefPtr<Message>> result;
-  nsTArray<CachedMsg> cached;
+  nsTArray<UniquePtr<CachedMsg>> cached;
   nsTArray<Maybe<uint32_t>> matches;
   if (!result.SetLength(messages.Length(), fallible) ||
       !cached.SetLength(messages.Length(), fallible) ||
       !matches.SetLength(messages.Length(), fallible)) {
     return NS_ERROR_OUT_OF_MEMORY;
+  }
+  // CachedMsg contains inline strings and must not be memmoved by nsTArray.
+  for (auto& row : cached) {
+    row.reset(new (fallible) CachedMsg());
+    NS_ENSURE_TRUE(row, NS_ERROR_OUT_OF_MEMORY);
   }
   UniquePtr<QueuedMessageBatch> notification;
   MOZ_TRY(PrepareMessageBatch(notification));
@@ -1946,7 +1951,7 @@ nsresult MessageDatabase::CompleteFolderRepair(
     for (uint32_t i = 0; i < messages.Length(); ++i) {
       const auto& item = messages[i];
       const auto& parsed = *item.parsed;
-      auto& row = cached[i];
+      auto& row = *cached[i];
       auto& repaired = notification->repairs[i];
       auto& change = repaired.change;
       repaired.added = !matches[i];
@@ -2057,7 +2062,7 @@ nsresult MessageDatabase::CompleteFolderRepair(
       // copied from the on-disk parser draft.
     }
     for (uint32_t i = 0; i < messages.Length(); ++i) {
-      auto& row = cached[i];
+      auto& row = *cached[i];
       auto& change = notification->repairs[i].change;
       if (notification->repairs[i].added &&
           !messages[i].parsed->references.IsEmpty()) {
@@ -2102,11 +2107,11 @@ nsresult MessageDatabase::CompleteFolderRepair(
   }();
   if (NS_FAILED(rv)) return RollbackMessageChange(connection, rv);
   for (auto& row : cached) {
-    auto entry = mMsgCache.lookup(row.key);
+    auto entry = mMsgCache.lookup(row->key);
     if (entry)
-      entry->value() = std::move(row);
+      entry->value() = std::move(*row);
     else
-      mMsgCache.putNewInfallible(row.key, std::move(row));
+      mMsgCache.putNewInfallible(row->key, std::move(*row));
   }
   snapshot.mData = nullptr;
   output = std::move(result);
@@ -2448,6 +2453,8 @@ MessageDatabase::GetSearchSnapshot(nsMsgKey after, uint32_t limit,
 }
 
 NS_IMETHODIMP MessageDatabase::NoteMessageContentChanged(nsMsgKey key) {
+  MOZ_LOG(gPanoramaLog, LogLevel::Debug,
+          ("Message content changed key=%u", key));
   MOZ_TRY(RequireCommittedSearchRead());
   MOZ_TRY(CheckMessageBodyAccess(key));
   bool exists;
@@ -8773,6 +8780,15 @@ nsresult MessageDatabase::SetMessageProperty(nsMsgKey aKey,
   NS_ENSURE_TRUE(!IsNewsBindingProperty(aName) &&
                      !aName.EqualsLiteral(kAcceptedAppendObservationProperty),
                  NS_ERROR_INVALID_ARG);
+  if (MOZ_LOG_TEST(gPanoramaLog, LogLevel::Debug)) {
+    nsAutoCString existing;
+    nsresult readResult = GetMessageProperty(aKey, aName, existing);
+    MOZ_LOG(gPanoramaLog, LogLevel::Debug,
+            ("Property string key=%u name=%s unchanged=%d read=0x%08x", aKey,
+             PromiseFlatCString(aName).get(),
+             NS_SUCCEEDED(readResult) && existing.Equals(aValue),
+             static_cast<uint32_t>(readResult)));
+  }
 
   nsCOMPtr<mozIStorageStatement> stmt;
   nsresult rv = GetHeaderStatement(
@@ -8797,6 +8813,15 @@ nsresult MessageDatabase::SetMessageProperty(nsMsgKey aKey,
   NS_ENSURE_TRUE(!IsNewsBindingProperty(aName) &&
                      !aName.EqualsLiteral(kAcceptedAppendObservationProperty),
                  NS_ERROR_INVALID_ARG);
+  if (MOZ_LOG_TEST(gPanoramaLog, LogLevel::Debug)) {
+    uint32_t existing = 0;
+    nsresult readResult = GetMessageProperty(aKey, aName, existing);
+    MOZ_LOG(gPanoramaLog, LogLevel::Debug,
+            ("Property uint32 key=%u name=%s unchanged=%d read=0x%08x", aKey,
+             PromiseFlatCString(aName).get(),
+             NS_SUCCEEDED(readResult) && existing == aValue,
+             static_cast<uint32_t>(readResult)));
+  }
   nsCOMPtr<mozIStorageStatement> stmt;
   nsresult rv = GetHeaderStatement(
       aKey, "SetMessageProperty"_ns, HeaderTable::Properties,
@@ -9604,6 +9629,7 @@ nsresult MessageDatabase::SetMessageRecipients(nsMsgKey key,
 }
 
 nsresult MessageDatabase::SetMessageTags(nsMsgKey key, nsACString const& tags) {
+  MOZ_LOG(gPanoramaLog, LogLevel::Debug, ("Message tags key=%u", key));
   MOZ_TRY(RequireCommittedSearchRead());
   bool staged;
   MOZ_TRY(IsMessageStaged(key, staged));

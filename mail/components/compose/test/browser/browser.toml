@@ -33,3 +33,6 @@ tags = ["oauth"]
 ["browser_sendMessage_spellCheck.js"]
 
 ["browser_sentCopyFailure.js"]
+
+["browser_taskbarUnavailable.js"]
+run-if = ["os == 'win'"]

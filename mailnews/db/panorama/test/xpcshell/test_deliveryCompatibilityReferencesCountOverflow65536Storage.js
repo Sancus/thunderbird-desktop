@@ -17,11 +17,13 @@ add_task(function test_numReferencesOverflow65536PreservesStorage() {
   const folder = folderDB.insertFolder(root, "Inbox");
   const tokens = Array(65535).fill("visible@invalid");
   tokens.push("last@invalid");
+  info("Reference fixture: inserting all raw references");
   const key = addMessage({
     folderId: folder,
     messageId: "self@invalid",
     references: tokens,
   });
+  info("Reference fixture: raw references inserted");
   const header = messageDB.getMessage(key);
   const file = do_get_profile().clone();
   file.append("panorama.sqlite");
@@ -34,29 +36,78 @@ add_task(function test_numReferencesOverflow65536PreservesStorage() {
     reader.close();
   });
   statement = reader.createStatement(
-    "SELECT ordinal, token FROM message_references WHERE id = :id ORDER BY ordinal"
+    "SELECT json_group_array(json_array(ordinal, token) ORDER BY ordinal), " +
+      "min(typeof(ordinal) = 'integer' AND typeof(token) = 'text') " +
+      "FROM message_references WHERE id = :id"
   );
   statement.params.id = key;
-  const before = [];
-  while (statement.executeStep()) {
-    before.push([statement.row.ordinal, statement.row.token]);
-  }
+  info("Reference fixture: reading before complete raw snapshot");
+  Assert.ok(
+    statement.executeStep(),
+    "The complete reference snapshot is available"
+  );
+  const before = JSON.parse(statement.getString(0));
+  const beforeTypesValid = statement.getInt32(1) === 1;
+  Assert.ok(
+    !statement.executeStep(),
+    "The complete reference snapshot has one result"
+  );
+  Assert.ok(
+    beforeTypesValid,
+    "The raw reference SQL column types are preserved"
+  );
   statement.reset();
   Assert.equal(before.length, 65536);
+  // Compare every tuple and report only the exact comparison result.
+  Assert.ok(
+    before.every(
+      ([ordinal, token]) =>
+        Number.isSafeInteger(ordinal) && typeof token == "string"
+    ),
+    "Every stored reference row has a safe integer ordinal and string token"
+  );
   Assert.deepEqual(
-    before,
-    tokens.map((token, ordinal) => [ordinal, token])
+    before.every(
+      ([ordinal, token], index) => ordinal === index && token === tokens[index]
+    ),
+    true
   );
   Assert.throws(
     () => header.numReferences,
     error => error.result == Cr.NS_ERROR_LOSS_OF_SIGNIFICANT_DATA
   );
-  const after = [];
   statement.params.id = key;
-  while (statement.executeStep()) {
-    after.push([statement.row.ordinal, statement.row.token]);
-  }
+  info("Reference fixture: reading after complete raw snapshot");
+  Assert.ok(
+    statement.executeStep(),
+    "The complete reference snapshot is available"
+  );
+  const after = JSON.parse(statement.getString(0));
+  const afterTypesValid = statement.getInt32(1) === 1;
+  Assert.ok(
+    !statement.executeStep(),
+    "The complete reference snapshot has one result"
+  );
+  Assert.ok(
+    afterTypesValid,
+    "The raw reference SQL column types are preserved"
+  );
   statement.reset();
-  Assert.deepEqual(after, before, "Reading the count preserves every raw row");
+  Assert.ok(
+    after.every(
+      ([ordinal, token]) =>
+        Number.isSafeInteger(ordinal) && typeof token == "string"
+    ),
+    "Every reread reference row has a safe integer ordinal and string token"
+  );
+  Assert.deepEqual(
+    after.length === before.length &&
+      after.every(
+        ([ordinal, token], index) =>
+          ordinal === before[index][0] && token === before[index][1]
+      ),
+    true,
+    "Reading the count preserves every raw row"
+  );
   Assert.equal(header.getStringReference(65535), "last@invalid");
 });

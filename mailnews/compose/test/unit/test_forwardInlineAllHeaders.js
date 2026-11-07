@@ -44,12 +44,19 @@ add_task(async function testForwardInlineAllHeadersTrailingWhitespace() {
     .QueryInterface(Ci.nsIMsgLocalMailFolder)
     .addMessage(messageSource);
 
+  Assert.ok(identity.doFcc, "Forwarding should retain the default sent copy");
+  const sendCompleted = promiseComposeSendCompletion(identity);
   MailServices.compose.forwardMessage(
     "to@local.invalid",
     mailTestUtils.firstMsgHdr(localAccountUtils.inboxFolder),
     null,
     localAccountUtils.incomingServer,
     Ci.nsIMsgComposeService.kForwardInline
+  );
+  Assert.equal(
+    await sendCompleted,
+    Cr.NS_OK,
+    "Forwarding and its sent copy should finish successfully"
   );
 
   await TestUtils.waitForCondition(

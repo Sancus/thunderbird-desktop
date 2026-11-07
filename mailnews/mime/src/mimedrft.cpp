@@ -1656,13 +1656,14 @@ static void mime_parse_stream_complete(nsMIMESession* stream) {
 
   for (uint32_t i = 0; i < mdd->attachments.Length(); i++)
     mdd->attachments[i]->m_tmpFile = nullptr;
+  mime_free_attachments(mdd->attachments);
 
   PR_FREEIF(mdd->mailcharset);
 
   mdd->identity = nullptr;
   PR_Free(mdd->url_name);
   mdd->origMsgHdr = nullptr;
-  PR_Free(mdd);
+  delete mdd;
 
   PR_FREEIF(to_and_cc);
   PR_FREEIF(re_subject);
@@ -1722,7 +1723,7 @@ static void mime_parse_stream_abort(nsMIMESession* stream, int status) {
 
   PR_FREEIF(mdd->mailcharset);
 
-  PR_Free(mdd);
+  delete mdd;
 }
 
 static int make_mime_headers_copy(MimeClosure closure, MimeHeaders* headers) {

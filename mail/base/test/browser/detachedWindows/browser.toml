@@ -1,4 +1,5 @@
 [DEFAULT]
+support-files = ["head.js"]
 prefs = [
   "mail.provider.suppress_dialog_on_startup=true",
   "mail.spellcheck.inline=false",
@@ -11,6 +12,16 @@ prefs = [
 subsuite = "thunderbird"
 
 ["browser_detachedWindows.js"]
+skip-if = [
+  "debug",
+]
+
+["browser_detachedWindowsCompose.js"]
+skip-if = [
+  "debug",
+]
+
+["browser_detachedWindowsDialogs.js"]
 skip-if = [
   "debug",
 ]

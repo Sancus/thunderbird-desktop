@@ -32,6 +32,8 @@ run-if = ["nightly_build"]
 
 ["test_secretKeys.js"]
 
+["test_sqliteDb.js"]
+
 ["test_strip.js"]
 
 ["test_uid.js"]

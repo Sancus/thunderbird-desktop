@@ -10146,15 +10146,16 @@ class ImapOfflineMsgStreamListener : public nsIStreamListener {
     AUTO_PROFILER_LABEL("ImapOfflineMsgStreamListener::OnStopRequest",
                         MAILNEWS);
     MOZ_RELEASE_ASSERT(NS_IsMainThread());
+    if (NS_FAILED(status) &&
+        Preferences::GetBool("mail.discard_offline_msg_on_failure", true)) {
+      // Discard before the consumer handles the original read error, so a
+      // message display retry fetches from the server instead of this cache.
+      mFolder->DiscardOfflineMsg(mMsgKey);
+    }
     nsresult rv = mListener->OnStopRequest(mChannel, status);
     mListener = nullptr;
     mChannel->Close();
     mChannel = nullptr;
-    if (NS_FAILED(status) &&
-        Preferences::GetBool("mail.discard_offline_msg_on_failure", true)) {
-      // The streaming failed, discard the offline copy of the message.
-      mFolder->DiscardOfflineMsg(mMsgKey);
-    }
     return rv;
   }
 

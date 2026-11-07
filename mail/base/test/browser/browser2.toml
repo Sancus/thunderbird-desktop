@@ -14,6 +14,7 @@ prefs = [
 ]
 subsuite = "thunderbird"
 support-files = [
+  "head_markAsRead.js",
   "files/**",
 ]
 
@@ -51,6 +52,12 @@ run-if = [
 ] # See bug 1806870.
 
 ["browser_markAsRead.js"]
+
+["browser_markAsReadIMAP.js"]
+
+["browser_markAsReadEWS.js"]
+
+["browser_markAsReadGraph.js"]
 
 ["browser_messageBodyAs.js"]
 

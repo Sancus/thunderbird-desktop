@@ -916,6 +916,27 @@ async function checkImapFcc(retry) {
   const sentCount = gSentMessages.length;
   let prompts = 0;
   let protocolAlerts = 0;
+  // Every IMAP command error reaches the mail session's feedback listeners.
+  // How it is then displayed (system notification, or a modal fallback when
+  // the alerts service fails) depends on the platform, so record the signal.
+  const commandErrors = [];
+  const feedbackListener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIMsgUserFeedbackListener"]),
+    onAlert(message, serverKey, silent) {
+      if (serverKey == incoming.key) {
+        commandErrors.push({
+          message,
+          silent,
+          smtpMessages: gSentMessages.length - sentCount,
+          serverMessages:
+            imap.daemon.getMailbox("ConfiguredSent")._messages.length,
+          prompts,
+        });
+      }
+      return false;
+    },
+    onCertError() {},
+  };
   let recoveryDialog;
   let loaded = false;
   let cleaned = false;
@@ -945,6 +966,7 @@ async function checkImapFcc(retry) {
     }
     cleaned = true;
     MailServices.mfn.removeListener(folderListener);
+    MailServices.mailSession.removeUserFeedbackListener(feedbackListener);
     if (recoveryDialog && !recoveryDialog.closed) {
       recoveryDialog.close();
     }
@@ -970,13 +992,14 @@ async function checkImapFcc(retry) {
     folderListener,
     MailServices.mfn.msgAdded | MailServices.mfn.msgsClassified
   );
+  MailServices.mailSession.addUserFeedbackListener(feedbackListener);
   let recovery = Promise.resolve();
   let dialogObserver = null;
   if (retry) {
     imap.daemon.commandToFail = "APPEND";
-    // The protocol alert and the copy recovery prompt come from separate
-    // main-thread events, so either dialog may load first (macOS aarch64
-    // loads the recovery prompt first). Observe both windows once each.
+    // A modal protocol alert is only the fallback display of the recorded
+    // command error, and it may load before or after the copy recovery
+    // prompt. Observe both windows once each.
     recovery = new Promise((resolve, reject) => {
       const handle = async win => {
         recoveryDialog = win;
@@ -997,7 +1020,11 @@ async function checkImapFcc(retry) {
           Assert.equal(
             protocolAlerts,
             1,
-            "The rejected APPEND reports one command error"
+            "The rejected APPEND shows at most one modal command error"
+          );
+          Assert.ok(
+            commandErrors.some(error => error.message == text),
+            "The modal alert displays the recorded command error"
           );
         } else {
           prompts++;
@@ -1033,8 +1060,8 @@ async function checkImapFcc(retry) {
                 return;
               }
               handle(win).then(() => {
-                // The recovery prompt completes the flow. The protocol alert
-                // is optional: Try environments do not show it at all.
+                // The recovery prompt completes the flow; the command error
+                // itself is checked through the feedback listener below.
                 if (prompts == 1) {
                   resolve();
                 }
@@ -1171,11 +1198,43 @@ async function checkImapFcc(retry) {
   if (dialogObserver) {
     Services.ww.unregisterNotification(dialogObserver);
   }
-  // A protocol alert, when shown at all, may follow the copy retry.
+  info("S375_FCC_COMMAND_ERRORS=" + JSON.stringify(commandErrors));
+  Assert.equal(
+    commandErrors.length,
+    retry ? 1 : 0,
+    "The rejected APPEND reports exactly one command error"
+  );
+  if (retry) {
+    const [error] = commandErrors;
+    Assert.stringContains(
+      error.message,
+      "APPEND failed.",
+      "The original server rejection reaches the user"
+    );
+    Assert.ok(
+      !error.silent,
+      "The command error is not a silent background alert"
+    );
+    Assert.equal(
+      error.smtpMessages,
+      1,
+      "The command error occurs after one SMTP send"
+    );
+    Assert.equal(
+      error.serverMessages,
+      0,
+      "The original failed command has not stored an FCC"
+    );
+    Assert.equal(
+      error.prompts,
+      0,
+      "The command error is reported before copy recovery is offered"
+    );
+  }
   Assert.lessOrEqual(
     protocolAlerts,
-    retry ? 1 : 0,
-    "The rejected APPEND reports at most one command error"
+    commandErrors.length,
+    "A modal alert appears only as the display of a recorded command error"
   );
   await cleanup();
 }

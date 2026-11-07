@@ -659,6 +659,7 @@ nsresult nsImapOfflineSync::CompleteNativeFolderDelete(nsIURI* url,
   using namespace mozilla::mailnews;
   RefPtr<nsImapOfflineSync> self(this);
   nsCOMPtr<nsIMsgFolder> folder = m_currentFolder;
+  (void)folder;
   auto attempt = std::move(mNativeFolderDelete);
   bool refresh = mNativeFolderRefreshing;
   mNativeFolderDeleteUrl = nullptr;
@@ -822,6 +823,7 @@ nsresult nsImapOfflineSync::ContinueNativeMove(
     // The native output is filled before removal callbacks. Keep this object
     // and its original folder alive and refuse same-object playback reentry.
     nsCOMPtr<nsIMsgFolder> folder = m_currentFolder;
+    (void)folder;
     mozilla::AutoRestore<bool> guard(mNativeReplayCompleting);
     mNativeReplayCompleting = true;
     rv = core->MessageDB().SettleOfflineMove(attempt, settlement);

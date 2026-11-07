@@ -9378,7 +9378,7 @@ nsresult nsImapMailFolder::PrepareAcceptedAppendDiscovery(nsImapUrl* url) {
   nsTArray<nsImapUrl::AcceptedAppendInput> inputs;
   auto cleanup = mozilla::MakeScopeExit([&] {
     for (const auto& input : inputs) {
-      nsresult rv = input.snapshot->Remove(false);
+      [[maybe_unused]] nsresult rv = input.snapshot->Remove(false);
       NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
                            "Accepted APPEND snapshot cleanup failed");
     }
@@ -9416,7 +9416,7 @@ nsresult nsImapMailFolder::PrepareAcceptedAppendDiscovery(nsImapUrl* url) {
     nsCOMPtr<nsIInputStream> source;
     MOZ_TRY(GetMsgInputStream(header, getter_AddRefs(source)));
     auto close = mozilla::MakeScopeExit([&] {
-      nsresult rv = source->Close();
+      [[maybe_unused]] nsresult rv = source->Close();
       NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
                            "Accepted APPEND source cleanup failed");
     });

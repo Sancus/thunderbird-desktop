@@ -137,6 +137,174 @@ registerCleanupFunction(async function () {
   Services.focus.focusedWindow = window;
 });
 
+add_task(function test_statusActivityPauseResumeAccounting() {
+  const feedback = window.MsgStatusFeedback;
+  const manager = Cc["@mozilla.org/activity-manager;1"].getService(
+    Ci.nsIActivityManager
+  );
+  const states = Ci.nsIActivityProcess;
+  const baseline = feedback._startRequests;
+  const processes = Array.from({ length: 4 }, () =>
+    Cc["@mozilla.org/activity-process;1"].createInstance(states)
+  );
+  const [paused, running, waiting, completed] = processes;
+  for (const process of processes) {
+    process.init("Attachment activity lifecycle", null);
+  }
+  try {
+    paused.state = states.STATE_PAUSED;
+    waiting.state = states.STATE_WAITINGFORRETRY;
+    completed.state = states.STATE_COMPLETED;
+    manager.addActivity(paused);
+    manager.addActivity(waiting);
+    manager.addActivity(completed);
+    Assert.equal(
+      feedback._startRequests,
+      baseline,
+      "Initially idle processes do not request busy UI"
+    );
+    Assert.ok(
+      feedback._activeProcesses.includes(paused),
+      "A paused process retains its resume listener"
+    );
+    Assert.ok(
+      feedback._activeProcesses.includes(waiting),
+      "A waiting process retains its retry listener"
+    );
+    Assert.ok(
+      !feedback._activeProcesses.includes(completed),
+      "An initially terminal process is released"
+    );
+
+    manager.addActivity(running);
+    Assert.equal(
+      feedback._startRequests,
+      baseline + 1,
+      "A running process contributes one request"
+    );
+    paused.state = states.STATE_INPROGRESS;
+    Assert.equal(
+      feedback._startRequests,
+      baseline + 2,
+      "Resuming adds a separate overlapping request"
+    );
+    paused.state = states.STATE_PAUSED;
+    Assert.equal(
+      feedback._startRequests,
+      baseline + 1,
+      "Pausing leaves the other process busy"
+    );
+    paused.state = states.STATE_WAITINGFORINPUT;
+    Assert.equal(
+      feedback._startRequests,
+      baseline + 1,
+      "Moving between idle states does not stop other work"
+    );
+    paused.state = states.STATE_INPROGRESS;
+    Assert.equal(
+      feedback._startRequests,
+      baseline + 2,
+      "Input completion resumes the existing listener"
+    );
+    paused.state = states.STATE_WAITINGFORRETRY;
+    Assert.equal(
+      feedback._startRequests,
+      baseline + 1,
+      "Retry waiting releases only its running request"
+    );
+    paused.state = states.STATE_INPROGRESS;
+    Assert.equal(
+      feedback._startRequests,
+      baseline + 2,
+      "Retry resumes exactly one request"
+    );
+    paused.state = states.STATE_INPROGRESS;
+    Assert.equal(
+      feedback._startRequests,
+      baseline + 2,
+      "Repeated running state does not duplicate a request"
+    );
+    paused.state = states.STATE_COMPLETED;
+    Assert.equal(
+      feedback._startRequests,
+      baseline + 1,
+      "Completion balances the resumed request"
+    );
+    Assert.ok(
+      !feedback._activeProcesses.includes(paused),
+      "Completion releases the listener"
+    );
+    manager.removeActivity(paused.id);
+    Assert.equal(
+      feedback._startRequests,
+      baseline + 1,
+      "Later completed removal preserves overlapping work"
+    );
+
+    waiting.state = states.STATE_INPROGRESS;
+    Assert.equal(
+      feedback._startRequests,
+      baseline + 2,
+      "An initially waiting process can resume"
+    );
+    waiting.state = states.STATE_CANCELED;
+    Assert.equal(
+      feedback._startRequests,
+      baseline + 1,
+      "Cancellation balances a running request"
+    );
+    Assert.ok(
+      !feedback._activeProcesses.includes(waiting),
+      "Cancellation releases the listener"
+    );
+    manager.removeActivity(waiting.id);
+    manager.removeActivity(completed.id);
+    Assert.equal(
+      feedback._startRequests,
+      baseline + 1,
+      "Terminal removals do not consume another request"
+    );
+
+    running.state = states.STATE_PAUSED;
+    Assert.equal(
+      feedback._startRequests,
+      baseline,
+      "The last pause restores the original request count"
+    );
+    Assert.ok(
+      manager.containsActivity(running.id),
+      "A legitimate paused activity remains in the manager"
+    );
+    manager.removeActivity(running.id);
+    Assert.equal(
+      feedback._startRequests,
+      baseline,
+      "Removing a paused activity does not stop unrelated work"
+    );
+    Assert.ok(
+      !feedback._activeProcesses.includes(running),
+      "Paused removal releases its listener"
+    );
+  } finally {
+    for (const process of processes) {
+      if (manager.containsActivity(process.id)) {
+        if (
+          process.state != states.STATE_COMPLETED &&
+          process.state != states.STATE_CANCELED
+        ) {
+          process.state = states.STATE_CANCELED;
+        }
+        manager.removeActivity(process.id);
+      }
+    }
+  }
+  Assert.equal(
+    feedback._startRequests,
+    baseline,
+    "Only test-owned requests have been released"
+  );
+});
+
 function createMockedHandler(type, preferredAction, alwaysAskBeforeHandling) {
   info(`Creating handler for ${type}`);
 

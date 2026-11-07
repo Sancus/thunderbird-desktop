@@ -688,7 +688,7 @@ nsMsgStatusFeedback.prototype = {
     } else if (activity instanceof Ci.nsIActivityProcess) {
       this._activeProcesses.push(activity);
       activity.addListener(this);
-      this.startMeteors();
+      this.onStateChanged(activity, Ci.nsIActivityProcess.STATE_NOTSTARTED);
     }
   },
 
@@ -700,10 +700,9 @@ nsMsgStatusFeedback.prototype = {
   },
 
   /**
-   * Balance the startMeteors() call we made for this process in
-   * onAddedActivity(), at most once per process.
+   * Remove a process listener and balance its running request, if any.
    *
-   * @param {nsIActivityProcess} process
+   * @param {nsIActivityProcess} process - The tracked process to release.
    */
   _releaseProcess(process) {
     const index = this._activeProcesses.indexOf(process);
@@ -712,23 +711,34 @@ nsMsgStatusFeedback.prototype = {
     }
     this._activeProcesses.splice(index, 1);
     process.removeListener(this);
-    this.stopMeteors();
+    if (process.state == Ci.nsIActivityProcess.STATE_INPROGRESS) {
+      this.stopMeteors();
+    }
   },
 
   // nsIActivityListener
-  onStateChanged(aActivity) {
-    // Each activity module is individually responsible for calling
-    // removeActivity() once its process is done, and the activity manager only
-    // prunes finished processes when the user clears the Activity Manager
-    // list. A module that forgets would otherwise leave the progress meter
-    // spinning -- and repainting -- for the lifetime of the window, so stop
-    // tracking a process as soon as it reaches a state it cannot leave.
+  onStateChanged(aActivity, aOldState) {
+    if (!this._activeProcesses.includes(aActivity)) {
+      return;
+    }
+    // Paused and waiting processes remain tracked so they can resume, but only
+    // running processes contribute a busy request.
+    if (aActivity.state != aOldState) {
+      if (aActivity.state == Ci.nsIActivityProcess.STATE_INPROGRESS) {
+        this.startMeteors();
+      } else if (aOldState == Ci.nsIActivityProcess.STATE_INPROGRESS) {
+        this.stopMeteors();
+      }
+    }
+    // Terminal processes cannot resume. Later manager removal must not stop
+    // another process or an independent status-feedback request.
     if (
       aActivity.state == Ci.nsIActivityProcess.STATE_COMPLETED ||
       aActivity.state == Ci.nsIActivityProcess.STATE_CANCELED
     ) {
       this._releaseProcess(aActivity);
     }
+    this.updateProgress();
   },
 
   onProgressChanged(aActivity, aStatusText) {

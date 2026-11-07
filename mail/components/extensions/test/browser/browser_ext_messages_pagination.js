@@ -1475,7 +1475,8 @@ add_task(async function test_folderEnumerationErrorAndCancelledRead() {
   try {
     await extension.startup();
     await extension.awaitMessage("cancel-ready");
-    const list = messageListTracker.createList(extension.extension);
+    const nativeExtension = WebExtensionPolicy.getByID(extension.id).extension;
+    const list = messageListTracker.createList(nativeExtension);
     let reads = 0;
     const headers = [...actual.messages];
     await messageListTracker._addMessages(

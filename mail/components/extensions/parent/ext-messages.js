@@ -1994,11 +1994,18 @@ this.messages = class extends ExtensionAPIPersistent {
                 null
               );
             });
-            if (newKey === null) {
-              throw new Error("Copy completed without a destination key");
-            }
-            let msgHdr =
-              addedMessages.get(newKey) || database.getMsgHdrForKey(newKey);
+            const findPublishedHeader = () => {
+              if (newKey === null) {
+                return null;
+              }
+              return (
+                addedMessages.get(newKey) ||
+                (database.containsKey(newKey)
+                  ? database.getMsgHdrForKey(newKey)
+                  : null)
+              );
+            };
+            let msgHdr = findPublishedHeader();
             if (!msgHdr && serverType == "imap" && !offlineFolderListenerType) {
               await new Promise((resolve, reject) => {
                 destinationFolder
@@ -2014,8 +2021,34 @@ this.messages = class extends ExtensionAPIPersistent {
                     },
                   });
               });
-              msgHdr =
-                addedMessages.get(newKey) || database.getMsgHdrForKey(newKey);
+              msgHdr = findPublishedHeader();
+            }
+            if (newKey === null) {
+              // The legacy offline copy listener may omit setMessageKey.
+              // Accept only one physical publication observed during this
+              // operation, never a Message-ID search through existing mail.
+              const published = [...addedMessages.values()].filter(
+                header => messageId && header.messageId == messageId
+              );
+              if (published.length != 1) {
+                throw new Error("Copy completed without a destination key");
+              }
+              [msgHdr] = published;
+              const expectedBytes = new Uint8Array(await file.arrayBuffer());
+              const stored = await new MsgHdrProcessor(msgHdr, {
+                strFormat: "binarystring",
+              }).getOriginalMessage();
+              if (
+                stored.length != expectedBytes.length ||
+                expectedBytes.some(
+                  (byte, index) => byte != stored.charCodeAt(index)
+                )
+              ) {
+                throw new Error(
+                  "Imported physical message does not match file"
+                );
+              }
+              newKey = msgHdr.messageKey;
             }
             if (
               destinationFolder.msgDatabase !== database ||

@@ -83,9 +83,20 @@ add_task(async function test_query() {
 
       const rootFolder = _account.rootFolder;
 
+      // Temporary bounded diagnosis of the native IMAP New-state divergence.
+      // These snapshots do not change any query assertion or expected value.
+      if (accountType == "imap") {
+        await window.sendMessage("diagnose-native-status", "before-junk");
+      }
       // Mark two messages in folder1 as junk.
       await browser.messages.update(messages1.messages[4].id, { junk: true });
+      if (accountType == "imap") {
+        await window.sendMessage("diagnose-native-status", "after-first-junk");
+      }
       await browser.messages.update(messages1.messages[5].id, { junk: true });
+      if (accountType == "imap") {
+        await window.sendMessage("diagnose-native-status", "after-second-junk");
+      }
 
       // Mark a message in folder1 as read and unread again, to force a difference
       // between read and new.
@@ -99,6 +110,12 @@ add_task(async function test_query() {
         const msg = await browser.messages.get(messages1.messages[2].id);
         return !msg.read;
       }, `Message should have been marked as not read.`);
+      if (accountType == "imap") {
+        await window.sendMessage(
+          "diagnose-native-status",
+          "after-read-roundtrip"
+        );
+      }
 
       // Query messages from test1. No messages from test2 should be returned.
       // We'll use these messages as a reference for further tests.
@@ -412,6 +429,24 @@ add_task(async function test_query() {
     },
   });
 
+  extension.onMessage("diagnose-native-status", phase => {
+    const database = subFolders.test1.msgDatabase;
+    info(
+      "S378_NATIVE_STATUS " +
+        JSON.stringify({
+          phase,
+          newList: database.getNewList(),
+          messages: messages.map(header => ({
+            key: header.messageKey,
+            flags: header.flags,
+            read: header.isRead,
+            junk: header.getStringProperty("junkscore"),
+            keywords: header.getStringProperty("keywords"),
+          })),
+        })
+    );
+    extension.sendMessage();
+  });
   await extension.startup();
   extension.sendMessage(account.key);
   await extension.awaitFinish("finished");

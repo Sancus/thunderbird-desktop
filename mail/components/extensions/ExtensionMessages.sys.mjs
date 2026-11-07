@@ -1900,14 +1900,30 @@ export class MessageTracker extends EventEmitter {
           const folder = MailServices.folderLookup.getFolderForURL(
             data.folderURI
           );
-          const replacement = folder?.msgDatabase.getMsgHdrForKey(
-            data.newMessageKey
-          );
-          if (replacement) {
-            this._set(oldId, this.getIdentifier(replacement));
-          } else {
-            this._remove(this._messages.get(oldId));
+          const previous = this._messages.get(oldId);
+          const database = folder?.msgDatabase;
+          const epoch =
+            folder?.server.type == "imap"
+              ? database.dBFolderInfo.imapUidValidity
+              : null;
+          if (
+            !previous ||
+            previous.database !== database ||
+            previous.uidValidity !== epoch
+          ) {
+            if (previous) {
+              this._remove(previous);
+            }
+            return;
           }
+          // The copy listener can announce this key before its header is
+          // published. Retain the selected source, epoch and Message-ID;
+          // getMessage still requires the actual live replacement to match all
+          // of them before exposing it. Do not read an unpublished key here.
+          this._set(oldId, {
+            ...previous,
+            messageKey: data.newMessageKey,
+          });
           automationOnlyLog(
             "attachment-delete-msgkey-changed",
             `associating new key ${data.newMessageKey} with id ${oldId}`

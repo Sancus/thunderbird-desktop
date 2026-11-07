@@ -1011,3 +1011,704 @@ registerCleanupFunction(() => {
   // Remove created folders.
   folder.deleteSelf(null);
 });
+
+/**
+ * Creates two stored copies with the same Message-ID and distinct attachments.
+ *
+ * @param {string} name - Unique folder prefix.
+ * @param {number} [partCount=1] - One or two real displayed attachment parts.
+ * @returns {Promise<object>} Selected attachment, physical headers and folders.
+ */
+async function selectedDetachFixture(name, partCount = 1) {
+  const folders = [];
+  const headers = [];
+  for (const index of [0, 1]) {
+    const created = await create_folder(name + index);
+    registerCleanupFunction(async () => {
+      const tabmail = document.getElementById("tabmail");
+      const mailTab = tabmail.tabInfo.find(
+        tab => tab.mode.name == "mail3PaneTab"
+      );
+      Assert.ok(mailTab, "Owned source cleanup retains a live mail tab");
+      tabmail.switchToTab(mailTab);
+      const {
+        get_about_3pane,
+        get_about_message: cleanupGetAboutMessage,
+        select_none,
+        wait_for_blank_content_pane,
+      } = ChromeUtils.importESModule(
+        "resource://testing-common/mail/FolderDisplayHelpers.sys.mjs"
+      );
+      const { MailServices } = ChromeUtils.importESModule(
+        "resource:///modules/MailServices.sys.mjs"
+      );
+      const pane = get_about_3pane();
+      const reader = cleanupGetAboutMessage();
+      if (
+        pane.gFolder == created ||
+        (reader.gMessageURI && reader.gFolder == created)
+      ) {
+        if (pane.gDBView?.selection) {
+          await select_none();
+        } else {
+          reader.displayMessage();
+          await wait_for_blank_content_pane();
+        }
+        await be_in_folder(MailServices.accounts.localFoldersServer.rootFolder);
+      }
+      created.deleteSelf(null);
+    });
+    const message = create_message({
+      subject: name + index,
+      attachments: [
+        { body: "detach-copy-" + index, filename: "selected.txt", format: "" },
+        ...(partCount == 2
+          ? [
+              {
+                body: "second-copy-" + index,
+                filename: "second.txt",
+                format: "",
+              },
+            ]
+          : []),
+      ],
+    });
+    message.messageId = "same-detach-copy@example.invalid";
+    await add_message_to_folder([created], message);
+    folders.push(created);
+    headers.push(Array.from(created.messages)[0]);
+  }
+  const native = Services.prefs.getBoolPref("mail.panorama.enabled", false);
+  const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIMsgDBService
+  );
+  Assert.equal(service instanceof Ci.nsIDatabaseCore, native);
+  Assert.equal(headers[0].messageId, headers[1].messageId);
+  await be_in_folder(folders[1]);
+  aboutMessage = get_about_message();
+  await select_click_row(0);
+  const attachment = aboutMessage.currentAttachments[0];
+  Assert.equal(attachment.message.messageKey, headers[1].messageKey);
+  Assert.equal(attachment.uri, folders[1].getUriForMsg(headers[1]));
+  return {
+    folders,
+    headers,
+    attachment,
+    attachments: [...aboutMessage.currentAttachments],
+  };
+}
+
+/**
+ * Removes only fixture-owned download entries and their partial-data state.
+ *
+ * @param {string[]} paths - Exact target paths saved by this fixture.
+ */
+async function removeDetachDownloads(paths) {
+  const { Downloads } = ChromeUtils.importESModule(
+    "resource://gre/modules/Downloads.sys.mjs"
+  );
+  const list = await Downloads.getList(Downloads.ALL);
+  for (const download of await list.getAll()) {
+    if (paths.includes(download.target.path)) {
+      await list.remove(download);
+      await download.finalize(true);
+    }
+  }
+}
+
+/**
+ * Reads the real stored parent through its ordinary local-only message service.
+ *
+ * @param {nsIMsgDBHdr} header - Selected physical header.
+ * @returns {Promise<string>} The complete stored RFC822 message.
+ */
+async function readDetachParent(header) {
+  const { MailServices } = ChromeUtils.importESModule(
+    "resource:///modules/MailServices.sys.mjs"
+  );
+  const { PromiseTestUtils } = ChromeUtils.importESModule(
+    "resource://testing-common/mailnews/PromiseTestUtils.sys.mjs"
+  );
+  const uri = header.folder.getUriForMsg(header);
+  const listener = new PromiseTestUtils.PromiseStreamListener();
+  MailServices.messageServiceFromURI(uri).streamMessage(
+    uri,
+    listener,
+    null,
+    null,
+    false,
+    "",
+    true
+  );
+  try {
+    return await listener.promise;
+  } finally {
+    listener._stream?.close();
+    listener._stream = null;
+  }
+}
+
+/**
+ * Checks strip and replacement-copy failures against a normally stored parent.
+ * Faults use the native storage connection, without manufacturing message rows.
+ */
+async function assertNativeDetachFailureRollback() {
+  const { folders, headers, attachment } =
+    await selectedDetachFixture("DetachFailure");
+  const selected = headers[1];
+  const original = await readDetachParent(selected);
+  const token = selected.storeToken;
+  const flags = selected.flags;
+  const core = Cc["@mozilla.org/mailnews/database-core;1"].getService(
+    Ci.nsIDatabaseCore
+  );
+  const connection = core.connectionForTests;
+  const { AttachmentInfo } = ChromeUtils.importESModule(
+    "resource:///modules/AttachmentInfo.sys.mjs"
+  );
+  // Every normal header remains real. Only its lower storage-property query is
+  // faulted, so the command must preserve the native getter's actual nsresult.
+  connection.executeSimpleSQL(
+    "CREATE TEMP VIEW message_properties AS SELECT id,name,CASE WHEN id=" +
+      selected.messageKey +
+      " AND name='storeToken' THEN abs(-9223372036854775808) ELSE value END AS value FROM main.message_properties"
+  );
+  try {
+    let expected;
+    try {
+      Reflect.get(selected, "storeToken");
+    } catch (error) {
+      expected = error.result;
+    }
+    Assert.ok(
+      typeof expected == "number" && !Components.isSuccessCode(expected),
+      "Native storage getter actually failed"
+    );
+    await Assert.rejects(
+      AttachmentInfo.deleteAttachments(selected, [attachment]),
+      error => error.result == expected,
+      "Native preflight retains the reached original body-storage failure"
+    );
+  } finally {
+    connection.executeSimpleSQL("DROP VIEW temp.message_properties");
+  }
+  Assert.equal(await readDetachParent(selected), original);
+  Assert.equal(selected.storeToken, token);
+  Assert.equal(selected.flags, flags);
+  Assert.equal(folders[1].getTotalMessages(false), 1);
+  const dir = await IOUtils.createUniqueDirectory(
+    PathUtils.tempDir,
+    "failed-selected-detach"
+  );
+  const target = PathUtils.join(dir, "selected.txt");
+  const staging = async () =>
+    (await IOUtils.getChildren(PathUtils.tempDir))
+      .filter(p => PathUtils.filename(p).startsWith("tmp-msg"))
+      .sort();
+  const before = await staging();
+  connection.executeSimpleSQL(
+    "CREATE TEMP TRIGGER attachment_copy_failure BEFORE INSERT ON main.messages WHEN NEW.folderId=" +
+      folders[1].id +
+      " BEGIN SELECT RAISE(ABORT,'attachment replacement copy failed'); END"
+  );
+  try {
+    await Assert.rejects(
+      AttachmentInfo.detachAttachments(selected, [attachment], dir),
+      error => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT,
+      "Replacement-copy terminal failure retains its native storage result"
+    );
+    Assert.deepEqual(
+      await staging(),
+      before,
+      "Failed replacement removed its staging EML"
+    );
+    Assert.equal(
+      await readDetachParent(selected),
+      original,
+      "Copy failure keeps the exact original body"
+    );
+    Assert.equal(selected.storeToken, token);
+    Assert.equal(selected.flags, flags);
+    Assert.ok(folders[1].msgDatabase.containsKey(selected.messageKey));
+    Assert.equal(
+      folders[1].getTotalMessages(false),
+      1,
+      "No replacement was published"
+    );
+    Assert.equal(
+      folders[0].getTotalMessages(false),
+      1,
+      "Other physical copy was untouched"
+    );
+    Assert.equal(
+      await IOUtils.readUTF8(target),
+      "detach-copy-1",
+      "A completed attachment save is still its actual selected bytes"
+    );
+  } finally {
+    connection.executeSimpleSQL("DROP TRIGGER attachment_copy_failure");
+    await removeDetachDownloads([target]);
+    await IOUtils.remove(dir, { recursive: true });
+    for (const path of await staging()) {
+      if (!before.includes(path)) {
+        await IOUtils.remove(path, { ignoreAbsent: true });
+      }
+    }
+  }
+}
+
+/**
+ * Invalidates a real retained selection after actual replacement publication and
+ * staging cleanup, before the consumer is allowed to delete the original.
+ */
+async function assertNativeDetachDeleteHandoff() {
+  const { folders, headers, attachment } =
+    await selectedDetachFixture("DetachHandoff");
+  const selected = headers[1];
+  const original = await readDetachParent(selected);
+  const token = selected.storeToken;
+  const flags = selected.flags;
+  const dir = await IOUtils.createUniqueDirectory(
+    PathUtils.tempDir,
+    "detach-handoff"
+  );
+  const target = PathUtils.join(dir, "selected.txt");
+  const { AttachmentInfo } = ChromeUtils.importESModule(
+    "resource:///modules/AttachmentInfo.sys.mjs"
+  );
+  const attachmentIO = Cu.getGlobalForObject(AttachmentInfo).IOUtils;
+  Assert.ok(attachmentIO, "Observe the actual module's IO namespace");
+  const remove = attachmentIO.remove;
+  let changedAtHandoff = false;
+  attachmentIO.remove = async function (path, options) {
+    const result = await remove.call(attachmentIO, path, options);
+    if (!changedAtHandoff && PathUtils.filename(path).startsWith("tmp-msg")) {
+      Assert.equal(
+        folders[1].getTotalMessages(false),
+        2,
+        "Actual replacement was published before staging cleanup finished"
+      );
+      attachment.message = headers[0];
+      changedAtHandoff = true;
+    }
+    return result;
+  };
+  try {
+    await Assert.rejects(
+      AttachmentInfo.detachAttachments(selected, [attachment], dir),
+      error => error.result == Cr.NS_ERROR_NOT_AVAILABLE,
+      "Changed selection refuses the destructive post-copy handoff"
+    );
+    Assert.ok(
+      changedAtHandoff,
+      "The real awaited staging cleanup reached the targeted handoff"
+    );
+    Assert.ok(folders[1].msgDatabase.containsKey(selected.messageKey));
+    Assert.equal(
+      await readDetachParent(selected),
+      original,
+      "The exact original body survives invalidation after copy"
+    );
+    Assert.equal(selected.storeToken, token);
+    Assert.equal(selected.flags, flags);
+    Assert.equal(
+      folders[1].getTotalMessages(false),
+      2,
+      "Completed replacement and original are retained consistently on deletion refusal"
+    );
+    const replacement = Array.from(folders[1].messages).find(
+      header => header.messageKey != selected.messageKey
+    );
+    Assert.ok(replacement);
+    Assert.equal(replacement.folder, folders[1]);
+    Assert.ok(
+      (await readDetachParent(replacement)).includes(
+        "X-Mozilla-External-Attachment-URL: " + PathUtils.toFileURI(target)
+      )
+    );
+    Assert.equal(await IOUtils.readUTF8(target), "detach-copy-1");
+    Assert.equal(
+      folders[0].getTotalMessages(false),
+      1,
+      "Other real physical parent was untouched"
+    );
+  } finally {
+    attachmentIO.remove = remove;
+    attachment.message = selected;
+    try {
+      await removeDetachDownloads([target]);
+    } finally {
+      await IOUtils.remove(dir, { recursive: true, retryReadonly: true });
+    }
+  }
+}
+
+/**
+ * Refuses saved-byte/body mismatch during the real confirmation and multi-save
+ * intervals while preserving the currently stored physical parent.
+ */
+async function assertNativeDetachSavedBodyHandoff() {
+  const { AttachmentInfo } = ChromeUtils.importESModule(
+    "resource:///modules/AttachmentInfo.sys.mjs"
+  );
+  for (const mode of ["confirmation", "multiSave"]) {
+    const { folders, headers, attachment, attachments } =
+      await selectedDetachFixture(
+        "DetachSavedBody" + mode,
+        mode == "multiSave" ? 2 : 1
+      );
+    const selected = headers[1];
+    const original = await readDetachParent(selected);
+    const storage = {
+      token: selected.storeToken,
+      size: selected.messageSize,
+      offlineSize: selected.offlineMessageSize,
+    };
+    const donor = folders[1]
+      .QueryInterface(Ci.nsIMsgLocalMailFolder)
+      .addMessage(
+        original
+          .replace("detach-copy-1", "changed-detach-body-longer")
+          .replace("second-copy-1", "changed-second-body-longer")
+      );
+    const changedBody = await readDetachParent(donor);
+    const change = () => {
+      selected.storeToken = donor.storeToken;
+      selected.messageSize = donor.messageSize;
+      selected.offlineMessageSize = donor.offlineMessageSize;
+    };
+    const dir = await IOUtils.createUniqueDirectory(
+      PathUtils.tempDir,
+      "saved-body-handoff"
+    );
+    const target = PathUtils.join(dir, "selected.txt");
+    const laterTarget = PathUtils.join(dir, "second.txt");
+    const laterSave = attachments[1]?.saveToFile;
+    let changedDuringCommand = false;
+    try {
+      if (mode == "confirmation") {
+        const pickerFactory = MockFilePicker.factory;
+        Assert.ok(pickerFactory);
+        MockFilePicker.reset();
+        const file = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+        file.initWithPath(target);
+        MockFilePicker.setFiles([file]);
+        MockFilePicker.returnValue = Ci.nsIFilePicker.returnOK;
+        const confirmation = BrowserTestUtils.promiseAlertDialogOpen(
+          "",
+          "chrome://global/content/commonDialog.xhtml",
+          {
+            callback(win) {
+              change();
+              changedDuringCommand = true;
+              win.document.querySelector("dialog").acceptDialog();
+            },
+          }
+        );
+        await Assert.rejects(
+          attachment.detachFromMessage(aboutMessage.browsingContext),
+          error => error.result == Cr.NS_ERROR_NOT_AVAILABLE,
+          "Real confirmation cannot strip a different body from the saved bytes"
+        );
+        await confirmation;
+        Assert.equal(MockFilePicker.factory, pickerFactory);
+      } else {
+        attachments[1].saveToFile = async function (...args) {
+          change();
+          changedDuringCommand = true;
+          return laterSave.apply(this, args);
+        };
+        await Assert.rejects(
+          AttachmentInfo.detachAttachments(selected, attachments, dir),
+          error => error.result == Cr.NS_ERROR_NOT_AVAILABLE,
+          "A later part save cannot replace the body consumed by an earlier save"
+        );
+        Assert.equal(
+          await IOUtils.readUTF8(laterTarget),
+          "changed-second-body-longer"
+        );
+      }
+      Assert.ok(changedDuringCommand);
+      Assert.equal(
+        await IOUtils.readUTF8(target),
+        "detach-copy-1",
+        "Earlier output retains its actual original part bytes"
+      );
+      Assert.ok(folders[1].msgDatabase.containsKey(selected.messageKey));
+      Assert.equal(
+        await readDetachParent(selected),
+        changedBody,
+        "The changed current parent is retained, not stripped or deleted"
+      );
+      Assert.equal(
+        folders[1].getTotalMessages(false),
+        2,
+        "No replacement was published"
+      );
+    } finally {
+      if (attachments[1]) {
+        attachments[1].saveToFile = laterSave;
+      }
+      if (mode == "confirmation") {
+        MockFilePicker.reset();
+      }
+      if (folders[1].msgDatabase.containsKey(selected.messageKey)) {
+        selected.storeToken = storage.token;
+        selected.messageSize = storage.size;
+        selected.offlineMessageSize = storage.offlineSize;
+      }
+      try {
+        await removeDetachDownloads([target, laterTarget]);
+      } finally {
+        await IOUtils.remove(dir, { recursive: true, retryReadonly: true });
+      }
+    }
+    Assert.equal(await readDetachParent(selected), original);
+  }
+}
+
+add_task(async function test_nativeDetachKeepsSelectedPhysicalMessage() {
+  const { folders, headers, attachment } =
+    await selectedDetachFixture("NativeDetach");
+  const firstToken = headers[0].storeToken;
+  const selectedMessageId = headers[1].messageId;
+  const dir = await IOUtils.createUniqueDirectory(
+    PathUtils.tempDir,
+    "selected-detach"
+  );
+  const { AttachmentInfo } = ChromeUtils.importESModule(
+    "resource:///modules/AttachmentInfo.sys.mjs"
+  );
+  try {
+    await AttachmentInfo.detachAttachments(headers[1], [attachment], dir);
+    Assert.equal(
+      await IOUtils.readUTF8(PathUtils.join(dir, "selected.txt")),
+      "detach-copy-1"
+    );
+    Assert.ok(
+      !folders[1].msgDatabase.containsKey(headers[1].messageKey),
+      "Original row was replaced after success"
+    );
+    Assert.equal(
+      folders[1].getTotalMessages(false),
+      1,
+      "Exactly one replacement remains"
+    );
+    const replacement = Array.from(folders[1].messages)[0];
+    Assert.equal(replacement.messageId, selectedMessageId);
+    Assert.notEqual(replacement.messageKey, headers[1].messageKey);
+    await select_click_row(0);
+    Assert.equal(
+      aboutMessage.currentAttachments[0].url,
+      PathUtils.toFileURI(PathUtils.join(dir, "selected.txt"))
+    );
+    Assert.ok(folders[0].msgDatabase.containsKey(headers[0].messageKey));
+    Assert.equal(headers[0].storeToken, firstToken);
+    await be_in_folder(folders[0]);
+    await select_click_row(0);
+    Assert.equal(
+      new TextDecoder().decode(
+        await aboutMessage.currentAttachments[0].fetchAttachment()
+      ),
+      "detach-copy-0"
+    );
+  } finally {
+    await removeDetachDownloads([PathUtils.join(dir, "selected.txt")]);
+    await IOUtils.remove(dir, { recursive: true });
+  }
+});
+
+add_task(async function test_attachmentDetachCancellationRetainsOriginal() {
+  const { folders, headers, attachment } =
+    await selectedDetachFixture("CancelDetach");
+  const token = headers[1].storeToken;
+  const bytes = new Uint8Array(await attachment.fetchAttachment());
+  // The earlier EML task owns this registration until its deferred cleanup.
+  // Reset per-command state without releasing or replacing that shared factory.
+  const pickerFactory = MockFilePicker.factory;
+  Assert.ok(pickerFactory, "The existing full-file picker owner is registered");
+  MockFilePicker.reset();
+  MockFilePicker.returnValue = Ci.nsIFilePicker.returnCancel;
+  try {
+    await attachment.detachFromMessage(aboutMessage.browsingContext);
+    Assert.ok(MockFilePicker.shown, "Detach asked for its save destination");
+  } finally {
+    MockFilePicker.reset();
+    Assert.equal(
+      MockFilePicker.factory,
+      pickerFactory,
+      "Original picker teardown retains ownership"
+    );
+  }
+  Assert.ok(folders[1].msgDatabase.containsKey(headers[1].messageKey));
+  Assert.equal(headers[1].storeToken, token);
+  Assert.deepEqual(new Uint8Array(await attachment.fetchAttachment()), bytes);
+  Assert.equal(folders[1].getTotalMessages(false), 1);
+  const dir = await IOUtils.createUniqueDirectory(
+    PathUtils.tempDir,
+    "cancel-selected-detach"
+  );
+  const target = PathUtils.join(dir, "selected.txt");
+  const file = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+  file.initWithPath(target);
+  MockFilePicker.reset();
+  MockFilePicker.setFiles([file]);
+  MockFilePicker.returnValue = Ci.nsIFilePicker.returnOK;
+  try {
+    const confirmation = BrowserTestUtils.promiseAlertDialogOpen("cancel");
+    const action = attachment.detachFromMessage(aboutMessage.browsingContext);
+    await Promise.all([confirmation, action]);
+    Assert.equal(await IOUtils.readUTF8(target), "detach-copy-1");
+    Assert.ok(folders[1].msgDatabase.containsKey(headers[1].messageKey));
+    Assert.equal(headers[1].storeToken, token);
+    Assert.deepEqual(new Uint8Array(await attachment.fetchAttachment()), bytes);
+    Assert.equal(
+      folders[1].getTotalMessages(false),
+      1,
+      "Confirmation cancellation retains the original physical row"
+    );
+  } finally {
+    MockFilePicker.reset();
+    Assert.equal(
+      MockFilePicker.factory,
+      pickerFactory,
+      "Original picker teardown retains ownership"
+    );
+    await removeDetachDownloads([target]);
+    await IOUtils.remove(dir, { recursive: true });
+  }
+  const { AttachmentInfo } = ChromeUtils.importESModule(
+    "resource:///modules/AttachmentInfo.sys.mjs"
+  );
+  await Assert.rejects(
+    AttachmentInfo.deleteAttachments(headers[0], [attachment]),
+    error => error.result == Cr.NS_ERROR_NOT_AVAILABLE,
+    "A different physical parent cannot receive the selected detach command"
+  );
+  Assert.equal(folders[0].getTotalMessages(false), 1);
+  if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    await assertNativeDetachFailureRollback();
+    await assertNativeDetachDeleteHandoff();
+    await assertNativeDetachSavedBodyHandoff();
+  }
+});
+
+add_task(async function test_attachmentPermissionsAndEncryptionGatesRemain() {
+  await selectedDetachFixture("PermissionDetach");
+  Assert.ok(
+    aboutMessage.CanDetachAttachments(),
+    "Ordinary local attachment can detach"
+  );
+  const originalType = aboutMessage.currentHeaderData["content-type"];
+  try {
+    for (const type of [
+      "application/pkcs7-mime",
+      "application/x-pkcs7-signature",
+    ]) {
+      aboutMessage.currentHeaderData["content-type"] = { headerValue: type };
+      Assert.ok(
+        !aboutMessage.CanDetachAttachments(),
+        "S/MIME detach remains blocked"
+      );
+    }
+  } finally {
+    aboutMessage.currentHeaderData["content-type"] = originalType;
+  }
+  const originalSecurity = aboutMessage.Enigmail.msg.securityInfo;
+  const { EnigmailConstants } = ChromeUtils.importESModule(
+    "chrome://openpgp/content/modules/constants.sys.mjs"
+  );
+  try {
+    for (const statusFlags of [
+      EnigmailConstants.PGP_MIME_SIGNED,
+      EnigmailConstants.PGP_MIME_ENCRYPTED,
+    ]) {
+      aboutMessage.Enigmail.msg.securityInfo = { statusFlags };
+      Assert.ok(
+        !aboutMessage.CanDetachAttachments(),
+        "The real OpenPGP gate refuses signed/encrypted state"
+      );
+    }
+  } finally {
+    aboutMessage.Enigmail.msg.securityInfo = originalSecurity;
+  }
+  const { AttachmentInfo } = ChromeUtils.importESModule(
+    "resource:///modules/AttachmentInfo.sys.mjs"
+  );
+  await Assert.rejects(
+    AttachmentInfo.stripAttachments(
+      { folder: { canDeleteMessages: false, URI: "denied" } },
+      new Map(),
+      "DETACH"
+    ),
+    /Cannot delete messages/,
+    "Existing delete permission remains enforced"
+  );
+  await Assert.rejects(
+    AttachmentInfo.stripAttachments(
+      {
+        folder: {
+          canDeleteMessages: true,
+          canFileMessages: false,
+          URI: "denied",
+        },
+      },
+      new Map(),
+      "DETACH"
+    ),
+    /Cannot file messages/,
+    "Existing file permission remains enforced"
+  );
+});
+
+/** Record the remaining native animation owner without changing UI state. */
+add_task(function record_attachment_cleanup_animation_owner() {
+  registerCleanupFunction(() => {
+    const tabmail = document.getElementById("tabmail");
+    const mailTab = tabmail.tabInfo.find(
+      tab => tab.mode.name == "mail3PaneTab"
+    );
+    const pane = mailTab?.chromeBrowser.contentWindow;
+    const reader = pane?.messageBrowser.contentWindow;
+    const documents = [
+      ["chrome", document],
+      ["three-pane", pane?.document],
+      ["message", reader?.document],
+    ];
+    info(
+      "ATTACHMENT_CLEANUP_ANIMATION_OWNER " +
+        JSON.stringify({
+          native: Services.prefs.getBoolPref("mail.panorama.enabled", false),
+          vsync: ChromeUtils.vsyncEnabled(),
+          feedback: {
+            started: window.MsgStatusFeedback._startRequests,
+            spinning: window.MsgStatusFeedback._meteorsSpinning,
+            startPending: window.MsgStatusFeedback._startTimeoutID != null,
+            stopPending: window.MsgStatusFeedback._stopTimeoutID != null,
+          },
+          documents: documents.map(([label, doc]) => ({
+            label,
+            uri: doc?.documentURI,
+            animations: (doc?.getAnimations() ?? []).map(animation => ({
+              name: animation.animationName,
+              state: animation.playState,
+              target: animation.effect?.target?.localName,
+              id: animation.effect?.target?.id,
+              classes: String(animation.effect?.target?.className ?? ""),
+            })),
+          })),
+          tabs: tabmail.tabInfo.map(tab => ({
+            mode: tab.mode.name,
+            busy: tab.busy,
+            uri: tab.browser?.currentURI?.spec,
+          })),
+          message: {
+            uri: reader?.gMessageURI,
+            loading:
+              reader?.getMessagePaneBrowser()?.webProgress.isLoadingDocument,
+            browserURI: reader?.getMessagePaneBrowser()?.currentURI.spec,
+          },
+        })
+    );
+  });
+});

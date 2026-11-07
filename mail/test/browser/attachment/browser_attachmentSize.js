@@ -472,3 +472,140 @@ add_task(function test_attachmentPartIdentityAcrossMessageUrls() {
     Assert.equal(attachment.url, expectedUrl, `Reader URL for ${url}`);
   }
 });
+
+add_task(async function test_selectedPhysicalMimePartsRetainNamesAndSizes() {
+  const { select_none } = ChromeUtils.importESModule(
+    "resource://testing-common/mail/FolderDisplayHelpers.sys.mjs"
+  );
+  try {
+    const copies = [];
+    const bodies = [
+      ["first-copy-text", "binary-zero\x00\xff"],
+      [
+        "selected physical text is longer",
+        "selected-binary-payload-with-extra-bytes\x00\xff",
+      ],
+    ];
+    const names = [
+      ["first-text.txt", "first-binary.bin"],
+      ["selected-text.txt", "selected-binary.bin"],
+    ];
+    Assert.equal(
+      new Set(bodies.flat().map(body => body.length)).size,
+      4,
+      "All displayed size oracles discriminate parent and part"
+    );
+    Assert.equal(new Set(names.flat()).size, 4);
+    for (const index of [0, 1]) {
+      const copyFolder = await create_folder("PhysicalMimeSize" + index);
+      registerCleanupFunction(async () => {
+        const tabmail = document.getElementById("tabmail");
+        const mailTab = tabmail.tabInfo.find(
+          tab => tab.mode.name == "mail3PaneTab"
+        );
+        Assert.ok(mailTab, "Owned source cleanup retains a live mail tab");
+        tabmail.switchToTab(mailTab);
+        const {
+          get_about_3pane,
+          get_about_message: cleanupGetAboutMessage,
+          select_none: cleanupSelectNone,
+          wait_for_blank_content_pane,
+        } = ChromeUtils.importESModule(
+          "resource://testing-common/mail/FolderDisplayHelpers.sys.mjs"
+        );
+        const { MailServices } = ChromeUtils.importESModule(
+          "resource:///modules/MailServices.sys.mjs"
+        );
+        const pane = get_about_3pane();
+        const reader = cleanupGetAboutMessage();
+        if (
+          pane.gFolder == copyFolder ||
+          (reader.gMessageURI && reader.gFolder == copyFolder)
+        ) {
+          if (pane.gDBView?.selection) {
+            await cleanupSelectNone();
+          } else {
+            reader.displayMessage();
+            await wait_for_blank_content_pane();
+          }
+          await be_in_folder(
+            MailServices.accounts.localFoldersServer.rootFolder
+          );
+        }
+        copyFolder.deleteSelf(null);
+      });
+      const message = create_message({
+        subject: "Physical MIME copy " + index,
+        attachments: [
+          {
+            body: btoa(bodies[index][0]),
+            encoding: "base64",
+            filename: names[index][0],
+          },
+          {
+            body: btoa(bodies[index][1]),
+            encoding: "base64",
+            filename: names[index][1],
+            contentType: "application/octet-stream",
+          },
+        ],
+      });
+      message.messageId = "same-mime-size@example.invalid";
+      await add_message_to_folder([copyFolder], message);
+      copies.push(copyFolder);
+    }
+    const native = Services.prefs.getBoolPref("mail.panorama.enabled", false);
+    const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+      Ci.nsIMsgDBService
+    );
+    Assert.equal(service instanceof Ci.nsIDatabaseCore, native);
+    for (const index of [1, 0]) {
+      await be_in_folder(copies[index]);
+      await select_click_row(0);
+      const view = get_about_message();
+      view.toggleAttachmentList(true);
+      const attachments = view.currentAttachments;
+      const header = Array.from(copies[index].messages)[0];
+      Assert.deepEqual(
+        attachments.map(a => a.name),
+        names[index]
+      );
+      Assert.deepEqual(
+        attachments.map(a => a.partID),
+        ["1.2", "1.3"]
+      );
+      Assert.deepEqual(
+        attachments.map(a => a.contentType),
+        ["text/plain", "application/octet-stream"]
+      );
+      for (const [partIndex, attachment] of attachments.entries()) {
+        Assert.equal(attachment.uri, copies[index].getUriForMsg(header));
+        Assert.equal(attachment.message.folder, copies[index]);
+        Assert.equal(attachment.message.messageKey, header.messageKey);
+        const expected = bodies[index][partIndex];
+        Assert.equal(
+          view.document
+            .getElementById("attachmentList")
+            .getItemAtIndex(partIndex)
+            .getAttribute("name"),
+          names[index][partIndex]
+        );
+        Assert.equal(
+          attachment.size,
+          expected.length,
+          "Displayed decoded size belongs to selected copy"
+        );
+        Assert.deepEqual(
+          new Uint8Array(await attachment.fetchAttachment()),
+          Uint8Array.from(expected, c => c.charCodeAt(0))
+        );
+        check_attachment_size(partIndex, expected.length);
+      }
+    }
+  } finally {
+    // Clear displayed MIME/attachment images while their physical parents still
+    // exist. Do not delete the currently displayed fixture during file teardown.
+    await select_none();
+    await be_in_folder(folder.rootFolder);
+  }
+});

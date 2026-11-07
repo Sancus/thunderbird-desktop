@@ -2331,7 +2331,16 @@ function startupFolderOrigin(source, summary, caches) {
   if (source.protocol !== "imap") {
     throw new Error("No native startup discovery provider for this protocol");
   }
-  const originalKey = new FileUtils.File(source.path).persistentDescriptor;
+  // Use the same strict UTF-8 cache-key projection as the existing importer.
+  // persistentDescriptor is an ACString byte sequence, not JavaScript text.
+  const originalKey = new TextDecoder("utf-8", {
+    fatal: true,
+    ignoreBOM: true,
+  }).decode(
+    MailStringUtils.byteStringToUint8Array(
+      new FileUtils.File(source.path).persistentDescriptor
+    )
+  );
   const matches = caches.flatMap(({ identity, input }) => {
     const row = input.entries.get(originalKey);
     return row ? [{ identity, row }] : [];

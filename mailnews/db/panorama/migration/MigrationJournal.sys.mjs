@@ -4,6 +4,7 @@
 
 import { AppConstants } from "resource://gre/modules/AppConstants.sys.mjs";
 import { FileUtils } from "resource://gre/modules/FileUtils.sys.mjs";
+import { MailStringUtils } from "resource:///modules/MailStringUtils.sys.mjs";
 import {
   verifyMigrationBackup,
   captureWindowsMigrationRoots,
@@ -2150,7 +2151,11 @@ function validateStartupFolderOrigin(source, caches) {
         input.cacheKeys?.includes(cache.originalKey)
     ) ||
     cache.originalKey !==
-      new FileUtils.File(source.path).persistentDescriptor ||
+      new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
+        MailStringUtils.byteStringToUint8Array(
+          new FileUtils.File(source.path).persistentDescriptor
+        )
+      ) ||
     !Number.isInteger(cache.sourceKey) ||
     cache.sourceKey < 0 ||
     cache.sourceKey > 0xffffffff ||

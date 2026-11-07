@@ -7593,7 +7593,9 @@ nsresult DatabaseCore::ImportFolderCacheMetadataV2(
     MOZ_TRY(raw->GetUTF8String(0, type));
     MOZ_TRY(raw->GetInt64(1, &size));
     MOZ_TRY(raw->GetInt32(2, &equal));
-    NS_ENSURE_TRUE(type == "blob"_ns && size == bytes.Length() && equal == 1,
+    NS_ENSURE_TRUE(type == "blob"_ns && size >= 0 &&
+                       static_cast<uint64_t>(size) == bytes.Length() &&
+                       equal == 1,
                    NS_ERROR_FILE_CORRUPTED);
     raw = nullptr;
     nsCString finalSource;
@@ -8148,7 +8150,7 @@ nsresult StartupVersion(JSContext* cx, JS::Handle<JSObject*> record) {
                  NS_ERROR_NOT_AVAILABLE);
   int32_t order;
   MOZ_TRY(comparator->Compare(current, floor, &order));
-  NS_ENSURE_TRUE(order > 0 || (order == 0 && currentBuild.Compare(build) >= 0),
+  NS_ENSURE_TRUE(order > 0 || (order == 0 && Compare(currentBuild, build) >= 0),
                  NS_ERROR_NOT_AVAILABLE);
   return NS_OK;
 }
@@ -8623,16 +8625,16 @@ nsresult StartupConfiguredRoots(nsIFile* profile,
     servers.Insert(branch);
     nsCOMPtr<nsIFile> root;
     bool relative;
-    MOZ_TRY(prefs->PrefHasUserValue((branch + "directory-rel"_ns).get(),
-                                    &relative));
+    MOZ_TRY(prefs->PrefHasUserValue(
+        nsCString(branch + "directory-rel"_ns).get(), &relative));
     if (relative) {
       nsCOMPtr<nsIRelativeFilePref> value;
-      MOZ_TRY(prefs->GetComplexValue((branch + "directory-rel"_ns).get(),
-                                     NS_GET_IID(nsIRelativeFilePref),
-                                     getter_AddRefs(value)));
+      MOZ_TRY(prefs->GetComplexValue(
+          nsCString(branch + "directory-rel"_ns).get(),
+          NS_GET_IID(nsIRelativeFilePref), getter_AddRefs(value)));
       MOZ_TRY(value->GetFile(getter_AddRefs(root)));
     } else {
-      MOZ_TRY(prefs->GetComplexValue((branch + "directory"_ns).get(),
+      MOZ_TRY(prefs->GetComplexValue(nsCString(branch + "directory"_ns).get(),
                                      NS_GET_IID(nsIFile),
                                      getter_AddRefs(root)));
     }
@@ -8646,9 +8648,9 @@ nsresult StartupConfiguredRoots(nsIFile* profile,
       StartupServerRoot binding;
       binding.key = Substring(branch, 12, branch.Length() - 13);
       MOZ_TRY(root->GetNativePath(binding.path));
-      MOZ_TRY(Preferences::GetCString((branch + "type"_ns).get(),
+      MOZ_TRY(Preferences::GetCString(nsCString(branch + "type"_ns).get(),
                                       binding.protocol));
-      Preferences::GetCString((branch + "storeContractID"_ns).get(),
+      Preferences::GetCString(nsCString(branch + "storeContractID"_ns).get(),
                               binding.contract);
       if (binding.contract.IsEmpty())
         binding.contract.AssignLiteral("@mozilla.org/msgstore/berkeleystore;1");
@@ -8744,7 +8746,7 @@ nsresult StartupBackup(JSContext* cx, ProfileStartupOperation& operation,
     nsCString source, leaf;
     MOZ_TRY(StartupText(cx, root, "source", source));
     MOZ_TRY(StartupText(cx, root, "directory", leaf));
-    NS_ENSURE_TRUE(leaf == "root-"_ns + nsPrintfCString("%u", i),
+    NS_ENSURE_TRUE(leaf.Equals("root-"_ns + nsPrintfCString("%u", i)),
                    NS_ERROR_FILE_CORRUPTED);
     nsCOMPtr<nsIFile> original, copy;
     MOZ_TRY(NS_NewNativeLocalFile(source, getter_AddRefs(original)));
@@ -8956,7 +8958,7 @@ nsresult StartupServer(JSContext* cx, JS::Handle<JSObject*> source,
   }
   NS_ENSURE_TRUE(
       output.serverKey.FindChar('.') < 0 &&
-          output.path == output.storePath + ".msf"_ns &&
+          output.path.Equals(output.storePath + ".msf"_ns) &&
           (output.protocol == "none"_ns || output.protocol == "imap"_ns),
       NS_ERROR_NOT_IMPLEMENTED);
   int64_t size;
@@ -8978,16 +8980,16 @@ nsresult StartupServer(JSContext* cx, JS::Handle<JSObject*> source,
   NS_ENSURE_TRUE(prefs, NS_ERROR_NOT_AVAILABLE);
   nsCString branch("mail.server."_ns + output.serverKey + "."_ns);
   bool relative;
-  MOZ_TRY(
-      prefs->PrefHasUserValue((branch + "directory-rel"_ns).get(), &relative));
+  MOZ_TRY(prefs->PrefHasUserValue(nsCString(branch + "directory-rel"_ns).get(),
+                                  &relative));
   if (relative) {
     nsCOMPtr<nsIRelativeFilePref> pref;
-    MOZ_TRY(prefs->GetComplexValue((branch + "directory-rel"_ns).get(),
+    MOZ_TRY(prefs->GetComplexValue(nsCString(branch + "directory-rel"_ns).get(),
                                    NS_GET_IID(nsIRelativeFilePref),
                                    getter_AddRefs(pref)));
     MOZ_TRY(pref->GetFile(getter_AddRefs(storedRoot)));
   } else {
-    MOZ_TRY(prefs->GetComplexValue((branch + "directory"_ns).get(),
+    MOZ_TRY(prefs->GetComplexValue(nsCString(branch + "directory"_ns).get(),
                                    NS_GET_IID(nsIFile),
                                    getter_AddRefs(storedRoot)));
   }
@@ -8995,8 +8997,10 @@ nsresult StartupServer(JSContext* cx, JS::Handle<JSObject*> source,
   MOZ_TRY(root->Equals(storedRoot, &same));
   NS_ENSURE_TRUE(same, NS_ERROR_NOT_AVAILABLE);
   nsCString protocol, contract;
-  MOZ_TRY(Preferences::GetCString((branch + "type"_ns).get(), protocol));
-  Preferences::GetCString((branch + "storeContractID"_ns).get(), contract);
+  MOZ_TRY(
+      Preferences::GetCString(nsCString(branch + "type"_ns).get(), protocol));
+  Preferences::GetCString(nsCString(branch + "storeContractID"_ns).get(),
+                          contract);
   if (contract.IsEmpty())
     contract.AssignLiteral("@mozilla.org/msgstore/berkeleystore;1");
   NS_ENSURE_TRUE(protocol == output.protocol &&
@@ -9056,7 +9060,8 @@ nsresult StartupServer(JSContext* cx, JS::Handle<JSObject*> source,
   for (const char* pref : {"server_sub_directory", "namespace.personal",
                            "namespace.public", "namespace.other_users"}) {
     nsCString value;
-    Preferences::GetCString((branch + nsDependentCString(pref)).get(), value);
+    Preferences::GetCString(nsCString(branch + nsDependentCString(pref)).get(),
+                            value);
     NS_ENSURE_TRUE(value.IsEmpty() || value == "\"\""_ns,
                    NS_ERROR_NOT_IMPLEMENTED);
   }
@@ -9544,7 +9549,7 @@ nsresult DatabaseCore::BuildStartupFolders() {
     if (source.protocol == "imap"_ns) imap.AppendElement(&source);
   // Parents precede children. A missing parent was refused before creation.
   imap.Sort([](const StartupMailSource* a, const StartupMailSource* b) {
-    return a->canonicalPath.Compare(b->canonicalPath);
+    return Compare(a->canonicalPath, b->canonicalPath);
   });
   for (const auto* source : imap) {
     auto root = roots.Lookup(source->serverKey);
@@ -9865,7 +9870,7 @@ nsresult DatabaseCore::CheckProfileActivation(
   MOZ_TRY(StartupText(cx, caller, "profilePath", profile));
   MOZ_TRY(StartupText(cx, caller, "selectorPath", selectorPath));
   NS_ENSURE_TRUE(profile == operation.profilePath &&
-                     selectorPath == profile + "/panorama-profile.json"_ns,
+                     selectorPath.Equals(profile + "/panorama-profile.json"_ns),
                  NS_ERROR_NOT_AVAILABLE);
   JS::Rooted<JS::Value> declaredJournal(cx);
   MOZ_TRY(ImportMember(cx, identity, "journalPath", &declaredJournal));
@@ -9974,7 +9979,7 @@ nsresult DatabaseCore::CheckProfileActivation(
                  retained.hash == native.sourceSha256;
     }
     NS_ENSURE_TRUE(planned, NS_ERROR_NOT_AVAILABLE);
-    MOZ_TRY_VAR(native.folderPath, mFolderDatabase->GetFolderPath(folder));
+    native.folderPath = MOZ_TRY(mFolderDatabase->GetFolderPath(folder));
     NS_ENSURE_TRUE(state == "imported"_ns && !tokens.Contains(native.token) &&
                        !folderIds.Contains(folder),
                    NS_ERROR_NOT_AVAILABLE);
@@ -10191,8 +10196,8 @@ nsresult DatabaseCore::CheckProfileActivation(
           NS_ENSURE_TRUE((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'),
                          NS_ERROR_NOT_AVAILABLE);
         NS_ENSURE_TRUE(
-            fileName == "panorama-import-"_ns + suffix + ".sqlite"_ns &&
-                uri == "jsaddrbook://"_ns + fileName,
+            fileName.Equals("panorama-import-"_ns + suffix + ".sqlite"_ns) &&
+                uri.Equals("jsaddrbook://"_ns + fileName),
             NS_ERROR_NOT_AVAILABLE);
         nsCOMPtr<nsIFile> target;
         MOZ_TRY(StartupChild(operation.profile, fileName.get(),

@@ -14,6 +14,7 @@ const {
   admitWindowsMigrationPath,
   hashMigrationFile,
   readMorkMigrationSource,
+  readMorkFolderCacheSource,
 } = ChromeUtils.importESModule(
   "resource:///modules/panorama/MigrationSource.sys.mjs"
 );
@@ -1877,6 +1878,130 @@ add_task(
       !(await IOUtils.exists(
         PathUtils.join(input.profilePath, "panorama.sqlite")
       ))
+    );
+  }
+);
+
+add_task(
+  { skip_if: () => AppConstants.platform === "win" },
+  async function test_startupJournalRetainsUnicodeCacheDescriptor() {
+    const root = await IOUtils.createUniqueDirectory(
+      PathUtils.tempDir,
+      "startup-journal-unicode-"
+    );
+    registerCleanupFunction(() => IOUtils.remove(root, { recursive: true }));
+    const profilePath = PathUtils.join(root, "\u90ae\u4ef6-e\u0301");
+    const work = PathUtils.join(root, "work");
+    await IOUtils.makeDirectory(profilePath);
+    await IOUtils.makeDirectory(work);
+    const source = PathUtils.join(profilePath, "Inbox.msf");
+    await IOUtils.copy(do_get_file("data/migration.msf").path, source);
+    const sourceBytes = await IOUtils.read(source);
+    const { identity } = await readMorkMigrationSource(source);
+    const { MailStringUtils } = ChromeUtils.importESModule(
+      "resource:///modules/MailStringUtils.sys.mjs"
+    );
+    const raw = new FileUtils.File(source).persistentDescriptor;
+    const key = new TextDecoder("utf-8", {
+      fatal: true,
+      ignoreBOM: true,
+    }).decode(MailStringUtils.byteStringToUint8Array(raw));
+    Assert.notEqual(
+      key,
+      raw,
+      "The actual non-ASCII descriptor is a byte string"
+    );
+    const encoded = [...new TextEncoder().encode(key)]
+      .map(byte => "$" + byte.toString(16).padStart(2, "0"))
+      .join("");
+    const cachePath = PathUtils.join(profilePath, "panacea.dat");
+    // A strict parser fixture, never a native folder/receipt/origin grant.
+    await IOUtils.writeUTF8(
+      cachePath,
+      "< <(a=c)>(80=ns:msg:db:row:scope:folders:all)" +
+        "(81=ns:msg:db:table:kind:folders)(82=key)" +
+        "(8A=boxFlags)(8B=hierDelim)(8C=onlineName)>\n" +
+        "{1:^80 {(k^81:c)} [1(^82=" +
+        encoded +
+        ")(^8A=0)(^8B=2f)(^8C=INBOX)]}\n"
+    );
+    const cacheBytes = await IOUtils.read(cachePath);
+    const { cache, identity: cacheIdentity } =
+      await readMorkFolderCacheSource(cachePath);
+    const row = cache.entries.get(key);
+    Assert.ok(row, "The strict original cache reader projects the UTF-8 key");
+    Assert.equal(row.values.boxFlags, 0, "Explicit zero remains present");
+    Assert.equal(row.values.hierDelim, 47);
+    const backupPath = PathUtils.join(root, "backup");
+    await createMigrationBackup(profilePath, [], backupPath);
+    const path = PathUtils.join(work, "journal.json");
+    const journal = await MigrationJournal.create(path, {
+      profilePath,
+      mailPaths: [],
+      backupPath,
+      sources: [],
+      startupInventory: {
+        sources: [
+          {
+            id: "unicode-summary",
+            ...identity,
+            serverKey: "server1",
+            serverRoot: profilePath,
+            storePath: source.slice(0, -4),
+            storeType: "mbox",
+            protocol: "imap",
+            storeContractID: "@mozilla.org/msgstore/berkeleystore;1",
+            origin: {
+              provider: "imap-client-discovery",
+              cache: {
+                ...cacheIdentity,
+                originalKey: key,
+                sourceKey: row.sourceKey,
+              },
+              originalCells: Object.fromEntries(
+                ["onlineName", "hierDelim", "boxFlags"].map(name => [
+                  name,
+                  row.properties.get(name),
+                ])
+              ),
+              onlineName: row.values.onlineName,
+              hierarchyDelimiter: row.values.hierDelim,
+              boxFlags: row.values.boxFlags,
+            },
+          },
+        ],
+        caches: [
+          {
+            id: "cache",
+            ...cacheIdentity,
+            cacheKeys: [...cache.entries.keys()],
+          },
+        ],
+      },
+    });
+    registerCleanupFunction(() => journal.close());
+    const state = journal.state;
+    const before = await IOUtils.read(path);
+    Assert.equal(state.startup.bound, false, "No native target is invented");
+    Assert.strictEqual(state.startup.databaseSourceId, null);
+    Assert.strictEqual(state.startup.inventory.sources[0].folderURI, undefined);
+    journal.close();
+    const reopened = await MigrationJournal.open(path, profilePath);
+    Assert.deepEqual(reopened.state, state);
+    reopened.close();
+    Assert.deepEqual(await IOUtils.read(path), before);
+    state.startup.inventory.sources[0].origin.cache.originalKey = raw;
+    await IOUtils.writeJSON(path, state);
+    const invalid = await IOUtils.read(path);
+    await Assert.rejects(
+      MigrationJournal.open(path, profilePath),
+      /startup IMAP cache origin/
+    );
+    Assert.deepEqual(await IOUtils.read(path), invalid);
+    Assert.deepEqual(await IOUtils.read(source), sourceBytes);
+    Assert.deepEqual(await IOUtils.read(cachePath), cacheBytes);
+    Assert.ok(
+      !(await IOUtils.exists(PathUtils.join(profilePath, "panorama.sqlite")))
     );
   }
 );

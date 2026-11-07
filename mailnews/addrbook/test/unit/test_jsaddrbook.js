@@ -1429,7 +1429,11 @@ async function assertMigrationPreferenceWriteFailure(atPublished) {
           input.target,
           input.options.sourceBytes,
           input.options.receipt.storageSourceId,
-          { requireClosed: true }
+          {
+            requireClosed: true,
+            // The copy has its own Windows file ID but the stage's pin.
+            stageIdentity: input.options.receipt.stagePhysicalIdentity,
+          }
         ).cards,
         input.options.receipt.cards,
         "The completed unpublished copy remains available for exact retry"

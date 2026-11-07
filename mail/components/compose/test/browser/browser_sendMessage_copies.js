@@ -11,6 +11,10 @@ const { PromiseTestUtils } = ChromeUtils.importESModule(
   "resource://testing-common/mailnews/PromiseTestUtils.sys.mjs"
 );
 
+// Each subtest waits for the real IMAP save, folder refresh and Trash move,
+// which takes about 120s under TSan.
+requestLongerTimeout(2);
+
 let smtpServer;
 let imapServer, imapIdentity, imapRootFolder;
 let localRootFolder;

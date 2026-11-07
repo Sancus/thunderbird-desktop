@@ -25,10 +25,13 @@ const { readMorkFolderImport, captureMorkFolderWindowsInventory } =
   ChromeUtils.importESModule(
     "resource:///modules/panorama/MorkFolderImport.sys.mjs"
   );
-const { createPanoramaMigrationTarget, resumeMorkImports } =
-  ChromeUtils.importESModule(
-    "resource:///modules/panorama/MigrationCoordinator.sys.mjs"
-  );
+const {
+  createPanoramaMigrationTarget,
+  createWindowsPanoramaMigrationTarget,
+  resumeMorkImports,
+} = ChromeUtils.importESModule(
+  "resource:///modules/panorama/MigrationCoordinator.sys.mjs"
+);
 const { MailSearchService } = ChromeUtils.importESModule(
   "resource:///modules/panorama/MailSearchService.sys.mjs"
 );
@@ -702,9 +705,12 @@ add_task(async function test_createRetainedNativeRebuildTrial() {
       sources,
     });
     await journal.recordBackup(backup);
+    // Windows imports bind through the native reparse-admitted target.
     await resumeMorkImports(
       journal,
-      createPanoramaMigrationTarget(
+      (AppConstants.platform == "win"
+        ? createWindowsPanoramaMigrationTarget
+        : createPanoramaMigrationTarget)(
         journal,
         database,
         id => folders.get(id),

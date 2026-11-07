@@ -1,0 +1,34 @@
+[DEFAULT]
+head = "head.js"
+prefs = [
+  "mail.provider.suppress_dialog_on_startup=true",
+  "mail.spellcheck.inline=false",
+  "mail.spotlight.firstRunDone=true",
+  "mail.winsearch.firstRunDone=true",
+  "mailnews.message_display.disable_remote_image=false",
+  "mailnews.start_page.override_url=about:blank",
+  "mailnews.start_page.url=about:blank",
+  # Suppress the bar because it sometimes steals focus or causes other unexpected
+  # issues.
+  "mail.rights.override=true",
+  "mail.panorama.enabled=true",
+]
+subsuite = "thunderbird"
+support-files = [
+  "head_menus.js",
+  "head_spaces.js",
+  "test_browserAction.js",
+  "../xpcshell/data/utils.js",
+]
+tags = ["webextensions"]
+
+# Tests in this folder are split across multiple manifests. When adding a test,
+# please put it in the manifest with its (alphabetical) neighbours.
+
+["browser_ext_menus_context_tabs.js"]
+support-files = [
+  "data/content.html",
+  "data/content_body.html",
+  "data/tb-logo.png",
+]
+tags = ["contextmenu"]

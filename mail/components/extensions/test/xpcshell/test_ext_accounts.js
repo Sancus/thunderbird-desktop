@@ -22,7 +22,7 @@ const OPENPGP_KEY_PATH = PathUtils.join(
   "alice@openpgp.example-0xf231550c4f47e38e-secret.asc"
 );
 
-add_setup(async () => {
+add_setup(async function setupAccounts() {
   // There are a couple of deprecated properties in MV3, which we still want to
   // test in MV2 but also report to the user. By default, tests throw when
   // deprecated properties are used.
@@ -1259,6 +1259,18 @@ add_task(async function test_accounts_events() {
               type: "imap",
               identities: [],
               name: "Mail for account7user@localhost",
+              rootFolder: {
+                id: "account7://",
+                name: "Root",
+                path: "/",
+                specialUse: [],
+                isFavorite: false,
+                isRoot: true,
+                isTag: false,
+                isUnified: false,
+                isVirtual: false,
+                accountId: "account7",
+              },
               folders: null,
             },
           },
@@ -1269,6 +1281,18 @@ add_task(async function test_accounts_events() {
               type: "none",
               identities: [],
               name: "account8user on localhost",
+              rootFolder: {
+                id: "account8://",
+                name: "Root",
+                path: "/",
+                specialUse: [],
+                isFavorite: false,
+                isRoot: true,
+                isTag: false,
+                isUnified: false,
+                isVirtual: false,
+                accountId: "account8",
+              },
               folders: null,
             },
           },
@@ -1279,6 +1303,18 @@ add_task(async function test_accounts_events() {
               type: "pop3",
               identities: [],
               name: "account9user on localhost",
+              rootFolder: {
+                id: "account9://",
+                name: "Root",
+                path: "/",
+                specialUse: [],
+                isFavorite: false,
+                isRoot: true,
+                isTag: false,
+                isUnified: false,
+                isVirtual: false,
+                accountId: "account9",
+              },
               folders: null,
             },
           },

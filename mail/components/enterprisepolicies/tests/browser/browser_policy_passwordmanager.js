@@ -3,6 +3,8 @@
 
 "use strict";
 
+/* global EditContextMenu */
+
 const { wait_for_frame_load } = ChromeUtils.importESModule(
   "resource://testing-common/mail/WindowHelpers.sys.mjs"
 );
@@ -43,6 +45,11 @@ add_task(async function test_password_reveal_policy() {
   const passwordMgr = await wait_for_frame_load(
     prefWin.gSubDialog._topDialog._frame,
     "chrome://messenger/content/preferences/passwordManager.xhtml"
+  );
+
+  await TestUtils.waitForCondition(
+    () => passwordMgr.document.getElementById("signonsTree").view,
+    "waiting for saved logins to finish loading"
   );
 
   // Check the "Show Passwords" button is hidden.

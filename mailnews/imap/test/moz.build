@@ -9,6 +9,8 @@ XPCSHELL_TESTS_MANIFESTS += [
 
 if CONFIG["MOZ_PANORAMA"]:
     XPCSHELL_TESTS_MANIFESTS += [
+        "unit/xpcshell-panorama-ci041-maildir.toml",
+        "unit/xpcshell-panorama-ci041-mbox.toml",
         "unit/xpcshell-panorama-discovery-child-mork-maildir.toml",
         "unit/xpcshell-panorama-discovery-child-mork-mbox.toml",
         "unit/xpcshell-panorama-discovery-child-panorama-maildir.toml",
@@ -31,6 +33,8 @@ if CONFIG["MOZ_PANORAMA"]:
         "unit/xpcshell-panorama-discovery-repeat-panorama-mbox.toml",
         "unit/xpcshell-panorama-epoch-maildir.toml",
         "unit/xpcshell-panorama-epoch-mbox.toml",
+        "unit/xpcshell-panorama-ingestion-maildir.toml",
+        "unit/xpcshell-panorama-ingestion-mbox.toml",
     ]
 
 LOCAL_INCLUDES += [

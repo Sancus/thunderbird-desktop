@@ -7,11 +7,29 @@
  * Drafts folders.
  */
 
+const { MockAlertsService } = ChromeUtils.importESModule(
+  "resource://testing-common/mailnews/MockAlertsService.sys.mjs"
+);
+
+const { PromiseTestUtils: MailPromiseTestUtils } = ChromeUtils.importESModule(
+  "resource://testing-common/mailnews/PromiseTestUtils.sys.mjs"
+);
+
 let imapServer;
 let localAccount;
 let smtpAccount;
 let smtpIdentity;
 let smtpOutgoingServer;
+
+/**
+ * Finish the real server warning before another recovery operation starts.
+ */
+function finishServerAlert() {
+  if (MockAlertsService.alert) {
+    MockAlertsService.callbacks.onAlertFinished();
+    MockAlertsService.reset();
+  }
+}
 
 /**
  * Replace the prompt service with a recovery-prompt handler.
@@ -28,6 +46,13 @@ function mockRecoveryPrompt(composeWindow, buttonPressed, onPrompt) {
   Services.prompt = {
     QueryInterface: ChromeUtils.generateQI(["nsIPromptService"]),
     confirmEx(parentWindow) {
+      Assert.ok(
+        MockAlertsService.alert?.text.includes(
+          `${imapServer.daemon.commandToFail} failed`
+        ),
+        "The failed IMAP command emitted its separate server warning"
+      );
+      finishServerAlert();
       state.count++;
       state.hadOpenComposeParent &&=
         parentWindow == composeWindow && !composeWindow.closed;
@@ -39,6 +64,7 @@ function mockRecoveryPrompt(composeWindow, buttonPressed, onPrompt) {
   return {
     promptCalled: promptCalled.promise,
     restore() {
+      finishServerAlert();
       Services.prompt = originalPrompt;
     },
     state,
@@ -59,6 +85,7 @@ function progressStopPromise(composeWindow) {
 }
 
 add_setup(async function () {
+  MockAlertsService.init();
   await addLoginInfo("imap://test.test", "user", "password");
   await addLoginInfo("smtp://test.test", "user", "password");
 
@@ -77,7 +104,13 @@ add_setup(async function () {
   smtpIdentity.doFcc = true;
 
   const incomingServer = smtpAccount.incomingServer;
-  incomingServer.performBiff(window.msgWindow);
+  const discovered = new MailPromiseTestUtils.PromiseUrlListener();
+  MailServices.imap.discoverAllFolders(
+    incomingServer.rootFolder,
+    discovered,
+    null
+  );
+  await discovered.promise;
   await TestUtils.waitForCondition(
     () => incomingServer.rootFolder.containsChildNamed("Sent"),
     "waiting for the Sent folder to synchronise"
@@ -91,7 +124,9 @@ add_setup(async function () {
     MailServices.accounts.removeAccount(smtpAccount, false);
     MailServices.accounts.removeAccount(localAccount, false);
     await Services.logins.removeAllLoginsAsync();
+    await clearStatusBar(window);
   });
+  registerCleanupFunction(() => MockAlertsService.cleanup());
 });
 
 add_task(async function testSentCopyFailureOffersRecovery() {
@@ -298,4 +333,53 @@ add_task(async function testRetryImapDraftCopyAfterFolderCreation() {
   );
 
   await BrowserTestUtils.closeWindow(composeWindow);
+});
+
+// Keep final animation ownership facts when the ordinary vsync gate fails.
+registerCleanupFunction(function queueFinalComposeActivityLog() {
+  registerCleanupFunction(function logComposeRemainingAnimations() {
+    const documents = new Set([window.document]);
+    for (const doc of documents) {
+      for (const frame of doc.querySelectorAll("browser, iframe")) {
+        if (frame.contentDocument) {
+          documents.add(frame.contentDocument);
+        }
+      }
+      let pendingTick = "unavailable";
+      try {
+        pendingTick = doc.defaultView.windowUtils.refreshDriverHasPendingTick;
+      } catch (ex) {
+        if (ex.result != Cr.NS_ERROR_NOT_AVAILABLE) {
+          throw ex;
+        }
+      }
+      info(
+        "Compose remaining UI activity: " +
+          JSON.stringify({
+            document: doc.documentURI,
+            vsyncEnabled: ChromeUtils.vsyncEnabled(),
+            pendingTick,
+            progressStarts: window.MsgStatusFeedback?._startRequests,
+            meteorsSpinning: window.MsgStatusFeedback?._meteorsSpinning,
+            animations: doc.getAnimations().map(animation => ({
+              state: animation.playState,
+              name: animation.animationName,
+              transitionProperty: animation.transitionProperty,
+              currentTime: animation.currentTime,
+              endTime: animation.effect?.getComputedTiming().endTime,
+              target: animation.effect?.target?.localName,
+              id: animation.effect?.target?.id,
+              classes: animation.effect?.target?.getAttribute("class"),
+            })),
+            busy: Array.from(
+              doc.querySelectorAll('[busy="true"], .busy, [loading="true"]')
+            ).map(element => ({
+              target: element.localName,
+              id: element.id,
+              classes: element.getAttribute("class"),
+            })),
+          })
+      );
+    }
+  });
 });

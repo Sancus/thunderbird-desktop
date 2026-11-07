@@ -50,7 +50,12 @@ add_task(async function test_app_menu() {
 });
 
 add_task(async function test_start_page_settings() {
-  await withNewTab({ url: "about:preferences" }, browser => {
+  await withNewTab({ url: "about:preferences" }, async browser => {
+    await browser.contentWindow.selectPrefPane("paneGeneral");
+    await TestUtils.waitForCondition(
+      () => browser.contentDocument.getElementById("startPageSettings"),
+      "General preferences should be initialized"
+    );
     const startPageSettings =
       browser.contentDocument.getElementById("startPageSettings");
 

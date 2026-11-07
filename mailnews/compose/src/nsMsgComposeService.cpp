@@ -1122,6 +1122,23 @@ nsresult nsMsgComposeService::RunMessageThroughMimeDraft(
     // so the base URL is parsed as the message service will expect.
     rv = mailnewsurl->SetSpecInternal(mailboxUri);
     NS_ENSURE_SUCCESS(rv, rv);
+
+    // Repair legacy #key?query ordering on the inner standard URI. Cloning the
+    // protocol URL after giving it a message URI can select a different URI
+    // implementation, before the MIME converter can read the compose mode.
+    nsCOMPtr<nsIURI> baseURI;
+    rv = mailnewsurl->GetBaseURI(getter_AddRefs(baseURI));
+    NS_ENSURE_SUCCESS(rv, rv);
+    nsCOMPtr<nsIURI> repairedURI;
+    rv = RepairDodgyQueryURI(baseURI, getter_AddRefs(repairedURI));
+    NS_ENSURE_SUCCESS(rv, rv);
+    if (repairedURI != baseURI) {
+      nsAutoCString repairedSpec;
+      rv = repairedURI->GetSpec(repairedSpec);
+      NS_ENSURE_SUCCESS(rv, rv);
+      rv = mailnewsurl->SetSpecInternal(repairedSpec);
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
   }
 
   // if we are forwarding a message and that message used a charset override

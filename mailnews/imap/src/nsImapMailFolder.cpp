@@ -10898,6 +10898,7 @@ nsresult nsImapFolderCopyState::StartNextCopy() {
   nsCOMPtr<nsIImapService> imapService = mozilla::components::Imap::Service();
   rv = imapService->EnsureFolderExists(m_curDestParent, m_curFolderName,
                                        m_msgWindow, this);
+  if (NS_FAILED(rv)) NS_WARNING("CI051 diagnostic EnsureFolderExists failed synchronously");
   return NS_FAILED(rv) ? Finish(rv) : rv;
 }
 
@@ -10924,7 +10925,10 @@ nsImapFolderCopyState::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
   nsCOMPtr<nsIMsgFolder> phaseSource = m_curSrcFolder;
   const uint64_t phase = m_messagePhase;
 #endif
-  if (NS_FAILED(aExitCode)) return Finish(aExitCode);
+  if (NS_FAILED(aExitCode)) {
+    NS_WARNING("CI051 diagnostic folder-copy URL failed");
+    return Finish(aExitCode);
+  }
   nsresult rv;
   nsCOMPtr<nsIImapUrl> imapUrl = do_QueryInterface(aUrl, &rv);
   if (NS_FAILED(rv)) return Finish(rv);
@@ -11013,6 +11017,7 @@ nsImapFolderCopyState::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
   // service request. Only our final subtree completion may settle that request.
   rv = newMsgFolder->CopyMessages(m_curSrcFolder, messages, m_isMoveMessages,
                                   m_msgWindow, this, true, false);
+  if (NS_FAILED(rv)) NS_WARNING("CI051 diagnostic folder-copy CopyMessages failed synchronously");
   return NS_FAILED(rv) ? Finish(rv) : rv;
 }
 
@@ -11069,6 +11074,7 @@ NS_IMETHODIMP nsImapFolderCopyState::OnStopCopy(nsresult aStatus) {
   auto outputs = std::move(m_messageOutputs);
   m_messageKeys.Clear();
   ++m_messagePhase;
+  if (NS_FAILED(aStatus)) NS_WARNING("CI051 diagnostic folder-copy message phase failed");
   return AdvanceToNextFolder(aStatus);
 }
 

@@ -1120,3 +1120,66 @@ add_task(async function testExternalMessageWindow() {
 
   await BrowserTestUtils.closeWindow(win);
 });
+
+// CI051 diagnostic only (never a candidate): report what keeps vsync enabled.
+add_task(async function diagnoseRemainingAnimations() {
+  await new Promise(resolve => setTimeout(resolve, 3000));
+  const describe = node =>
+    node
+      ? `${node.localName}#${node.id || ""}.${[...(node.classList || [])].join(".")}`
+      : "null";
+  const documents = [];
+  const collect = doc => {
+    if (!doc || documents.includes(doc)) {
+      return;
+    }
+    documents.push(doc);
+    for (const frame of doc.querySelectorAll("browser, iframe")) {
+      try {
+        collect(frame.contentDocument);
+      } catch (e) {}
+    }
+  };
+  for (const win of Services.wm.getEnumerator(null)) {
+    collect(win.document);
+  }
+  const report = { vsync: ChromeUtils.vsyncEnabled(), documents: [] };
+  for (const doc of documents) {
+    const entry = { url: doc.documentURI, hidden: doc.hidden, animations: [], loading: [] };
+    for (const animation of doc.getAnimations()) {
+      entry.animations.push({
+        target: describe(animation.effect?.target),
+        pseudo: animation.effect?.pseudoElement,
+        name: animation.animationName || animation.transitionProperty,
+        state: animation.playState,
+      });
+    }
+    for (const element of doc.querySelectorAll("*")) {
+      for (const pseudo of [null, "::before", "::after"]) {
+        const style = doc.defaultView.getComputedStyle(element, pseudo);
+        const images = [style.content, style.backgroundImage, style.listStyleImage].join(" ");
+        if (images.includes("loading.svg")) {
+          const rect = element.getBoundingClientRect();
+          entry.loading.push({
+            element: describe(element),
+            pseudo,
+            parents: [element.parentElement, element.parentElement?.parentElement].map(describe),
+            visibility: style.visibility,
+            display: style.display,
+            rect: [rect.width, rect.height],
+          });
+        }
+      }
+    }
+    if (entry.animations.length || entry.loading.length) {
+      report.documents.push(entry);
+    }
+  }
+  let tries = 0;
+  while (ChromeUtils.vsyncEnabled() && tries++ < 50) {
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  report.vsyncAfterWait = ChromeUtils.vsyncEnabled();
+  info("CI051_DIAG_ANIMATIONS=" + JSON.stringify(report));
+  Assert.ok(true, "diagnostic recorded");
+});

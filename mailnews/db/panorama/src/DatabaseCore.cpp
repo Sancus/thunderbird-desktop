@@ -8054,7 +8054,8 @@ nsresult StartupEqual(JSContext* cx, JS::Handle<JS::Value> a,
                      JS::IsArrayObject(cx, right, &rightArray),
                  NS_ERROR_FAILURE);
   NS_ENSURE_TRUE(leftArray == rightArray, NS_ERROR_NOT_AVAILABLE);
-  JS::Rooted<JS::IdVector> keys(cx), other(cx);
+  JS::Rooted<JS::IdVector> keys(cx, JS::IdVector(cx));
+  JS::Rooted<JS::IdVector> other(cx, JS::IdVector(cx));
   NS_ENSURE_TRUE(
       JS_Enumerate(cx, left, &keys) && JS_Enumerate(cx, right, &other),
       NS_ERROR_FAILURE);

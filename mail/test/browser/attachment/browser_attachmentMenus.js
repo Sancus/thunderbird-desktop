@@ -1007,6 +1007,19 @@ add_task(async function test_attachment_menus_eml_file() {
   );
 });
 
+// Register owned fixture teardown before the shared folder teardown. The
+// ordinary browser harness runs registered cleanup functions in FIFO order.
+const s376MenuFolders = [];
+registerCleanupFunction(async function cleanupSelectedAttachmentFolders() {
+  if (!s376MenuFolders.length) {
+    return;
+  }
+  await be_in_folder(folder);
+  for (const selectedFolder of s376MenuFolders) {
+    selectedFolder.deleteSelf(null);
+  }
+});
+
 registerCleanupFunction(() => {
   // Remove created folders.
   folder.deleteSelf(null);
@@ -1021,10 +1034,7 @@ registerCleanupFunction(() => {
  */
 async function s376MenuAttachment(name, body) {
   const selectedFolder = await create_folder(name);
-  registerCleanupFunction(async () => {
-    await be_in_folder(folder);
-    selectedFolder.deleteSelf(null);
-  });
+  s376MenuFolders.push(selectedFolder);
   const message = create_message({
     attachments: [{ body, filename: "selected.txt", format: "" }],
   });

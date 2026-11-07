@@ -83,6 +83,33 @@ add_setup(async function () {
   });
 });
 
+// The shared folder must remain live while owned fixtures leave their current
+// selection. Register this before the original shared-folder cleanup.
+const s376LocalFolders = [];
+let s376NewsPrefPushed = false;
+registerCleanupFunction(async function cleanupSelectedAttachmentFixtures() {
+  if (s376LocalFolders.length || s376Imap || s376News) {
+    await be_in_folder(folder);
+  }
+  for (const selectedFolder of s376LocalFolders) {
+    selectedFolder.deleteSelf(null);
+  }
+  if (s376Imap) {
+    s376Imap.incoming.closeCachedConnections();
+    MailServices.accounts.removeAccount(s376Imap.account, false);
+    s376Imap.server.close();
+  }
+  if (s376News) {
+    s376News.incoming.closeCachedConnections();
+    MailServices.accounts.removeAccount(s376News.account, false);
+    s376News.helpers.shutdownNNTPServer(s376News.server);
+  }
+  if (s376NewsPrefPushed) {
+    await SpecialPowers.popPrefEnv();
+    s376NewsPrefPushed = false;
+  }
+});
+
 registerCleanupFunction(async function () {
   MockFilePicker.cleanup();
 
@@ -784,10 +811,7 @@ async function s376LocalAttachment(
   name = "selected.txt"
 ) {
   const selectedFolder = await create_folder(`S376Open${s376FolderNumber++}`);
-  registerCleanupFunction(async () => {
-    await be_in_folder(folder);
-    selectedFolder.deleteSelf(null);
-  });
+  s376LocalFolders.push(selectedFolder);
   const message = create_message({
     attachments: [{ body, contentType, filename: name, format: "" }],
   });
@@ -902,12 +926,7 @@ add_task(async function test_imapAttachmentRetainsPhysicalSourceAndPart() {
     1;
   incoming.useIdle = false;
   incoming.setBoolValue("autosync_offline_stores", false);
-  registerCleanupFunction(async () => {
-    await be_in_folder(folder);
-    incoming.closeCachedConnections();
-    MailServices.accounts.removeAccount(account, false);
-    server.close();
-  });
+  s376Imap = { server, incoming, account };
   server.daemon.createMailbox("S376Other", { subscribed: true });
   for (const name of ["INBOX", "S376Other"]) {
     const mailbox = server.daemon.getMailbox(name);
@@ -977,11 +996,12 @@ add_task(async function test_imapAttachmentRetainsPhysicalSourceAndPart() {
     decoded,
     "The local MIME-supplied part is not replaced by the IMAP wire part"
   );
-  s376Imap = { server, incoming, folders, generator };
+  s376Imap = { server, incoming, account, folders, generator };
 });
 
 add_task(async function test_nntpAttachmentRetainsPhysicalSourceAndPart() {
   await SpecialPowers.pushPrefEnv({ set: [["mail.strict_threading", true]] });
+  s376NewsPrefPushed = true;
   const helpers = ChromeUtils.importESModule(
     "resource://testing-common/mail/NNTPHelpers.sys.mjs"
   );
@@ -1019,13 +1039,7 @@ add_task(async function test_nntpAttachmentRetainsPhysicalSourceAndPart() {
   const account = [...MailServices.accounts.accounts].find(
     a => a.incomingServer == incoming
   );
-  registerCleanupFunction(async () => {
-    await be_in_folder(folder);
-    incoming.closeCachedConnections();
-    MailServices.accounts.removeAccount(account, false);
-    helpers.shutdownNNTPServer(server);
-    await SpecialPowers.popPrefEnv();
-  });
+  s376News = { server, incoming, account, helpers };
   const folders = names.map(name => incoming.rootFolder.getChildNamed(name));
   for (const [index, selectedFolder] of folders.entries()) {
     const listener = new PromiseTestUtils.PromiseUrlListener();
@@ -1053,6 +1067,8 @@ add_task(async function test_nntpAttachmentRetainsPhysicalSourceAndPart() {
   s376News = {
     server,
     incoming,
+    account,
+    helpers,
     folders,
     names,
     daemon,

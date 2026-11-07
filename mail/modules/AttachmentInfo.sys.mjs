@@ -275,7 +275,8 @@ export class AttachmentInfo {
    * @param {BrowsingContext} browsingContext - The browsing context to use.
    * @param {string} [fpDialogTitle] - File picker dialog title, to override
    *   the default "save attachment" title.
-   * @returns {?string} the path of the saved attachment. null if not saved.
+   * @returns {Promise<?string>} Saved path, or null for an empty part or cancellation.
+   * @throws {Components.Exception} If the selected stored part cannot be read.
    */
   async save(browsingContext, fpDialogTitle) {
     this.#checkSelection();
@@ -349,7 +350,8 @@ export class AttachmentInfo {
    * @param {BrowsingContext} browsingContext - The browsing context to use.
    * @param {string} [fpDialogTitle] - File picker dialog title, to override
    *   the default "save attachment" title.
-   * @returns {?string} the dir path of the saved attachments. null if not saved.
+   * @returns {Promise<?string>} Saved directory, or null for an empty part or cancellation.
+   * @throws {Components.Exception} If a selected stored part cannot be read.
    */
   static async saveAttachments(attachments, browsingContext, fpDialogTitle) {
     attachments = [...attachments];
@@ -1026,13 +1028,13 @@ export class AttachmentInfo {
    */
   static async deleteAttachments(msgHdr, attachments, silent = true) {
     attachments = [...attachments];
+    if (attachments.some(a => a.contentType == "text/x-moz-deleted")) {
+      throw new Error(`An attachment was already deleted.`);
+    }
     const checkSelection = AttachmentInfo.#modificationGuard(
       msgHdr,
       attachments
     );
-    if (attachments.some(a => a.contentType == "text/x-moz-deleted")) {
-      throw new Error(`An attachment was already deleted.`);
-    }
     if (!silent) {
       // Confirm to proceed.
       const message = await lazy.l10n.formatValue("attachment-delete-confirm", {
@@ -1061,10 +1063,10 @@ export class AttachmentInfo {
    */
   async detachFromMessage(browsingContext) {
     const msgHdr = this.message;
-    const checkSelection = AttachmentInfo.#modificationGuard(msgHdr, [this]);
     if (this.contentType == "text/x-moz-deleted") {
       throw new Error(`${this.name} was already deleted.`);
     }
+    const checkSelection = AttachmentInfo.#modificationGuard(msgHdr, [this]);
     // Ask where to save.
     const fpDialogTitle = await lazy.l10n.formatValue(
       "attachment-detach-dialog-title"
@@ -1108,13 +1110,13 @@ export class AttachmentInfo {
     browsingContext = null
   ) {
     attachments = [...attachments];
+    if (attachments.some(a => a.contentType == "text/x-moz-deleted")) {
+      throw new Error(`An attachment was already deleted.`);
+    }
     const checkSelection = AttachmentInfo.#modificationGuard(
       msgHdr,
       attachments
     );
-    if (attachments.some(a => a.contentType == "text/x-moz-deleted")) {
-      throw new Error(`An attachment was already deleted.`);
-    }
     const silent = !!detachDir;
     if (!silent) {
       // Non-silent mode. No dir provided - need to ask for dir where to save.

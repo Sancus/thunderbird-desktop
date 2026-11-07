@@ -48,6 +48,7 @@ tags = [
 ]
 
 ["test_jsaddrbook.js"]
+run-sequentially = true # Times out in parallel runs; passes well within the limit alone.
 support-files = ["../../../../mail/components/addrbook/test/browser/data/import.mab"]
 
 ["test_ldap1.js"]
@@ -104,6 +105,7 @@ tags = [
 ["test_nsLDAPURL.js"]
 
 ["test_panoramaMigrationImport.js"]
+run-sequentially = true # Times out in parallel runs; passes well within the limit alone.
 run-if = ["nightly_build"]
 # Windows migration path admission remains held.
 skip-if = ["os == 'win'"]

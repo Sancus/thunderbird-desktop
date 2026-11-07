@@ -271,12 +271,17 @@ add_setup(async function () {
     "chrome://messenger/content/messageWindow.xhtml"
   );
 
-  registerCleanupFunction(() => {
+  registerCleanupFunction(async () => {
+    // CI051 diagnostic only: report what each cleanup step leaves running.
+    await ci051ReportAnimations("cleanup-start");
     for (const folder of MailServices.accounts.allFolders) {
       Gloda.setFolderIndexingPriority(folder, -1);
     }
+    await ci051ReportAnimations("after-gloda-priority");
     MailServices.accounts.removeAccount(account, false);
+    await ci051ReportAnimations("after-remove-account");
     cal.manager.getCalendars()[0].setProperty("disabled", true);
+    await ci051ReportAnimations("after-calendar-disabled");
   });
 });
 
@@ -1122,8 +1127,8 @@ add_task(async function testExternalMessageWindow() {
 });
 
 // CI051 diagnostic only (never a candidate): report what keeps vsync enabled.
-add_task(async function diagnoseRemainingAnimations() {
-  await new Promise(resolve => setTimeout(resolve, 3000));
+async function ci051ReportAnimations(step) {
+  await new Promise(resolve => setTimeout(resolve, 2000));
   const describe = node =>
     node
       ? `${node.localName}#${node.id || ""}.${[...(node.classList || [])].join(".")}`
@@ -1143,9 +1148,19 @@ add_task(async function diagnoseRemainingAnimations() {
   for (const win of Services.wm.getEnumerator(null)) {
     collect(win.document);
   }
-  const report = { vsync: ChromeUtils.vsyncEnabled(), documents: [] };
+  const feedback = window.MsgStatusFeedback;
+  const report = {
+    step,
+    vsync: ChromeUtils.vsyncEnabled(),
+    meteors: feedback?._meteorsSpinning,
+    activeProcesses: feedback?._activeProcesses?.length,
+    throbberBusy: document.querySelector(".throbber")?.classList.contains("busy"),
+    tabsBusy: [...document.getElementById("tabmail").tabInfo].map(t => !!t.busy),
+    viewSearching: document.getElementById("tabmail").currentAbout3Pane?.gViewWrapper?.searching,
+    documents: [],
+  };
   for (const doc of documents) {
-    const entry = { url: doc.documentURI, hidden: doc.hidden, animations: [], loading: [] };
+    const entry = { url: doc.documentURI, animations: [], loading: [] };
     for (const animation of doc.getAnimations()) {
       entry.animations.push({
         target: describe(animation.effect?.target),
@@ -1158,14 +1173,12 @@ add_task(async function diagnoseRemainingAnimations() {
       for (const pseudo of [null, "::before", "::after"]) {
         const style = doc.defaultView.getComputedStyle(element, pseudo);
         const images = [style.content, style.backgroundImage, style.listStyleImage].join(" ");
-        if (images.includes("loading.svg")) {
+        if (images.includes("loading.svg") && style.visibility != "hidden" && style.display != "none") {
           const rect = element.getBoundingClientRect();
           entry.loading.push({
             element: describe(element),
             pseudo,
             parents: [element.parentElement, element.parentElement?.parentElement].map(describe),
-            visibility: style.visibility,
-            display: style.display,
             rect: [rect.width, rect.height],
           });
         }
@@ -1175,11 +1188,10 @@ add_task(async function diagnoseRemainingAnimations() {
       report.documents.push(entry);
     }
   }
-  let tries = 0;
-  while (ChromeUtils.vsyncEnabled() && tries++ < 50) {
-    await new Promise(resolve => setTimeout(resolve, 100));
-  }
-  report.vsyncAfterWait = ChromeUtils.vsyncEnabled();
-  info("CI051_DIAG_ANIMATIONS=" + JSON.stringify(report));
+  dump("CI051_DIAG_STEP=" + JSON.stringify(report) + "\n");
+}
+
+add_task(async function diagnoseRemainingAnimations() {
+  await ci051ReportAnimations("after-last-subtest");
   Assert.ok(true, "diagnostic recorded");
 });

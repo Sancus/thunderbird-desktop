@@ -1455,8 +1455,10 @@ export class IMAP_RFC3501_handler {
       date = Date.now();
       text = args[1];
     }
+    // Keep the literal bytes exactly: encodeURI leaves "#", which a data URI
+    // treats as a fragment and so truncates the stored message.
     var msg = new ImapMessage(
-      "data:text/plain," + encodeURI(text),
+      "data:text/plain;base64," + btoa(text),
       mailbox.uidnext++,
       flags
     );

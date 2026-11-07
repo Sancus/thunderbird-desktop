@@ -749,7 +749,7 @@ export class MigrationJournal {
    */
   async planCacheImport(id, snapshot) {
     if (
-      ![1, 2].includes(
+      ![1, 2, 3].includes(
         snapshot.requestVersion === undefined ? 1 : snapshot.requestVersion
       )
     ) {
@@ -764,8 +764,11 @@ export class MigrationJournal {
       databaseSourceId: snapshot.databaseSourceId,
       ...snapshot.source,
       folders: snapshot.folders,
-      ...(snapshot.requestVersion === 2
-        ? { requestVersion: 2, proof: snapshot.proof }
+      ...(snapshot.requestVersion >= 2
+        ? { requestVersion: snapshot.requestVersion, proof: snapshot.proof }
+        : {}),
+      ...(snapshot.requestVersion === 3
+        ? { sourceFormat: snapshot.sourceFormat }
         : {}),
       token: Services.uuid.generateUUID().toString(),
       state: "pending",
@@ -1656,7 +1659,7 @@ export class MigrationJournal {
       ) ||
       (state.caches ?? []).some(
         cache =>
-          cache.requestVersion !== 2 ||
+          ![2, 3].includes(cache.requestVersion) ||
           cache.databaseSourceId !== state.startup.databaseSourceId
       )
     ) {
@@ -1852,7 +1855,7 @@ export class MigrationJournal {
       createMorkFolderCacheRequest(cache);
       getMorkFolderCacheCells(cache.folders);
       if (
-        cache.requestVersion === 2 &&
+        cache.requestVersion >= 2 &&
         (cache.proof.profilePath !== state.profilePath ||
           cache.proof.manifest.path !== state.backup?.path ||
           cache.proof.manifest.sha256 !== state.backup.sha256)
@@ -1869,7 +1872,12 @@ export class MigrationJournal {
         !roots.some(root => root.contains(source)) ||
         files.some(other => source.equals(other)) ||
         source.parent.contains(file) ||
-        !state.sources.length ||
+        (!state.sources.length &&
+          !(
+            state.version === STARTUP_VERSION &&
+            state.startup?.bound &&
+            state.startup.databaseSourceId === cache.databaseSourceId
+          )) ||
         state.sources.some(
           s => s.databaseSourceId !== cache.databaseSourceId
         ) ||
@@ -1883,7 +1891,7 @@ export class MigrationJournal {
           [
             folder.cachePath,
             folder.storePath,
-            ...(cache.requestVersion === 2 && !folder.isServer
+            ...(cache.requestVersion >= 2 && !folder.isServer
               ? [folder.originalSummaryPath]
               : []),
           ].some(path => {
@@ -2149,7 +2157,10 @@ function validateStartupFolderOrigin(source, caches) {
     !caches.some(
       input =>
         ["path", "sha256", "size"].every(key => input[key] === cache[key]) &&
-        input.cacheKeys?.includes(cache.originalKey)
+        input.cacheKeys?.includes(cache.originalKey) &&
+        (cache.sourceFormat === "json"
+          ? input.sourceFormat === "json"
+          : !Object.hasOwn(input, "sourceFormat"))
     ) ||
     cache.originalKey !==
       new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
@@ -2157,9 +2168,12 @@ function validateStartupFolderOrigin(source, caches) {
           new FileUtils.File(source.path).persistentDescriptor
         )
       ) ||
-    !Number.isInteger(cache.sourceKey) ||
-    cache.sourceKey < 0 ||
-    cache.sourceKey > 0xffffffff ||
+    (cache.sourceFormat === "json"
+      ? Object.hasOwn(cache, "sourceKey")
+      : Object.hasOwn(cache, "sourceFormat") ||
+        !Number.isInteger(cache.sourceKey) ||
+        cache.sourceKey < 0 ||
+        cache.sourceKey > 0xffffffff) ||
     !["onlineName", "hierDelim", "boxFlags"].every(
       key => typeof origin.originalCells?.[key] === "string"
     ) ||

@@ -423,6 +423,10 @@ MailGlue.panoramaStartup = null;
 MailGlue.prototype = {
   /** @type {?AbortController} Cancellation for the selected startup operation. */
   _panoramaStartupController: null,
+  _panoramaStartupFailed: false,
+  _finalUIStartupObserved: false,
+  _panoramaFailureQuitScheduled: false,
+  _fogInitialized: false,
 
   _isNewProfile: undefined,
 
@@ -520,7 +524,44 @@ MailGlue.prototype = {
         "panorama-startup-failed",
         String(error)
       );
-      Services.startup.quit(Ci.nsIAppStartup.eForceQuit, Cr.NS_ERROR_FAILURE);
+      this._panoramaStartupFailed = true;
+      this._quitAfterPanoramaStartupFailure();
+    });
+  },
+
+  /**
+   * Initializes ordinary telemetry once, before either normal idle or shutdown.
+   *
+   * @throws {Error} When the existing FOG initialization fails.
+   */
+  _initializeFOG() {
+    if (!this._fogInitialized) {
+      Services.fog.initializeFOG(undefined, "thunderbird.desktop");
+      this._fogInitialized = true;
+    }
+  },
+
+  /**
+   * Requests the failure exit after XRE has finished its startup notification.
+   * Initializes FOG before shutdown without running successful mail startup.
+   * The original rejected promise and native admission gate remain unchanged.
+   */
+  _quitAfterPanoramaStartupFailure() {
+    if (!this._finalUIStartupObserved || this._panoramaFailureQuitScheduled) {
+      return;
+    }
+    this._panoramaFailureQuitScheduled = true;
+    Services.tm.dispatchToMainThread(() => {
+      try {
+        this._initializeFOG();
+      } catch (error) {
+        console.error(
+          "Telemetry initialization before failed startup quit",
+          error
+        );
+      } finally {
+        Services.startup.quit(Ci.nsIAppStartup.eForceQuit, Cr.NS_ERROR_FAILURE);
+      }
     });
   },
 
@@ -669,6 +710,11 @@ MailGlue.prototype = {
         break;
       }
       case "final-ui-startup":
+        this._finalUIStartupObserved = true;
+        if (this._panoramaStartupFailed) {
+          this._quitAfterPanoramaStartupFailure();
+          break;
+        }
         this._afterPanoramaStartup(() => {
           // Initialise the permission manager. If this happens before telling
           // the folder service that strings are available, it's a *much* less
@@ -1345,9 +1391,7 @@ MailGlue.prototype = {
       // pre-init buffer.
       {
         name: "initializeFOG",
-        task: () => {
-          Services.fog.initializeFOG(undefined, "thunderbird.desktop");
-        },
+        task: () => this._initializeFOG(),
       },
       {
         name: "checkInstalledExtensions",

@@ -23,6 +23,7 @@ class TestPanoramaStartupBackup(MarionetteTestCase):
         )).resolve()
         self.original_args = list(self.marionette.instance.app_args or [])
         self.instance_prefs = self.marionette.instance.prefs
+        self.panorama_enabled = self.marionette.get_pref("mail.panorama.enabled")
         self.saved_prefs = {}
         self.work = tempfile.TemporaryDirectory(prefix="comm-startup-copy-")
         self.root = Path(self.work.name).resolve()
@@ -61,7 +62,8 @@ class TestPanoramaStartupBackup(MarionetteTestCase):
             "return Services.dirsvc.get('ProfD', Ci.nsIFile).path;"
         )
         self.assertEqual(self.profile, Path(selected).resolve())
-        self.assertEqual(enabled, self.marionette.get_pref("mail.panorama.enabled"))
+        expected = self.changed_prefs.get("mail.panorama.enabled", self.panorama_enabled)
+        self.assertEqual(expected, self.marionette.get_pref("mail.panorama.enabled"))
         self.assertEqual("mail:3pane", self.marionette.get_window_type())
 
     def startup_code(self):
@@ -624,12 +626,17 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
                   .map(book => ({uid: book.UID, uri: book.URI,
                     emails: [...book.childCards].filter(card => !card.isMailList)
                       .map(card => card.primaryEmail).sort(),
-                    lists: [...book.childNodes].map(list => list.dirName).sort()}));
+                    lists: [...book.childNodes].map(list => ({
+                      name: list.dirName,
+                      emails: [...list.childCards].map(card => card.primaryEmail).sort()
+                    })).sort((a, b) => a.name.localeCompare(b.name))}));
             """)
         books = public_book()
         self.assertEqual(1, len(books))
-        self.assertEqual(["contact1@invalid", "contact2@invalid"], books[0]["emails"])
-        self.assertTrue(books[0]["lists"])
+        # The pinned import.mab contains one card and one one-member list.
+        self.assertEqual(["contact1@invalid"], books[0]["emails"])
+        self.assertEqual([{"name": "list", "emails": ["contact1@invalid"]}],
+                         books[0]["lists"])
         self.assertEqual(original, source.read_bytes())
         self.stop_application()
         selector = (self.profile / "panorama-profile.json").read_bytes()
@@ -665,28 +672,33 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
 
     def test_cacheOnlyStartupKeepsNativeRootIdentity(self):
         self.clean_profile(False)
-        source = self.marionette.execute_script("""
-            const { MailServices } = ChromeUtils.importESModule(
-              'resource:///modules/MailServices.sys.mjs');
-            const { FileUtils } = ChromeUtils.importESModule(
-              'resource://gre/modules/FileUtils.sys.mjs');
-            const file = new FileUtils.File(PathUtils.join(PathUtils.profileDir,
-              'Mail', 'cache-only'));
-            if (!file.parent.exists()) file.parent.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
-            file.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
-            const server = MailServices.accounts.createIncomingServer(
-              'cache-only', 'localhost', 'none');
-            server.localPath = file;
-            const account = MailServices.accounts.createAccount();
-            account.incomingServer = server;
-            const root = server.rootFolder;
-            Services.prefs.savePrefFile(null);
-            return {key: root.filePath.path, flags: (root.flags >>> 0).toString(16),
-              folderName: root.name};
+        accounts = self.marionette.execute_script("""
+            return Services.prefs.getCharPref('mail.accountmanager.accounts', '');
         """)
         self.stop_application()
-        self.assertFalse(list(Path(source["key"]).rglob("*.msf")))
-        cache = self.write_legacy_cache([source])
+        root = self.profile / "Mail" / "cache-only"
+        root.mkdir(parents=True)
+        # Persist the ordinary account before its first native root open. Opening
+        # a legacy local root here would create Trash/Outbox Mork summaries.
+        self.marionette.instance.profile.set_preferences({
+            "mail.accountmanager.accounts": ",".join(
+                [value for value in [accounts, "accountS526"] if value]),
+            "mail.account.accountS526.server": "serverS526",
+            "mail.server.serverS526.type": "none",
+            "mail.server.serverS526.hostname": "localhost",
+            "mail.server.serverS526.userName": "cache-only",
+            "mail.server.serverS526.name": "Cache only",
+            "mail.server.serverS526.directory-rel": "[ProfD]Mail/cache-only",
+            "mail.server.serverS526.storeContractID":
+                "@mozilla.org/msgstore/berkeleystore;1",
+        })
+        source = {"key": str(root), "folderName": "Cache only"}
+        self.assertFalse(list(root.rglob("*.msf")))
+        obsolete = self.write_legacy_cache([source])
+        obsolete_bytes = obsolete.read_bytes()
+        cache = self.profile / "folderCache.json"
+        cache.write_text(json.dumps({source["key"]: {
+            "folderName": source["folderName"]}}), encoding="utf-8")
         original = cache.read_bytes()
         self.start_same_profile(True)
         selected = self.selection()
@@ -694,12 +706,18 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.assertEqual([], selected["record"]["identity"]["imports"])
         self.assertEqual(1, len(selected["record"]["identity"]["caches"]))
         self.assertEqual(original, cache.read_bytes())
+        identity = selected["record"]["identity"]["caches"][0]["receipt"]["identity"]
+        self.assertEqual(str(cache), identity["path"])
+        self.assertEqual(3, identity["version"])
+        self.assertEqual("json", identity["sourceFormat"])
+        self.assertEqual(obsolete_bytes, obsolete.read_bytes())
         self.stop_application()
         self.start_same_profile(True)
         repeated = self.selection()
         self.assertEqual(selected["sourceId"], repeated["sourceId"])
         self.assertEqual(selected["record"]["identity"], repeated["record"]["identity"])
         self.assertEqual(original, cache.read_bytes())
+        self.assertEqual(obsolete_bytes, obsolete.read_bytes())
 
     def test_migratesNativeImapUidAndCacheThenReuses(self):
         self.clean_profile(False)
@@ -723,7 +741,9 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             const account = MailServices.accounts.createAccount();
             account.incomingServer = server;
             const root = server.rootFolder.QueryInterface(Ci.nsIMsgImapMailFolder);
-            root.createClientSubfolderInfo('INBOX', '/', 0, true);
+            if (!root.containsChildNamed('INBOX')) {
+                root.createClientSubfolderInfo('INBOX', '/', 0, true);
+            }
             const folder = server.rootFolder.getChildNamed('INBOX');
             const imap = folder.QueryInterface(Ci.nsIMsgImapMailFolder);
             imap.onlineName = 'INBOX';
@@ -783,6 +803,27 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.assertEqual(original, summary.read_bytes())
         self.assertEqual(cache_bytes, cache.read_bytes())
 
+    def test_invalidActiveJsonCacheNeverFallsBackToMork(self):
+        for case in ["malformed", "array", "negativeFlags", "objectName"]:
+            self.clean_profile(False)
+            source = self.create_legacy_message("mbox")
+            self.stop_application()
+            summary = Path(source["summary"])
+            legacy = self.write_legacy_cache([{"key": str(summary),
+                "flags": format(source["flags"] & 0xffffffff, "x"),
+                "folderName": source["name"]}])
+            cache = self.profile / "folderCache.json"
+            raw = {
+                "malformed": b'{corrupt JSON',
+                "array": b'[]',
+                "negativeFlags": json.dumps({str(summary): {"flags": -1}}).encode(),
+                "objectName": json.dumps({str(summary): {"folderName": {}}}).encode(),
+            }[case]
+            cache.write_bytes(raw)
+            self.assert_startup_refuses([cache, legacy, summary], absent=[
+                self.profile / "panorama.sqlite",
+                self.profile / "panorama-profile.json"])
+
     def test_activeMigrationRequiresUnchangedCompleteJournal(self):
         self.clean_profile(False)
         source = self.create_legacy_message("mbox")
@@ -828,6 +869,31 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.assertEqual(selected["sourceId"], self.selection()["sourceId"])
         self.assertEqual(before, (self.profile / "panorama-profile.json").read_bytes())
         self.assertEqual(b"unrelated stale Mork must not be imported\n", stale.read_bytes())
+
+    def test_emptyNativeJsonCacheInitializesWithoutLegacyBackup(self):
+        self.clean_profile(False)
+        self.stop_application()
+        self.assertFalse(list(self.profile.rglob("*.msf")))
+        self.assertFalse(list(self.profile.rglob("*.mab")))
+        cache = self.profile / "folderCache.json"
+        cache.write_bytes(b"{}")
+        work = self.profile.parent / ("panorama-migration-" + self.profile.name)
+        self.assertFalse(work.exists())
+        self.start_same_profile(True)
+        selected = self.selection()
+        self.assertEqual("initialized-empty", selected["record"]["origin"])
+        self.assertIsNone(selected["record"]["identity"]["backup"])
+        self.assertIsNone(selected["record"]["identity"]["journalPath"])
+        self.assertEqual([], selected["record"]["identity"]["caches"])
+        self.assertEqual(b"{}", cache.read_bytes())
+        self.assertFalse(work.exists(), "Empty JSON requires no invented archive")
+        self.stop_application()
+        selector = (self.profile / "panorama-profile.json").read_bytes()
+        self.start_same_profile(True)
+        self.assertEqual(selected["sourceId"], self.selection()["sourceId"])
+        self.assertEqual(selector, (self.profile / "panorama-profile.json").read_bytes())
+        self.assertEqual(b"{}", cache.read_bytes())
+        self.assertFalse(work.exists())
 
     def test_genuine_mork_mbox_migration_and_reuse(self):
         self.assert_mork_migration("mbox")

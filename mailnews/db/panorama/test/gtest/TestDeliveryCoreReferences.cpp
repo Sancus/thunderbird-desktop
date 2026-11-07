@@ -47,6 +47,7 @@
 #include "nsIEventTarget.h"
 #include "nsIFile.h"
 #include "nsIInputStream.h"
+#include "nsIDirectoryEnumerator.h"
 #include "nsIOutputStream.h"
 #include "nsICryptoHash.h"
 #include "nsIMsgPluggableStore.h"
@@ -56,6 +57,7 @@
 #include "nsIMsgDatabase.h"
 #include "nsIMsgFolder.h"
 #include "nsIMsgIncomingServer.h"
+#include "nsIMsgImapMailFolder.h"
 #include "nsIMsgOfflineImapOperation.h"
 #include "nsIProperties.h"
 #include "nsIVariant.h"
@@ -3684,6 +3686,416 @@ class DeliveryCoreReferences : public testing::Test {
                            bool durable = false) {
     return mCore->ReadImapImportReceipt(input, proof, output, durable);
   }
+
+  nsresult JSONCacheQuote(JSContext* cx, const nsACString& value,
+                          nsACString& output) {
+    JS::Rooted<JSString*> text(
+        cx, JS_NewStringCopyUTF8N(
+                cx, JS::UTF8Chars(value.BeginReading(), value.Length())));
+    NS_ENSURE_TRUE(text, NS_ERROR_OUT_OF_MEMORY);
+    JS::Rooted<JS::Value> input(cx, JS::StringValue(text));
+    return StartupJSONValue(cx, input, output);
+  }
+  static nsresult JSONCacheReadFile(nsIFile* file, nsACString& bytes) {
+    int64_t size;
+    MOZ_TRY(file->GetFileSize(&size));
+    nsCOMPtr<nsIInputStream> stream;
+    MOZ_TRY(NS_NewLocalFileInputStream(getter_AddRefs(stream), file));
+    nsresult first = NS_ReadInputStreamToString(stream, bytes, size);
+    nsresult closed = stream->Close();
+    MOZ_TRY(first);
+    return closed;
+  }
+  // Copy all actual files, not a caller assertion that unlisted files vanished.
+  // This is a cache transaction proof fixture, not a startup activation claim.
+  nsresult JSONCacheCopyTree(JSContext* cx, nsIFile* from, nsIFile* to,
+                             nsTArray<nsCString>& parts, nsACString& entries,
+                             bool& first) {
+    nsCOMPtr<nsIDirectoryEnumerator> children;
+    MOZ_TRY(from->GetDirectoryEntries(getter_AddRefs(children)));
+    auto close = MakeScopeExit([&] { children->Close(); });
+    while (true) {
+      nsCOMPtr<nsIFile> file;
+      MOZ_TRY(children->GetNextFile(getter_AddRefs(file)));
+      if (!file) break;
+      bool linked, directory;
+      MOZ_TRY(file->IsSymlink(&linked));
+      NS_ENSURE_FALSE(linked, NS_ERROR_FILE_ACCESS_DENIED);
+      MOZ_TRY(file->IsDirectory(&directory));
+      nsCString leaf;
+      MOZ_TRY(file->GetNativeLeafName(leaf));
+      // The new native output is never original legacy backup evidence.
+      if (parts.IsEmpty() &&
+          (leaf == "panorama.sqlite"_ns || leaf == "panorama.sqlite-wal"_ns ||
+           leaf == "panorama.sqlite-shm"_ns ||
+           leaf == "panorama-profile.json"_ns))
+        continue;
+      parts.AppendElement(leaf);
+      if (!first) entries.Append(',');
+      first = false;
+      entries.AppendLiteral("{\"parts\":[");
+      for (uint32_t i = 0; i < parts.Length(); ++i) {
+        if (i) entries.Append(',');
+        nsCString quoted;
+        MOZ_TRY(JSONCacheQuote(cx, parts[i], quoted));
+        entries.Append(quoted);
+      }
+      entries.AppendLiteral("],\"type\":");
+      if (directory) {
+        entries.AppendLiteral("\"directory\"}");
+        nsCOMPtr<nsIFile> destination;
+        MOZ_TRY(to->Clone(getter_AddRefs(destination)));
+        MOZ_TRY(destination->AppendNative(leaf));
+        MOZ_TRY(destination->Create(nsIFile::DIRECTORY_TYPE, 0700));
+        MOZ_TRY(
+            JSONCacheCopyTree(cx, file, destination, parts, entries, first));
+      } else {
+        nsCString bytes, digest, quoted;
+        MOZ_TRY(JSONCacheReadFile(file, bytes));
+        MOZ_TRY(StartupHashControl(bytes, digest));
+        MOZ_TRY(JSONCacheQuote(cx, digest, quoted));
+        entries.AppendLiteral("\"regular\",\"size\":");
+        entries.AppendInt(bytes.Length());
+        entries.AppendLiteral(",\"sha256\":");
+        entries.Append(quoted);
+        entries.Append('}');
+        MOZ_TRY(file->CopyToNative(to, leaf));
+      }
+      parts.RemoveLastElement();
+    }
+    MOZ_TRY(children->Close());
+    close.release();
+    return NS_OK;
+  }
+  nsresult PrepareJSONCacheRequest(nsIMsgFolder* folder,
+                                   const nsACString& rowCells,
+                                   nsACString& request,
+                                   nsACString& originalBytes) {
+    dom::AutoJSAPI jsapi;
+    NS_ENSURE_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()), NS_ERROR_FAILURE);
+    JSContext* cx = jsapi.cx();
+    nsCString descriptor, cachePath, storePath, protocol, storeType;
+    uint64_t id = 0;
+    bool isServer = false;
+    if (folder) {
+      nsCOMPtr<nsIFile> summary, storeFile;
+      MOZ_TRY(folder->GetId(&id));
+      MOZ_TRY(folder->GetIsServer(&isServer));
+      MOZ_TRY(folder->GetSummaryFile(getter_AddRefs(summary)));
+      MOZ_TRY(folder->GetFilePath(getter_AddRefs(storeFile)));
+      MOZ_TRY(summary->GetPersistentDescriptor(descriptor));
+      MOZ_TRY(summary->GetNativePath(cachePath));
+      MOZ_TRY(storeFile->GetNativePath(storePath));
+      MOZ_TRY(folder->GetIncomingServerType(protocol));
+      nsCOMPtr<nsIMsgPluggableStore> store;
+      MOZ_TRY(folder->GetMsgStore(getter_AddRefs(store)));
+      MOZ_TRY(store->GetStoreType(storeType));
+    }
+    nsCString quotedDescriptor;
+    MOZ_TRY(JSONCacheQuote(cx, descriptor, quotedDescriptor));
+    nsCString raw("{");
+    if (folder) {
+      raw.Append(quotedDescriptor);
+      raw.Append(':');
+      raw.Append(rowCells);
+    }
+    raw.Append('}');
+    MOZ_TRY(WriteStartupFile("folderCache.json", raw));
+    nsCString hash;
+    MOZ_TRY(StartupHashControl(raw, hash));
+    NS_ENSURE_FALSE(mStartupFixtureWork, NS_ERROR_ALREADY_INITIALIZED);
+    nsCOMPtr<nsIFile> work, copy, manifest, cache;
+    MOZ_TRY(mProfile->GetParent(getter_AddRefs(work)));
+    MOZ_TRY(work->AppendNative("native-json-cache-copy"_ns));
+    MOZ_TRY(work->CreateUnique(nsIFile::DIRECTORY_TYPE, 0700));
+    mStartupFixtureWork = work;
+    MOZ_TRY(work->Clone(getter_AddRefs(copy)));
+    MOZ_TRY(copy->AppendNative("root-0"_ns));
+    MOZ_TRY(copy->Create(nsIFile::DIRECTORY_TYPE, 0700));
+    nsTArray<nsCString> parts;
+    nsCString entries;
+    bool first = true;
+    MOZ_TRY(JSONCacheCopyTree(cx, mProfile, copy, parts, entries, first));
+    MOZ_TRY(work->Clone(getter_AddRefs(manifest)));
+    MOZ_TRY(manifest->AppendNative("manifest.json"_ns));
+    MOZ_TRY(mProfile->Clone(getter_AddRefs(cache)));
+    MOZ_TRY(cache->AppendNative("folderCache.json"_ns));
+    nsCString profilePath, manifestPath, sourcePath, databaseId;
+    MOZ_TRY(mProfile->GetNativePath(profilePath));
+    MOZ_TRY(manifest->GetNativePath(manifestPath));
+    MOZ_TRY(cache->GetNativePath(sourcePath));
+    MOZ_TRY(mCore->GetSourceId(databaseId));
+    nsCString profileQuoted;
+    MOZ_TRY(JSONCacheQuote(cx, profilePath, profileQuoted));
+    nsCString document(
+        "{\"version\":1,\"complete\":true,\"roots\":[{\"source\":");
+    document.Append(profileQuoted);
+    document.AppendLiteral(",\"directory\":\"root-0\",\"entries\":[");
+    document.Append(entries);
+    document.AppendLiteral("]}]}");
+    MOZ_TRY(StartupWriteControl(manifest, document));
+    nsCString manifestHash;
+    MOZ_TRY(StartupHashControl(document, manifestHash));
+    nsCString result(
+        "{\"version\":3,\"sourceFormat\":\"json\","
+        "\"policy\":\"native-reconciled-json-v3\","
+        "\"token\":\"native-json-cache\",\"sourceId\":\"native-json-source\",");
+    for (auto field : {std::pair { "databaseSourceId", &databaseId }}) {
+      nsCString quoted;
+      MOZ_TRY(JSONCacheQuote(cx, *field.second, quoted));
+      result.Append('"');
+      result.Append(field.first);
+      result.AppendLiteral("\":");
+      result.Append(quoted);
+      result.Append(',');
+    }
+    nsCString quotedPath, quotedHash;
+    MOZ_TRY(JSONCacheQuote(cx, sourcePath, quotedPath));
+    MOZ_TRY(JSONCacheQuote(cx, hash, quotedHash));
+    result.AppendLiteral("\"source\":{\"path\":");
+    result.Append(quotedPath);
+    result.AppendLiteral(",\"sha256\":");
+    result.Append(quotedHash);
+    result.AppendLiteral(",\"size\":");
+    result.AppendInt(raw.Length());
+    result.Append('}');
+    result.AppendLiteral(",\"proof\":{\"profilePath\":");
+    result.Append(profileQuoted);
+    MOZ_TRY(JSONCacheQuote(cx, manifestPath, quotedPath));
+    MOZ_TRY(JSONCacheQuote(cx, manifestHash, quotedHash));
+    result.AppendLiteral(",\"manifest\":{\"path\":");
+    result.Append(quotedPath);
+    result.AppendLiteral(",\"sha256\":");
+    result.Append(quotedHash);
+    result.AppendLiteral(",\"size\":");
+    result.AppendInt(document.Length());
+    result.AppendLiteral("}},\"folders\":[");
+    if (folder) {
+      result.Append('{');
+      for (auto field : {std::pair{"originalKey", &descriptor},
+                         std::pair{"descriptor", &descriptor},
+                         std::pair{"cachePath", &cachePath},
+                         std::pair{"storePath", &storePath},
+                         std::pair{"protocol", &protocol},
+                         std::pair{"storeType", &storeType}, std::pair {
+                           "originalSummaryPath",
+                           &cachePath
+                         }}) {
+        nsCString quoted;
+        MOZ_TRY(JSONCacheQuote(cx, *field.second, quoted));
+        result.Append('"');
+        result.Append(field.first);
+        result.AppendLiteral("\":");
+        result.Append(quoted);
+        result.Append(',');
+      }
+      result.AppendLiteral("\"id\":");
+      result.AppendInt(id);
+      result.AppendLiteral(",\"isServer\":");
+      result.Append(isServer ? "true" : "false");
+      result.Append('}');
+    }
+    result.AppendLiteral("]}");
+    request = result;
+    originalBytes = raw;
+    return NS_OK;
+  }
+  nsresult JSONCacheCall(const nsACString& request, bool read,
+                         nsACString& result) {
+    dom::AutoJSAPI jsapi;
+    NS_ENSURE_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()), NS_ERROR_FAILURE);
+    JSContext* cx = jsapi.cx();
+    JS::Rooted<JS::Value> input(cx), output(cx);
+    NS_ConvertUTF8toUTF16 text(request);
+    NS_ENSURE_TRUE(JS_ParseJSON(cx, text.get(), text.Length(), &input),
+                   NS_ERROR_INVALID_ARG);
+    JS::Rooted<JSString*> sentinel(cx,
+                                   JS_NewStringCopyZ(cx, "unchanged-output"));
+    NS_ENSURE_TRUE(sentinel, NS_ERROR_OUT_OF_MEMORY);
+    output.setString(sentinel);
+    nsresult rv = read ? mCore->GetFolderCacheImportReceipt(input, cx, &output)
+                       : mCore->ImportFolderCacheMetadata(input, cx, &output);
+    if (NS_FAILED(rv)) {
+      if (jsapi.HasException()) jsapi.ClearException();
+      EXPECT_TRUE(output.isString());
+      if (output.isString()) {
+        nsCString preserved;
+        EXPECT_EQ(NS_OK, StartupJSONValue(cx, output, preserved));
+        EXPECT_EQ("\"unchanged-output\""_ns, preserved);
+      }
+      if (jsapi.HasException()) jsapi.ClearException();
+      return rv;
+    }
+    return StartupJSONValue(cx, output, result);
+  }
+  void WithNativeJSONCache(const nsACString& protocol, const nsACString& type,
+                           const std::function<void(nsIMsgFolder*)>& action) {
+    (void)StaticPrefs::mail_panorama_enabled_AtStartup();
+    nsCOMPtr<nsIMsgAccountManager> manager =
+        do_GetService("@mozilla.org/messenger/account-manager;1");
+    ASSERT_TRUE(manager);
+    ASSERT_EQ(NS_OK, manager->UnloadAccounts());
+    AutoRestore<bool> restoreNative(
+        StaticPrefs::sMirror_mail_panorama_enabled_AtStartup);
+    StaticPrefs::sMirror_mail_panorama_enabled_AtStartup = true;
+    mCore = DatabaseCore::GetInstanceForService();
+    mConnection = Connection();
+    if (!mConnection) {
+      ASSERT_EQ(NS_OK, mCore->Startup());
+      mConnection = Connection();
+    }
+    ASSERT_TRUE(mConnection);
+    nsCOMPtr<nsIFile> actualFile;
+    ASSERT_EQ(NS_OK, mConnection->GetDatabaseFile(getter_AddRefs(actualFile)));
+    bool same;
+    ASSERT_EQ(NS_OK, mFile->Equals(actualFile, &same));
+    ASSERT_TRUE(same);
+    nsCOMPtr<nsIComponentRegistrar> registrar;
+    ASSERT_EQ(NS_OK, NS_GetComponentRegistrar(getter_AddRefs(registrar)));
+    constexpr auto contract = "@mozilla.org/msgDatabase/msgDBService;1";
+    nsCID* previous = nullptr;
+    ASSERT_EQ(NS_OK, registrar->ContractIDToCID(contract, &previous));
+    ASSERT_TRUE(previous);
+    const nsCID originalCID = *previous;
+    std::free(previous);
+    const nsCID nativeCID = nsID::GenerateUUID();
+    RefPtr<GenericFactory> factory =
+        new GenericFactory([](const nsIID& iid, void** output) -> nsresult {
+          RefPtr<DatabaseCore> core = DatabaseCore::GetInstanceForService();
+          return core->QueryInterface(iid, output);
+        });
+    ASSERT_EQ(NS_OK,
+              registrar->RegisterFactory(nativeCID, "", contract, factory));
+    auto restore = MakeScopeExit([&] {
+      EXPECT_EQ(NS_OK,
+                registrar->RegisterFactory(originalCID, "", contract, nullptr));
+      EXPECT_EQ(NS_OK, registrar->UnregisterFactory(nativeCID, factory));
+    });
+    nsCOMPtr<nsIDatabaseCore> selected = do_GetService(contract);
+    ASSERT_EQ(static_cast<nsIDatabaseCore*>(mCore.get()), selected.get());
+    auto unload =
+        MakeScopeExit([&] { EXPECT_EQ(NS_OK, manager->UnloadAccounts()); });
+    nsCOMPtr<nsIMsgIncomingServer> server;
+    ASSERT_EQ(NS_OK,
+              manager->CreateIncomingServer("json-native"_ns, "localhost"_ns,
+                                            protocol, getter_AddRefs(server)));
+    auto remove = MakeScopeExit([&] {
+      EXPECT_EQ(NS_OK, manager->RemoveIncomingServer(server, false));
+    });
+    nsCOMPtr<nsIFile> path;
+    ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(path)));
+    ASSERT_EQ(NS_OK, path->AppendNative("json-native-store"_ns));
+    ASSERT_EQ(NS_OK, path->Create(nsIFile::DIRECTORY_TYPE, 0700));
+    // Local rows must be born from actual on-disk discovery, not AddSubfolder's
+    // ordinary public-row path. IMAP uses its actual initial server discovery.
+    if (protocol == "none"_ns) {
+      nsCOMPtr<nsIFile> body;
+      ASSERT_EQ(NS_OK, path->Clone(getter_AddRefs(body)));
+      ASSERT_EQ(NS_OK, body->AppendNative("JSON"_ns));
+      ASSERT_EQ(NS_OK,
+                body->Create(type == "mbox"_ns ? nsIFile::NORMAL_FILE_TYPE
+                                               : nsIFile::DIRECTORY_TYPE,
+                             type == "mbox"_ns ? 0600 : 0700));
+      if (type == "maildir"_ns) {
+        for (auto leaf : {"cur", "new", "tmp"}) {
+          nsCOMPtr<nsIFile> child;
+          ASSERT_EQ(NS_OK, body->Clone(getter_AddRefs(child)));
+          ASSERT_EQ(NS_OK, child->AppendNative(nsDependentCString(leaf)));
+          ASSERT_EQ(NS_OK, child->Create(nsIFile::DIRECTORY_TYPE, 0700));
+        }
+      }
+    }
+    ASSERT_EQ(NS_OK, server->SetLocalPath(path));
+    ASSERT_EQ(NS_OK, server->SetStringValue(
+                         "storeContractID",
+                         type == "mbox"_ns
+                             ? "@mozilla.org/msgstore/berkeleystore;1"_ns
+                             : "@mozilla.org/msgstore/maildirstore;1"_ns));
+    nsCOMPtr<nsIMsgFolder> root, folder;
+    ASSERT_EQ(NS_OK, server->GetRootFolder(getter_AddRefs(root)));
+    if (protocol == "imap"_ns) {
+      nsCOMPtr<nsIMsgImapMailFolder> imap = do_QueryInterface(root);
+      ASSERT_TRUE(imap);
+      ASSERT_EQ(NS_OK,
+                imap->CreateClientSubfolderInfo("JSON"_ns, '/', 0, true));
+    }
+    ASSERT_EQ(NS_OK, root->GetChildNamed("JSON"_ns, getter_AddRefs(folder)));
+    ASSERT_TRUE(folder);
+    nsCOMPtr<nsIMsgPluggableStore> store;
+    ASSERT_EQ(NS_OK, folder->GetMsgStore(getter_AddRefs(store)));
+    ASSERT_EQ(NS_OK, store->EnsureLocalStore(folder));
+    ASSERT_EQ(NS_OK, folder->GetId(&mFolderId));
+    action(folder);
+  }
+
+  nsresult JSONCacheImportCount(int64_t& count) {
+    nsCOMPtr<mozIStorageStatement> statement;
+    MOZ_TRY(mConnection->CreateStatement(
+        "SELECT COUNT(*) FROM folder_cache_imports"_ns,
+        getter_AddRefs(statement)));
+    bool row;
+    MOZ_TRY(statement->ExecuteStep(&row));
+    NS_ENSURE_TRUE(row, NS_ERROR_UNEXPECTED);
+    return statement->GetInt64(0, &count);
+  }
+  void CheckNativeJSONCache(const nsACString& protocol, const nsACString& type,
+                            bool omitFlags = false) {
+    nsCString request, original, receipt, databaseId;
+    WithNativeJSONCache(protocol, type, [&](nsIMsgFolder* folder) {
+      ASSERT_EQ(NS_OK, mCore->GetSourceId(databaseId));
+      ASSERT_EQ(
+          NS_OK,
+          PrepareJSONCacheRequest(
+              folder,
+              omitFlags
+                  ? "{\"custom\":\"\"}"_ns
+                  : "{\"flags\":0,\"custom\":\"\",\"lastSyncTimeInSec\":-1,"
+                    "\"aclFlags\":4294967295,\"hexText\":\"0000\"}"_ns,
+              request, original));
+      ASSERT_EQ(NS_OK, JSONCacheCall(request, false, receipt));
+      EXPECT_NE(kNotFound, receipt.Find("\"version\":3"));
+      EXPECT_NE(kNotFound, receipt.Find("\"sourceFormat\":\"json\""));
+      EXPECT_NE(kNotFound,
+                receipt.Find("\"policy\":\"native-reconciled-json-v3\""));
+      EXPECT_EQ(kNotFound, receipt.Find("\"sourceKey\""));
+      EXPECT_NE(kNotFound, receipt.Find("\"name\":\"custom\",\"text\":\"\""));
+      if (!omitFlags) {
+        EXPECT_NE(kNotFound, receipt.Find("\"name\":\"flags\",\"text\":\"0\""));
+        EXPECT_NE(kNotFound, receipt.Find("\"integer\":0"));
+        EXPECT_NE(kNotFound,
+                  receipt.Find(
+                      "\"name\":\"lastSyncTimeInSec\",\"text\":\"ffffffff\""));
+        EXPECT_NE(kNotFound, receipt.Find("\"integer\":-1"));
+        EXPECT_NE(kNotFound, receipt.Find("\"integer\":4294967295"));
+        EXPECT_NE(kNotFound,
+                  receipt.Find("\"name\":\"hexText\",\"text\":\"0000\""));
+      }
+      int64_t count;
+      ASSERT_EQ(NS_OK, JSONCacheImportCount(count));
+      EXPECT_EQ(1, count);
+      nsCString read;
+      ASSERT_EQ(NS_OK, JSONCacheCall(request, true, read));
+      EXPECT_EQ(receipt, read);
+      ASSERT_EQ(NS_OK, JSONCacheCall(request, false, read));
+      EXPECT_EQ(receipt, read);
+    });
+    ASSERT_FALSE(request.IsEmpty());
+    ASSERT_FALSE(receipt.IsEmpty());
+    // Release real account/provider handles before closing the native service.
+    Stop();
+    ASSERT_EQ(NS_OK, Start());
+    nsCString read, actualSource;
+    ASSERT_EQ(NS_OK, mCore->GetSourceId(actualSource));
+    EXPECT_EQ(databaseId, actualSource);
+    ASSERT_EQ(NS_OK, JSONCacheCall(request, true, read));
+    EXPECT_EQ(receipt, read);
+    nsCOMPtr<nsIFile> cache;
+    ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(cache)));
+    ASSERT_EQ(NS_OK, cache->AppendNative("folderCache.json"_ns));
+    ASSERT_EQ(NS_OK, JSONCacheReadFile(cache, read));
+    EXPECT_EQ(original, read);
+  }
+
   static nsresult sStartupReentry;
   nsCOMPtr<nsIFile> mStartupFixtureWork;
   nsCOMPtr<nsIFile> mOldStartupProfile, mOldStartupLocal;
@@ -22820,6 +23232,274 @@ TEST_F(DeliveryCoreReferences,
   ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&transaction));
   EXPECT_FALSE(transaction);
 }
+
+TEST_F(DeliveryCoreReferences, StartupReuseRechecksSelectedRecordBeforeOpen) {
+  ASSERT_EQ(NS_OK, Start());
+  ASSERT_EQ(NS_OK, WriteStartupSelector("adopted-existing"));
+  nsCString source;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
+  nsCOMPtr<nsIFile> selector;
+  ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(selector)));
+  ASSERT_EQ(NS_OK, selector->AppendNative("panorama-profile.json"_ns));
+  int64_t size;
+  ASSERT_EQ(NS_OK, selector->GetFileSize(&size));
+  nsCOMPtr<nsIInputStream> stream;
+  ASSERT_EQ(NS_OK,
+            NS_NewLocalFileInputStream(getter_AddRefs(stream), selector));
+  nsCString valid;
+  ASSERT_EQ(NS_OK, NS_ReadInputStreamToString(stream, valid, size));
+  ASSERT_EQ(NS_OK, stream->Close());
+  stream = nullptr;
+  Stop();
+  ASSERT_EQ(NS_OK, ArmSelectedStartup());
+  // A private direct call also needs a successful native descriptor.
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, OpenStartup("reuse"));
+  EXPECT_FALSE(mConnection);
+  nsCString selected;
+  ASSERT_EQ(NS_OK, DescribeStartup(selected));
+  for (uint32_t mode = 0; mode < 3; ++mode) {
+    SCOPED_TRACE(mode);
+    nsCString changed(valid);
+    if (mode == 0)
+      changed.ReplaceSubstring("\"state\":\"active\"",
+                               "\"state\":\"prepared\"");
+    if (mode == 1)
+      changed.ReplaceSubstring(source.get(), "foreign-database-source");
+    if (mode == 2) {
+      ASSERT_EQ(NS_OK, selector->Remove(false));
+    } else {
+      ASSERT_NE(valid, changed);
+      ASSERT_EQ(NS_OK, WriteStartupFile("panorama-profile.json", changed));
+    }
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, OpenStartup("reuse"));
+    EXPECT_FALSE(mConnection);
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DatabaseCore::CheckAccountStartup());
+    ASSERT_EQ(NS_OK, WriteStartupFile("panorama-profile.json", valid));
+  }
+  ASSERT_EQ(NS_OK, OpenStartup("reuse"));
+  nsCString actual;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(actual));
+  EXPECT_EQ(source, actual);
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DatabaseCore::CheckAccountStartup());
+  ASSERT_EQ(NS_OK, CheckStartupActivation(true));
+  EXPECT_EQ(NS_OK, DatabaseCore::CheckAccountStartup());
+}
+
+TEST_F(DeliveryCoreReferences, NativeJSONCacheMboxTypedCellsAndReopen) {
+  CheckNativeJSONCache("none"_ns, "mbox"_ns);
+}
+
+TEST_F(DeliveryCoreReferences, NativeJSONCacheMaildirTypedCellsAndReopen) {
+  CheckNativeJSONCache("none"_ns, "maildir"_ns);
+}
+
+TEST_F(DeliveryCoreReferences, NativeJSONCacheImapDiscoveryAndReopen) {
+  CheckNativeJSONCache("imap"_ns, "mbox"_ns);
+}
+
+TEST_F(DeliveryCoreReferences, NativeJSONCacheAbsentFlagsRemainAbsent) {
+  CheckNativeJSONCache("none"_ns, "mbox"_ns, true);
+}
+
+TEST_F(DeliveryCoreReferences, NativeJSONCacheRefusesIncompleteOrForeignProof) {
+  WithNativeJSONCache("none"_ns, "mbox"_ns, [&](nsIMsgFolder* folder) {
+    nsCString request, original, output;
+    ASSERT_EQ(NS_OK, PrepareJSONCacheRequest(folder, "{\"flags\":0}"_ns,
+                                             request, original));
+    nsTArray<nsCString> rejected;
+    nsCString bad(request);
+    bad.ReplaceSubstring("\"folders\":[{", "\"folders\":[{\"sourceKey\":1,");
+    rejected.AppendElement(bad);
+    bad = request;
+    bad.ReplaceSubstring("native-reconciled-json-v3",
+                         "native-reconciled-selected-v2");
+    rejected.AppendElement(bad);
+    bad = request;
+    bad.ReplaceSubstring("\"sourceFormat\":\"json\"",
+                         "\"sourceFormat\":\"mork\"");
+    rejected.AppendElement(bad);
+    int32_t start = request.Find(",\"folders\":[");
+    ASSERT_NE(kNotFound, start);
+    bad.Assign(Substring(request, 0, start));
+    bad.AppendLiteral(",\"folders\":[]}");
+    rejected.AppendElement(bad);
+    bad = request;
+    bad.ReplaceSubstring("\"originalKey\":", "\"foreignKey\":");
+    rejected.AppendElement(bad);
+    for (const auto& item : rejected) {
+      SCOPED_TRACE(item.get());
+      ASSERT_NE(request, item);
+      output.AssignLiteral("unchanged-result");
+      EXPECT_TRUE(NS_FAILED(JSONCacheCall(item, false, output)));
+      EXPECT_EQ("unchanged-result"_ns, output);
+      int64_t count;
+      ASSERT_EQ(NS_OK, JSONCacheImportCount(count));
+      EXPECT_EQ(0, count);
+      bool transaction;
+      ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&transaction));
+      EXPECT_FALSE(transaction);
+    }
+    ASSERT_EQ(NS_OK, WriteStartupFile("folderCache.json", original + " "_ns));
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, JSONCacheCall(request, false, output));
+    int64_t count;
+    ASSERT_EQ(NS_OK, JSONCacheImportCount(count));
+    EXPECT_EQ(0, count);
+    ASSERT_EQ(NS_OK, WriteStartupFile("folderCache.json", original));
+    ASSERT_EQ(NS_OK, JSONCacheCall(request, false, output));
+    EXPECT_FALSE(output.IsEmpty());
+    ASSERT_EQ(NS_OK, JSONCacheImportCount(count));
+    EXPECT_EQ(1, count);
+  });
+}
+
+TEST_F(DeliveryCoreReferences,
+       NativeJSONCacheReadbackChecksRawAndOriginalCells) {
+  WithNativeJSONCache("none"_ns, "mbox"_ns, [&](nsIMsgFolder* folder) {
+    nsCString request, original, receipt, output;
+    ASSERT_EQ(NS_OK, PrepareJSONCacheRequest(folder,
+                                             "{\"flags\":0,\"custom\":\"\"}"_ns,
+                                             request, original));
+    ASSERT_EQ(NS_OK, JSONCacheCall(request, false, receipt));
+    ASSERT_EQ(
+        NS_OK,
+        mConnection->ExecuteSimpleSQL(
+            "UPDATE folder_cache_imports SET raw=CAST('bad' AS BLOB)"_ns));
+    EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, JSONCacheCall(request, true, output));
+    nsCOMPtr<mozIStorageStatement> restore;
+    ASSERT_EQ(NS_OK, mConnection->CreateStatement(
+                         "UPDATE folder_cache_imports SET raw=:raw"_ns,
+                         getter_AddRefs(restore)));
+    ASSERT_EQ(NS_OK, restore->BindBlobByName("raw"_ns,
+                                             reinterpret_cast<const uint8_t*>(
+                                                 original.BeginReading()),
+                                             original.Length()));
+    ASSERT_EQ(NS_OK, restore->Execute());
+    restore = nullptr;
+    nsCString damaged(receipt);
+    damaged.ReplaceSubstring("\"name\":\"custom\",\"text\":\"\"",
+                             "\"name\":\"custom\",\"text\":\"changed\"");
+    ASSERT_NE(receipt, damaged);
+    ASSERT_EQ(NS_OK, mConnection->CreateStatement(
+                         "UPDATE folder_cache_imports SET receipt=:receipt"_ns,
+                         getter_AddRefs(restore)));
+    ASSERT_EQ(NS_OK, restore->BindUTF8StringByName("receipt"_ns, damaged));
+    ASSERT_EQ(NS_OK, restore->Execute());
+    EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, JSONCacheCall(request, true, output));
+    ASSERT_EQ(NS_OK, restore->Reset());
+    ASSERT_EQ(NS_OK, restore->BindUTF8StringByName("receipt"_ns, receipt));
+    ASSERT_EQ(NS_OK, restore->Execute());
+    restore = nullptr;
+    ASSERT_EQ(NS_OK, JSONCacheCall(request, true, output));
+    EXPECT_EQ(receipt, output);
+  });
+}
+
+TEST_F(DeliveryCoreReferences, NativeJSONCacheGenuineZeroEntryReceipt) {
+  ASSERT_EQ(NS_OK, Start());
+  nsCString request, original, receipt, output;
+  ASSERT_EQ(NS_OK,
+            PrepareJSONCacheRequest(nullptr, "{}"_ns, request, original));
+  EXPECT_EQ("{}"_ns, original);
+  ASSERT_EQ(NS_OK, JSONCacheCall(request, false, receipt));
+  EXPECT_NE(kNotFound, receipt.Find("\"folders\":[]"));
+  EXPECT_NE(kNotFound, receipt.Find("\"cells\":[]"));
+  int64_t count;
+  ASSERT_EQ(NS_OK, JSONCacheImportCount(count));
+  EXPECT_EQ(1, count);
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  ASSERT_EQ(NS_OK, JSONCacheCall(request, true, output));
+  EXPECT_EQ(receipt, output);
+}
+
+TEST_F(DeliveryCoreReferences, StartupEmptyJSONPrecedesObsoleteMork) {
+  const auto json = " { } \n"_ns;
+  const auto stale = "obsolete historical Mork stays byte-for-byte"_ns;
+  ASSERT_EQ(NS_OK, WriteStartupFile("folderCache.json", json));
+  ASSERT_EQ(NS_OK, WriteStartupFile("panacea.dat", stale));
+  ASSERT_EQ(NS_OK, ArmSelectedStartup());
+  nsCString selected;
+  ASSERT_EQ(NS_OK, DescribeStartup(selected));
+  EXPECT_NE(kNotFound, selected.Find("\"mode\":\"initialize\""));
+  ASSERT_EQ(NS_OK, OpenStartup("initialize"));
+  ASSERT_EQ(NS_OK, WriteStartupSelector());
+  ASSERT_EQ(NS_OK, CheckStartupActivation(true));
+  EXPECT_EQ(NS_OK, DatabaseCore::CheckAccountStartup());
+  for (auto item : {std::pair{"folderCache.json", &json},
+                    std::pair{"panacea.dat", &stale}}) {
+    nsCOMPtr<nsIFile> file;
+    ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(file)));
+    ASSERT_EQ(NS_OK, file->AppendNative(nsDependentCString(item.first)));
+    nsCString actual;
+    ASSERT_EQ(NS_OK, JSONCacheReadFile(file, actual));
+    EXPECT_EQ(*item.second, actual);
+  }
+  EXPECT_FALSE(mStartupFixtureWork);
+}
+
+TEST_F(DeliveryCoreReferences, StartupNonemptyJSONCannotInitialize) {
+  dom::AutoJSAPI jsapi;
+  ASSERT_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()));
+  nsCOMPtr<nsIFile> summary;
+  ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(summary)));
+  ASSERT_EQ(NS_OK, summary->AppendNative("cache-only.msf"_ns));
+  nsCString descriptor, quoted;
+  ASSERT_EQ(NS_OK, summary->GetPersistentDescriptor(descriptor));
+  ASSERT_EQ(NS_OK, JSONCacheQuote(jsapi.cx(), descriptor, quoted));
+  ASSERT_EQ(NS_OK, WriteStartupFile("folderCache.json",
+                                    "{"_ns + quoted + ":{\"flags\":0}}"_ns));
+  ASSERT_EQ(NS_OK, ArmSelectedStartup());
+  nsCString selected;
+  ASSERT_EQ(NS_OK, DescribeStartup(selected));
+  EXPECT_NE(kNotFound, selected.Find("\"mode\":\"migrate\""));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, OpenStartup("initialize"));
+  bool exists;
+  ASSERT_EQ(NS_OK, mFile->Exists(&exists));
+  EXPECT_FALSE(exists);
+}
+
+TEST_F(DeliveryCoreReferences, StartupInvalidJSONNeverFallsBackToMork) {
+  ASSERT_EQ(NS_OK, WriteStartupFile("panacea.dat", "historical bytes"_ns));
+  ASSERT_EQ(NS_OK, ArmSelectedStartup());
+  nsCString selected;
+  for (const char* raw : {"{", "[]", "null", "{\"relative\":{}}",
+                          "{\"/original.msf\":{\"flags\":true}}",
+                          "{\"/original.msf\":{\"flags\":4294967296}}",
+                          "{\"/original.msf\":{\"unknown\":1}}",
+                          "{\"/original.msf\":{\"custom\":null}}",
+                          "{\"/original.msf\":{\"custom\":{}}}"}) {
+    SCOPED_TRACE(raw);
+    ASSERT_EQ(NS_OK,
+              WriteStartupFile("folderCache.json", nsDependentCString(raw)));
+    EXPECT_TRUE(NS_FAILED(DescribeStartup(selected)));
+    EXPECT_TRUE(NS_FAILED(OpenStartup("initialize")));
+    bool exists;
+    ASSERT_EQ(NS_OK, mFile->Exists(&exists));
+    EXPECT_FALSE(exists);
+  }
+  // Only genuinely removing the malformed source restores Mork selection.
+  nsCOMPtr<nsIFile> file;
+  ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(file)));
+  ASSERT_EQ(NS_OK, file->AppendNative("folderCache.json"_ns));
+  ASSERT_EQ(NS_OK, file->Remove(false));
+  ASSERT_EQ(NS_OK, DescribeStartup(selected));
+  EXPECT_NE(kNotFound, selected.Find("\"mode\":\"migrate\""));
+}
+
+TEST_F(DeliveryCoreReferences, StartupEmptyJSONRetainsOtherLegacyData) {
+  ASSERT_EQ(NS_OK, WriteStartupFile("folderCache.json", "{}"_ns));
+  ASSERT_EQ(NS_OK, WriteStartupFile("retained.msf", "real summary bytes"_ns));
+  ASSERT_EQ(NS_OK, ArmSelectedStartup());
+  nsCString selected;
+  ASSERT_EQ(NS_OK, DescribeStartup(selected));
+  EXPECT_NE(kNotFound, selected.Find("\"mode\":\"migrate\""));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, OpenStartup("initialize"));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, OpenStartup("migrate"));
+  bool exists;
+  ASSERT_EQ(NS_OK, mFile->Exists(&exists));
+  EXPECT_FALSE(exists);
+}
+
 #endif
 
 }  // namespace mozilla::mailnews

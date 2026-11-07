@@ -28,6 +28,7 @@ import { getMorkThreadRelations } from "resource:///modules/panorama/MigrationMe
 import { verifyMigrationBackup } from "resource:///modules/panorama/MigrationBackup.sys.mjs";
 
 import {
+  parseJSONFolderCache,
   createMorkFolderCacheRequest,
   getMorkFolderCacheCells,
   validateMorkFolderCacheReceipt,
@@ -537,6 +538,7 @@ export async function resumeMorkBookImportsAndPublish(
  *   Every original key with its admitted canonical native cache descriptor.
  * @param {number} [requestVersion=2] - Reconciled version2; explicit1 retains
  *   original provenance-only plan semantics without upgrading old receipts.
+ *   An original native JSON input uses explicit version3 reconciliation.
  * @param {?nsISupports} [startupOperation=null] - Native operation for the
  *   distinct startup caller; otherwise profileLock must be a genuine held lock.
  * @returns {Promise<object>} Owned source bytes/raw records and exact folder
@@ -552,7 +554,7 @@ export async function prepareMorkFolderCacheImport(
   requestVersion = 2,
   startupOperation = null
 ) {
-  if (requestVersion !== 1 && requestVersion !== 2) {
+  if (![1, 2, 3].includes(requestVersion)) {
     throw new Error("Unsupported native cache request version");
   }
   const database = core.QueryInterface(Ci.nsIDatabaseCore);
@@ -573,6 +575,14 @@ export async function prepareMorkFolderCacheImport(
     checkTarget,
     checkInput,
   } = input;
+  if (cache.format === "json") {
+    if (requestVersion === 1) {
+      throw new Error("Native JSON cache requires reconciled version3");
+    }
+    requestVersion = 3;
+  } else if (requestVersion === 3) {
+    throw new Error("Version3 requires an original JSON cache");
+  }
   if (
     Object.prototype.toString.call(bindings) != "[object Map]" ||
     bindings.size != cache.entries.size
@@ -620,7 +630,7 @@ export async function prepareMorkFolderCacheImport(
       descriptors.add(descriptor);
       return {
         originalKey: key,
-        ...(requestVersion === 2
+        ...(requestVersion >= 2
           ? { originalSummaryPath: isServer ? "" : cachePath }
           : {}),
         id,
@@ -659,9 +669,95 @@ export async function prepareMorkFolderCacheImport(
     source: identity,
     bytes,
     records: structuredClone(cache.source),
-    ...(requestVersion === 2 ? { requestVersion, proof } : {}),
+    ...(requestVersion >= 2 ? { requestVersion, proof } : {}),
+    ...(requestVersion === 3 ? { sourceFormat: "json" } : {}),
     folders: folders.map(folder => bindMorkFolderCacheRecord(folder, cache)),
   };
+}
+
+/**
+ * Reads native JSON cache bytes under the existing selected-profile admission.
+ * Historical Mork files keep their original parser and source identity.
+ *
+ * @param {string} path - Admitted original cache file.
+ * @returns {Promise<{cache: object, bytes: Uint8Array, identity: object}>}
+ *   Complete original rows, bytes and checked path/size/SHA-256.
+ * @throws {Error} For changed input, malformed rows or unsupported cell values.
+ */
+async function readStartupFolderCacheSource(path) {
+  if (PathUtils.filename(path) !== "folderCache.json") {
+    return readMorkFolderCacheSource(path);
+  }
+  const file = startupSourceFile(path);
+  const before = await IOUtils.stat(file.path);
+  const limit = 64 * 1024 * 1024;
+  if (before.type !== "regular" || before.size > limit) {
+    throw new Error("Unsupported native JSON cache file");
+  }
+  const bytes = await IOUtils.read(file.path, { maxBytes: limit + 1 });
+  const hash = Cc["@mozilla.org/security/hash;1"].createInstance(
+    Ci.nsICryptoHash
+  );
+  hash.init(Ci.nsICryptoHash.SHA256);
+  hash.update(bytes, bytes.length);
+  const sha256 = Array.from(hash.finish(false), byte =>
+    byte.charCodeAt(0).toString(16).padStart(2, "0")
+  ).join("");
+  const after = await IOUtils.stat(file.path);
+  if (
+    startupSourceFile(path).path !== file.path ||
+    bytes.length !== before.size ||
+    after.type !== "regular" ||
+    after.size !== before.size ||
+    after.lastModified !== before.lastModified ||
+    (await hashMigrationFile(file.path)) !== sha256
+  ) {
+    throw new Error("Native JSON cache changed while reading");
+  }
+  return {
+    cache: parseJSONFolderCache(bytes),
+    bytes,
+    identity: { path: file.path, size: bytes.length, sha256 },
+  };
+}
+
+/**
+ * Classifies a fully parsed empty JSON cache before the startup backup decision.
+ * Native startup independently rechecks its unchanged bytes before any create.
+ *
+ * @param {string} path - Closed selected-profile original JSON cache.
+ * @returns {boolean} Whether the complete original cache contains no rows.
+ * @throws {Error} For links, changed files, malformed JSON or unsupported values.
+ */
+function startupJSONCacheIsEmpty(path) {
+  const file = startupSourceFile(path);
+  const size = file.fileSize;
+  const modified = file.lastModifiedTime;
+  if (!file.isFile() || size < 0 || size > 64 * 1024 * 1024) {
+    throw new Error("Unsupported startup JSON cache file");
+  }
+  const stream = Cc["@mozilla.org/network/file-input-stream;1"].createInstance(
+    Ci.nsIFileInputStream
+  );
+  stream.init(file, 0x01, 0, 0);
+  try {
+    const binary = Cc["@mozilla.org/binaryinputstream;1"].createInstance(
+      Ci.nsIBinaryInputStream
+    );
+    binary.setInputStream(stream);
+    const bytes = new Uint8Array(binary.readByteArray(size));
+    const parsed = parseJSONFolderCache(bytes);
+    if (
+      startupSourceFile(path).path !== file.path ||
+      file.fileSize !== size ||
+      file.lastModifiedTime !== modified
+    ) {
+      throw new Error("Startup JSON cache changed during classification");
+    }
+    return parsed.entries.size === 0;
+  } finally {
+    stream.close();
+  }
 }
 
 /**
@@ -741,7 +837,8 @@ async function readBoundMorkFolderCacheInput(
   }
   const original = new FileUtils.File(path);
   const canonical = admittedFolderPath(original, roots);
-  const { cache, bytes, identity } = await readMorkFolderCacheSource(canonical);
+  const { cache, bytes, identity } =
+    await readStartupFolderCacheSource(canonical);
   const backup = await verifyMigrationBackup(state.backupPath);
   if (
     backup.path !== state.backup?.path ||
@@ -822,7 +919,9 @@ function bindMorkFolderCacheRecord(folder, cache) {
   }
   return {
     ...folder,
-    sourceKey: entry.sourceKey,
+    ...(Object.hasOwn(entry, "sourceKey")
+      ? { sourceKey: entry.sourceKey }
+      : {}),
     properties: [...entry.properties].map(([name, text]) => ({
       name,
       text,
@@ -837,6 +936,7 @@ function bindMorkFolderCacheRecord(folder, cache) {
  * Applies supported cache cells through native SQL receipts, then checkpoints.
  * The caller retains the selected profile lock and quiesces source/target writers.
  * Version2 reconciles eligible fields against native origin and source proof.
+ * Version3 applies the same checks to explicit native JSON cache entries.
  * Committed version1 plans retain their original provenance-only semantics.
  *
  * @param {MigrationJournal} journal - Explicit version5 cache plan.
@@ -880,7 +980,7 @@ export async function resumeMorkCacheImports(
   try {
     for (const cache of journal.state.caches) {
       await checkCancelled();
-      if (cache.requestVersion === 2) {
+      if (cache.requestVersion >= 2) {
         const input = await readBoundMorkFolderCacheInput(
           journal,
           database,
@@ -937,7 +1037,7 @@ export async function resumeMorkCacheImports(
         ...snapshot.source,
         folders: snapshot.folders,
         databaseSourceId: snapshot.databaseSourceId,
-        ...(snapshot.requestVersion === 2 ? { proof: snapshot.proof } : {}),
+        ...(snapshot.requestVersion >= 2 ? { proof: snapshot.proof } : {}),
       };
       const request = createMorkFolderCacheRequest(cache);
       const actual = createMorkFolderCacheRequest(current);
@@ -2205,12 +2305,27 @@ function captureStartupMigration(signal) {
         id: "book:" + file.getRelativePath(profile),
         path: file.path,
       });
-    } else if (file.leafName === "panacea.dat") {
+    } else if (
+      file.parent.equals(profile) &&
+      ["panacea.dat", "folderCache.json"].includes(file.leafName)
+    ) {
       caches.push({
         id: "cache:" + file.getRelativePath(profile),
         path: file.path,
       });
     }
+  }
+  const activeJSON = caches.find(
+    cache => PathUtils.filename(cache.path) === "folderCache.json"
+  );
+  if (activeJSON) {
+    // Follow native legacy JSON precedence. The complete backup preserves an
+    // obsolete Mork cache; its stale fields never override the active JSON.
+    caches.splice(
+      0,
+      caches.length,
+      ...(startupJSONCacheIsEmpty(activeJSON.path) ? [] : [activeJSON])
+    );
   }
   for (const file of files) {
     const server = servers.find(item =>
@@ -2344,12 +2459,12 @@ function startupFolderOrigin(source, summary, caches) {
   );
   const matches = caches.flatMap(({ identity, input }) => {
     const row = input.entries.get(originalKey);
-    return row ? [{ identity, row }] : [];
+    return row ? [{ identity, row, format: input.format }] : [];
   });
   if (matches.length !== 1) {
     throw new Error("IMAP summary has no unique original folder-cache entry");
   }
-  const { identity, row } = matches[0];
+  const { identity, row, format } = matches[0];
   const { onlineName, hierDelim, boxFlags } = row.values;
   if (
     !["onlineName", "hierDelim", "boxFlags"].every(name =>
@@ -2388,7 +2503,13 @@ function startupFolderOrigin(source, summary, caches) {
   }
   return {
     provider: "imap-client-discovery",
-    cache: { ...identity, originalKey, sourceKey: row.sourceKey },
+    cache: {
+      ...identity,
+      originalKey,
+      ...(format === "json"
+        ? { sourceFormat: "json" }
+        : { sourceKey: row.sourceKey }),
+    },
     originalCells: Object.fromEntries(
       ["onlineName", "hierDelim", "boxFlags"].map(name => [
         name,
@@ -2512,13 +2633,14 @@ async function finishPanoramaProfileStartup(
       const caches = [];
       const cacheInputs = [];
       for (const cache of captured.caches) {
-        const { identity, cache: input } = await readMorkFolderCacheSource(
+        const { identity, cache: input } = await readStartupFolderCacheSource(
           cache.path
         );
         caches.push({
           ...cache,
           ...identity,
           cacheKeys: [...input.entries.keys()],
+          ...(input.format === "json" ? { sourceFormat: "json" } : {}),
         });
         cacheInputs.push({ identity, input });
         database.validateProfileStartup(operation);

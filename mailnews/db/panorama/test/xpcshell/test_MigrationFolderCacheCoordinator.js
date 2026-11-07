@@ -31,10 +31,13 @@ const { prepareMorkFolderCacheImport, resumeMorkCacheImports } =
     "resource:///modules/panorama/MigrationCoordinator.sys.mjs"
   );
 
-const { createMorkFolderCacheRequest, validateMorkFolderCacheReceipt } =
-  ChromeUtils.importESModule(
-    "resource:///modules/panorama/MorkFolderCache.sys.mjs"
-  );
+const {
+  parseJSONFolderCache,
+  createMorkFolderCacheRequest,
+  validateMorkFolderCacheReceipt,
+} = ChromeUtils.importESModule(
+  "resource:///modules/panorama/MorkFolderCache.sys.mjs"
+);
 
 const CACHE_FILE = "panacea.dat";
 const OLD_ROOT = "/foo/bar/profile-default/";
@@ -1462,3 +1465,102 @@ add_task(
     }
   }
 );
+
+add_task(function test_JSONCacheRetainsDescriptorIdentityAndTypedPresence() {
+  const key = PathUtils.join(PathUtils.profileDir, "Original ☃.msf");
+  const input = {
+    [key]: {
+      flags: 0,
+      pendingMsgs: -1,
+      folderSize: 9007199254740991,
+      folderName: "Original ☃",
+      empty: "",
+      unknownText: "unchanged",
+    },
+  };
+  const bytes = new TextEncoder().encode(JSON.stringify(input));
+  const before = bytes.slice();
+  const parsed = parseJSONFolderCache(bytes);
+  Assert.equal(parsed.format, "json");
+  Assert.deepEqual([...parsed.entries.keys()], [key]);
+  const row = parsed.entries.get(key);
+  Assert.ok(!Object.hasOwn(row, "sourceKey"), "JSON has no Mork row ID");
+  Assert.equal(row.properties.get("key"), key);
+  Assert.equal(row.properties.get("flags"), "0");
+  Assert.equal(row.values.flags, 0, "Explicit numeric zero stays present");
+  Assert.equal(row.properties.get("pendingMsgs"), "ffffffff");
+  Assert.equal(row.values.pendingMsgs, -1);
+  Assert.equal(row.properties.get("folderSize"), "1fffffffffffff");
+  Assert.equal(row.values.folderSize, 9007199254740991);
+  Assert.equal(row.properties.get("folderName"), "Original ☃");
+  Assert.equal(row.properties.get("empty"), "");
+  Assert.equal(row.properties.get("unknownText"), "unchanged");
+  Assert.ok(!row.properties.has("absent"));
+  Assert.deepEqual(parsed.source, input, "Original JSON rows remain JSON");
+  Assert.deepEqual(bytes, before, "Parsing never rewrites original bytes");
+  const empty = parseJSONFolderCache(new TextEncoder().encode("{}"));
+  Assert.equal(
+    empty.entries.size,
+    0,
+    "Only an actual empty object has zero rows"
+  );
+  Assert.deepEqual(empty.source, {});
+});
+
+add_task(function test_JSONCacheRefusesUnsafeOrAmbiguousCellTypes() {
+  const key = PathUtils.join(PathUtils.profileDir, "Original.msf");
+  const encode = value => new TextEncoder().encode(JSON.stringify(value));
+  for (const value of [null, [], 0, "rows"]) {
+    Assert.throws(
+      () => parseJSONFolderCache(encode(value)),
+      /requires an object/
+    );
+  }
+  for (const row of [null, [], true]) {
+    Assert.throws(
+      () => parseJSONFolderCache(encode({ [key]: row })),
+      /cache row/
+    );
+  }
+  for (const row of [
+    { flags: -1 },
+    { flags: 0x100000000 },
+    { totalMsgs: 0x80000000 },
+    { totalMsgs: -0x80000001 },
+    { folderSize: 9007199254740992 },
+    { flags: "0" },
+    { flags: 0.5 },
+  ]) {
+    Assert.throws(
+      () => parseJSONFolderCache(encode({ [key]: row })),
+      /cache number/
+    );
+  }
+  for (const row of [
+    { folderName: true },
+    { folderName: null },
+    { folderName: [] },
+    { folderName: {} },
+    { unknownNumber: 1 },
+    { folderName: "nul\0value" },
+    { folderName: "\ud800" },
+  ]) {
+    Assert.throws(
+      () => parseJSONFolderCache(encode({ [key]: row })),
+      /cache text/
+    );
+  }
+  Assert.throws(
+    () => parseJSONFolderCache(encode({ relative: {} })),
+    /cache row/
+  );
+  Assert.throws(
+    () => parseJSONFolderCache(encode({ [key]: { key: "replacement" } })),
+    /cache property/
+  );
+  Assert.throws(() => parseJSONFolderCache(new Uint8Array([0xff])), /./);
+  Assert.throws(
+    () => parseJSONFolderCache(new TextEncoder().encode("{broken")),
+    /./
+  );
+});

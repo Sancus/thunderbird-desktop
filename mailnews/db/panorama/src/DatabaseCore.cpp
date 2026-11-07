@@ -6498,14 +6498,14 @@ DatabaseCore::MigrateFolderDatabase(nsIMsgFolder* srcFolder, JSContext* aCx,
 struct CacheFolder {
   nsCString originalKey, descriptor, cachePath, storePath, protocol, storeType;
   uint64_t id;
-  uint32_t sourceKey;
+  Maybe<uint32_t> sourceKey;
   bool isServer;
   nsCString originalSummaryPath;
   Maybe<uint32_t> originalFlags;
   nsTArray<FolderImportProperty> properties;
 };
 struct CacheImport {
-  nsCString token, sourceId, databaseId, path, sha256;
+  nsCString token, sourceId, databaseId, path, sha256, sourceFormat;
   uint32_t version{1};
   uint32_t size;
   nsCString profilePath, manifestPath, manifestSha256;
@@ -6553,8 +6553,18 @@ nsresult CacheRequest(JSContext* cx, JS::Handle<JS::Value> value,
   JS::Rooted<JS::Value> field(cx);
   int64_t number;
   MOZ_TRY(ImportMember(cx, request, "version", &field));
-  MOZ_TRY(ImportNumber(field, 1, 2, number));
+  MOZ_TRY(ImportNumber(field, 1, 3, number));
   input.version = number;
+  if (input.version == 3) {
+    MOZ_TRY(ImportMember(cx, request, "sourceFormat", &field));
+    MOZ_TRY(ImportText(cx, field, input.sourceFormat));
+    NS_ENSURE_TRUE(input.sourceFormat == "json"_ns, NS_ERROR_INVALID_ARG);
+    MOZ_TRY(ImportMember(cx, request, "policy", &field));
+    nsCString policy;
+    MOZ_TRY(ImportText(cx, field, policy));
+    NS_ENSURE_TRUE(policy == "native-reconciled-json-v3"_ns,
+                   NS_ERROR_INVALID_ARG);
+  }
   for (auto pair : {std::pair{"token", &input.token},
                     {"sourceId", &input.sourceId},
                     {"databaseSourceId", &input.databaseId}}) {
@@ -6581,7 +6591,14 @@ nsresult CacheRequest(JSContext* cx, JS::Handle<JS::Value> value,
   MOZ_TRY(ImportMember(cx, object, "size", &field));
   MOZ_TRY(ImportNumber(field, 1, UINT32_MAX - 1, number));
   input.size = number;
-  if (input.version == 2) {
+  if (input.version == 3) {
+    nsCOMPtr<nsIFile> file;
+    MOZ_TRY(NS_NewNativeLocalFile(input.path, getter_AddRefs(file)));
+    nsCString leaf;
+    MOZ_TRY(file->GetNativeLeafName(leaf));
+    NS_ENSURE_TRUE(leaf == "folderCache.json"_ns, NS_ERROR_INVALID_ARG);
+  }
+  if (input.version >= 2) {
     MOZ_TRY(ImportMember(cx, request, "proof", &field));
     NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
     object = &field.toObject();
@@ -6607,11 +6624,14 @@ nsresult CacheRequest(JSContext* cx, JS::Handle<JS::Value> value,
     MOZ_TRY(ImportMember(cx, object, "size", &field));
     MOZ_TRY(ImportNumber(field, 1, UINT32_MAX - 1, number));
     input.manifestSize = number;
+    if (input.version == 3)
+      NS_ENSURE_TRUE(input.path == input.profilePath + "/folderCache.json"_ns,
+                     NS_ERROR_INVALID_ARG);
   }
   MOZ_TRY(ImportMember(cx, request, "folders", &field));
   uint32_t length;
   MOZ_TRY(ImportArray(cx, field, &array, length));
-  NS_ENSURE_TRUE(length, NS_ERROR_INVALID_ARG);
+  NS_ENSURE_TRUE(length || input.version == 3, NS_ERROR_INVALID_ARG);
   for (uint32_t i = 0; i < length; ++i) {
     NS_ENSURE_TRUE(JS_GetElement(cx, array, i, &field), NS_ERROR_FAILURE);
     NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
@@ -6631,13 +6651,25 @@ nsresult CacheRequest(JSContext* cx, JS::Handle<JS::Value> value,
     MOZ_TRY(ImportMember(cx, object, "id", &field));
     MOZ_TRY(ImportNumber(field, 1, 9007199254740991., number));
     folder.id = number;
-    MOZ_TRY(ImportMember(cx, object, "sourceKey", &field));
-    MOZ_TRY(ImportNumber(field, 1, UINT32_MAX, number));
-    folder.sourceKey = number;
+    if (input.version == 3) {
+      bool hasSourceKey;
+      NS_ENSURE_TRUE(JS_HasOwnProperty(cx, object, "sourceKey", &hasSourceKey),
+                     NS_ERROR_FAILURE);
+      NS_ENSURE_FALSE(hasSourceKey, NS_ERROR_INVALID_ARG);
+      nsCOMPtr<nsIFile> original;
+      MOZ_TRY(
+          NS_NewNativeLocalFile(folder.originalKey, getter_AddRefs(original)));
+      NS_ENSURE_TRUE(folder.originalKey == folder.descriptor,
+                     NS_ERROR_NOT_AVAILABLE);
+    } else {
+      MOZ_TRY(ImportMember(cx, object, "sourceKey", &field));
+      MOZ_TRY(ImportNumber(field, 1, UINT32_MAX, number));
+      folder.sourceKey = Some(uint32_t(number));
+    }
     MOZ_TRY(ImportMember(cx, object, "isServer", &field));
     NS_ENSURE_TRUE(field.isBoolean(), NS_ERROR_INVALID_ARG);
     folder.isServer = field.toBoolean();
-    if (input.version == 2) {
+    if (input.version >= 2) {
       MOZ_TRY(ImportMember(cx, object, "originalSummaryPath", &field));
       MOZ_TRY(ImportText(cx, field, folder.originalSummaryPath));
       NS_ENSURE_TRUE(folder.originalSummaryPath.FindChar(0) < 0 &&
@@ -6647,13 +6679,14 @@ nsresult CacheRequest(JSContext* cx, JS::Handle<JS::Value> value,
                      NS_ERROR_INVALID_ARG);
     }
     for (const auto& previous : input.folders) {
-      NS_ENSURE_TRUE(previous.id != folder.id &&
-                         previous.originalKey != folder.originalKey &&
-                         previous.sourceKey != folder.sourceKey &&
-                         previous.descriptor != folder.descriptor &&
-                         previous.cachePath != folder.cachePath &&
-                         previous.storePath != folder.storePath,
-                     NS_ERROR_INVALID_ARG);
+      NS_ENSURE_TRUE(
+          previous.id != folder.id &&
+              previous.originalKey != folder.originalKey &&
+              (input.version == 3 || previous.sourceKey != folder.sourceKey) &&
+              previous.descriptor != folder.descriptor &&
+              previous.cachePath != folder.cachePath &&
+              previous.storePath != folder.storePath,
+          NS_ERROR_INVALID_ARG);
     }
     input.folders.AppendElement(std::move(folder));
   }
@@ -6736,9 +6769,13 @@ nsresult CacheIdentity(JSContext* cx, const CacheImport& input,
       JS_DefineProperty(cx, result, "version", input.version,
                         JSPROP_ENUMERATE) &&
           CacheText(cx, result, "policy",
-                    input.version == 1 ? "native-authoritative-v1"_ns
-                                       : "native-reconciled-selected-v2"_ns),
+                    input.version == 1   ? "native-authoritative-v1"_ns
+                    : input.version == 2 ? "native-reconciled-selected-v2"_ns
+                                         : "native-reconciled-json-v3"_ns),
       NS_ERROR_OUT_OF_MEMORY);
+  if (input.version == 3)
+    NS_ENSURE_TRUE(CacheText(cx, result, "sourceFormat", input.sourceFormat),
+                   NS_ERROR_OUT_OF_MEMORY);
   for (auto pair : {std::pair{"token", &input.token},
                     {"sourceId", &input.sourceId},
                     {"databaseSourceId", &input.databaseId},
@@ -6750,7 +6787,7 @@ nsresult CacheIdentity(JSContext* cx, const CacheImport& input,
   NS_ENSURE_TRUE(JS_DefineProperty(cx, result, "size", double(input.size),
                                    JSPROP_ENUMERATE),
                  NS_ERROR_OUT_OF_MEMORY);
-  if (input.version == 2) {
+  if (input.version >= 2) {
     JS::Rooted<JSObject*> proof(
         cx, JS_NewObjectWithGivenProto(cx, nullptr, nullptr));
     JS::Rooted<JSObject*> manifest(
@@ -6781,7 +6818,7 @@ nsresult CacheIdentity(JSContext* cx, const CacheImport& input,
       NS_ENSURE_TRUE(CacheText(cx, object, pair.first, *pair.second),
                      NS_ERROR_OUT_OF_MEMORY);
     }
-    if (input.version == 2) {
+    if (input.version >= 2) {
       NS_ENSURE_TRUE(CacheText(cx, object, "originalSummaryPath",
                                folder.originalSummaryPath),
                      NS_ERROR_OUT_OF_MEMORY);
@@ -6790,8 +6827,9 @@ nsresult CacheIdentity(JSContext* cx, const CacheImport& input,
     NS_ENSURE_TRUE(
         JS_DefineProperty(cx, object, "id", double(folder.id),
                           JSPROP_ENUMERATE) &&
-            JS_DefineProperty(cx, object, "sourceKey", double(folder.sourceKey),
-                              JSPROP_ENUMERATE) &&
+            (input.version == 3 ||
+             JS_DefineProperty(cx, object, "sourceKey",
+                               double(*folder.sourceKey), JSPROP_ENUMERATE)) &&
             JS_DefineProperty(cx, object, "isServer", server,
                               JSPROP_ENUMERATE) &&
             JS_DefineElement(cx, folders, i, object, JSPROP_ENUMERATE),
@@ -6861,8 +6899,8 @@ bool CacheUnsupportedAlias(const nsACString& name) {
          name.EqualsLiteral("unreadPendingMsgs");
 }
 
-nsresult ParseCacheBytes(JSContext* cx, const nsACString& bytes,
-                         CacheImport& input) {
+nsresult ParseCacheDocument(JSContext* cx, const nsACString& bytes, bool json,
+                            JS::MutableHandle<JSObject*> output) {
   JS::Rooted<JSObject*> module(cx),
       buffer(cx, JS_NewUint8Array(cx, bytes.Length()));
   NS_ENSURE_TRUE(buffer, NS_ERROR_OUT_OF_MEMORY);
@@ -6882,24 +6920,48 @@ nsresult ParseCacheBytes(JSContext* cx, const nsACString& bytes,
   JS::Rooted<JS::Value> function(cx), parsed(cx),
       argument(cx, JS::ObjectValue(*buffer)), field(cx);
   NS_ENSURE_TRUE(
-      JS_GetProperty(cx, module, "parseMorkFolderCache", &function) &&
+      JS_GetProperty(cx, module,
+                     json ? "parseJSONFolderCache" : "parseMorkFolderCache",
+                     &function) &&
           JS::Call(cx, module, function, JS::HandleValueArray(argument),
                    &parsed),
       NS_ERROR_FAILURE);
   NS_ENSURE_TRUE(parsed.isObject(), NS_ERROR_FAILURE);
-  JS::Rooted<JSObject*> object(cx, &parsed.toObject()), entries(cx), source(cx),
-      rows(cx);
+  JS::Rooted<JSObject*> object(cx, &parsed.toObject());
+  if (json) {
+    MOZ_TRY(ImportMember(cx, object, "format", &field));
+    nsCString format;
+    MOZ_TRY(ImportText(cx, field, format));
+    NS_ENSURE_TRUE(format == "json"_ns, NS_ERROR_FILE_CORRUPTED);
+  }
+  output.set(object);
+  return NS_OK;
+}
+
+nsresult ParseCacheBytes(JSContext* cx, const nsACString& bytes,
+                         CacheImport& input) {
+  JS::Rooted<JSObject*> object(cx), entries(cx), source(cx), rows(cx);
+  MOZ_TRY(ParseCacheDocument(cx, bytes, input.version == 3, &object));
+  JS::Rooted<JS::Value> field(cx);
   MOZ_TRY(ImportMember(cx, object, "entries", &field));
   NS_ENSURE_TRUE(field.isObject(), NS_ERROR_FAILURE);
   entries = &field.toObject();
   MOZ_TRY(ImportMember(cx, object, "source", &field));
   NS_ENSURE_TRUE(field.isObject(), NS_ERROR_FAILURE);
   source = &field.toObject();
-  MOZ_TRY(ImportMember(cx, source, "rows", &field));
-  NS_ENSURE_TRUE(field.isObject(), NS_ERROR_FAILURE);
-  rows = &field.toObject();
-  NS_ENSURE_TRUE(JS::MapSize(cx, rows) == input.folders.Length() &&
-                     JS::MapSize(cx, entries) == input.folders.Length(),
+  if (input.version == 3) {
+    JS::Rooted<JS::IdVector> keys(cx, JS::IdVector(cx));
+    NS_ENSURE_TRUE(JS_Enumerate(cx, source, &keys), NS_ERROR_FAILURE);
+    NS_ENSURE_TRUE(keys.length() == input.folders.Length(),
+                   NS_ERROR_NOT_IMPLEMENTED);
+  } else {
+    MOZ_TRY(ImportMember(cx, source, "rows", &field));
+    NS_ENSURE_TRUE(field.isObject(), NS_ERROR_FAILURE);
+    rows = &field.toObject();
+    NS_ENSURE_TRUE(JS::MapSize(cx, rows) == input.folders.Length(),
+                   NS_ERROR_NOT_IMPLEMENTED);
+  }
+  NS_ENSURE_TRUE(JS::MapSize(cx, entries) == input.folders.Length(),
                  NS_ERROR_NOT_IMPLEMENTED);
   for (auto& folder : input.folders) {
     JS::Rooted<JSString*> key(
@@ -6911,9 +6973,18 @@ nsresult ParseCacheBytes(JSContext* cx, const nsACString& bytes,
     NS_ENSURE_TRUE(JS::MapGet(cx, entries, keyValue, &field), NS_ERROR_FAILURE);
     NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
     object = &field.toObject();
-    MOZ_TRY(ImportMember(cx, object, "sourceKey", &field));
     int64_t number;
-    MOZ_TRY(ImportNumber(field, folder.sourceKey, folder.sourceKey, number));
+    if (input.version == 3) {
+      bool hasSourceKey;
+      NS_ENSURE_TRUE(JS_HasOwnProperty(cx, object, "sourceKey", &hasSourceKey),
+                     NS_ERROR_FAILURE);
+      NS_ENSURE_FALSE(hasSourceKey || folder.sourceKey,
+                      NS_ERROR_FILE_CORRUPTED);
+    } else {
+      MOZ_TRY(ImportMember(cx, object, "sourceKey", &field));
+      MOZ_TRY(
+          ImportNumber(field, *folder.sourceKey, *folder.sourceKey, number));
+    }
     MOZ_TRY(ImportMember(cx, object, "values", &field));
     NS_ENSURE_TRUE(field.isObject(), NS_ERROR_FAILURE);
     JS::Rooted<JSObject*> values(cx, &field.toObject()), properties(cx);
@@ -6937,6 +7008,9 @@ nsresult ParseCacheBytes(JSContext* cx, const nsACString& bytes,
       MOZ_TRY(ImportText(cx, field, property.text));
       NS_ENSURE_FALSE(CacheUnsupportedAlias(property.name),
                       NS_ERROR_NOT_IMPLEMENTED);
+      if (input.version == 3 && property.name == "key"_ns)
+        NS_ENSURE_TRUE(property.text == folder.originalKey,
+                       NS_ERROR_FILE_CORRUPTED);
       if (!property.name.EqualsLiteral("key")) {
         JS::Rooted<JS::PropertyKey> id(cx);
         NS_ENSURE_TRUE(JS_ValueToId(cx, name, &id) &&
@@ -6949,6 +7023,102 @@ nsresult ParseCacheBytes(JSContext* cx, const nsACString& bytes,
         }
       }
       folder.properties.AppendElement(std::move(property));
+    }
+  }
+  return NS_OK;
+}
+
+// Reuse checks native retained bytes and their complete original cells. It
+// never reopens obsolete source files or replays a projection into live state.
+nsresult CheckStoredJSONCacheReceipt(JSContext* cx,
+                                     mozIStorageConnection* connection,
+                                     CacheImport& input,
+                                     const nsACString& receipt) {
+  NS_ENSURE_TRUE(input.version == 3, NS_ERROR_INVALID_ARG);
+  nsCOMPtr<mozIStorageStatement> stored;
+  MOZ_TRY(connection->CreateStatement(
+      "SELECT raw FROM folder_cache_imports WHERE token=:token"_ns,
+      getter_AddRefs(stored)));
+  MOZ_TRY(stored->BindUTF8StringByName("token"_ns, input.token));
+  bool row;
+  MOZ_TRY(stored->ExecuteStep(&row));
+  NS_ENSURE_TRUE(row, NS_ERROR_FILE_CORRUPTED);
+  int32_t type;
+  MOZ_TRY(stored->GetTypeOfIndex(0, &type));
+  NS_ENSURE_TRUE(type == mozIStorageStatement::VALUE_TYPE_BLOB,
+                 NS_ERROR_FILE_CORRUPTED);
+  uint32_t length;
+  uint8_t* raw = nullptr;
+  MOZ_TRY(stored->GetBlob(0, &length, &raw));
+  auto release = MakeScopeExit([&] { std::free(raw); });
+  NS_ENSURE_TRUE(length == input.size && length, NS_ERROR_FILE_CORRUPTED);
+  nsCString bytes(reinterpret_cast<const char*>(raw), length);
+  nsCOMPtr<nsICryptoHash> hash;
+  MOZ_TRY(NS_NewCryptoHash(nsICryptoHash::SHA256, getter_AddRefs(hash)));
+  MOZ_TRY(hash->Update(raw, length));
+  nsCString digest, actual;
+  MOZ_TRY(hash->Finish(false, digest));
+  for (unsigned char c : digest.View()) {
+    actual.Append("0123456789abcdef"[c >> 4]);
+    actual.Append("0123456789abcdef"[c & 15]);
+  }
+  NS_ENSURE_TRUE(actual == input.sha256, NS_ERROR_FILE_CORRUPTED);
+  MOZ_TRY(stored->ExecuteStep(&row));
+  NS_ENSURE_FALSE(row, NS_ERROR_FILE_CORRUPTED);
+  stored = nullptr;
+  for (auto& folder : input.folders) folder.properties.Clear();
+  MOZ_TRY(ParseCacheBytes(cx, bytes, input));
+  JS::Rooted<JS::Value> value(cx);
+  MOZ_TRY(CacheParseJSON(cx, receipt, &value));
+  JS::Rooted<JSObject*> result(cx, &value.toObject()), identity(cx), cells(cx);
+  MOZ_TRY(ImportMember(cx, result, "identity", &value));
+  NS_ENSURE_TRUE(value.isObject(), NS_ERROR_FILE_CORRUPTED);
+  identity = &value.toObject();
+  nsCString expectedIdentity, actualIdentity;
+  MOZ_TRY(CacheJSON(cx, identity, actualIdentity));
+  MOZ_TRY(CacheIdentity(cx, input, &identity));
+  MOZ_TRY(CacheJSON(cx, identity, expectedIdentity));
+  NS_ENSURE_TRUE(actualIdentity == expectedIdentity, NS_ERROR_FILE_CORRUPTED);
+  MOZ_TRY(ImportMember(cx, result, "cells", &value));
+  uint32_t count;
+  MOZ_TRY(ImportArray(cx, value, &cells, count));
+  uint64_t expectedCount = 0;
+  for (const auto& folder : input.folders)
+    expectedCount += folder.properties.Length();
+  NS_ENSURE_TRUE(count == expectedCount, NS_ERROR_FILE_CORRUPTED);
+  nsTHashSet<nsCString> seen;
+  for (uint32_t i = 0; i < count; ++i) {
+    NS_ENSURE_TRUE(JS_GetElement(cx, cells, i, &value) && value.isObject(),
+                   NS_ERROR_FILE_CORRUPTED);
+    JS::Rooted<JSObject*> cell(cx, &value.toObject());
+    MOZ_TRY(ImportMember(cx, cell, "id", &value));
+    int64_t id;
+    MOZ_TRY(ImportNumber(value, 1, 9007199254740991., id));
+    nsCString name, text;
+    MOZ_TRY(ImportMember(cx, cell, "name", &value));
+    MOZ_TRY(ImportText(cx, value, name));
+    MOZ_TRY(ImportMember(cx, cell, "text", &value));
+    MOZ_TRY(ImportText(cx, value, text));
+    nsAutoCString key;
+    key.AppendInt(id);
+    key.Append(':');
+    key.Append(name);
+    NS_ENSURE_FALSE(seen.Contains(key), NS_ERROR_FILE_CORRUPTED);
+    seen.Insert(key);
+    const FolderImportProperty* original = nullptr;
+    for (const auto& folder : input.folders) {
+      if (folder.id != uint64_t(id)) continue;
+      for (const auto& property : folder.properties)
+        if (property.name == name) original = &property;
+    }
+    NS_ENSURE_TRUE(original && original->text == text, NS_ERROR_FILE_CORRUPTED);
+    MOZ_TRY(ImportMember(cx, cell, "integer", &value, true));
+    if (original->integer) {
+      int64_t integer;
+      MOZ_TRY(
+          ImportNumber(value, *original->integer, *original->integer, integer));
+    } else {
+      NS_ENSURE_TRUE(value.isUndefined(), NS_ERROR_FILE_CORRUPTED);
     }
   }
   return NS_OK;
@@ -7344,6 +7514,8 @@ nsresult DatabaseCore::ImportFolderCacheMetadataV2(
   if (prior) {
     nsCString bytes;
     MOZ_TRY(ReadCacheBytes(input, bytes));
+    if (input.version == 3)
+      MOZ_TRY(CheckStoredJSONCacheReceipt(cx, connection, input, *prior));
     JS::Rooted<JS::Value> result(cx);
     MOZ_TRY(CacheParseJSON(cx, *prior, &result));
     NS_ENSURE_TRUE(current(), NS_ERROR_NOT_AVAILABLE);
@@ -7545,7 +7717,7 @@ nsresult DatabaseCore::ImportFolderCacheMetadataV2(
           JS_DefineElement(cx, cells, cellIndex++, cell, JSPROP_ENUMERATE),
           NS_ERROR_OUT_OF_MEMORY);
     }
-    NS_ENSURE_TRUE(sawFlags, NS_ERROR_NOT_IMPLEMENTED);
+    NS_ENSURE_TRUE(sawFlags || input.version == 3, NS_ERROR_NOT_IMPLEMENTED);
     MOZ_TRY(plan.wrapper->CheckCacheImportFlags(input.databaseId, plan.id,
                                                 plan.warmBeforeFlags));
     plans.AppendElement(std::move(plan));
@@ -7788,18 +7960,24 @@ DatabaseCore::GetFolderCacheImportReceipt(JS::Handle<JS::Value> request,
   // Request getters can reenter the core. Refuse to adopt their transaction.
   MOZ_TRY(sConnection->GetTransactionInProgress(&active));
   NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
+  auto connection = sConnection;
   JS::Rooted<JSObject*> identityObject(cx);
   MOZ_TRY(CacheIdentity(cx, input, &identityObject));
   nsCString identity;
   MOZ_TRY(CacheJSON(cx, identityObject, identity));
   nsCString currentSource;
-  MOZ_TRY(ReadDatabaseSourceId(sConnection, currentSource));
+  MOZ_TRY(ReadDatabaseSourceId(connection, currentSource));
   NS_ENSURE_TRUE(currentSource == input.databaseId, NS_ERROR_NOT_AVAILABLE);
   Maybe<nsCString> receipt;
-  MOZ_TRY(ReadCacheReceipt(sConnection, input, identity, receipt));
-  if (!receipt) MOZ_TRY(CheckCacheFolders(this, sConnection, input));
+  MOZ_TRY(ReadCacheReceipt(connection, input, identity, receipt));
+  if (!receipt) MOZ_TRY(CheckCacheFolders(this, connection, input));
+  if (receipt && input.version == 3)
+    MOZ_TRY(CheckStoredJSONCacheReceipt(cx, connection, input, *receipt));
   JS::Rooted<JS::Value> result(cx, JS::NullValue());
   if (receipt) MOZ_TRY(CacheParseJSON(cx, *receipt, &result));
+  NS_ENSURE_TRUE(
+      sInstance.get() == this && sConnection == connection && !mShuttingDown,
+      NS_ERROR_NOT_AVAILABLE);
   output.set(result);
   return NS_OK;
 #endif
@@ -7823,7 +8001,7 @@ DatabaseCore::ImportFolderCacheMetadata(JS::Handle<JS::Value> request,
                  NS_ERROR_NOT_AVAILABLE);
   MOZ_TRY(sConnection->GetTransactionInProgress(&active));
   NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
-  if (input.version == 2) {
+  if (input.version >= 2) {
     return ImportFolderCacheMetadataV2(input, cx, output);
   }
   MOZ_TRY(CheckCacheFolders(this, sConnection, input));
@@ -8712,10 +8890,51 @@ nsresult StartupContained(nsIFile* root, const nsACString& path,
 }
 // Independent on-disk inventory. Only selected-profile roots are admitted here;
 // a path or digest does not prove an external writer has been excluded.
+nsresult StartupJSONCache(nsIFile* file, bool& empty) {
+#ifndef XP_WIN
+  nsCString bytes;
+  MOZ_TRY(StartupRead(file, bytes));
+  dom::AutoJSAPI jsapi;
+  NS_ENSURE_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()), NS_ERROR_FAILURE);
+  JSContext* cx = jsapi.cx();
+  JS::Rooted<JSObject*> parsed(cx), entries(cx), source(cx);
+  nsresult rv = ParseCacheDocument(cx, bytes, true, &parsed);
+  if (NS_FAILED(rv)) {
+    if (jsapi.HasException()) jsapi.ClearException();
+    return rv;
+  }
+  JS::Rooted<JS::Value> value(cx);
+  MOZ_TRY(ImportMember(cx, parsed, "entries", &value));
+  NS_ENSURE_TRUE(value.isObject(), NS_ERROR_FILE_CORRUPTED);
+  entries = &value.toObject();
+  MOZ_TRY(ImportMember(cx, parsed, "source", &value));
+  NS_ENSURE_TRUE(value.isObject(), NS_ERROR_FILE_CORRUPTED);
+  source = &value.toObject();
+  JS::Rooted<JS::IdVector> keys(cx, JS::IdVector(cx));
+  NS_ENSURE_TRUE(JS_Enumerate(cx, source, &keys), NS_ERROR_FAILURE);
+  uint32_t count = JS::MapSize(cx, entries);
+  NS_ENSURE_TRUE(keys.length() == count, NS_ERROR_FILE_CORRUPTED);
+  nsCString after;
+  MOZ_TRY(StartupRead(file, after));
+  NS_ENSURE_TRUE(after == bytes, NS_ERROR_NOT_AVAILABLE);
+  empty = count == 0;
+  return NS_OK;
+#else
+  return NS_ERROR_NOT_AVAILABLE;
+#endif
+}
+
 nsresult StartupInventory(nsIFile* directory, nsTArray<nsCString>& sources,
                           bool mailTree = false, bool selectedRoot = true) {
   nsAutoCString ignored;
   MOZ_TRY(StartupDirectory(directory, ignored));
+  bool jsonCache = false, emptyJSON = false;
+  if (selectedRoot) {
+    nsCOMPtr<nsIFile> file;
+    MOZ_TRY(StartupChild(directory, "folderCache.json", getter_AddRefs(file)));
+    MOZ_TRY(file->Exists(&jsonCache));
+    if (jsonCache) MOZ_TRY(StartupJSONCache(file, emptyJSON));
+  }
   nsCOMPtr<nsIDirectoryEnumerator> entries;
   MOZ_TRY(directory->GetDirectoryEntries(getter_AddRefs(entries)));
   auto close = MakeScopeExit([&] { entries->Close(); });
@@ -8733,6 +8952,13 @@ nsresult StartupInventory(nsIFile* directory, nsTArray<nsCString>& sources,
     NS_ENSURE_FALSE(linked, NS_ERROR_FILE_ACCESS_DENIED);
     bool isDirectory;
     MOZ_TRY(file->IsDirectory(&isDirectory));
+    // Precedence never waives the original physical-file admission.
+    if (selectedRoot && jsonCache &&
+        (name == "panacea.dat"_ns ||
+         (name == "folderCache.json"_ns && emptyJSON))) {
+      MOZ_TRY(StartupRegular(file));
+      continue;
+    }
     if (isDirectory) {
       MOZ_TRY(StartupInventory(file, sources,
                                mailTree || name == "Mail"_ns ||
@@ -9355,30 +9581,72 @@ nsresult StartupServer(JSContext* cx, JS::Handle<JSObject*> source,
   JS::Rooted<JSObject*> cache(cx), parsed(cx), row(cx), properties(cx),
       values(cx), original(cx);
   MOZ_TRY(StartupObject(cx, origin, "cache", &cache));
-  nsCString cachePath, cacheHash, key;
-  int64_t cacheSize, sourceKey;
+  nsCString cachePath, cacheHash, key, sourceFormat;
+  int64_t cacheSize, sourceKey = 0;
+  JS::Rooted<JS::Value> format(cx);
+  MOZ_TRY(ImportMember(cx, cache, "sourceFormat", &format, true));
+  bool jsonCache = !format.isUndefined();
+  if (jsonCache) {
+    MOZ_TRY(ImportText(cx, format, sourceFormat));
+    NS_ENSURE_TRUE(sourceFormat == "json"_ns || sourceFormat == "mork"_ns,
+                   NS_ERROR_INVALID_ARG);
+    jsonCache = sourceFormat == "json"_ns;
+  }
   MOZ_TRY(StartupText(cx, cache, "path", cachePath));
   MOZ_TRY(StartupText(cx, cache, "sha256", cacheHash));
   MOZ_TRY(StartupText(cx, cache, "originalKey", key));
   MOZ_TRY(StartupNumber(cx, cache, "size", 1, UINT32_MAX - 1, cacheSize));
-  MOZ_TRY(StartupNumber(cx, cache, "sourceKey", 0, UINT32_MAX, sourceKey));
+  if (jsonCache) {
+    bool hasSourceKey;
+    NS_ENSURE_TRUE(JS_HasOwnProperty(cx, cache, "sourceKey", &hasSourceKey),
+                   NS_ERROR_FAILURE);
+    NS_ENSURE_FALSE(hasSourceKey, NS_ERROR_INVALID_ARG);
+  } else {
+    MOZ_TRY(StartupNumber(cx, cache, "sourceKey", 0, UINT32_MAX, sourceKey));
+  }
   nsCString actualKey;
   MOZ_TRY(file->GetPersistentDescriptor(actualKey));
   NS_ENSURE_TRUE(key == actualKey, NS_ERROR_NOT_AVAILABLE);
   nsCOMPtr<nsIFile> cacheFile;
   MOZ_TRY(StartupContained(operation.profile, cachePath,
                            getter_AddRefs(cacheFile)));
+  nsCOMPtr<nsIFile> activeJSON;
+  MOZ_TRY(StartupChild(operation.profile, "folderCache.json",
+                       getter_AddRefs(activeJSON)));
+  bool hasJSON;
+  MOZ_TRY(activeJSON->Exists(&hasJSON));
+  if (jsonCache) {
+    nsCString actualPath;
+    MOZ_TRY(activeJSON->GetNativePath(actualPath));
+    auto archived = operation.backupFiles.Lookup(cachePath);
+    NS_ENSURE_TRUE(hasJSON && actualPath == cachePath && archived &&
+                       archived.Data() == cacheHash,
+                   NS_ERROR_NOT_AVAILABLE);
+  } else {
+    NS_ENSURE_FALSE(hasJSON, NS_ERROR_NOT_AVAILABLE);
+  }
   MOZ_TRY(StartupCheckHash(cacheFile, cacheHash, cacheSize));
   MOZ_TRY(StartupParseFile(
       cx, cacheFile, u"resource:///modules/panorama/MorkFolderCache.sys.mjs"_ns,
-      "parseMorkFolderCache", &parsed));
+      jsonCache ? "parseJSONFolderCache" : "parseMorkFolderCache", &parsed));
   JS::Rooted<JS::Value> field(cx);
   MOZ_TRY(StartupMapEntry(cx, parsed, "entries", key, &field));
   NS_ENSURE_TRUE(field.isObject(), NS_ERROR_FILE_CORRUPTED);
   row = &field.toObject();
-  int64_t actualSourceKey;
-  MOZ_TRY(StartupNumber(cx, row, "sourceKey", 0, UINT32_MAX, actualSourceKey));
-  NS_ENSURE_TRUE(sourceKey == actualSourceKey, NS_ERROR_NOT_AVAILABLE);
+  if (jsonCache) {
+    bool hasSourceKey;
+    NS_ENSURE_TRUE(JS_HasOwnProperty(cx, row, "sourceKey", &hasSourceKey),
+                   NS_ERROR_FAILURE);
+    NS_ENSURE_FALSE(hasSourceKey, NS_ERROR_FILE_CORRUPTED);
+    nsCString parsedFormat;
+    MOZ_TRY(StartupText(cx, parsed, "format", parsedFormat));
+    NS_ENSURE_TRUE(parsedFormat == "json"_ns, NS_ERROR_FILE_CORRUPTED);
+  } else {
+    int64_t actualSourceKey;
+    MOZ_TRY(
+        StartupNumber(cx, row, "sourceKey", 0, UINT32_MAX, actualSourceKey));
+    NS_ENSURE_TRUE(sourceKey == actualSourceKey, NS_ERROR_NOT_AVAILABLE);
+  }
   MOZ_TRY(StartupObject(cx, row, "values", &values));
   MOZ_TRY(StartupObject(cx, origin, "originalCells", &original));
   for (const char* name : {"onlineName", "hierDelim", "boxFlags"}) {
@@ -9544,9 +9812,15 @@ nsresult DatabaseCore::BindStartupLocalNames(JSContext* cx,
       MOZ_TRY(ReadStartupSummaryName(cx, summary, archived.Data(), name));
     nsCOMPtr<nsIFile> cache;
     MOZ_TRY(operation.profile->Clone(getter_AddRefs(cache)));
-    MOZ_TRY(cache->AppendNative("panacea.dat"_ns));
+    MOZ_TRY(cache->AppendNative("folderCache.json"_ns));
+    bool jsonCache;
+    MOZ_TRY(cache->Exists(&jsonCache));
+    if (!jsonCache) MOZ_TRY(cache->SetNativeLeafName("panacea.dat"_ns));
     nsCString cachePath;
     MOZ_TRY(cache->GetNativePath(cachePath));
+    if (jsonCache)
+      NS_ENSURE_TRUE(operation.backupFiles.Contains(cachePath),
+                     NS_ERROR_NOT_AVAILABLE);
     if (auto archived = operation.backupFiles.Lookup(cachePath)) {
       nsCString cacheHash;
       MOZ_TRY(StartupHash(cache, cacheHash));
@@ -9554,7 +9828,8 @@ nsresult DatabaseCore::BindStartupLocalNames(JSContext* cx,
       JS::Rooted<JSObject*> parsed(cx), row(cx), values(cx);
       MOZ_TRY(StartupParseFile(
           cx, cache, u"resource:///modules/panorama/MorkFolderCache.sys.mjs"_ns,
-          "parseMorkFolderCache", &parsed));
+          jsonCache ? "parseJSONFolderCache" : "parseMorkFolderCache",
+          &parsed));
       nsCString descriptor;
       MOZ_TRY(summary->GetPersistentDescriptor(descriptor));
       JS::Rooted<JS::Value> value(cx);
@@ -9605,6 +9880,8 @@ nsresult DatabaseCore::DescribeProfileStartup(
   MOZ_TRY(CheckProfileStartup(ProfileStartupToken()));
   auto& operation = *mProfileStartup;
   if (!operation.selected) {
+    AutoRestore<bool> busy(operation.busy);
+    operation.busy = true;
     JS::Rooted<JSObject*> selector(cx);
     MOZ_TRY(StartupSelector(cx, operation, &selector));
     nsCOMPtr<nsIFile> file;
@@ -9721,6 +9998,8 @@ nsresult DatabaseCore::OpenProfileStartup(JSContext* cx,
                                           JS::Handle<JS::Value> input) {
   MOZ_TRY(CheckProfileStartup(ProfileStartupToken()));
   auto& operation = *mProfileStartup;
+  // A failed descriptor must not leave its partial probe as open authority.
+  NS_ENSURE_TRUE(operation.selected, NS_ERROR_NOT_AVAILABLE);
   NS_ENSURE_FALSE(operation.opened || operation.ready,
                   NS_ERROR_ALREADY_INITIALIZED);
   // Freeze caller input before using any fields. Accessors may reenter, but
@@ -9736,7 +10015,9 @@ nsresult DatabaseCore::OpenProfileStartup(JSContext* cx,
   MOZ_TRY(StartupText(cx, plan, "mode", mode));
   MOZ_TRY(StartupText(cx, plan, "profilePath", profile));
   NS_ENSURE_TRUE(profile == operation.profilePath, NS_ERROR_NOT_AVAILABLE);
-  MOZ_TRY(StartupSelector(cx, operation, &selector));
+  MOZ_TRY(StartupSelector(
+      cx, operation, &selector,
+      mode == "reuse"_ns && !operation.initialSelector.IsEmpty()));
   nsCOMPtr<nsIFile> file;
   MOZ_TRY(
       StartupChild(operation.profile, "panorama.sqlite", getter_AddRefs(file)));
@@ -9760,7 +10041,19 @@ nsresult DatabaseCore::OpenProfileStartup(JSContext* cx,
       NS_ERROR_INVALID_ARG);
   nsTArray<nsCString> inventory;
   if (mode == "reuse"_ns) {
-    NS_ENSURE_TRUE(exists && !count, NS_ERROR_NOT_AVAILABLE);
+    NS_ENSURE_TRUE(operation.mode == "reuse"_ns && exists && !count,
+                   NS_ERROR_NOT_AVAILABLE);
+    // Recheck the exact selected active record after freezing caller input.
+    // An unmarked existing database remains adoptable only while unmarked.
+    if (operation.initialSelector.IsEmpty()) {
+      NS_ENSURE_FALSE(selector, NS_ERROR_NOT_AVAILABLE);
+    } else {
+      NS_ENSURE_TRUE(selector, NS_ERROR_NOT_AVAILABLE);
+      JS::Rooted<JS::Value> selected(cx),
+          actual(cx, JS::ObjectValue(*selector));
+      MOZ_TRY(StartupParse(cx, operation.initialSelector, &selected));
+      MOZ_TRY(StartupEqual(cx, selected, actual));
+    }
   } else {
     NS_ENSURE_TRUE(mode == "migrate"_ns || (!exists && !selector),
                    NS_ERROR_NOT_AVAILABLE);
@@ -10309,6 +10602,13 @@ nsresult DatabaseCore::CheckStartupCachePublication(JSContext* cx,
     NS_ENSURE_TRUE(!found && source == input.sourceId && path == input.path &&
                        hash == input.sha256,
                    NS_ERROR_NOT_AVAILABLE);
+    if (input.version == 3) {
+      int64_t version;
+      nsCString format;
+      MOZ_TRY(StartupNumber(cx, unit, "requestVersion", 3, 3, version));
+      MOZ_TRY(StartupText(cx, unit, "sourceFormat", format));
+      NS_ENSURE_TRUE(format == "json"_ns, NS_ERROR_NOT_AVAILABLE);
+    }
     found = true;
   }
   NS_ENSURE_TRUE(found, NS_ERROR_NOT_AVAILABLE);
@@ -10902,6 +11202,14 @@ nsresult DatabaseCore::CheckProfileActivation(
           MOZ_TRY(StartupCopy(cx, unit, request, field));
         MOZ_TRY(StartupCopy(cx, unit, request, "id", "sourceId"));
         MOZ_TRY(StartupCopy(cx, unit, request, "requestVersion", "version"));
+        JS::Rooted<JS::Value> requestVersion(cx);
+        MOZ_TRY(ImportMember(cx, request, "version", &requestVersion));
+        if (requestVersion.isNumber() && requestVersion.toNumber() == 3) {
+          MOZ_TRY(StartupCopy(cx, unit, request, "sourceFormat"));
+          NS_ENSURE_TRUE(ImapImportText(cx, request, "policy",
+                                        "native-reconciled-json-v3"_ns),
+                         NS_ERROR_OUT_OF_MEMORY);
+        }
         for (const char* field : {"path", "sha256", "size"})
           MOZ_TRY(StartupCopy(cx, unit, source, field));
         NS_ENSURE_TRUE(
@@ -10939,6 +11247,9 @@ nsresult DatabaseCore::CheckProfileActivation(
           NS_ENSURE_TRUE(retained == encoded, NS_ERROR_NOT_AVAILABLE);
           MOZ_TRY(stored->ExecuteStep(&row));
           NS_ENSURE_FALSE(row, NS_ERROR_FILE_CORRUPTED);
+          if (input.version == 3)
+            MOZ_TRY(
+                CheckStoredJSONCacheReceipt(cx, sConnection, input, receipt));
           MOZ_TRY(CacheParseJSON(cx, receipt, &expected));
 #else
           return NS_ERROR_NOT_AVAILABLE;

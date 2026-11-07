@@ -100,6 +100,81 @@ export function parseMorkFolderCache(bytes) {
 }
 
 /**
+ * Reads native JSON cache rows without constructing the legacy cache service.
+ * Uses each original descriptor as its source entry identity. JSON entries have
+ * no Mork row ID. Numeric cells keep their typed value and canonical hex text.
+ *
+ * @param {Uint8Array} bytes - Complete original folderCache.json bytes.
+ * @returns {{format: string, entries: Map<string, {properties: Map<string, string>,
+ *   values: Record<string, string|number>}>, source: object}} Complete original rows.
+ * @throws {Error} For malformed JSON, unsupported types or unsafe cell values.
+ */
+export function parseJSONFolderCache(bytes) {
+  if (Object.prototype.toString.call(bytes) !== "[object Uint8Array]") {
+    throw new TypeError("Expected Uint8Array");
+  }
+  const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+  const source = JSON.parse(decoder.decode(bytes));
+  if (!source || Array.isArray(source) || typeof source !== "object") {
+    throw new Error("Native JSON cache requires an object");
+  }
+  const text = value => {
+    if (
+      typeof value !== "string" ||
+      value.includes("\0") ||
+      decoder.decode(new TextEncoder().encode(value)) !== value
+    ) {
+      throw new Error("Invalid native JSON cache text");
+    }
+    return value;
+  };
+  const entries = new Map();
+  for (const [key, row] of Object.entries(source)) {
+    if (
+      !PathUtils.isAbsolute(text(key)) ||
+      !row ||
+      Array.isArray(row) ||
+      typeof row !== "object"
+    ) {
+      throw new Error("Invalid native JSON cache row");
+    }
+    const properties = new Map([["key", key]]);
+    const values = Object.create(null);
+    for (const [name, value] of Object.entries(row)) {
+      if (!text(name) || name === "key") {
+        throw new Error("Invalid native JSON cache property");
+      }
+      const width = SIGNED64.has(name)
+        ? 64
+        : SIGNED32.has(name) || UNSIGNED32.has(name)
+          ? 32
+          : 0;
+      let cell;
+      if (width) {
+        const minimum = UNSIGNED32.has(name) ? 0 : -(2 ** (width - 1));
+        const maximum = UNSIGNED32.has(name)
+          ? 0xffffffff
+          : 2 ** (width - 1) - 1;
+        if (
+          !Number.isSafeInteger(value) ||
+          value < minimum ||
+          value > maximum
+        ) {
+          throw new Error("Unsupported native JSON cache number");
+        }
+        cell = BigInt.asUintN(width, BigInt(value)).toString(16);
+      } else {
+        cell = text(value);
+      }
+      properties.set(name, cell);
+      values[name] = value;
+    }
+    entries.set(key, { properties, values });
+  }
+  return { format: "json", entries, source };
+}
+
+/**
  * Writes a new JSON cache after validating all rows and physical path mappings.
  * Never overwrites a cache or removes the legacy input. The caller supplies
  * mappings from discovered original folder descriptors to destination keys.
@@ -241,6 +316,7 @@ const CACHE_AUTHORITY = new Set([
  * Builds the supported native cache envelope from a retained journal unit.
  *
  * Version2 binds the verified backup and original physical input paths.
+ * Version3 binds native JSON descriptors instead of Mork row IDs.
  * Units without `requestVersion` retain their exact version1 envelope.
  *
  * @param {object} unit - Exact source identity and complete physical bindings.
@@ -249,10 +325,18 @@ const CACHE_AUTHORITY = new Set([
  */
 export function createMorkFolderCacheRequest(unit) {
   const version = unit.requestVersion === undefined ? 1 : unit.requestVersion;
-  if (version !== 1 && version !== 2) {
+  if (![1, 2, 3].includes(version)) {
     throw new Error("Unsupported native cache request version");
   }
-  const proof = version === 2 ? cacheReconciliationProof(unit.proof) : null;
+  const json = version === 3;
+  if (
+    json &&
+    (unit.sourceFormat !== "json" ||
+      PathUtils.filename(unit.path) !== "folderCache.json")
+  ) {
+    throw new Error("JSON cache requires its explicit original source format");
+  }
+  const proof = version >= 2 ? cacheReconciliationProof(unit.proof) : null;
   if (version === 1 && unit.proof !== undefined) {
     throw new Error("Cache proof requires version2");
   }
@@ -267,10 +351,14 @@ export function createMorkFolderCacheRequest(unit) {
     !Number.isSafeInteger(unit.size) ||
     unit.size <= 0 ||
     unit.size >= 0xffffffff ||
-    !unit.folders?.length
+    !Array.isArray(unit.folders) ||
+    (!json && !unit.folders.length)
   ) {
     throw new Error("Invalid cache source identity");
   }
+  const bindingFields = json
+    ? CACHE_BINDING_FIELDS.filter(name => name !== "sourceKey")
+    : CACHE_BINDING_FIELDS;
   const unique = new Map(
     [
       "originalKey",
@@ -282,12 +370,13 @@ export function createMorkFolderCacheRequest(unit) {
     ].map(name => [name, new Set()])
   );
   const fields =
-    version === 2
-      ? [...CACHE_BINDING_FIELDS, "originalSummaryPath"]
-      : CACHE_BINDING_FIELDS;
+    version >= 2 ? [...bindingFields, "originalSummaryPath"] : bindingFields;
   const originals = new Set();
   const folders = unit.folders.map(folder => {
-    for (const name of CACHE_BINDING_FIELDS) {
+    if (json && Object.hasOwn(folder, "sourceKey")) {
+      throw new Error("JSON cache entry has no Mork source row ID");
+    }
+    for (const name of bindingFields) {
       const value = folder[name];
       if (name == "id" || name == "sourceKey") {
         if (
@@ -318,7 +407,7 @@ export function createMorkFolderCacheRequest(unit) {
     ) {
       throw new Error("Unsupported cache folder binding");
     }
-    if (version === 2) {
+    if (version >= 2) {
       if (
         typeof folder.originalSummaryPath != "string" ||
         folder.originalSummaryPath.includes("\0") ||
@@ -338,6 +427,9 @@ export function createMorkFolderCacheRequest(unit) {
   });
   return {
     version,
+    ...(json
+      ? { sourceFormat: "json", policy: "native-reconciled-json-v3" }
+      : {}),
     token: unit.token,
     sourceId: unit.id,
     databaseSourceId: unit.databaseSourceId,
@@ -447,9 +539,12 @@ export function validateMorkFolderCacheReceipt(unit, receipt) {
   if (
     identity?.version !== expected.version ||
     identity.policy !==
-      (expected.version === 2
-        ? "native-reconciled-selected-v2"
-        : "native-authoritative-v1") ||
+      (expected.version === 3
+        ? "native-reconciled-json-v3"
+        : expected.version === 2
+          ? "native-reconciled-selected-v2"
+          : "native-authoritative-v1") ||
+    (expected.version === 3 && identity.sourceFormat !== "json") ||
     identity.token !== unit.token ||
     identity.sourceId !== unit.id ||
     identity.databaseSourceId !== unit.databaseSourceId ||
@@ -461,7 +556,7 @@ export function validateMorkFolderCacheReceipt(unit, receipt) {
     throw new Error("Invalid native cache receipt identity");
   }
   if (
-    expected.version === 2 &&
+    expected.version >= 2 &&
     JSON.stringify(cacheReconciliationProof(identity.proof)) !==
       JSON.stringify(expected.proof)
   ) {
@@ -483,7 +578,7 @@ export function validateMorkFolderCacheReceipt(unit, receipt) {
   for (const cell of receipt.cells) {
     const folder = byFolder.get(cell.id);
     let dispositions;
-    if (expected.version === 2) {
+    if (expected.version >= 2) {
       validateReconciledCacheCell(cell);
       dispositions = [cell.disposition];
     } else if (cell.name == "key") {

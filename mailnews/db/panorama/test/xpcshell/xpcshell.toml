@@ -20,11 +20,14 @@ tags = ["panorama"]
 ["test_LegacyGlodaChatReader.js"]
 
 ["test_LegacyGlodaMailReader.js"]
+run-sequentially = true # Times out in parallel runs; passes well within the limit alone.
 
 ["test_MigrationBookCoordinator.js"]
+run-sequentially = true # Times out in parallel runs; passes well within the limit alone.
 support-files = ["../../../../../mail/components/addrbook/test/browser/data/import.mab"]
 
 ["test_MigrationCoordinator.js"]
+run-sequentially = true # Times out in parallel runs; passes well within the limit alone.
 requesttimeoutfactor = 2 # About 30s on Windows opt, at the default limit.
 
 ["test_MigrationFileSystemWindows.js"]
@@ -48,6 +51,7 @@ skip-if = ["os == 'win'"]
 head = ""
 
 ["test_MigrationWindowsImport.js"]
+run-sequentially = true # Times out in parallel runs; passes well within the limit alone.
 run-if = ["os == 'win'"]
 prefs = [
   "mail.serverDefaultStoreContractID=@mozilla.org/msgstore/berkeleystore;1",
@@ -179,8 +183,10 @@ prefs = [
 ["test_mailSearchQueries.js"]
 
 ["test_mailSearchResults.js"]
+run-sequentially = true # Times out in parallel runs; passes well within the limit alone.
 
 ["test_mailSearchService.js"]
+run-sequentially = true # Times out in parallel runs; passes well within the limit alone.
 
 ["test_mailSearchView.js"]
 
@@ -199,6 +205,7 @@ prefs = [
 ["test_reconcile.js"]
 
 ["test_recoveredSemanticContent.js"]
+run-sequentially = true # Times out in parallel runs; passes well within the limit alone.
 
 ["test_relations.js"]
 

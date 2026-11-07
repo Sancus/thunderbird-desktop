@@ -488,12 +488,12 @@ class MsgOperationWrapper {
         }
         // Ordinary local CopyMessages supplies destination headers, while other
         // copy paths supply setMessageKey. Both identify actual publication.
-        const newHdr =
-          additionalKey === null
-            ? additionalHeaders.size == 1
-              ? additionalHeaders.values().next().value
-              : null
-            : additionalDatabase.getMsgHdrForKey(additionalKey);
+        let newHdr;
+        if (additionalKey !== null) {
+          newHdr = additionalDatabase.getMsgHdrForKey(additionalKey);
+        } else if (additionalHeaders.size == 1) {
+          newHdr = additionalHeaders.values().next().value;
+        }
         if (
           !newHdr?.isLive ||
           additionalFccFolder.msgDatabase !== additionalDatabase ||

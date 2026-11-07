@@ -210,8 +210,10 @@ export async function readLegacyChatLog(logsRoot, relativePath) {
     }
   }
   const source = await inspectSource(file.path, 64 * 1024 * 1024);
+  // IOUtils allocates maxBytes up front; one byte past the measured size
+  // still detects growth without a 64MB buffer per log.
   const bytes = await IOUtils.read(source.path, {
-    maxBytes: 64 * 1024 * 1024 + 1,
+    maxBytes: source.size + 1,
   });
   const hash = Cc["@mozilla.org/security/hash;1"].createInstance(
     Ci.nsICryptoHash

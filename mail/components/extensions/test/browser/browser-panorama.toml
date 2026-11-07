@@ -12,6 +12,8 @@ prefs = [
   # issues.
   "mail.rights.override=true",
   "mail.panorama.enabled=true",
+  # Native tests here assert the native search path without the Gloda indexer.
+  "mailnews.database.global.indexer.enabled=false",
 ]
 subsuite = "thunderbird"
 support-files = [

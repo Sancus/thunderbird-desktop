@@ -710,6 +710,8 @@ var chatHandler = {
       return;
     }
     browser.init(aConversation);
+    browser.isActive =
+      document.getElementById("tabmail").currentTabInfo == gChatTab;
     this._pendingLogBrowserLoad = true;
     Services.obs.addObserver(this, "conversation-loaded");
 
@@ -1429,6 +1431,11 @@ var chatHandler = {
     const convView = chatHandler._getActiveConvView();
     if (convView && !convView.hidden) {
       convView.switchingToPanel();
+    } else {
+      const browser = chatTabType.getBrowser();
+      if (browser?.id == "conv-log-browser") {
+        browser.isActive = true;
+      }
     }
     if (
       !this._pendingLogBrowserLoad &&
@@ -1445,6 +1452,11 @@ var chatHandler = {
     const convView = chatHandler._getActiveConvView();
     if (convView) {
       convView.switchingAwayFromPanel(aHidden);
+    } else if (aHidden) {
+      const browser = chatTabType.getBrowser();
+      if (browser?.id == "conv-log-browser") {
+        browser.isActive = false;
+      }
     }
   },
   async observe(aSubject, aTopic, aData) {

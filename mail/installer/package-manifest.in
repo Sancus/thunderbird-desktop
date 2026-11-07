@@ -373,6 +373,12 @@
 @BINPATH@/@MOZ_DXC_DLL_NAME@
 #endif
 
+; [ MSIX Background Task COM Server ]
+;
+#if defined(XP_WIN) && defined(MOZ_BACKGROUNDTASKS)
+@BINPATH@/@DLL_PREFIX@msixcomserver@DLL_SUFFIX@
+#endif
+
 ; Background tasks-specific preferences.  These are in the GRE
 ; location since they apply to all tasks at this time.
 #ifdef MOZ_BACKGROUNDTASKS

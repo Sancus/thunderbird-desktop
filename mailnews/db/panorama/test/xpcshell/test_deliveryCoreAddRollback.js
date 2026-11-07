@@ -53,10 +53,13 @@ add_task(async function test_failedAddLeavesNoMessageOrPublication() {
   const root = folderDB.insertRoot("delivery-rollback");
   const folderId = folderDB.insertFolder(root, "Inbox");
   // Observe raw rows without requiring an account-backed nsIMsgFolder.
-  const view = Cc["@mozilla.org/mailnews/live-view;1"].createInstance(
+  let view = Cc["@mozilla.org/mailnews/live-view;1"].createInstance(
     Ci.nsILiveView
   );
-  registerCleanupFunction(() => view.clearListener());
+  registerCleanupFunction(() => {
+    view.clearListener();
+    view = null;
+  });
   const events = [];
   view.setListener({
     onMessageAdded(message) {

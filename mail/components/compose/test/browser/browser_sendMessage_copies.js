@@ -275,11 +275,29 @@ async function removeFolder(folder) {
   info(`removing ${folder.URI}`);
   const rootFolder = folder.rootFolder;
   if (folder.incomingServerType == "imap") {
-    const deletedPromise = PromiseTestUtils.promiseFolderDeleted(folder);
+    const parent = folder.parent;
+    const name = folder.name;
     const promptPromise = BrowserTestUtils.promiseAlertDialog("accept");
+    info("Folder removal: calling deleteSelf");
     folder.deleteSelf(null);
+    info("Folder removal: deleteSelf returned");
     await promptPromise;
-    await deletedPromise;
+    info("Folder removal: confirmation accepted");
+    await TestUtils.waitForCondition(
+      () =>
+        !parent.containsChildNamed(name) &&
+        rootFolder
+          .getFolderWithFlags(Ci.nsMsgFolderFlags.Trash)
+          .containsChildNamed(name),
+      "waiting for the folder to move to Trash"
+    );
+    await TestUtils.waitForCondition(
+      () =>
+        rootFolder.server.QueryInterface(Ci.nsIImapIncomingServer)
+          .allConnectionsIdle,
+      "waiting for the folder move URL to finish"
+    );
+    info("Folder removal: move to Trash completed");
   } else {
     folder.deleteSelf(null);
   }
@@ -292,13 +310,16 @@ async function removeFolder(folder) {
   );
   const listener = new PromiseTestUtils.PromiseUrlListener();
   rootFolder.emptyTrash(listener);
-  await listener;
+  if (folder.incomingServerType == "imap") {
+    await listener.promise;
+  }
 }
 
 /**
  * @param {string} action
  * @param {nsIMsgFolder} expectedParent
- * @returns {nsIMsgFolder}
+ * @param {string} [expectedName] - Expected destination folder name.
+ * @returns {Promise<nsIMsgFolder>}
  */
 async function subtest(action, expectedParent, expectedName) {
   const property = {
@@ -340,18 +361,40 @@ async function subtest(action, expectedParent, expectedName) {
     );
     await BrowserTestUtils.domWindowClosed(composeWindow);
   } else {
-    EventUtils.synthesizeMouseAtCenter(
-      composeWindow.document.querySelector("#button-save > dropmarker"),
-      {},
-      composeWindow
-    );
-    const savePopup = composeWindow.document.getElementById("button-savePopup");
-    await BrowserTestUtils.waitForPopupEvent(savePopup, "shown");
-    savePopup.activateItem(
-      composeWindow.document.getElementById(`savePopup_${action}`)
-    );
-    await BrowserTestUtils.waitForPopupEvent(savePopup, "hidden");
-    // Don't close the window, we'll do that at the end.
+    const msgCompose = composeWindow.gMsgCompose;
+    const { promise: completed, resolve } = Promise.withResolvers();
+    const stateListener = {
+      NotifyComposeFieldsReady() {},
+      NotifyComposeBodyReady() {},
+      SaveInFolderDone(folderURI) {
+        resolve(folderURI);
+      },
+      ComposeProcessDone(status) {
+        info(`Final ${action} copy callback status ${status}`);
+      },
+      QueryInterface: ChromeUtils.generateQI(["nsIMsgComposeStateListener"]),
+    };
+    msgCompose.RegisterStateListener(stateListener);
+    try {
+      EventUtils.synthesizeMouseAtCenter(
+        composeWindow.document.querySelector("#button-save > dropmarker"),
+        {},
+        composeWindow
+      );
+      const savePopup =
+        composeWindow.document.getElementById("button-savePopup");
+      await BrowserTestUtils.waitForPopupEvent(savePopup, "shown");
+      savePopup.activateItem(
+        composeWindow.document.getElementById(`savePopup_${action}`)
+      );
+      await BrowserTestUtils.waitForPopupEvent(savePopup, "hidden");
+      // Don't close the window, we'll do that at the end.
+      const folderURI = await completed;
+      info(`Final ${action} copy saved in ${folderURI}`);
+      await TestUtils.waitForTick();
+    } finally {
+      msgCompose.UnregisterStateListener(stateListener);
+    }
   }
 
   // Check that the folder is created.
@@ -381,7 +424,16 @@ async function subtest(action, expectedParent, expectedName) {
   // Check that the message was saved to the folder.
 
   const expectedMessageCount = folderCountBeforeTest + 1;
+  const folderLoaded = PromiseTestUtils.promiseFolderEvent(
+    folder,
+    "FolderLoaded"
+  );
   folder.updateFolder(window.msgWindow);
+  await folderLoaded;
+  if (folder.server instanceof Ci.nsIImapIncomingServer) {
+    await TestUtils.waitForCondition(() => folder.server.allConnectionsIdle);
+  }
+  info("Copy destination folder refresh completed");
   await TestUtils.waitForCondition(
     () =>
       folder.getTotalMessages(false) - folder.numPendingTotalMessages ==

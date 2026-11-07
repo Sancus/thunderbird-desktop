@@ -1,4 +1,5 @@
 [DEFAULT]
+verbose = true
 head = "head_imap_maildir.js ../../../db/panorama/test/xpcshell/head_delivery.js"
 dupe-manifest = true
 run-sequentially = true

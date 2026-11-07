@@ -399,12 +399,26 @@ export var PgpSqliteDb2 = {
     }
   },
 
+  /**
+   * Accepts a personal key and waits for its database write and close.
+   *
+   * @param {string} fingerprint - The key fingerprint.
+   * @returns {Promise<void>} Resolves after acceptance is stored. Rejects if the
+   *   database operation fails.
+   */
   async acceptAsPersonalKey(fingerprint) {
-    this.updateAcceptance(fingerprint, null, "personal");
+    return this.updateAcceptance(fingerprint, null, "personal");
   },
 
+  /**
+   * Deletes personal-key acceptance and waits for its database write and close.
+   *
+   * @param {string} fingerprint - The key fingerprint.
+   * @returns {Promise<void>} Resolves after acceptance is deleted. Rejects if the
+   *   database operation fails.
+   */
   async deletePersonalKeyAcceptance(fingerprint) {
-    this.deleteAcceptance(fingerprint);
+    return this.deleteAcceptance(fingerprint);
   },
 
   async isAcceptedAsPersonalKey(fingerprint) {

@@ -23,7 +23,7 @@ add_setup(function () {
   folder.QueryInterface(Ci.nsIMsgLocalMailFolder);
 });
 
-add_task(function () {
+add_task(function test_messagePropertiesRoundTrip() {
   const generatedMessage = generator.makeMessage({
     cc: generator.makeNamesAndAddresses(1),
   });
@@ -36,6 +36,8 @@ add_task(function () {
     `Hello ${generatedMessage.toName}!\r\n`
   );
   const addedMessage = folder.addMessage(generatedMessage.toMessageString());
+  // This property round-trip checks the raw flags after New has been cleared.
+  folder.msgDatabase.clearNewList(false);
   const folderId = folder.id;
 
   // Check the added message's properties match the input properties.

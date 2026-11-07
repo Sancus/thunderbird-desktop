@@ -437,8 +437,9 @@ add_task(async function test_maxNotificationsPerDay() {
 
   notificationManager._MAX_MS_BETWEEN_NOTIFICATIONS = 100;
   NotificationManager._PER_TIME_UNIT = 1000 * 10;
-  notificationManager.updatedNotifications(notifications);
+  // Capture the epoch before selection synchronously records notification history.
   const startTime = Date.now();
+  notificationManager.updatedNotifications(notifications);
 
   for (let i = 0; i <= 5; i++) {
     ({ detail: notification } = await newNotificationEvent);

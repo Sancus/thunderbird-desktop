@@ -32,16 +32,26 @@ function checkUnlockedPref(prefName, prefValue) {
 }
 
 async function withNewTab(options, taskFn) {
-  const tab = window.openContentTab(options.url);
-  await BrowserTestUtils.browserLoaded(tab.browser, {
-    wantLoad: options.url,
+  const expectedURI = Services.io.newURI(options.url);
+  let pageLoaded;
+  const tab = window.openTab("contentTab", {
+    url: options.url,
+    duplicate: true,
+    onListener(browser) {
+      pageLoaded = BrowserTestUtils.browserLoaded(browser, {
+        // Preferences selects a category fragment before its load event.
+        wantLoad: url =>
+          Services.io.newURI(url).specIgnoringRef ==
+          expectedURI.specIgnoringRef,
+      });
+    },
   });
-
-  const result = await taskFn(tab.browser);
-
-  const tabmail = document.getElementById("tabmail");
-  tabmail.closeTab(tab);
-  return Promise.resolve(result);
+  try {
+    await pageLoaded;
+    return await taskFn(tab.browser);
+  } finally {
+    document.getElementById("tabmail").closeTab(tab);
+  }
 }
 
 add_setup(async function policies_headjs_startWithCleanSlate() {

@@ -33,7 +33,87 @@ add_setup(() => {
     native,
     "The actual database service matches the startup backend"
   );
-  Assert.equal(rootFolder.id > 0, native, "The RSS root has native identity");
+  const rssServer = server;
+  Assert.equal(
+    rootFolder,
+    rssServer.rootFolder,
+    "The configured RSS root is retained"
+  );
+  Assert.equal(
+    rootFolder.server,
+    rssServer,
+    "The RSS root belongs to this server"
+  );
+  Assert.equal(
+    rssServer.type,
+    "rss",
+    "The configured server is an RSS account"
+  );
+  Assert.ok(rootFolder.isServer, "The RSS root is a server folder");
+  Assert.equal(rootFolder.parent, null, "The RSS root has no parent");
+  Assert.equal(
+    rootFolder.URI,
+    rssServer.serverURI,
+    "The RSS root has its server URI"
+  );
+  Assert.equal(
+    MailServices.folderLookup.getFolderForURL(rssServer.serverURI),
+    rootFolder,
+    "The existing folder lookup resolves the same RSS root"
+  );
+
+  // Numeric folder identity is an additional Panorama-only contract.
+  if (native) {
+    const folderDB = databaseService.QueryInterface(
+      Ci.nsIDatabaseCore
+    ).folderDB;
+    const rootId = folderDB.getFolderChildNamed(0, rssServer.key);
+    Assert.greater(
+      rootId,
+      0,
+      "The RSS server has a physical native root record"
+    );
+    Assert.equal(
+      rootFolder.id,
+      rootId,
+      "The RSS root has that exact native identity"
+    );
+    Assert.ok(
+      folderDB.getFolderIsServer(rootId),
+      "The native root is a server record"
+    );
+    Assert.equal(
+      folderDB.getFolderParent(rootId),
+      0,
+      "The native root has no parent"
+    );
+    Assert.equal(
+      folderDB.getFolderRoot(rootId),
+      rootId,
+      "The native root identifies itself"
+    );
+    const mappedRoot = folderDB.getMsgFolderForFolder(rootId);
+    Assert.equal(
+      mappedRoot,
+      rootFolder,
+      "The physical root maps to the retained RSS folder"
+    );
+    Assert.equal(
+      mappedRoot.server,
+      rssServer,
+      "The physical root retains server ownership"
+    );
+    Assert.equal(
+      mappedRoot.URI,
+      rssServer.serverURI,
+      "The physical root retains its URI"
+    );
+    Assert.greater(
+      mappedRoot.id,
+      0,
+      "The mapped RSS root retains positive native identity"
+    );
+  }
   const store = Services.prefs.getCharPref(
     "mail.server.server1.storeContractID"
   );
@@ -402,4 +482,100 @@ add_task(async function test_importCreateCollisionKeepsOtherFolder() {
   Assert.equal(errors.length, 1, "The original create error is logged once");
   Assert.ok(errors[0], "The caught native error is retained in the log");
   Assert.equal(errors[0].result, expectedError);
+});
+
+// Read final UI activity after the ordinary fixture cleanup, preserving its order.
+registerCleanupFunction(function queueFinalRssActivityLog() {
+  registerCleanupFunction(async function logRssRemainingAnimations() {
+    // The fixture has retired its folders. Finish the real pane transition
+    // before the harness checks animations, preferences and remaining activity.
+    const pane = document.getElementById("tabmail").currentAbout3Pane;
+    pane.messagePane.displayMessage();
+    await TestUtils.waitForCondition(() => {
+      const browser = pane.messageBrowser.contentWindow.getMessagePaneBrowser();
+      return (
+        browser.webProgress?.isLoadingDocument === false &&
+        browser.currentURI?.spec == "about:blank"
+      );
+    }, "The RSS fixture's message pane finishes clearing");
+    await TestUtils.waitForTick();
+    const status = window.MsgStatusFeedback;
+    info(
+      "RSS strict cleanup entry: " +
+        JSON.stringify({
+          progressStarts: status._startRequests,
+          processes: status._activeProcesses.length,
+          observedProcesses: Array.from(
+            status._observedProcesses.values(),
+            process => ({
+              id: process.id,
+              state: process.state,
+              contextType: process.contextType,
+              displayText: process.displayText,
+            })
+          ),
+          meteorsSpinning: status._meteorsSpinning,
+          startTimer: Boolean(status._startTimeoutID),
+          stopTimer: Boolean(status._stopTimeoutID),
+        })
+    );
+    await TestUtils.waitForCondition(
+      () =>
+        status._startRequests == 0 &&
+        !status._startTimeoutID &&
+        !status._meteorsSpinning &&
+        !status._stopTimeoutID &&
+        status._activeProcesses.length == 0,
+      "The RSS fixture's real status requests finish"
+    );
+    Assert.equal(
+      status._startRequests,
+      0,
+      "RSS cleanup leaves no status requests"
+    );
+    Assert.equal(
+      status._activeProcesses.length,
+      0,
+      "RSS cleanup leaves no activity processes"
+    );
+    Assert.ok(
+      BrowserTestUtils.isHidden(status._progressBar),
+      "RSS cleanup leaves the progress bar hidden"
+    );
+    Assert.ok(
+      status._progressBar.hasAttribute("value"),
+      "RSS cleanup leaves the progress bar determinate"
+    );
+    const documents = new Set([window.document]);
+    for (const doc of documents) {
+      for (const frame of doc.querySelectorAll("browser, iframe")) {
+        if (frame.contentDocument) {
+          documents.add(frame.contentDocument);
+        }
+      }
+      info(
+        "RSS remaining UI activity: " +
+          JSON.stringify({
+            document: doc.documentURI,
+            vsyncEnabled: ChromeUtils.vsyncEnabled(),
+            progressStarts: window.MsgStatusFeedback?._startRequests,
+            meteorsSpinning: window.MsgStatusFeedback?._meteorsSpinning,
+            animations: doc.getAnimations().map(animation => ({
+              state: animation.playState,
+              name: animation.animationName,
+              target: animation.effect?.target?.localName,
+              id: animation.effect?.target?.id,
+              classes: animation.effect?.target?.getAttribute("class"),
+            })),
+            busy: Array.from(
+              doc.querySelectorAll('[busy="true"], .busy, [loading="true"]')
+            ).map(element => ({
+              target: element.localName,
+              id: element.id,
+              classes: element.getAttribute("class"),
+            })),
+          })
+      );
+    }
+  });
 });

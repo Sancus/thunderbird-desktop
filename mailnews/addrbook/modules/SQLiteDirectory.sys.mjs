@@ -694,9 +694,13 @@ export class SQLiteDirectory extends AddrBookDirectory {
         }
       }
       if (AppConstants.platform == "win") {
+        // A closed book denies writers; a live published book keeps its own
+        // SQLite connection open, so its admission must share writing.
         lease = lazy.admitWindowsMigrationPath(
           target,
-          Ci.nsIPanoramaMigrationFileSystem.KIND_FILE
+          requireClosed
+            ? Ci.nsIPanoramaMigrationFileSystem.KIND_FILE
+            : Ci.nsIPanoramaMigrationFileSystem.KIND_FILE_OR_MISSING
         );
         target.initWithPath(lease.canonicalPath);
       }

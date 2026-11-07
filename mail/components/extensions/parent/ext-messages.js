@@ -426,50 +426,78 @@ class MsgOperationWrapper {
         const additionalBaseline = new Set(
           getMessagesInFolder(additionalFccFolder).map(hdr => hdr.messageKey)
         );
+        const additionalDatabase = additionalFccFolder.msgDatabase;
+        const additionalHeaders = new Map();
+        const publicationListener = {
+          msgsMoveCopyCompleted(move, sources, destination, copies) {
+            if (
+              !move &&
+              destination.URI == additionalFccFolder.URI &&
+              sources.length == 1 &&
+              sources[0].folder.URI == primaryHdr.folder.URI &&
+              sources[0].messageKey == primaryHdr.messageKey
+            ) {
+              for (const header of copies) {
+                additionalHeaders.set(header.messageKey, header);
+              }
+            }
+          },
+        };
+        MailServices.mfn.addListener(
+          publicationListener,
+          MailServices.mfn.msgsMoveCopyCompleted
+        );
         let additionalKey = null;
-        await new Promise((resolve, reject) => {
-          MailServices.copy.copyMessages(
-            primaryCached.folder,
-            [primaryHdr],
-            additionalFccFolder,
-            false,
-            {
-              QueryInterface: ChromeUtils.generateQI([
-                "nsIMsgCopyServiceListener",
-              ]),
-              onStartCopy() {},
-              onProgress() {},
-              setMessageKey(key) {
-                additionalKey = key;
+        try {
+          await new Promise((resolve, reject) => {
+            MailServices.copy.copyMessages(
+              primaryCached.folder,
+              [primaryHdr],
+              additionalFccFolder,
+              false,
+              {
+                QueryInterface: ChromeUtils.generateQI([
+                  "nsIMsgCopyServiceListener",
+                ]),
+                onStartCopy() {},
+                onProgress() {},
+                setMessageKey(key) {
+                  additionalKey = key;
+                },
+                getMessageId() {
+                  return null;
+                },
+                onStopCopy(status) {
+                  if (Components.isSuccessCode(status)) {
+                    resolve();
+                  } else {
+                    reject(
+                      new ExtensionError(
+                        `Failed to copy to additionalFccFolder: 0x${status.toString(16)}`
+                      )
+                    );
+                  }
+                },
               },
-              getMessageId() {
-                return null;
-              },
-              onStopCopy(status) {
-                if (Components.isSuccessCode(status)) {
-                  resolve();
-                } else {
-                  reject(
-                    new ExtensionError(
-                      `Failed to copy to additionalFccFolder: 0x${status.toString(16)}`
-                    )
-                  );
-                }
-              },
-            },
-            null,
-            false
-          );
-        });
-        // Select the copy service's actual destination key, never an older
-        // message that happens to have the same Message-ID.
+              null,
+              false
+            );
+          });
+        } finally {
+          MailServices.mfn.removeListener(publicationListener);
+        }
+        // Ordinary local CopyMessages supplies destination headers, while other
+        // copy paths supply setMessageKey. Both identify actual publication.
         const newHdr =
           additionalKey === null
-            ? null
-            : additionalFccFolder.msgDatabase.getMsgHdrForKey(additionalKey);
+            ? additionalHeaders.size == 1
+              ? additionalHeaders.values().next().value
+              : null
+            : additionalDatabase.getMsgHdrForKey(additionalKey);
         if (
-          !newHdr ||
-          additionalBaseline.has(additionalKey) ||
+          !newHdr?.isLive ||
+          additionalFccFolder.msgDatabase !== additionalDatabase ||
+          additionalBaseline.has(newHdr.messageKey) ||
           newHdr.folder.URI != additionalFccFolder.URI ||
           newHdr.messageId != primaryCached.messageId
         ) {

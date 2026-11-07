@@ -1123,7 +1123,9 @@ export class MessageTracker extends EventEmitter {
     // nsIFolderListener
     MailServices.mailSession.AddFolderListener(
       this,
-      Ci.nsIFolderListener.propertyFlagChanged | Ci.nsIFolderListener.removed
+      Ci.nsIFolderListener.propertyFlagChanged |
+        Ci.nsIFolderListener.added |
+        Ci.nsIFolderListener.removed
     );
     // nsIMsgFolderListener
     MailServices.mfn.addListener(
@@ -1529,6 +1531,22 @@ export class MessageTracker extends EventEmitter {
         newProperties,
         oldProperties
       );
+    }
+  }
+
+  /**
+   * Collect new messages from the ordinary folder listener as well as msgAdded.
+   * Native local batch publication delivers this existing notification.
+   *
+   * @param {nsIMsgFolder} folder - Folder that published the message.
+   * @param {nsIMsgDBHdr} msgHdr - Newly published physical header.
+   */
+  onMessageAdded(folder, msgHdr) {
+    const cachedHdr = new CachedMsgHeader(this, msgHdr, {
+      addToMessageTracker: false,
+    });
+    if (cachedHdr.flags & Ci.nsMsgMessageFlags.New) {
+      this.addPendingNewMessage(cachedHdr);
     }
   }
 

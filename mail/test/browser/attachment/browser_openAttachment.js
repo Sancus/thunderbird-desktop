@@ -1434,7 +1434,7 @@ async function assertSelectedAttachmentBytes(attachment, expected) {
 
 add_task(async function test_selectedLocalAttachmentBytesAndSavedTarget() {
   const { attachments } = await physicalAttachmentFixture("local");
-  await assertSelectedAttachmentBytes(attachments[0], "physical-1\x00\xff");
+  await assertSelectedAttachmentBytes(attachments[0], "physical-0\x00\xff");
   await assertSelectedAttachmentBytes(attachments[1], "nested-1");
   createMockedHandler(
     "application/octet-stream",

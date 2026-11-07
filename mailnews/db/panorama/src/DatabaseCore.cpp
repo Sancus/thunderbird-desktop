@@ -2102,7 +2102,7 @@ nsresult DatabaseCore::ImportFolderSnapshotFromFile(
 namespace {
 
 void ImapImportFrame(nsACString& output, const nsACString& value) {
-  output.AppendInt(value.Length());
+  output.AppendInt(static_cast<uint64_t>(value.Length()));
   output.Append(':');
   output.Append(value);
 }
@@ -7200,7 +7200,9 @@ nsresult DatabaseCore::ImportFolderCacheMetadataV2(
     MOZ_TRY(raw->GetUTF8String(0, type));
     MOZ_TRY(raw->GetInt64(1, &size));
     MOZ_TRY(raw->GetInt32(2, &equal));
-    NS_ENSURE_TRUE(type == "blob"_ns && size == bytes.Length() && equal == 1,
+    NS_ENSURE_TRUE(type == "blob"_ns &&
+                       size == static_cast<int64_t>(bytes.Length()) &&
+                       equal == 1,
                    NS_ERROR_FILE_CORRUPTED);
     raw = nullptr;
     nsCString finalSource;

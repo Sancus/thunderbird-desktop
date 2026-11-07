@@ -811,9 +811,15 @@ void PerFolderDatabase::OnMessageFlagsChangedCaptured(
     mNewList.RemoveElement(after.id);
   }
   uint32_t newStatus = StatusFlags(after.id, after.flags);
+  // Preserve the existing facade's retained header identity for ordinary UI
+  // listeners. The native writer's batch header is a separate view of the row.
+  nsCOMPtr<nsIMsgDBHdr> observed = mCachedHeaders.Get(after.id);
+  if (!observed) {
+    observed = message;
+  }
   // Freeze both outgoing words before ordinary listeners can remove/re-add the
   // key, change flags again, or close this facade.
-  NotifyHdrChangeAll(message, oldStatus, newStatus, nullptr);
+  NotifyHdrChangeAll(observed, oldStatus, newStatus, nullptr);
   if (mIsNewsFolder &&
       ((before.flags ^ after.flags) & nsMsgMessageFlags::Read)) {
     // The native writer already committed the checkpoint and installed/swapped
@@ -833,9 +839,13 @@ void PerFolderDatabase::OnMessageTagsChangedCaptured(
     return;
   }
   RefPtr<PerFolderDatabase> self(this);
+  nsCOMPtr<nsIMsgDBHdr> observed = mCachedHeaders.Get(after.id);
+  if (!observed) {
+    observed = message;
+  }
   for (RefPtr<nsIDBChangeListener> listener : mListeners.EndLimitedRange()) {
     uint32_t status = 0;
-    listener->OnHdrPropertyChanged(message, "keywords"_ns, false, &status,
+    listener->OnHdrPropertyChanged(observed, "keywords"_ns, false, &status,
                                    nullptr);
   }
 }
@@ -4081,8 +4091,10 @@ NS_IMETHODIMP MessageEnumerator::GetNext(nsIMsgDBHdr** item) {
   MOZ_TRY(mStatus);
   NS_ENSURE_TRUE(current && mHasNext, NS_ERROR_FAILURE);
   nsMsgKey key = static_cast<nsMsgKey>(mStmt->AsInt64(0));
-  RefPtr<Message> message = new Message(key);
-  MOZ_TRY(mOwner->CacheHeader(key, message));
+  // Enumeration shares the same bounded facade cache as direct lookup.
+  // Re-enumerating a live row must not replace a header retained by its UI.
+  nsCOMPtr<nsIMsgDBHdr> message;
+  MOZ_TRY(mOwner->GetMsgHdrForKey(key, getter_AddRefs(message)));
   message.forget(item);
   Advance();
   return NS_OK;

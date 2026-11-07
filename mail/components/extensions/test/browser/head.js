@@ -100,7 +100,42 @@ registerCleanupFunction(async () => {
     tabmail.closeTab(tabmail.tabInfo[1]);
   }
 
+  // Release the test's mail before auditing its background activity.
+  MailServices.accounts.accounts.forEach(cleanUpAccount);
+  let searchDrainError;
+  if (
+    AppConstants.MOZ_PANORAMA &&
+    Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+      Ci.nsIMsgDBService
+    ) instanceof Ci.nsIDatabaseCore
+  ) {
+    const { TestUtils } = ChromeUtils.importESModule(
+      "resource://testing-common/TestUtils.sys.mjs"
+    );
+    // Test bodies keep indexing disabled. After their accounts are removed,
+    // let the normal writer settle its actual pending work, then restore the
+    // pref before the unchanged ordinary audit. Never discard an activity.
+    await SpecialPowers.pushPrefEnv({
+      set: [["mailnews.database.global.indexer.enabled", true]],
+    });
+    try {
+      await TestUtils.waitForCondition(
+        () =>
+          !window.MsgStatusFeedback._activeProcesses.some(
+            process => process.contextType == "panorama-search"
+          ),
+        "Waiting for removed account search work to settle"
+      );
+    } catch (error) {
+      searchDrainError = error;
+    } finally {
+      await SpecialPowers.popPrefEnv();
+    }
+  }
   await clearStatusBar(window);
+  if (searchDrainError) {
+    throw searchDrainError;
+  }
 
   // Some tests that open new windows don't return focus to the main window
   // in a way that satisfies mochitest, and the test times out.
@@ -112,7 +147,6 @@ registerCleanupFunction(async () => {
   mainWindowElement.focus();
   mainWindowElement.blur();
 
-  MailServices.accounts.accounts.forEach(cleanUpAccount);
   check3PaneState(true, true);
 
   // The unified toolbar must have been cleaned up. If this fails, check if a

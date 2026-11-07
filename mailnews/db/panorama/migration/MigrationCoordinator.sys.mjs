@@ -2281,7 +2281,13 @@ function captureStartupMigration(signal) {
         new FileUtils.File(server.root).contains(file)
       );
       if (matches.length !== 1) {
-        throw new Error("Mork summary has no unique persisted server root");
+        throw new Error(
+          "Mork summary has no unique persisted server root: " +
+            file.path +
+            " (matches " +
+            matches.length +
+            ")"
+        );
       }
       const server = matches[0];
       if (!["none", "imap"].includes(server.protocol)) {

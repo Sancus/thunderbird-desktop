@@ -724,18 +724,14 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         source = self.marionette.execute_script("""
             const { MailServices } = ChromeUtils.importESModule(
               'resource:///modules/MailServices.sys.mjs');
-            const { FileUtils } = ChromeUtils.importESModule(
-              'resource://gre/modules/FileUtils.sys.mjs');
             Services.io.offline = true;
             Services.prefs.setBoolPref('network.manage-offline-status', false);
             Services.prefs.setIntPref('offline.startup_state', 2);
-            const file = new FileUtils.File(PathUtils.join(PathUtils.profileDir,
-              'ImapMail', 's526-imap'));
-            if (!file.parent.exists()) file.parent.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
-            file.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
             const server = MailServices.accounts.createIncomingServer(
               's526', 'imap.invalid', 'imap');
-            server.localPath = file;
+            // Account creation can already expose the server to native listeners.
+            // Keep its normal persisted root instead of relocating a live server.
+            const file = server.localPath;
             server.setBoolValue('login_at_startup', false);
             server.setBoolValue('download_on_biff', false);
             const account = MailServices.accounts.createAccount();
@@ -760,12 +756,14 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             database.summaryValid = true;
             database.commit(Ci.nsMsgDBCommitType.kLargeCommit);
             Services.prefs.savePrefFile(null);
-            return {serverKey: server.key, summary: folder.summaryFile.path,
+            return {serverKey: server.key, root: file.path,
+              summary: folder.summaryFile.path,
               flags: (database.dBFolderInfo.flags >>> 0).toString(16),
               folderName: folder.name, onlineName: imap.onlineName,
               hierDelim: imap.hierarchyDelimiter.charCodeAt(0).toString(16),
               boxFlags: '0'};
         """)
+        self.assertTrue(Path(source["summary"]).is_relative_to(Path(source["root"])))
         self.stop_application()
         summary = Path(source["summary"])
         original = summary.read_bytes()

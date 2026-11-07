@@ -140,6 +140,7 @@ struct StartupMailSource {
   nsTArray<nsCString> localNames, localLeaves;
   uint64_t size = 0;
   uint32_t boxFlags = 0;
+  Maybe<uint32_t> originalFlags;
   char delimiter = 0;
 };
 
@@ -177,6 +178,7 @@ class ProfileStartupOperation final : public nsIAsyncShutdownBlocker {
   nsTArray<StartupMailSource> sources;
   nsTArray<StartupServerRoot> servers;
   nsTHashMap<nsCString, nsCString> backupFiles;
+  nsTHashMap<nsCString, nsCString> createdEmptyStores;
   nsTArray<nsCString> sourceIds;
   nsTArray<nsCOMPtr<nsIMsgFolder>> folders;
   nsTArray<nsCOMPtr<nsIMsgFolder>> localFolders;
@@ -7693,9 +7695,8 @@ nsresult DatabaseCore::ImportFolderCacheMetadataV2(
           // No cached contribution is added to independently imported work.
           nativeInteger = Some(int64_t{0});
         } else if (target == "folderSize"_ns || target == "expungedBytes"_ns) {
-          // Missing native accounting is measured, never filled from a hint.
-          NS_ENSURE_TRUE(target == "folderSize"_ns || plan.storeSize == 0,
-                         NS_ERROR_NOT_IMPLEMENTED);
+          // Native size is measured; absent expungedBytes has FolderInfo's
+          // effective default zero even when committed messages remain.
           nativeInteger =
               Some(target == "folderSize"_ns ? plan.storeSize : int64_t{0});
           disposition = "applied-native";
@@ -9088,7 +9089,8 @@ nsresult StartupConfiguredRoots(nsIFile* profile,
 }
 nsresult StartupStores(ProfileStartupOperation& operation,
                        const nsTArray<nsCString>& inventory,
-                       const nsTHashSet<nsCString>& declared) {
+                       const nsTHashSet<nsCString>& declared,
+                       const nsTArray<nsCString>& cacheRoots = {}) {
   for (const auto& path : inventory) {
     if (declared.Contains(path)) continue;
     nsCOMPtr<nsIFile> file;
@@ -9108,12 +9110,30 @@ nsresult StartupStores(ProfileStartupOperation& operation,
       MOZ_TRY(store->Contains(file, &contains));
       covered |= contains;
     }
-    NS_ENSURE_TRUE(covered, NS_ERROR_NOT_AVAILABLE);
+    auto created = operation.createdEmptyStores.Lookup(path);
+    bool nativeEmpty = false;
+    if (created) {
+      for (const auto& rootPath : cacheRoots) {
+        nsCOMPtr<nsIFile> root;
+        MOZ_TRY(NS_NewNativeLocalFile(rootPath, getter_AddRefs(root)));
+        bool contains;
+        MOZ_TRY(root->Contains(file, &contains));
+        nativeEmpty |= contains;
+      }
+      if (nativeEmpty) {
+        int64_t size;
+        MOZ_TRY(file->GetFileSize(&size));
+        NS_ENSURE_TRUE(!size, NS_ERROR_NOT_AVAILABLE);
+      }
+    }
+    NS_ENSURE_TRUE(covered || nativeEmpty, NS_ERROR_NOT_AVAILABLE);
     auto saved = operation.backupFiles.Lookup(path);
-    NS_ENSURE_TRUE(saved, NS_ERROR_NOT_AVAILABLE);
+    NS_ENSURE_TRUE(saved || nativeEmpty, NS_ERROR_NOT_AVAILABLE);
     nsCString actual;
     MOZ_TRY(StartupHash(file, actual));
-    NS_ENSURE_TRUE(saved.Data() == actual, NS_ERROR_NOT_AVAILABLE);
+    NS_ENSURE_TRUE((saved && saved.Data() == actual) ||
+                       (nativeEmpty && created.Data() == actual),
+                   NS_ERROR_NOT_AVAILABLE);
   }
   return NS_OK;
 }
@@ -10164,6 +10184,45 @@ nsresult DatabaseCore::OpenProfileStartup(JSContext* cx,
         auto archived = operation.backupFiles.Lookup(native.path);
         NS_ENSURE_TRUE(archived && archived.Data() == native.hash,
                        NS_ERROR_NOT_AVAILABLE);
+        nsCOMPtr<nsIFile> summary;
+        MOZ_TRY(StartupContained(operation.profile, native.path,
+                                 getter_AddRefs(summary)));
+        JS::Rooted<JSObject*> parsed(cx), original(cx), rows(cx);
+        MOZ_TRY(StartupParseFile(
+            cx, summary,
+            u"resource:///modules/panorama/MorkSummaryReader.sys.mjs"_ns,
+            "parseMorkSummary", &parsed));
+        MOZ_TRY(StartupObject(cx, parsed, "source", &original));
+        MOZ_TRY(StartupObject(cx, original, "rows", &rows));
+        JS::Rooted<JS::Value> rowValue(cx);
+        NS_ENSURE_TRUE(JS::MapValues(cx, rows, &rowValue), NS_ERROR_FAILURE);
+        JS::ForOfIterator rowsIterator(cx);
+        NS_ENSURE_TRUE(rowsIterator.init(rowValue), NS_ERROR_FAILURE);
+        bool done, seenInfo = false;
+        while (true) {
+          NS_ENSURE_TRUE(rowsIterator.next(&rowValue, &done), NS_ERROR_FAILURE);
+          if (done) break;
+          NS_ENSURE_TRUE(rowValue.isObject(), NS_ERROR_FILE_CORRUPTED);
+          JS::Rooted<JSObject*> row(cx, &rowValue.toObject());
+          nsCString scope;
+          MOZ_TRY(StartupText(cx, row, "scope", scope));
+          if (scope != "ns:msg:db:row:scope:dbfolderinfo:all"_ns) continue;
+          NS_ENSURE_FALSE(seenInfo, NS_ERROR_NOT_IMPLEMENTED);
+          seenInfo = true;
+          MOZ_TRY(
+              StartupMapEntry(cx, row, "cells", "flags"_ns, &rowValue, true));
+          if (!rowValue.isUndefined()) {
+            nsCString text;
+            MOZ_TRY(ImportText(cx, rowValue, text));
+            uint64_t flags;
+            MOZ_TRY(ImportHex(text, 8, flags));
+            native.originalFlags = Some(uint32_t(flags));
+          }
+        }
+        NS_ENSURE_TRUE(seenInfo, NS_ERROR_NOT_IMPLEMENTED);
+        nsCString measured;
+        MOZ_TRY(StartupHash(summary, measured));
+        NS_ENSURE_TRUE(measured == native.hash, NS_ERROR_NOT_AVAILABLE);
         NS_ENSURE_TRUE(!ids.Contains(native.id) &&
                            !paths.Contains(native.path) &&
                            !destinations.Contains(native.serverKey + "/"_ns +
@@ -10270,6 +10329,13 @@ nsresult DatabaseCore::BuildStartupFolders() {
   NS_ENSURE_TRUE(accounts, NS_ERROR_NOT_AVAILABLE);
   nsTHashMap<nsCString, nsCOMPtr<nsIMsgFolder>> roots;
   for (const auto& source : operation.servers) {
+    nsCOMPtr<nsIFile> retainedRoot;
+    MOZ_TRY(NS_NewNativeLocalFile(source.path, getter_AddRefs(retainedRoot)));
+    nsTArray<nsCString> beforeConstruction;
+    MOZ_TRY(StartupInventory(retainedRoot, beforeConstruction, true, false));
+    for (const auto& path : beforeConstruction)
+      NS_ENSURE_TRUE(operation.backupFiles.Contains(path),
+                     NS_ERROR_NOT_AVAILABLE);
     nsCOMPtr<nsIMsgIncomingServer> server;
     MOZ_TRY(accounts->GetIncomingServer(source.key, getter_AddRefs(server)));
     NS_ENSURE_TRUE(server, NS_ERROR_NOT_AVAILABLE);
@@ -10419,8 +10485,82 @@ nsresult DatabaseCore::BuildStartupFolders() {
     MOZ_TRY(folder->GetId(&id));
     NS_ENSURE_TRUE(id && !ids.Contains(id), NS_ERROR_NOT_AVAILABLE);
     ids.Insert(id);
+    if (source.originalFlags) {
+      uint32_t before;
+      MOZ_TRY(folder->GetFlags(&before));
+      const uint32_t wanted =
+          source.protocol == "imap"_ns
+              ? (*source.originalFlags & ~nsMsgFolderFlags::OfflineEvents) |
+                    (before & nsMsgFolderFlags::OfflineEvents)
+              : *source.originalFlags;
+      const uint32_t protocolMask =
+          nsMsgFolderFlags::Newsgroup | nsMsgFolderFlags::Virtual |
+          nsMsgFolderFlags::ImapBox | nsMsgFolderFlags::ImapPersonal |
+          nsMsgFolderFlags::ImapPublic | nsMsgFolderFlags::ImapOtherUser |
+          nsMsgFolderFlags::ImapNoselect | nsMsgFolderFlags::ImapNoinferiors;
+      NS_ENSURE_TRUE(!((wanted ^ before) & protocolMask) &&
+                         !(before & nsMsgFolderFlags::SpecialUse & ~wanted),
+                     NS_ERROR_NOT_AVAILABLE);
+      if (wanted != before) {
+        auto connection = sConnection;
+        NS_ENSURE_TRUE(connection && !mShuttingDown, NS_ERROR_NOT_AVAILABLE);
+        bool active;
+        MOZ_TRY(connection->GetTransactionInProgress(&active));
+        NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
+        MOZ_TRY(connection->BeginTransaction());
+        auto apply = [&]() -> nsresult {
+          MOZ_TRY(CheckProfileStartup(ProfileStartupToken(), true));
+          NS_ENSURE_TRUE(sConnection == connection, NS_ERROR_NOT_AVAILABLE);
+          FolderDatabase::CacheOrigin origin;
+          MOZ_TRY(mFolderDatabase->CheckCacheProjectionOrigin(id, origin));
+          NS_ENSURE_TRUE(MOZ_TRY(mFolderDatabase->GetFolderFlags(id)) == before,
+                         NS_ERROR_NOT_AVAILABLE);
+          nsCString measured;
+          MOZ_TRY(StartupHash(summary, measured));
+          NS_ENSURE_TRUE(measured == source.hash, NS_ERROR_NOT_AVAILABLE);
+          MOZ_TRY(mFolderDatabase->WriteCacheFolderFlags(id, wanted));
+          NS_ENSURE_TRUE(origin.revision < INT64_MAX - 1,
+                         NS_ERROR_ILLEGAL_VALUE);
+          ++origin.revision;
+          MOZ_TRY(mFolderDatabase->WriteCacheOrigin(origin));
+          MOZ_TRY(CheckProfileStartup(ProfileStartupToken(), true));
+          NS_ENSURE_TRUE(sConnection == connection, NS_ERROR_NOT_AVAILABLE);
+          return NS_OK;
+        };
+        nsresult rv = apply();
+        if (NS_SUCCEEDED(rv)) rv = connection->CommitTransaction();
+        if (NS_FAILED(rv)) {
+          (void)connection->RollbackTransaction();
+          return rv;
+        }
+        static_cast<nsMsgDBFolder*>(folder.get())
+            ->PublishCacheImportFlags(wanted);
+      }
+    }
     operation.sourceIds.AppendElement(source.id);
     operation.folders.AppendElement(folder);
+  }
+  // Retain only empty physical files first observed during actual native root
+  // construction. Final coverage additionally needs an exact cache root
+  // receipt.
+  operation.createdEmptyStores.Clear();
+  for (const auto& server : operation.servers) {
+    if (server.protocol != "none"_ns) continue;
+    nsCOMPtr<nsIFile> root;
+    MOZ_TRY(NS_NewNativeLocalFile(server.path, getter_AddRefs(root)));
+    nsTArray<nsCString> files;
+    MOZ_TRY(StartupInventory(root, files, true, false));
+    for (const auto& path : files) {
+      if (operation.backupFiles.Contains(path)) continue;
+      nsCOMPtr<nsIFile> file;
+      MOZ_TRY(StartupContained(operation.profile, path, getter_AddRefs(file)));
+      int64_t size;
+      MOZ_TRY(file->GetFileSize(&size));
+      if (size) continue;
+      nsCString hash;
+      MOZ_TRY(StartupHash(file, hash));
+      operation.createdEmptyStores.InsertOrUpdate(path, hash);
+    }
   }
   return NS_OK;
 }
@@ -10793,6 +10933,7 @@ nsresult DatabaseCore::CheckProfileActivation(
   MOZ_TRY(ImportMember(cx, originalInventory, "sources", &expected));
   MOZ_TRY(StartupEqual(cx, expected, retainedInventory));
   nsTHashSet<nsCString> declaredPaths;
+  nsTArray<nsCString> cacheStoreRoots;
   uint32_t count, importCount;
   MOZ_TRY(StartupArray(cx, journal, "sources", &sources, count));
   MOZ_TRY(StartupArray(cx, identity, "imports", &imports, importCount));
@@ -11308,6 +11449,38 @@ nsresult DatabaseCore::CheckProfileActivation(
         }
         actual.setObject(*saved);
         MOZ_TRY(StartupEqual(cx, expected, actual));
+#ifndef XP_WIN
+        if (!reusing) {
+          CacheImport input;
+          JS::Rooted<JS::Value> requestValue(cx, JS::ObjectValue(*request));
+          MOZ_TRY(CacheRequest(cx, requestValue, input));
+          for (const auto& folder : input.folders) {
+            if (!folder.isServer) continue;
+            NS_ENSURE_TRUE(
+                MOZ_TRY(mFolderDatabase->GetFolderParent(folder.id)) == 0,
+                NS_ERROR_NOT_AVAILABLE);
+            nsCString key = MOZ_TRY(mFolderDatabase->GetFolderName(folder.id));
+            bool bound = false;
+            for (const auto& server : operation.servers) {
+              if (server.key != key) continue;
+              NS_ENSURE_TRUE(
+                  server.path == folder.storePath &&
+                      server.protocol == folder.protocol &&
+                      server.protocol == "none"_ns &&
+                      ((folder.storeType == "mbox"_ns &&
+                        server.contract ==
+                            "@mozilla.org/msgstore/berkeleystore;1"_ns) ||
+                       (folder.storeType == "maildir"_ns &&
+                        server.contract ==
+                            "@mozilla.org/msgstore/maildirstore;1"_ns)),
+                  NS_ERROR_NOT_AVAILABLE);
+              bound = true;
+            }
+            NS_ENSURE_TRUE(bound, NS_ERROR_NOT_AVAILABLE);
+            cacheStoreRoots.AppendElement(folder.storePath);
+          }
+        }
+#endif
       }
     }
   }
@@ -11355,7 +11528,8 @@ nsresult DatabaseCore::CheckProfileActivation(
         StringEndsWith(path, "/folderCache.json"_ns))
       NS_ENSURE_TRUE(declaredPaths.Contains(path), NS_ERROR_NOT_AVAILABLE);
   }
-  MOZ_TRY(StartupStores(operation, finalInventory, declaredPaths));
+  MOZ_TRY(
+      StartupStores(operation, finalInventory, declaredPaths, cacheStoreRoots));
   return NS_OK;
 }
 NS_IMETHODIMP DatabaseCore::CompleteProfileStartup(

@@ -45,6 +45,7 @@
 #include "nsDirectoryServiceUtils.h"
 #include "nsIComponentRegistrar.h"
 #include "nsICommandLineRunner.h"
+#include "nsCommandLine.h"
 #include "nsIPrefBranch.h"
 #include "nsID.h"
 #include "nsIEventTarget.h"
@@ -58,6 +59,7 @@
 #include "nsIInterfaceRequestorUtils.h"
 #include "nsIMsgAccountManager.h"
 #include "nsIMsgDatabase.h"
+#include "nsIDBFolderInfo.h"
 #include "nsIMsgFolder.h"
 #include "nsIMsgIncomingServer.h"
 #include "nsIMsgImapMailFolder.h"
@@ -3275,8 +3277,7 @@ class DeliveryCoreReferences : public testing::Test {
                                getter_AddRefs(mSelectedLock)));
     mCore = DatabaseCore::GetInstanceForService();
     if (observe) {
-      nsCOMPtr<nsICommandLineRunner> commandLine =
-          do_CreateInstance("@mozilla.org/toolkit/command-line;1");
+      nsCOMPtr<nsICommandLineRunner> commandLine = new nsCommandLine();
       NS_ENSURE_TRUE(commandLine, NS_ERROR_NOT_AVAILABLE);
       const char* argv[] = {"thunderbird"};
       MOZ_TRY(commandLine->Init(1, argv, mProfile,
@@ -3983,6 +3984,12 @@ class DeliveryCoreReferences : public testing::Test {
                 registrar->RegisterFactory(originalCID, "", contract, nullptr));
       EXPECT_EQ(NS_OK, registrar->UnregisterFactory(nativeCID, factory));
     });
+    mRestartNativeJSONService = [&]() -> nsresult {
+      MOZ_TRY(registrar->UnregisterFactory(nativeCID, factory));
+      return registrar->RegisterFactory(nativeCID, "", contract, factory);
+    };
+    auto clearRestart =
+        MakeScopeExit([&] { mRestartNativeJSONService = nullptr; });
     nsCOMPtr<nsIDatabaseCore> selected = do_GetService(contract);
     ASSERT_EQ(static_cast<nsIDatabaseCore*>(mCore.get()), selected.get());
     auto unload =
@@ -4060,6 +4067,20 @@ class DeliveryCoreReferences : public testing::Test {
     ASSERT_EQ(NS_OK, folder->GetId(&mFolderId));
     action(folder);
   }
+
+  nsresult ReopenNativeJSONCache() {
+    NS_ENSURE_TRUE(mRestartNativeJSONService, NS_ERROR_NOT_AVAILABLE);
+    Stop();
+    // Unregistering our owned factory releases XPCOM's old service entry.
+    MOZ_TRY(mRestartNativeJSONService());
+    MOZ_TRY(Start());
+    nsCOMPtr<nsIDatabaseCore> selected =
+        do_GetService("@mozilla.org/msgDatabase/msgDBService;1");
+    NS_ENSURE_TRUE(selected.get() == static_cast<nsIDatabaseCore*>(mCore.get()),
+                   NS_ERROR_UNEXPECTED);
+    return NS_OK;
+  }
+  std::function<nsresult()> mRestartNativeJSONService;
 
   nsresult JSONCacheImportCount(int64_t& count) {
     nsCOMPtr<mozIStorageStatement> statement;
@@ -4260,8 +4281,7 @@ class DeliveryCoreReferences : public testing::Test {
       EXPECT_EQ(receipt, read);
       // Close the actual per-folder facade before the real storage barrier.
       ASSERT_EQ(NS_OK, folder->ForceDBClosed());
-      Stop();
-      ASSERT_EQ(NS_OK, Start());
+      ASSERT_EQ(NS_OK, ReopenNativeJSONCache());
       check();
       ASSERT_EQ(NS_OK, JSONCacheCall(request, true, read));
       EXPECT_EQ(receipt, read);
@@ -4296,6 +4316,195 @@ class DeliveryCoreReferences : public testing::Test {
       uint32_t order;
       ASSERT_EQ(NS_OK, folder->GetUserSortOrder(&order));
       EXPECT_EQ(UINT32_MAX, order);
+    });
+  }
+
+  nsresult PrepareNonemptyCacheFolder(nsIMsgFolder* folder, nsACString& token,
+                                      nsACString& body, nsMsgKey& key) {
+    nsCOMPtr<nsIMsgPluggableStore> store;
+    MOZ_TRY(folder->GetMsgStore(getter_AddRefs(store)));
+    nsCOMPtr<nsIOutputStream> output;
+    MOZ_TRY(store->GetNewMsgOutputStream(folder, getter_AddRefs(output)));
+    auto discard =
+        MakeScopeExit([&] { store->DiscardNewMessage(folder, output); });
+    const auto bytes =
+        "From: accounting@example.invalid\r\n"
+        "Subject: committed native accounting\r\n\r\n"
+        "retained nonempty body\r\n"_ns;
+    uint32_t written;
+    MOZ_TRY(output->Write(bytes.BeginReading(), bytes.Length(), &written));
+    NS_ENSURE_TRUE(written == bytes.Length(), NS_ERROR_UNEXPECTED);
+    MOZ_TRY(store->FinishNewMessage(folder, output, token));
+    discard.release();
+    output = nullptr;
+    RawHdr raw;
+    raw.messageId = "native-cache-accounting@example.invalid"_ns;
+    raw.subject = "committed native accounting"_ns;
+    raw.storeToken = Some(nsCString(token));
+    raw.messageSize = Some(bytes.Length());
+    raw.lineCount = Some(uint32_t{4});
+    raw.flags = nsMsgMessageFlags::Offline;
+    MOZ_TRY(mCore->MessageDB().AddMessage(mFolderId, raw, true, &key));
+    body = bytes;
+    return NS_OK;
+  }
+
+  void CheckNonemptyCacheFolder(nsIMsgFolder* folder, const nsACString& token,
+                                const nsACString& body, nsMsgKey key) {
+    nsCOMPtr<nsIMsgPluggableStore> store;
+    ASSERT_EQ(NS_OK, folder->GetMsgStore(getter_AddRefs(store)));
+    int64_t size;
+    ASSERT_EQ(NS_OK, store->EstimateFolderSize(folder, &size));
+    ASSERT_GT(size, 0);
+    nsCOMPtr<nsIInputStream> input;
+    ASSERT_EQ(NS_OK, store->GetMsgInputStream(folder, token, 0,
+                                              getter_AddRefs(input)));
+    auto close = MakeScopeExit([&] { EXPECT_EQ(NS_OK, input->Close()); });
+    nsCString actual;
+    ASSERT_EQ(NS_OK, NS_ConsumeStream(input, UINT32_MAX, actual));
+    EXPECT_EQ(body, actual);
+    bool exists = false;
+    ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(key, exists));
+    EXPECT_TRUE(exists);
+    uint64_t count;
+    ASSERT_EQ(NS_OK, mCore->MessageDB().GetNumMessages(mFolderId, &count));
+    EXPECT_EQ(1u, count);
+  }
+
+  nsresult CacheFolderInfo(nsIMsgFolder* folder, nsIDBFolderInfo** info) {
+    nsCOMPtr<nsIMsgDatabase> db;
+    MOZ_TRY(mCore->OpenFolderDB(folder, false, getter_AddRefs(db)));
+    return db->GetDBFolderInfo(info);
+  }
+
+  void CheckCacheExpungedProperty(Maybe<int64_t> expected) {
+    nsTArray<FolderImportProperty> properties;
+    ASSERT_EQ(NS_OK,
+              mCore->FolderDB().GetFolderProperties(mFolderId, properties));
+    uint32_t found = 0;
+    for (const auto& property : properties) {
+      if (property.name != "expungedBytes"_ns) continue;
+      ++found;
+      ASSERT_TRUE(expected);
+      ASSERT_TRUE(property.integer);
+      EXPECT_EQ(*expected, *property.integer);
+      EXPECT_TRUE(property.text.IsEmpty());
+    }
+    EXPECT_EQ(expected ? 1u : 0u, found);
+  }
+
+  void CheckCacheExpungedReceipt(const nsACString& receipt,
+                                 Maybe<int64_t> original, int64_t native,
+                                 bool existing) {
+    dom::AutoJSAPI jsapi;
+    ASSERT_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()));
+    JSContext* cx = jsapi.cx();
+    NS_ConvertUTF8toUTF16 json(receipt);
+    JS::Rooted<JS::Value> value(cx);
+    ASSERT_TRUE(JS_ParseJSON(cx, json.get(), json.Length(), &value));
+    ASSERT_TRUE(value.isObject());
+    JS::Rooted<JSObject*> result(cx, &value.toObject()), cells(cx);
+    ASSERT_TRUE(JS_GetProperty(cx, result, "cells", &value));
+    ASSERT_TRUE(value.isObject());
+    cells = &value.toObject();
+    uint32_t length;
+    ASSERT_TRUE(JS::GetArrayLength(cx, cells, &length));
+    EXPECT_EQ(original ? 2u : 1u, length);
+    uint32_t found = 0;
+    for (uint32_t i = 0; i < length; ++i) {
+      ASSERT_TRUE(JS_GetElement(cx, cells, i, &value));
+      ASSERT_TRUE(value.isObject());
+      JS::Rooted<JSObject*> cell(cx, &value.toObject());
+      ASSERT_TRUE(JS_GetProperty(cx, cell, "name", &value));
+      nsCString text;
+      ASSERT_EQ(NS_OK, StartupJSONValue(cx, value, text));
+      if (text != "\"expungedBytes\""_ns) continue;
+      ++found;
+      ASSERT_TRUE(original);
+      ASSERT_TRUE(JS_GetProperty(cx, cell, "integer", &value));
+      ASSERT_TRUE(value.isNumber());
+      EXPECT_EQ(double(*original), value.toNumber());
+      ASSERT_TRUE(JS_GetProperty(cx, cell, "nativeInteger", &value));
+      ASSERT_TRUE(value.isNumber());
+      EXPECT_EQ(double(native), value.toNumber());
+      nsAutoCString hex;
+      hex.AppendInt(*original, 16);
+      nsCString quoted;
+      ASSERT_EQ(NS_OK, JSONCacheQuote(cx, hex, quoted));
+      ASSERT_TRUE(JS_GetProperty(cx, cell, "text", &value));
+      ASSERT_EQ(NS_OK, StartupJSONValue(cx, value, text));
+      EXPECT_EQ(quoted, text);
+      ASSERT_TRUE(JS_GetProperty(cx, cell, "target", &value));
+      ASSERT_EQ(NS_OK, StartupJSONValue(cx, value, text));
+      EXPECT_EQ("\"expungedBytes\""_ns, text);
+      ASSERT_TRUE(JS_GetProperty(cx, cell, "disposition", &value));
+      ASSERT_EQ(NS_OK, StartupJSONValue(cx, value, text));
+      EXPECT_EQ(existing ? "\"existing\""_ns : "\"applied-native\""_ns, text);
+      for (const char* field : {"nativeText", "eligibleMask"}) {
+        bool present;
+        ASSERT_TRUE(JS_HasOwnProperty(cx, cell, field, &present));
+        EXPECT_FALSE(present);
+      }
+    }
+    EXPECT_EQ(original ? 1u : 0u, found);
+  }
+
+  void CheckNativeEffectiveExpunged(Maybe<int64_t> native, Maybe<int64_t> hint,
+                                    const nsACString& type = "mbox"_ns) {
+    WithNativeJSONCache("none"_ns, type, [&](nsIMsgFolder* folder) {
+      nsCString token, body;
+      nsMsgKey key;
+      ASSERT_EQ(NS_OK, PrepareNonemptyCacheFolder(folder, token, body, key));
+      CheckCacheExpungedProperty(Nothing());
+      nsCOMPtr<nsIDBFolderInfo> info;
+      ASSERT_EQ(NS_OK, CacheFolderInfo(folder, getter_AddRefs(info)));
+      int64_t value = -1;
+      ASSERT_EQ(NS_OK, info->GetExpungedBytes(&value));
+      EXPECT_EQ(0, value);
+      CheckCacheExpungedProperty(Nothing());
+      if (native) ASSERT_EQ(NS_OK, info->SetExpungedBytes(*native));
+      CheckCacheExpungedProperty(native);
+      nsCString cells("{");
+      if (hint) {
+        cells.AppendLiteral("\"expungedBytes\":");
+        cells.AppendInt(*hint);
+      }
+      cells.Append('}');
+      nsCString request, raw, receipt, read;
+      ASSERT_EQ(NS_OK, PrepareJSONCacheRequest(folder, cells, request, raw));
+      CheckNonemptyCacheFolder(folder, token, body, key);
+      ASSERT_EQ(NS_OK, JSONCacheCall(request, false, receipt));
+      const int64_t expected = native.valueOr(0);
+      Maybe<int64_t> stored = native;
+      if (!stored && hint) stored = Some(int64_t{0});
+      CheckCacheExpungedProperty(stored);
+      CheckCacheExpungedReceipt(receipt, hint, expected, native.isSome());
+      ASSERT_EQ(NS_OK, info->GetExpungedBytes(&value));
+      EXPECT_EQ(expected, value);
+      ASSERT_EQ(NS_OK, JSONCacheCall(request, true, read));
+      EXPECT_EQ(receipt, read);
+      info = nullptr;
+      ASSERT_EQ(NS_OK, folder->ForceDBClosed());
+      ASSERT_EQ(NS_OK, ReopenNativeJSONCache());
+      ASSERT_EQ(NS_OK, CacheFolderInfo(folder, getter_AddRefs(info)));
+      ASSERT_EQ(NS_OK, info->GetExpungedBytes(&value));
+      EXPECT_EQ(expected, value);
+      CheckCacheExpungedProperty(stored);
+      CheckNonemptyCacheFolder(folder, token, body, key);
+      ASSERT_EQ(NS_OK, JSONCacheCall(request, true, read));
+      EXPECT_EQ(receipt, read);
+      ASSERT_EQ(NS_OK, info->SetExpungedBytes(23));
+      ASSERT_EQ(NS_OK, JSONCacheCall(request, false, read));
+      EXPECT_EQ(receipt, read);
+      ASSERT_EQ(NS_OK, info->GetExpungedBytes(&value));
+      EXPECT_EQ(23, value);
+      nsCOMPtr<nsIFile> source;
+      ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(source)));
+      ASSERT_EQ(NS_OK, source->AppendNative("folderCache.json"_ns));
+      ASSERT_EQ(NS_OK, JSONCacheReadFile(source, read));
+      EXPECT_EQ(raw, read);
+      info = nullptr;
+      ASSERT_EQ(NS_OK, folder->ForceDBClosed());
     });
   }
 
@@ -23795,7 +24004,8 @@ TEST_F(DeliveryCoreReferences, NativeJSONUserOrderReadbackRejectsTampering) {
     // The retained original is authoritative for readback, even if the obsolete
     // source file has changed after this committed import.
     ASSERT_EQ(NS_OK, WriteStartupFile("folderCache.json", "{}"_ns));
-    ASSERT_EQ(NS_OK, JSONCacheCall(request, false, output));
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, JSONCacheCall(request, false, output));
+    ASSERT_EQ(NS_OK, JSONCacheCall(request, true, output));
     EXPECT_EQ(receipt, output);
     CheckJSONUserOrderProperty(Some(uint32_t{91}));
   });
@@ -23853,6 +24063,215 @@ TEST_F(DeliveryCoreReferences,
     CheckJSONUserOrderReceipt(output, Some(uint32_t{0}), 0, false);
     ASSERT_EQ(NS_OK, folder->GetUserSortOrder(&order));
     EXPECT_EQ(0u, order);
+  });
+}
+
+TEST_F(DeliveryCoreReferences,
+       NativeEffectiveExpungedAbsentUsesZeroForNonemptyMbox) {
+  CheckNativeEffectiveExpunged(Nothing(), Some(int64_t{37}));
+}
+
+TEST_F(DeliveryCoreReferences,
+       NativeEffectiveExpungedExplicitZeroNativeWinsConflict) {
+  CheckNativeEffectiveExpunged(Some(int64_t{0}), Some(int64_t{37}));
+}
+
+TEST_F(DeliveryCoreReferences,
+       NativeEffectiveExpungedExplicitNonzeroNativeWinsConflict) {
+  CheckNativeEffectiveExpunged(Some(int64_t{17}), Some(int64_t{0}));
+}
+
+TEST_F(DeliveryCoreReferences,
+       NativeEffectiveExpungedExplicitZeroCacheUsesAbsentNativeDefault) {
+  CheckNativeEffectiveExpunged(Nothing(), Some(int64_t{0}));
+}
+
+TEST_F(DeliveryCoreReferences,
+       NativeEffectiveExpungedAbsentUsesZeroForNonemptyMaildir) {
+  CheckNativeEffectiveExpunged(Nothing(), Some(int64_t{37}), "maildir"_ns);
+}
+
+TEST_F(DeliveryCoreReferences,
+       NativeEffectiveExpungedAbsentCacheCellLeavesNativeAbsent) {
+  CheckNativeEffectiveExpunged(Nothing(), Nothing());
+}
+
+TEST_F(DeliveryCoreReferences, NativeEffectiveExpungedRefusesMalformedNative) {
+  WithNativeJSONCache("none"_ns, "mbox"_ns, [&](nsIMsgFolder* folder) {
+    nsCString token, body, request, raw, output;
+    nsMsgKey key;
+    ASSERT_EQ(NS_OK, PrepareNonemptyCacheFolder(folder, token, body, key));
+    CheckCacheExpungedProperty(Nothing());
+    ASSERT_EQ(NS_OK, PrepareJSONCacheRequest(
+                         folder, "{\"expungedBytes\":37}"_ns, request, raw));
+    ASSERT_EQ(NS_OK, WriteFolderProperty(&mCore->FolderDB(), mFolderId,
+                                         "expungedBytes"_ns, "0"_ns));
+    EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED, JSONCacheCall(request, false, output));
+    nsCString text;
+    ASSERT_EQ(NS_OK, ReadFolderProperty(&mCore->FolderDB(), mFolderId,
+                                        "expungedBytes"_ns, text));
+    EXPECT_EQ("0"_ns, text);
+    ASSERT_EQ(NS_OK, WriteFolderProperty(&mCore->FolderDB(), mFolderId,
+                                         "expungedBytes"_ns, int64_t{-1}));
+    EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED, JSONCacheCall(request, false, output));
+    int64_t value = 0, count = -1;
+    ASSERT_EQ(NS_OK, ReadFolderProperty(&mCore->FolderDB(), mFolderId,
+                                        "expungedBytes"_ns, value));
+    EXPECT_EQ(-1, value);
+    ASSERT_EQ(NS_OK, JSONCacheImportCount(count));
+    EXPECT_EQ(0, count);
+    CheckNonemptyCacheFolder(folder, token, body, key);
+    nsCOMPtr<nsIDBFolderInfo> info;
+    ASSERT_EQ(NS_OK, CacheFolderInfo(folder, getter_AddRefs(info)));
+    ASSERT_EQ(NS_OK, info->SetExpungedBytes(0));
+    ASSERT_EQ(NS_OK, JSONCacheCall(request, false, output));
+    CheckCacheExpungedReceipt(output, Some(int64_t{37}), 0, true);
+  });
+}
+
+TEST_F(DeliveryCoreReferences, NativeEffectiveExpungedRefusesStringSourceCell) {
+  WithNativeJSONCache("none"_ns, "mbox"_ns, [&](nsIMsgFolder* folder) {
+    nsCString token, body, request, raw, output;
+    nsMsgKey key;
+    ASSERT_EQ(NS_OK, PrepareNonemptyCacheFolder(folder, token, body, key));
+    ASSERT_EQ(NS_OK, PrepareJSONCacheRequest(
+                         folder, "{\"expungedBytes\":\"0\"}"_ns, request, raw));
+    EXPECT_EQ(NS_ERROR_FAILURE, JSONCacheCall(request, false, output));
+    CheckCacheExpungedProperty(Nothing());
+    int64_t count = -1;
+    ASSERT_EQ(NS_OK, JSONCacheImportCount(count));
+    EXPECT_EQ(0, count);
+    CheckNonemptyCacheFolder(folder, token, body, key);
+  });
+}
+
+TEST_F(DeliveryCoreReferences,
+       NativeEffectiveExpungedRefusesFractionSourceCell) {
+  WithNativeJSONCache("none"_ns, "mbox"_ns, [&](nsIMsgFolder* folder) {
+    nsCString token, body, request, raw, output;
+    nsMsgKey key;
+    ASSERT_EQ(NS_OK, PrepareNonemptyCacheFolder(folder, token, body, key));
+    ASSERT_EQ(NS_OK, PrepareJSONCacheRequest(
+                         folder, "{\"expungedBytes\":0.5}"_ns, request, raw));
+    EXPECT_EQ(NS_ERROR_FAILURE, JSONCacheCall(request, false, output));
+    CheckCacheExpungedProperty(Nothing());
+    int64_t count = -1;
+    ASSERT_EQ(NS_OK, JSONCacheImportCount(count));
+    EXPECT_EQ(0, count);
+    CheckNonemptyCacheFolder(folder, token, body, key);
+  });
+}
+
+TEST_F(DeliveryCoreReferences,
+       NativeEffectiveExpungedRollbackPreservesCommittedBody) {
+  WithNativeJSONCache("none"_ns, "mbox"_ns, [&](nsIMsgFolder* folder) {
+    nsCString token, body, request, raw, output;
+    nsMsgKey key;
+    ASSERT_EQ(NS_OK, PrepareNonemptyCacheFolder(folder, token, body, key));
+    CheckCacheExpungedProperty(Nothing());
+    ASSERT_EQ(NS_OK, PrepareJSONCacheRequest(
+                         folder, "{\"expungedBytes\":37}"_ns, request, raw));
+    ASSERT_EQ(NS_OK,
+              mConnection->ExecuteSimpleSQL(
+                  "CREATE TEMP TRIGGER fail_native_expunged BEFORE INSERT "
+                  "ON main.folder_cache_imports BEGIN SELECT "
+                  "RAISE(ABORT,'native accounting receipt'); END"_ns));
+    auto cleanup = MakeScopeExit([&] {
+      EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                           "DROP TRIGGER IF EXISTS fail_native_expunged"_ns));
+    });
+    EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+              JSONCacheCall(request, false, output));
+    CheckCacheExpungedProperty(Nothing());
+    CheckNonemptyCacheFolder(folder, token, body, key);
+    bool active = true;
+    ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    EXPECT_FALSE(active);
+    int64_t count = -1;
+    ASSERT_EQ(NS_OK, JSONCacheImportCount(count));
+    EXPECT_EQ(0, count);
+    nsCOMPtr<nsIFile> source;
+    ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(source)));
+    ASSERT_EQ(NS_OK, source->AppendNative("folderCache.json"_ns));
+    ASSERT_EQ(NS_OK, JSONCacheReadFile(source, output));
+    EXPECT_EQ(raw, output);
+    ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                         "DROP TRIGGER fail_native_expunged"_ns));
+    ASSERT_EQ(NS_OK, JSONCacheCall(request, false, output));
+    CheckCacheExpungedProperty(Some(int64_t{0}));
+    CheckCacheExpungedReceipt(output, Some(int64_t{37}), 0, false);
+    CheckNonemptyCacheFolder(folder, token, body, key);
+  });
+}
+
+TEST_F(DeliveryCoreReferences,
+       NativeEffectiveExpungedReadbackRetainsOriginalCells) {
+  WithNativeJSONCache("none"_ns, "mbox"_ns, [&](nsIMsgFolder* folder) {
+    nsCString token, body, request, raw, receipt, output;
+    nsMsgKey key;
+    ASSERT_EQ(NS_OK, PrepareNonemptyCacheFolder(folder, token, body, key));
+    ASSERT_EQ(NS_OK, PrepareJSONCacheRequest(
+                         folder, "{\"expungedBytes\":37}"_ns, request, raw));
+    ASSERT_EQ(NS_OK, JSONCacheCall(request, false, receipt));
+    CheckCacheExpungedReceipt(receipt, Some(int64_t{37}), 0, false);
+    ASSERT_EQ(
+        NS_OK,
+        mConnection->ExecuteSimpleSQL(
+            "UPDATE folder_cache_imports SET raw=CAST('bad' AS BLOB)"_ns));
+    EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, JSONCacheCall(request, true, output));
+    nsCOMPtr<mozIStorageStatement> restore;
+    ASSERT_EQ(NS_OK, mConnection->CreateStatement(
+                         "UPDATE folder_cache_imports SET raw=:raw"_ns,
+                         getter_AddRefs(restore)));
+    ASSERT_EQ(NS_OK, restore->BindBlobByName(
+                         "raw"_ns,
+                         reinterpret_cast<const uint8_t*>(raw.BeginReading()),
+                         raw.Length()));
+    ASSERT_EQ(NS_OK, restore->Execute());
+    restore = nullptr;
+    nsCString damaged(receipt);
+    damaged.ReplaceSubstring("\"name\":\"expungedBytes\",\"text\":\"25\"",
+                             "\"name\":\"expungedBytes\",\"text\":\"26\"");
+    ASSERT_NE(receipt, damaged);
+    ASSERT_EQ(NS_OK, mConnection->CreateStatement(
+                         "UPDATE folder_cache_imports SET receipt=:receipt"_ns,
+                         getter_AddRefs(restore)));
+    ASSERT_EQ(NS_OK, restore->BindUTF8StringByName("receipt"_ns, damaged));
+    ASSERT_EQ(NS_OK, restore->Execute());
+    EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, JSONCacheCall(request, true, output));
+    ASSERT_EQ(NS_OK, restore->Reset());
+    ASSERT_EQ(NS_OK, restore->BindUTF8StringByName("receipt"_ns, receipt));
+    ASSERT_EQ(NS_OK, restore->Execute());
+    restore = nullptr;
+    ASSERT_EQ(NS_OK, JSONCacheCall(request, true, output));
+    EXPECT_EQ(receipt, output);
+    CheckCacheExpungedProperty(Some(int64_t{0}));
+    CheckNonemptyCacheFolder(folder, token, body, key);
+  });
+}
+
+TEST_F(DeliveryCoreReferences, NativeJSONColdReopenRetiresOldServiceInstance) {
+  WithNativeJSONCache("none"_ns, "mbox"_ns, [&](nsIMsgFolder* folder) {
+    RefPtr<DatabaseCore> old = mCore;
+    nsCString before, after;
+    ASSERT_EQ(NS_OK, old->GetSourceId(before));
+    uint32_t order;
+    ASSERT_EQ(NS_OK, folder->SetUserSortOrder(37));
+    ASSERT_EQ(NS_OK, folder->ForceDBClosed());
+    ASSERT_EQ(NS_OK, ReopenNativeJSONCache());
+    EXPECT_NE(old.get(), mCore.get());
+    ASSERT_EQ(NS_OK, mCore->GetSourceId(after));
+    EXPECT_EQ(before, after);
+    nsCOMPtr<nsIMsgDatabase> refused;
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              old->OpenFolderDB(folder, false, getter_AddRefs(refused)));
+    EXPECT_FALSE(refused);
+    ASSERT_EQ(NS_OK, folder->GetUserSortOrder(&order));
+    EXPECT_EQ(37u, order);
+    int32_t derived;
+    ASSERT_EQ(NS_OK, folder->GetSortOrder(&derived));
+    EXPECT_EQ(37, derived);
+    ASSERT_EQ(NS_OK, folder->ForceDBClosed());
   });
 }
 

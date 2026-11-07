@@ -2,15 +2,10 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, you can obtain one at http://mozilla.org/MPL/2.0/. */
 
-const {
-  be_in_folder,
-  create_folder,
-  get_about_3pane,
-  get_about_message,
-  select_click_row,
-} = ChromeUtils.importESModule(
-  "resource://testing-common/mail/FolderDisplayHelpers.sys.mjs"
-);
+const { be_in_folder, create_folder, get_about_message, select_click_row } =
+  ChromeUtils.importESModule(
+    "resource://testing-common/mail/FolderDisplayHelpers.sys.mjs"
+  );
 const { add_message_to_folder, create_message } = ChromeUtils.importESModule(
   "resource://testing-common/mail/MessageInjectionHelpers.sys.mjs"
 );
@@ -134,37 +129,12 @@ registerCleanupFunction(async function () {
     }
   }
 
+  // Leave the displayed fixture before deleting its folder.
+  await be_in_folder(folder.rootFolder);
   // Remove created folders.
   folder.deleteSelf(null);
 
   Services.focus.focusedWindow = window;
-  // Bounded read-only diagnosis of the remaining ordinary vsync failure.
-  for (const doc of [
-    document,
-    get_about_3pane().document,
-    get_about_message().document,
-  ]) {
-    const activeAnimations = doc
-      .getAnimations()
-      .filter(
-        animation => animation.playState == "running" || animation.pending
-      );
-    info(
-      `S376 cleanup animation state: ${JSON.stringify({
-        document: doc.documentURI,
-        visibility: doc.visibilityState,
-        focusedElement: doc.activeElement?.id || null,
-        vsyncEnabled: ChromeUtils.vsyncEnabled(),
-        count: activeAnimations.length,
-        animations: activeAnimations.slice(0, 16).map(animation => ({
-          playState: animation.playState,
-          pending: animation.pending,
-          target: animation.effect?.target?.localName || null,
-          id: animation.effect?.target?.id || null,
-        })),
-      })}`
-    );
-  }
 });
 
 function createMockedHandler(type, preferredAction, alwaysAskBeforeHandling) {

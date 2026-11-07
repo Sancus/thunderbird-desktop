@@ -367,6 +367,7 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             prefs={**(self.original_prefs or {}), "mail.panorama.enabled": enabled},
             clean=True,
         )
+        self.marionette.raise_for_port(timeout=self.marionette.startup_timeout)
         self.marionette.start_session()
         self.marionette.set_context(self.marionette.CONTEXT_CHROME)
         self.profile = Path(self.marionette.execute_script(
@@ -707,6 +708,7 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             self.stop_application()
             self.marionette.instance.app_args = self.original_args
             self.marionette.instance.restart(prefs=self.original_prefs, clean=True)
+            self.marionette.raise_for_port(timeout=self.marionette.startup_timeout)
             self.marionette.start_session()
             for work in self.created_work:
                 # Remove only this disposable test's exact outside-profile archive.

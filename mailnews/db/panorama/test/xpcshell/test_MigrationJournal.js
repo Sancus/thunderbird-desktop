@@ -1810,6 +1810,28 @@ add_task(
       "Reopen preserves the exact pending plan"
     );
     reopened.close();
+    Assert.deepEqual(
+      state.protocolUnits,
+      [],
+      "Unbound startup has no IMAP unit"
+    );
+    const retained = await IOUtils.read(input.path);
+    for (const invalid of [
+      { ...state, protocolUnits: null },
+      { ...state, protocolUnits: [{}] },
+      { ...state, version: 6, startup: undefined },
+    ]) {
+      await IOUtils.writeJSON(input.path, invalid);
+      const corrupt = await IOUtils.read(input.path);
+      await Assert.rejects(
+        MigrationJournal.open(input.path, input.profilePath),
+        /Invalid migration protocol journal/,
+        "Only version7 can retain an empty unbound protocol inventory"
+      );
+      Assert.deepEqual(await IOUtils.read(input.path), corrupt);
+      Assert.deepEqual(await IOUtils.read(input.source), source);
+    }
+    await IOUtils.write(input.path, retained);
     Assert.deepEqual(await IOUtils.read(input.source), source);
     Assert.ok(
       !(await IOUtils.exists(

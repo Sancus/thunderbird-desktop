@@ -1473,7 +1473,8 @@ export class MigrationJournal {
     }
     if (
       !Array.isArray(state.protocolUnits) ||
-      !state.sources.some(source => source.protocol === "imap")
+      (!state.sources.some(source => source.protocol === "imap") &&
+        (state.version === PROTOCOL_VERSION || state.protocolUnits.length))
     ) {
       throw new Error("Invalid migration protocol journal");
     }

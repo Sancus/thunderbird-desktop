@@ -582,6 +582,8 @@ nsImapIncomingServer::LoadNextQueuedUrl(nsIImapProtocol* aProtocol,
   bool urlRun = false;
   bool keepGoing = true;
   nsCOMPtr<nsIImapProtocol> protocolInstance;
+  // Release dequeued consumers after unlocking, with both queues consistent.
+  nsTArray<nsCOMPtr<nsISupports>> removedConsumers;
 
   MutexAutoLock mon(mLock);
   int32_t cnt = m_urlQueue.Count();
@@ -625,8 +627,11 @@ nsImapIncomingServer::LoadNextQueuedUrl(nsIImapProtocol* aProtocol,
         NS_IF_RELEASE(aConsumer);
       }
       if (removeUrlFromQueue) {
+        nsCOMPtr<nsISupports> consumer =
+            dont_AddRef(m_urlConsumers.ElementAt(0));
         m_urlQueue.RemoveObjectAt(0);
         m_urlConsumers.RemoveElementAt(0);
+        removedConsumers.AppendElement(std::move(consumer));
       }
     }
     cnt = m_urlQueue.Count();
@@ -639,6 +644,8 @@ nsImapIncomingServer::LoadNextQueuedUrl(nsIImapProtocol* aProtocol,
 NS_IMETHODIMP
 nsImapIncomingServer::AbortQueuedUrls() {
   nsresult rv = NS_OK;
+  // Consumer destruction may call out; keep it outside the queue lock.
+  nsTArray<nsCOMPtr<nsISupports>> removedConsumers;
 
   MutexAutoLock mon(mLock);
   int32_t cnt = m_urlQueue.Count();
@@ -651,8 +658,11 @@ nsImapIncomingServer::AbortQueuedUrls() {
       rv = DoomUrlIfChannelHasError(aImapUrl, &removeUrlFromQueue);
       NS_ENSURE_SUCCESS(rv, rv);
       if (removeUrlFromQueue) {
+        nsCOMPtr<nsISupports> consumer =
+            dont_AddRef(m_urlConsumers.ElementAt(cnt - 1));
         m_urlQueue.RemoveObjectAt(cnt - 1);
         m_urlConsumers.RemoveElementAt(cnt - 1);
+        removedConsumers.AppendElement(std::move(consumer));
       }
     }
     cnt--;

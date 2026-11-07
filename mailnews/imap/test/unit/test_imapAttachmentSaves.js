@@ -38,12 +38,13 @@ class SaveAttachmentCallbackListener {
 
 const gCallbackObject = new SaveAttachmentCallbackListener();
 
-add_setup(function () {
-  setupIMAPPump();
-
+add_setup(async function () {
   registerCleanupFunction(() => {
     teardownIMAPPump();
   });
+
+  // UIDPLUS identifies the appended replacement before deleting the original.
+  await setupIMAPPump("RFC2195,RFC4315", { awaitInbox: true });
 });
 
 add_task(async function testImapAttachmentDetac() {

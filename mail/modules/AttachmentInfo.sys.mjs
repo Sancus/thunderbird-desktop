@@ -352,6 +352,7 @@ export class AttachmentInfo {
    * @returns {?string} the dir path of the saved attachments. null if not saved.
    */
   static async saveAttachments(attachments, browsingContext, fpDialogTitle) {
+    attachments = [...attachments];
     for (const attachment of attachments) {
       attachment.#checkSelection();
       if (!attachment.hasFile) {
@@ -1024,6 +1025,7 @@ export class AttachmentInfo {
    * @param {boolean} [silent=true] - If true, ask for confirmation to proceed.
    */
   static async deleteAttachments(msgHdr, attachments, silent = true) {
+    attachments = [...attachments];
     const checkSelection = AttachmentInfo.#modificationGuard(
       msgHdr,
       attachments
@@ -1105,6 +1107,7 @@ export class AttachmentInfo {
     detachDir = null,
     browsingContext = null
   ) {
+    attachments = [...attachments];
     const checkSelection = AttachmentInfo.#modificationGuard(
       msgHdr,
       attachments

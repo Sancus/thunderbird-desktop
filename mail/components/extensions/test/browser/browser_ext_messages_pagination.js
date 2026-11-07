@@ -739,7 +739,14 @@ add_task(
     subFolders.test1.msgDatabase.refreshCache(saved.virtualFolder.URI, [
       header.messageKey,
     ]);
-    saved.searchString = "AND (subject,unsupported-operation,scope)";
+    const invalid = "AND (subject,unsupported-operation,scope)";
+    // Native saved searches refuse an unparseable definition when it is set.
+    Assert.throws(() => {
+      saved.searchString = invalid;
+    }, /NS_ERROR_ILLEGAL_VALUE/);
+    // A definition already stored, as by an older profile, is read unchanged.
+    saved.virtualFolder.setStringProperty("searchStr", invalid);
+    Assert.equal(saved.searchString, invalid);
     const extension = ExtensionTestUtils.loadExtension({
       files: {
         "utils.js": await getUtilsJS(),

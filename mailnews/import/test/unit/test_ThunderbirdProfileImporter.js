@@ -482,7 +482,7 @@ add_task(async function test_importAddressBooks() {
       await IOUtils.read(PathUtils.join(tmpProfileDir.path, "mork.mab")),
       originalMab
     );
-    const book = MailServices.ab.getDirectoryFromId("ldap_2.servers.mab");
+    const book = MailServices.ab.getDirectory("jsaddrbook://mork.sqlite");
     const cards = book.childCards.filter(card => !card.isMailList);
     Assert.equal(cards.length, 1);
     Assert.equal(cards[0].displayName, "contact number one");

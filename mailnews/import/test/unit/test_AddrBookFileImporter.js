@@ -150,13 +150,14 @@ add_task(async function test_importLdifFile() {
 // display names/emails. The genuine saved native MAB is used by the profile test.
 const MAB_SOURCE = `// <!-- <mdb:mork:z v="1.4"/> -->
 < <(a=c)>(80=ns:addrbk:db:row:scope:card:all)
-(81=ns:addrbk:db:row:scope:list:all)(82=ns:addrbk:db:table:kind:pab)>
+(81=ns:addrbk:db:row:scope:list:all)(82=ns:addrbk:db:table:kind:pab)
+(83=Address1)(84=Address2)>
 {1:^80 {(k^82:c)}
 [1(DisplayName=Same)(PrimaryEmail=same@invalid)(UID=$EF$BB$BFone)
 (RecordKey=0000000a)(Empty=)(Opaque=$EF$BB$BFopaque$00tail)]
 [2(DisplayName=Same)(PrimaryEmail=same@invalid)(UID=two)(RecordKey=2)]
 [1:^81(ListName=Physical list)(ListNickName=)(ListDescription=$EF$BB$BFnote)
-(ListTotalAddresses=2)(Address1=2)(Address2=1)]}`;
+(ListTotalAddresses=2)(^83=2)(^84=1)]}`;
 let mabSerial = 0;
 
 /**
@@ -236,7 +237,7 @@ add_task(async function test_importMabWithoutRuntimeFactory() {
 add_task(async function test_importMabValidatesBeforeTarget() {
   for (const [source, message] of [
     [MAB_SOURCE.slice(0, -1), /Mork/],
-    [MAB_SOURCE.replace("(Address2=1)", "(Address2=3)"), /member is missing/],
+    [MAB_SOURCE.replace("(^84=1)", "(^84=3)"), /member is missing/],
     [MAB_SOURCE.replace("(RecordKey=2)", "(RecordKey=xyz)"), /RecordKey/],
     [
       MAB_SOURCE.replace("(UID=two)", "(UID=$EF$BB$BFone)"),
@@ -246,10 +247,7 @@ add_task(async function test_importMabValidatesBeforeTarget() {
       MAB_SOURCE.replace("(ListName=Physical list)", "(ListName=bad,name)"),
       /mailing list name/,
     ],
-    [
-      MAB_SOURCE.replace("(Address1=2)", "(Address1=1)"),
-      /mailing list membership/,
-    ],
+    [MAB_SOURCE.replace("(^83=2)", "(^83=1)"), /mailing list membership/],
     [
       MAB_SOURCE.replace(
         "(PrimaryEmail=same@invalid)(UID=two)",

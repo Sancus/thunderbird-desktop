@@ -270,3 +270,46 @@ function getMessageBody(content) {
 registerCleanupFunction(function () {
   load(gDEPTH + "mailnews/resources/mailShutdown.js");
 });
+
+/**
+ * Wait for the final send/copy callback for an immediate send from this identity.
+ * Retain the actual compose object until it reports completion.
+ *
+ * @param {nsIMsgIdentity} identity - The identity that sends the message.
+ * @returns {Promise<number>} The final compose result code.
+ */
+function promiseComposeSendCompletion(identity) {
+  const { promise, resolve } = Promise.withResolvers();
+  let compose = null;
+  let observing = true;
+  const listener = {
+    NotifyComposeFieldsReady() {},
+    NotifyComposeBodyReady() {},
+    SaveInFolderDone() {},
+    ComposeProcessDone(result) {
+      compose.UnregisterStateListener(listener);
+      compose = null;
+      resolve(result);
+    },
+    QueryInterface: ChromeUtils.generateQI(["nsIMsgComposeStateListener"]),
+  };
+  const observer = (subject, topic, data) => {
+    const [, mode, key] = data.split(",");
+    if (key != identity.key || Number(mode) != Ci.nsIMsgSend.nsMsgDeliverNow) {
+      return;
+    }
+    Services.obs.removeObserver(observer, "mail-set-sender");
+    observing = false;
+    compose = subject.QueryInterface(Ci.nsIMsgCompose);
+    compose.RegisterStateListener(listener);
+  };
+  Services.obs.addObserver(observer, "mail-set-sender");
+  registerCleanupFunction(() => {
+    if (observing) {
+      Services.obs.removeObserver(observer, "mail-set-sender");
+    }
+    compose?.UnregisterStateListener(listener);
+    compose = null;
+  });
+  return promise;
+}

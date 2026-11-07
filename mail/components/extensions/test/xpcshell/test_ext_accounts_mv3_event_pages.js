@@ -118,6 +118,10 @@ add_task(async function test_accounts_MV3_event_pages() {
 
     {
       const rv = await extension.awaitMessage("onCreated event received");
+      Assert.ok(
+        !Object.hasOwn(rv.args[1], "folders"),
+        "Manifest V3 excludes the deprecated folders property"
+      );
       Assert.deepEqual(
         {
           eventCount: 1,
@@ -127,7 +131,18 @@ add_task(async function test_accounts_MV3_event_pages() {
               id: details.account.key,
               name: details.expectedName(account.key),
               type: details.expectedType,
-              folders: null,
+              rootFolder: {
+                id: `${details.account.key}://`,
+                name: "Root",
+                path: "/",
+                specialUse: [],
+                isFavorite: false,
+                isRoot: true,
+                isTag: false,
+                isUnified: false,
+                isVirtual: false,
+                accountId: details.account.key,
+              },
               identities: [],
             },
           ],

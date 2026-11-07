@@ -883,8 +883,10 @@ export var FeedUtils = {
     Services.obs.notifyObservers(aFolder, "folder-properties-changed");
 
     const win = Services.wm.getMostRecentWindow("Mail:News-BlogSubscriptions");
-    if (win) {
-      win.FeedSubscriptions.mView.tree.invalidate();
+    // A closing subscription window can remain registered after its tree detaches.
+    const tree = win?.FeedSubscriptions?.mView.tree;
+    if (tree) {
+      tree.invalidate();
     }
   },
 

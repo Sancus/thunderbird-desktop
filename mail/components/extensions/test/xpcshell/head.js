@@ -67,8 +67,9 @@ async function createAccount(type = "none", options = {}) {
   }
 
   const account = MailServices.accounts.createAccount();
+  const native = Services.prefs.getBoolPref("mail.panorama.enabled", false);
   account.incomingServer = MailServices.accounts.createIncomingServer(
-    `${account.key}user`,
+    native && type == "ews" ? "user" : `${account.key}user`,
     "localhost",
     type
   );
@@ -114,7 +115,10 @@ async function createAccount(type = "none", options = {}) {
     const ewsServer = new EWSServer();
     ewsServer.open();
     account.incomingServer.port = ewsServer.port;
-    account.incomingServer.username = "user";
+    if (!native) {
+      // Legacy account events retain the original create-then-rename sequence.
+      account.incomingServer.username = "user";
+    }
     account.incomingServer.password = "password";
     account.incomingServer.setStringValue(
       "ews_url",
@@ -298,7 +302,7 @@ class IMAPServer {
     registerCleanupFunction(() => this.close());
   }
   close() {
-    this.server.stop();
+    return this.server.stop();
   }
   get port() {
     return this.server.port;
@@ -357,7 +361,7 @@ var NNTPServer = {
   },
 
   close() {
-    this.server.stop();
+    return this.server.stop();
   },
   get port() {
     return this.server.port;
@@ -409,7 +413,7 @@ class EWSServer {
   }
 
   close() {
-    this.server.stop();
+    return this.server.stop();
   }
 
   get port() {

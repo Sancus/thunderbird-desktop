@@ -29,6 +29,7 @@
 #  include "mozilla/ResultExtensions.h"
 #  include "mozilla/StaticPrefs_mail.h"
 #  include "nsDirectoryServiceDefs.h"
+#  include "nsIInputStream.h"
 #  include "nsIMsgPluggableStore.h"
 #  include "nsNetUtil.h"
 #  include "nsLocalUtils.h"

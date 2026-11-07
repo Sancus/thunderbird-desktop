@@ -785,8 +785,8 @@ add_task(async function testBadgesPersistentState() {
   const folder = rootFolder.getChildNamed("NewlyCreatedTestFolder");
   await be_in_folder(folder);
 
-  about3Pane.folderTree.selectedIndex = 3;
-  const row = about3Pane.folderTree.getRowAtIndex(3);
+  const folderIndex = about3Pane.folderTree.selectedIndex;
+  const row = about3Pane.folderTree.getRowAtIndex(folderIndex);
   Assert.equal(
     row.name,
     "NewlyCreatedTestFolder",
@@ -811,7 +811,7 @@ add_task(async function testBadgesPersistentState() {
   // messages, and the folder pane doesn't receive the folder size property
   // changes. This doesn't happen while using the app normally.
   about3Pane.folderTree.selectedIndex = 0;
-  about3Pane.folderTree.selectedIndex = 3;
+  about3Pane.folderTree.selectedIndex = folderIndex;
 
   await TestUtils.waitForCondition(
     () => currentTotal != row.querySelector(".total-count").textContent,
@@ -861,14 +861,22 @@ add_task(async function testAddFolderToFavorites() {
 
   // Set inbox as favorite and let the folder tree update itself.
   inbox.setFlag(Ci.nsMsgFolderFlags.Favorite);
-  await new Promise(resolve => setTimeout(resolve));
+  await TestUtils.waitForCondition(
+    () => about3Pane.folderPane.getRowForFolder(inbox.parent, "favorite"),
+    "The Inbox server row is present in Favorite Folders"
+  );
 
   // Expand the server row that has just been added to favorites.
-  about3Pane.folderTree.selectedIndex = 4;
-  about3Pane.folderTree.expandRowAtIndex(4);
+  const serverRow = about3Pane.folderPane.getRowForFolder(
+    inbox.parent,
+    "favorite"
+  );
+  const serverIndex = about3Pane.folderTree.rows.indexOf(serverRow);
+  about3Pane.folderTree.selectedIndex = serverIndex;
+  about3Pane.folderTree.expandRowAtIndex(serverIndex);
 
   // Check the inbox row.
-  const row = about3Pane.folderTree.getRowAtIndex(5);
+  const row = about3Pane.folderPane.getRowForFolder(inbox, "favorite");
   await assertAriaLabel(
     row,
     `Inbox, 9 unread messages, 10 total messages, ${row.folderSize}`

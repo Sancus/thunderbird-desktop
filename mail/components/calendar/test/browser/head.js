@@ -229,7 +229,7 @@ async function createEvent({
  * Opens an event on the calendar.
  *
  * @param {HTMLElement} eventBox - Event box element to interact with.
- * @returns {HTMLElement}
+ * @returns {Promise<HTMLElement>} The event box after the dialog opens.
  */
 async function openEvent({ eventBox }) {
   const dblClickEvent = new MouseEvent("dblclick", {
@@ -238,6 +238,12 @@ async function openEvent({ eventBox }) {
     cancelable: true,
   });
   const readyPromise = waitForCalendarReady();
+
+  // Finish pending painting before sending synthetic input to the calendar.
+  await TestUtils.waitForCondition(
+    () => !window.windowUtils.isMozAfterPaintPending,
+    "Calendar painting should finish before opening the event"
+  );
 
   EventUtils.sendMouseEvent(dblClickEvent, eventBox, window);
 
@@ -298,10 +304,17 @@ async function showEvent({
   let scrolledBox;
   await TestUtils.waitForCondition(() => {
     scrolledBox = weekView.getEventBoxAt(window, targetDate.getDay() + 1, 1);
-    return scrolledBox && BrowserTestUtils.isVisible(scrolledBox);
+    return (
+      scrolledBox?.isConnected &&
+      BrowserTestUtils.isVisible(scrolledBox) &&
+      scrolledBox.getBoundingClientRect().width > 0 &&
+      scrolledBox.getBoundingClientRect().height > 0
+    );
   }, "scrolled event box should exist and be laid out");
   return scrolledBox;
 }
+
+const calendarPositionMeasurements = new WeakMap();
 
 /**
  * Show and open the dialog for an event on the calendar.
@@ -324,7 +337,55 @@ async function openAndShowEvent({
   inline = "center",
 } = {}) {
   const box = await showEvent({ baseDate, offset, block, inline });
-  return openEvent({ eventBox: box, offset });
+  const occurrenceId = box.occurrence.hashId;
+  const measurements = { reads: [], scrolls: [] };
+  const ownRect = Object.getOwnPropertyDescriptor(box, "getBoundingClientRect");
+  const getRect = box.getBoundingClientRect;
+  const recordScroll = event => {
+    measurements.scrolls.push({
+      at: performance.now(),
+      target: event.target.id || event.target.localName,
+    });
+  };
+  // Observe the real reads without changing their values or adding a frame wait.
+  box.getBoundingClientRect = function (...args) {
+    const rect = getRect.apply(this, args);
+    measurements.reads.push({
+      at: performance.now(),
+      rect: rect.toJSON(),
+      stack: new Error().stack,
+    });
+    return rect;
+  };
+  window.addEventListener("scroll", recordScroll, true);
+  try {
+    await openEvent({ eventBox: box });
+  } finally {
+    if (ownRect) {
+      Object.defineProperty(box, "getBoundingClientRect", ownRect);
+    } else {
+      delete box.getBoundingClientRect;
+    }
+    window.removeEventListener("scroll", recordScroll, true);
+  }
+
+  // Opening the dialog awaits UI work that can recycle the calendar view.
+  // Measure the current box for the same occurrence, not the detached old node.
+  const targetDate = new Date(baseDate);
+  targetDate.setDate(targetDate.getDate() + offset);
+  let currentBox;
+  await TestUtils.waitForCondition(() => {
+    currentBox = weekView.getEventBoxAt(window, targetDate.getDay() + 1, 1);
+    return (
+      currentBox?.isConnected &&
+      currentBox.occurrence.hashId == occurrenceId &&
+      BrowserTestUtils.isVisible(currentBox) &&
+      currentBox.getBoundingClientRect().width > 0 &&
+      currentBox.getBoundingClientRect().height > 0
+    );
+  }, "opened event occurrence should still have a rendered target");
+  calendarPositionMeasurements.set(currentBox, measurements);
+  return currentBox;
 }
 
 /**
@@ -450,7 +511,29 @@ function checkTolerance(target, message, localDocument = document) {
     !horizontalContainer ||
     !verticalContainer
   ) {
-    info(JSON.stringify({ dialogRect, targetRect, containerRect }, null, 2));
+    const positionedDialog = localDocument.querySelector(
+      '[is="calendar-dialog"]'
+    );
+    info(
+      JSON.stringify(
+        {
+          dialogRect,
+          targetRect,
+          containerRect,
+          openingMeasurements: calendarPositionMeasurements.get(target),
+          triggerMatchesTarget: positionedDialog.trigger === target,
+          triggerConnected: positionedDialog.trigger?.isConnected,
+          triggerRect: positionedDialog.trigger?.getBoundingClientRect(),
+          dialogStyle: {
+            top: positionedDialog.style.top,
+            left: positionedDialog.style.left,
+            maxHeight: positionedDialog.style.maxHeight,
+          },
+        },
+        null,
+        2
+      )
+    );
   }
 
   Assert.ok(
@@ -570,13 +653,14 @@ async function setupPositioning() {
 /**
  * Test dialog positions with different screen sizes and durations
  *
- * @param {object} size - The size of the screen to test
+ * @param {object} size - The size of the screen to test.
+ * @param {number[]} [offsets] - Day offsets exercised by this test file.
  */
-async function testDurations(size) {
+async function testDurations(size, offsets = [0, 1, 2, 3, 4, 5, 6]) {
   const calendar = createCalendar();
 
   await resizeWindow(size);
-  for (const offset of [0, 1, 2, 3, 4, 5, 6]) {
+  for (const offset of offsets) {
     for (const { duration, hours } of durationTests) {
       for (const hour of hours) {
         await positionTest({ calendar, duration, hour, offset, size });
@@ -593,15 +677,19 @@ async function testDurations(size) {
 /**
  * Test dialog positions with different screensizes
  *
- * @param {object[]} windowSizes
+ * @param {object[]} windowSizes - Window sizes exercised by this test file.
+ * @param {number[]} [offsets] - Day offsets exercised by this test file.
  */
-async function runPositioningTest(windowSizes) {
+async function runPositioningTest(
+  windowSizes,
+  offsets = [0, 1, 2, 3, 4, 5, 6]
+) {
   const calendar = createCalendar();
 
   for (const size of windowSizes) {
     await resizeWindow(size);
 
-    for (const offset of [0, 1, 2, 3, 4, 5, 6]) {
+    for (const offset of offsets) {
       for (const hour of [0, 6, 12, 18, 23]) {
         await positionTest({ calendar, hour, offset, size });
       }

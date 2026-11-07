@@ -1,0 +1,13 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, you can obtain one at http://mozilla.org/MPL/2.0/. */
+
+"use strict";
+
+/* import-globals-from test_ext_messages_encryptedOpenPGP.js */
+
+load("test_ext_messages_encryptedOpenPGP.js");
+load("test_ext_messages_encryptedOpenPGPAttachment.js");
+load("test_ext_messages_encryptedOpenPGPDelete.js");
+
+encryptedMessageFixtures = [1, 2, 3];

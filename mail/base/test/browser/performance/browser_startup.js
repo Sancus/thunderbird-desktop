@@ -179,7 +179,7 @@ if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
   );
 }
 
-add_task(async function () {
+add_task(async function test_startupModulesLoadAtExpectedPhases() {
   if (
     !AppConstants.NIGHTLY_BUILD &&
     !AppConstants.MOZ_DEV_EDITION &&

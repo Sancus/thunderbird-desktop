@@ -798,26 +798,59 @@ function testCounts(aHasNew, aUnreadDelta, aFolderNewDelta, aDbNewDelta) {
 }
 
 /**
- * Test that Ci.nsMsgFilterAction.Forward works.
+ * Checks forwarding after the send and its copy have finished.
  *
  * @param {number} mode - 0 means forward as attachment, 2 means forward inline.
+ * @returns {Promise<void>} Resolves after completion and SMTP payload checks.
  */
 async function testForward(mode) {
   Services.prefs.setIntPref("mail.forward_message_mode", mode);
 
-  gSmtpServerD.resetTest();
-  gAction.type = Ci.nsMsgFilterAction.Forward;
-  gAction.strValue = "to@local";
-  await setupTest(gFilter, gAction);
+  let composeReference;
+  let complete;
+  const completion = new Promise(resolve => {
+    complete = resolve;
+  });
+  const stateListener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIMsgComposeStateListener"]),
+    NotifyComposeFieldsReady() {},
+    NotifyComposeBodyReady() {},
+    SaveInFolderDone() {},
+    ComposeProcessDone(status) {
+      complete(status);
+    },
+  };
+  const observeSend = subject => {
+    const compose = subject.QueryInterface(Ci.nsIMsgCompose);
+    // Observe completion without extending the sender's native lifetime.
+    composeReference = Cu.getWeakReference(compose);
+    compose.RegisterStateListener(stateListener);
+  };
+  Services.obs.addObserver(observeSend, "mail-set-sender");
 
-  await TestUtils.waitForCondition(
-    () => gSmtpServerD._daemon.post,
-    "waiting for smtp to receive data"
-  );
+  try {
+    gSmtpServerD.resetTest();
+    gAction.type = Ci.nsMsgFilterAction.Forward;
+    gAction.strValue = "to@local";
+    await setupTest(gFilter, gAction);
 
-  const msgData = gSmtpServerD._daemon.post;
-  Assert.ok(msgData.includes(`Subject: Fwd: ${gMessageSubject}`));
-  Assert.ok(msgData.includes(`${gMessageInBody}`));
+    Assert.equal(
+      await completion,
+      Cr.NS_OK,
+      "The forwarded message send and copy completed successfully"
+    );
+    await TestUtils.waitForCondition(
+      () => gSmtpServerD._daemon.post,
+      "waiting for smtp to receive data"
+    );
+
+    const msgData = gSmtpServerD._daemon.post;
+    Assert.ok(msgData.includes(`Subject: Fwd: ${gMessageSubject}`));
+    Assert.ok(msgData.includes(`${gMessageInBody}`));
+  } finally {
+    Services.obs.removeObserver(observeSend, "mail-set-sender");
+    composeReference?.get()?.UnregisterStateListener(stateListener);
+  }
 }
 
 add_task(async function test_nativeHeaderDeleteWithoutTrash() {

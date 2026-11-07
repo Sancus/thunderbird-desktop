@@ -1203,20 +1203,25 @@ async function socketUtil(
     },
     onDataAvailable(request, inputStream, offset, count) {
       try {
-        if (!signal.aborted) {
-          const inputData = instream.read(count);
-          this.data.push(inputData);
-          if (index < commands.length) {
-            // Send the next request to the server.
-            const outputData = commands[index++];
-            outstream.write(outputData, outputData.length);
-          } else {
-            // If the server doesn't hang up, do it ourselves, or we won't get
-            // to onStopRequest until the connection times out.
-            setTimeout(() => transport.close(Cr.NS_OK), 500);
-          }
+        if (signal.aborted) {
+          // Closing the transport does not cancel a callback already queued by
+          // the input pump. Cancel its request before returning without reading.
+          request.cancel(Cr.NS_ERROR_ABORT);
+          return;
+        }
+        const inputData = instream.read(count);
+        this.data.push(inputData);
+        if (index < commands.length) {
+          // Send the next request to the server.
+          const outputData = commands[index++];
+          outstream.write(outputData, outputData.length);
+        } else {
+          // If the server doesn't hang up, do it ourselves, or we won't get
+          // to onStopRequest until the connection times out.
+          setTimeout(() => transport.close(Cr.NS_OK), 500);
         }
       } catch (error) {
+        request.cancel(Cr.NS_ERROR_FAILURE);
         abortController.abort(error);
         promiseResolvers.reject(error);
       }

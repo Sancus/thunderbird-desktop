@@ -85,11 +85,15 @@ add_setup(async function () {
 
 // The shared folder must remain live while owned fixtures leave their current
 // selection. Register this before the original shared-folder cleanup.
+const { select_none: s376SelectNone } = ChromeUtils.importESModule(
+  "resource://testing-common/mail/FolderDisplayHelpers.sys.mjs"
+);
 const s376LocalFolders = [];
 let s376NewsPrefPushed = false;
 registerCleanupFunction(async function cleanupSelectedAttachmentFixtures() {
   if (s376LocalFolders.length || s376Imap || s376News) {
     await be_in_folder(folder);
+    await s376SelectNone();
   }
   for (const selectedFolder of s376LocalFolders) {
     selectedFolder.deleteSelf(null);
@@ -98,11 +102,13 @@ registerCleanupFunction(async function cleanupSelectedAttachmentFixtures() {
     s376Imap.incoming.closeCachedConnections();
     MailServices.accounts.removeAccount(s376Imap.account, false);
     s376Imap.server.close();
+    s376Imap = null;
   }
   if (s376News) {
     s376News.incoming.closeCachedConnections();
     MailServices.accounts.removeAccount(s376News.account, false);
     s376News.helpers.shutdownNNTPServer(s376News.server);
+    s376News = null;
   }
   if (s376NewsPrefPushed) {
     await SpecialPowers.popPrefEnv();
@@ -1091,6 +1097,7 @@ add_task(async function test_attachmentStaleSelectionRejectsBeforeOpening() {
   const tabmail = document.getElementById("tabmail");
   const beforeTabs = tabmail.tabInfo.length;
   await be_in_folder(folder);
+  await s376SelectNone();
   selectedFolder.deleteMessages([header], null, true, false, null, false);
   await TestUtils.waitForCondition(
     () => !selectedFolder.msgDatabase.containsKey(key)
@@ -1250,6 +1257,7 @@ add_task(async function test_attachmentCachedTempFileDoesNotOutliveSelection() {
     Assert.ok(raw.includes("Only this selected inner body."));
     const key = header.messageKey;
     await be_in_folder(folder);
+    await s376SelectNone();
     selectedFolder.deleteMessages([header], null, true, false, null, false);
     await TestUtils.waitForCondition(
       () => !selectedFolder.msgDatabase.containsKey(key)
@@ -1304,6 +1312,7 @@ add_task(async function test_cachedMessageRejectsReplacedDatabaseFacade() {
     );
     const key = header.messageKey;
     await be_in_folder(folder);
+    await s376SelectNone();
     const oldDB = selectedFolder.msgDatabase;
     oldDB.forceClosed();
     const currentDB = selectedFolder.msgDatabase;
@@ -1345,6 +1354,7 @@ add_task(async function test_nativeBodyFailurePrecedesSaveOrOpenEffects() {
   const directory = await s376SaveDirectory();
   const target = PathUtils.join(directory, "unavailable.txt");
   await be_in_folder(folder);
+  await s376SelectNone();
   const token = header.storeToken;
   const expectedStore = selectedFolder.msgStore.storeType;
   let nativeError;
@@ -1490,6 +1500,7 @@ add_task(async function test_pdfTabUsesSelectedBytesAcrossImapUidReuse() {
       message.messageId = "s376-pdf-reused-uid@example.invalid";
       if (index) {
         await be_in_folder(folder);
+        await s376SelectNone();
         incoming.closeCachedConnections();
         await TestUtils.waitForCondition(
           () => !server.daemon.getConnections().length
@@ -1604,6 +1615,7 @@ add_task(async function test_pdfTabUsesSelectedBytesAcrossImapUidReuse() {
       await IOUtils.remove(path, { ignoreAbsent: true });
     }
     await be_in_folder(folder);
+    await s376SelectNone();
   }
 });
 

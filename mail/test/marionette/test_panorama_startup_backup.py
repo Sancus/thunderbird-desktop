@@ -431,7 +431,7 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             file.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
             const server = MailServices.accounts.createIncomingServer(
               's526', 'localhost', 'none');
-            server.setCharValue('storeContractID', arguments[0] === 'maildir'
+            server.setStringValue('storeContractID', arguments[0] === 'maildir'
               ? '@mozilla.org/msgstore/maildirstore;1'
               : '@mozilla.org/msgstore/berkeleystore;1');
             server.localPath = file;
@@ -450,7 +450,7 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
               'Date: Thu, 5 Nov 2026 00:00:00 +0000\r\n\r\n' +
               'Preserved message body.\r\n');
             header.setStringProperty('s526-custom', 'retained');
-            folder.msgDatabase.Commit(Ci.nsMsgDBCommitType.kLargeCommit);
+            folder.msgDatabase.commit(Ci.nsMsgDBCommitType.kLargeCommit);
             Services.prefs.savePrefFile(null);
             return {serverKey: server.key, root, summary: folder.summaryFile.path,
               key: header.messageKey, store: folder.msgStore.storeType};
@@ -605,8 +605,6 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
                          self.assert_message_after_activation(source)[0]["messageId"])
 
     def test_native_downgrade_and_backend_fallback_refuse(self):
-        from marionette_driver import errors
-
         self.clean_profile(True)
         selected = self.selection()
         self.stop_application()
@@ -631,11 +629,12 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             self.marionette.instance.prefs = {
                 **(self.original_prefs or {}), "mail.panorama.enabled": enabled
             }
-            with self.assertRaises((OSError, errors.SessionNotCreatedException,
-                                    errors.TimeoutException)):
-                self.marionette.start_session()
-            self.assertIsNotNone(self.marionette.instance.runner.returncode,
-                                 "The native failure must terminate startup, not hang")
+            self.marionette.instance.start()
+            returncode = self.marionette.instance.runner.wait(
+                timeout=self.marionette.startup_timeout
+            )
+            self.assertEqual(5, returncode,
+                             "The native failure must exit with NS_ERROR_FAILURE")
             self.assertEqual(before, selector_path.read_bytes())
             self.assertEqual(original_database, database_path.read_bytes())
             selector_path.write_bytes(original)
@@ -646,17 +645,18 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
 
     def assert_startup_refuses(self, files, absent=()):
         """Require an actual stopped application and exact recovery preservation."""
-        from marionette_driver import errors
-
         before = {path: path.read_bytes() for path in files}
         self.marionette.instance.prefs = {
             **(self.original_prefs or {}), "mail.panorama.enabled": True
         }
-        with self.assertRaises((OSError, errors.SessionNotCreatedException,
-                                errors.TimeoutException)):
-            self.marionette.start_session()
-        self.assertIsNotNone(self.marionette.instance.runner.returncode,
-                             "Recovery must stop startup, not hang")
+        # Observe the ordinary failed process before session auto-cleanup can
+        # remove its disposable profile; inspect the same original files below.
+        self.marionette.instance.start()
+        returncode = self.marionette.instance.runner.wait(
+            timeout=self.marionette.startup_timeout
+        )
+        self.assertEqual(5, returncode,
+                         "Recovery must exit with NS_ERROR_FAILURE, not hang")
         for path, contents in before.items():
             self.assertEqual(contents, path.read_bytes())
         for path in absent:

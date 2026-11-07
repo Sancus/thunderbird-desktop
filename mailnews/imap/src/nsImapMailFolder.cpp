@@ -6681,6 +6681,9 @@ nsresult nsImapMailFolder::SyncFlags(
     if (NS_SUCCEEDED(dbHdr->GetMessageSize(&messageSize))) {
       newFolderSize += messageSize;
     }
+#ifdef MOZ_PANORAMA
+    if (IsImportHeldHeader(msgKey)) continue;
+#endif
 
     nsCString keywords;
     MOZ_TRY(flagState->GetCustomFlags(uidOfMessage, getter_Copies(keywords)));
@@ -6696,6 +6699,22 @@ nsresult nsImapMailFolder::SyncFlags(
 
   return NS_OK;
 }
+
+#ifdef MOZ_PANORAMA
+// Held import custody owns a header's local state, like its unplayed offline
+// operation; a server flag sync must not overwrite it until the hold is
+// resolved and the operation is played back. Only a proven hold skips the sync.
+bool nsImapMailFolder::IsImportHeldHeader(nsMsgKey key) {
+  if (!mFolderId || !mail_panorama_enabled_AtStartup()) return false;
+  RefPtr<mozilla::mailnews::DatabaseCore> core =
+      mozilla::mailnews::DatabaseCore::GetInstanceForService();
+  bool held = false;
+  return core &&
+         NS_SUCCEEDED(core->MessageDB().IsOfflineImportHeld(mFolderId, key,
+                                                            held)) &&
+         held;
+}
+#endif
 
 // helper routine to sync the flags on a given header
 nsresult nsImapMailFolder::NotifyMessageFlagsFromHdr(nsIMsgDBHdr* dbHdr,
@@ -6765,6 +6784,9 @@ nsImapMailFolder::NotifyMessageFlags(uint32_t aFlags,
       return NS_OK;
     }
     nsresult rv = mDatabase->GetMsgHdrForKey(msgKey, getter_AddRefs(dbHdr));
+#ifdef MOZ_PANORAMA
+    if (IsImportHeldHeader(msgKey)) return NS_OK;
+#endif
     if (NS_SUCCEEDED(rv) && dbHdr) {
       uint32_t supportedUserFlags;
       GetSupportedUserFlags(&supportedUserFlags);

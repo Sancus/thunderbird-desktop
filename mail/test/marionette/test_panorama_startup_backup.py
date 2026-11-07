@@ -61,6 +61,7 @@ class TestPanoramaStartupBackup(MarionetteTestCase):
             "return Services.dirsvc.get('ProfD', Ci.nsIFile).path;"
         )
         self.assertEqual(self.profile, Path(selected).resolve())
+        self.assertEqual(enabled, self.marionette.get_pref("mail.panorama.enabled"))
         self.assertEqual("mail:3pane", self.marionette.get_window_type())
 
     def startup_code(self):
@@ -351,6 +352,7 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.original_prefs = self.marionette.instance.prefs
         self.original_args = list(self.marionette.instance.app_args or [])
         self.created_work = set()
+        self.registered_profiles = set()
         self.profile = None
 
     def stop_application(self):
@@ -377,15 +379,14 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
 
     def start_same_profile(self, enabled):
         """Start the same stopped profile through its original normal runner."""
-        self.marionette.instance.prefs = {
-            **(self.original_prefs or {}), "mail.panorama.enabled": enabled
-        }
+        self.marionette.instance.profile.set_preferences({"mail.panorama.enabled": enabled})
         self.marionette.start_session()
         self.marionette.set_context(self.marionette.CONTEXT_CHROME)
         selected = self.marionette.execute_script(
             "return Services.dirsvc.get('ProfD', Ci.nsIFile).path;"
         )
         self.assertEqual(self.profile, Path(selected).resolve())
+        self.assertEqual(enabled, self.marionette.get_pref("mail.panorama.enabled"))
         self.assertEqual("mail:3pane", self.marionette.get_window_type())
 
     def selection(self):
@@ -415,7 +416,7 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             self.created_work.add(Path(record["identity"]["backup"]["path"]).parent.parent)
         return result
 
-    def create_legacy_message(self, store):
+    def create_legacy_message(self, store, name="Inbox"):
         """Write genuine Mork/store data through the normal legacy mail API."""
         result = self.marionette.execute_script(r"""
             const { MailServices } = ChromeUtils.importESModule(
@@ -438,8 +439,8 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             const account = MailServices.accounts.createAccount();
             account.incomingServer = server;
             const parent = server.rootFolder;
-            parent.createSubfolder('Inbox', null);
-            const folder = parent.getChildNamed('Inbox')
+            parent.createSubfolder(arguments[1], null);
+            const folder = parent.getChildNamed(arguments[1])
               .QueryInterface(Ci.nsIMsgLocalMailFolder);
             const header = folder.addMessage(
               'From - Thu Nov 05 00:00:00 2026\r\n' +
@@ -453,8 +454,9 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             folder.msgDatabase.commit(Ci.nsMsgDBCommitType.kLargeCommit);
             Services.prefs.savePrefFile(null);
             return {serverKey: server.key, root, summary: folder.summaryFile.path,
-              key: header.messageKey, store: folder.msgStore.storeType};
-        """, script_args=[store])
+              key: header.messageKey, store: folder.msgStore.storeType,
+              name: folder.name, flags: folder.msgDatabase.dBFolderInfo.flags};
+        """, script_args=[store, name])
         self.assertEqual(store, result["store"])
         return result
 
@@ -464,14 +466,14 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             const { MailServices } = ChromeUtils.importESModule(
               'resource:///modules/MailServices.sys.mjs');
             const server = MailServices.accounts.getIncomingServer(arguments[0]);
-            const folder = server.rootFolder.getChildNamed('Inbox');
+            const folder = server.rootFolder.getChildNamed(arguments[1]);
             return [...folder.msgDatabase.enumerateMessages()].map(header => ({
               messageId: header.messageId,
               subject: header.subject,
               property: header.getStringProperty('s526-custom'),
               key: header.messageKey,
             }));
-        """, script_args=[source["serverKey"]])
+        """, script_args=[source["serverKey"], source["name"]])
         self.assertEqual(1, len(result))
         self.assertEqual("activation-s526@invalid", result[0]["messageId"])
         self.assertEqual("Original startup migration", result[0]["subject"])
@@ -516,6 +518,300 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.assertEqual(journal, journal_path.read_bytes())
         self.assertEqual(before[Path(source["summary"])],
                          (backup.parent / "root-0" / Path(source["summary"]).relative_to(self.profile)).read_bytes())
+
+    def register_selected_profile(self):
+        """Register the actual current path; XRE resolves it on the next startup."""
+        name = "s526-" + uuid.uuid4().hex
+        result = self.marionette.execute_script("""
+            const service = Cc['@mozilla.org/toolkit/profile-service;1']
+              .getService(Ci.nsIToolkitProfileService);
+            const root = Services.dirsvc.get('ProfD', Ci.nsIFile);
+            const profile = service.createProfile(root, arguments[0], 'tests');
+            service.flush();
+            return {name: profile.name, path: profile.rootDir.path,
+              current: service.currentProfile?.name ?? null};
+        """, script_args=[name])
+        self.assertEqual(name, result["name"])
+        self.assertEqual(self.profile, Path(result["path"]).resolve())
+        self.registered_profiles.add(name)
+        return name
+
+    def assert_profile_registration(self, name):
+        """Check the real XRE-selected toolkit profile, including unnamed paths."""
+        actual = self.marionette.execute_script("""
+            return Cc['@mozilla.org/toolkit/profile-service;1']
+              .getService(Ci.nsIToolkitProfileService).currentProfile?.name ?? null;
+        """)
+        self.assertEqual(name, actual)
+
+    def write_legacy_cache(self, rows):
+        """Encode retained native folder fields as a complete legacy Mork cache."""
+        def cell(value):
+            return "".join("$%02X" % byte for byte in str(value).encode("utf-8"))
+        columns = {"key": "82", "flags": "83", "folderName": "84",
+                   "onlineName": "85", "hierDelim": "86", "boxFlags": "87"}
+        text = ('// <!-- <mdb:mork:z v="1.4"/> -->\n'
+                '< <(a=c)> (80=ns:msg:db:row:scope:folders:all)'
+                '(81=ns:msg:db:table:kind:folders)' +
+                ''.join('(%s=%s)' % (atom, column)
+                        for column, atom in columns.items()) + '>\n'
+                '{1:^80 {(k^81:c)(s=9)}\n')
+        for index, row in enumerate(rows, 1):
+            text += '[%X' % index + ''.join(
+                '(^%s=%s)' % (columns[column], cell(value))
+                for column, value in row.items()) + ']\n'
+        path = self.profile / "panacea.dat"
+        path.write_bytes((text + '}\n').encode("ascii"))
+        return path
+
+    def test_preservesSupportedNativeLogicalNames(self):
+        for store, name in [("mbox", "100% Real"),
+                            ("maildir", "Original logical name " + "long" * 45)]:
+            self.clean_profile(False)
+            source = self.create_legacy_message(store, name)
+            self.stop_application()
+            original = Path(source["summary"]).read_bytes()
+            self.start_same_profile(True)
+            selected = self.selection()
+            self.assertEqual("migrated", selected["record"]["origin"])
+            headers = self.assert_message_after_activation(source)
+            self.assertEqual(original, Path(source["summary"]).read_bytes())
+            self.stop_application()
+            self.start_same_profile(True)
+            self.assertEqual(selected["sourceId"], self.selection()["sourceId"])
+            self.assertEqual(headers, self.assert_message_after_activation(source))
+
+    def test_namedAndUnnamedActualSelection(self):
+        self.clean_profile(True)
+        first = self.selection()
+        self.assert_profile_registration(None)
+        name = self.register_selected_profile()
+        self.stop_application()
+        self.start_same_profile(True)
+        self.assert_profile_registration(name)
+        self.assertEqual(first["sourceId"], self.selection()["sourceId"])
+        self.stop_application()
+        self.start_same_profile(True)
+        self.assert_profile_registration(name)
+        self.assertEqual(first["sourceId"], self.selection()["sourceId"])
+
+    def test_migratesNamedBookAndReusesPublicDirectory(self):
+        self.clean_profile(False)
+        name = self.register_selected_profile()
+        source = self.profile / "s526-original.mab"
+        fixture = Path(__file__).resolve().parents[3] / (
+            "mail/components/addrbook/test/browser/data/import.mab")
+        source.write_bytes(fixture.read_bytes())
+        self.marionette.execute_script("""
+            Services.prefs.setStringPref('ldap_2.servers.s526.filename', arguments[0]);
+            Services.prefs.setStringPref('ldap_2.servers.s526.description',
+              'Original migration book');
+            Services.prefs.savePrefFile(null);
+        """, script_args=[source.name])
+        self.stop_application()
+        original = source.read_bytes()
+        self.start_same_profile(True)
+        self.assert_profile_registration(name)
+        selected = self.selection()
+        self.assertEqual("migrated", selected["record"]["origin"])
+        self.assertEqual(1, len(selected["record"]["identity"]["books"]))
+        def public_book():
+            return self.marionette.execute_script("""
+                const { MailServices } = ChromeUtils.importESModule(
+                  'resource:///modules/MailServices.sys.mjs');
+                return [...MailServices.ab.directories]
+                  .filter(book => book.dirName === 'Original migration book')
+                  .map(book => ({uid: book.UID, uri: book.URI,
+                    emails: [...book.childCards].filter(card => !card.isMailList)
+                      .map(card => card.primaryEmail).sort(),
+                    lists: [...book.childNodes].map(list => list.dirName).sort()}));
+            """)
+        books = public_book()
+        self.assertEqual(1, len(books))
+        self.assertEqual(["contact1@invalid", "contact2@invalid"], books[0]["emails"])
+        self.assertTrue(books[0]["lists"])
+        self.assertEqual(original, source.read_bytes())
+        self.stop_application()
+        selector = (self.profile / "panorama-profile.json").read_bytes()
+        self.start_same_profile(True)
+        self.assertEqual(selected["sourceId"], self.selection()["sourceId"])
+        self.assertEqual(books, public_book())
+        self.assertEqual(selector, (self.profile / "panorama-profile.json").read_bytes())
+        self.assertEqual(original, source.read_bytes())
+
+    def test_migratesCacheAndReusesCommittedProjection(self):
+        self.clean_profile(False)
+        source = self.create_legacy_message("mbox")
+        self.stop_application()
+        cache = self.write_legacy_cache([{"key": source["summary"],
+            "flags": format(source["flags"] & 0xffffffff, "x"),
+            "folderName": source["name"]}])
+        original = cache.read_bytes()
+        self.start_same_profile(True)
+        selected = self.selection()
+        self.assertEqual("migrated", selected["record"]["origin"])
+        caches = selected["record"]["identity"]["caches"]
+        self.assertEqual(1, len(caches))
+        self.assertTrue(caches[0]["receipt"])
+        headers = self.assert_message_after_activation(source)
+        self.assertEqual(original, cache.read_bytes())
+        self.stop_application()
+        self.start_same_profile(True)
+        repeated = self.selection()
+        self.assertEqual(selected["sourceId"], repeated["sourceId"])
+        self.assertEqual(caches, repeated["record"]["identity"]["caches"])
+        self.assertEqual(headers, self.assert_message_after_activation(source))
+        self.assertEqual(original, cache.read_bytes())
+
+    def test_cacheOnlyStartupKeepsNativeRootIdentity(self):
+        self.clean_profile(False)
+        source = self.marionette.execute_script("""
+            const { MailServices } = ChromeUtils.importESModule(
+              'resource:///modules/MailServices.sys.mjs');
+            const { FileUtils } = ChromeUtils.importESModule(
+              'resource://gre/modules/FileUtils.sys.mjs');
+            const file = new FileUtils.File(PathUtils.join(PathUtils.profileDir,
+              'Mail', 'cache-only'));
+            if (!file.parent.exists()) file.parent.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+            file.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+            const server = MailServices.accounts.createIncomingServer(
+              'cache-only', 'localhost', 'none');
+            server.localPath = file;
+            const account = MailServices.accounts.createAccount();
+            account.incomingServer = server;
+            const root = server.rootFolder;
+            Services.prefs.savePrefFile(null);
+            return {key: root.filePath.path, flags: (root.flags >>> 0).toString(16),
+              folderName: root.name};
+        """)
+        self.stop_application()
+        self.assertFalse(list(Path(source["key"]).rglob("*.msf")))
+        cache = self.write_legacy_cache([source])
+        original = cache.read_bytes()
+        self.start_same_profile(True)
+        selected = self.selection()
+        self.assertEqual("migrated", selected["record"]["origin"])
+        self.assertEqual([], selected["record"]["identity"]["imports"])
+        self.assertEqual(1, len(selected["record"]["identity"]["caches"]))
+        self.assertEqual(original, cache.read_bytes())
+        self.stop_application()
+        self.start_same_profile(True)
+        repeated = self.selection()
+        self.assertEqual(selected["sourceId"], repeated["sourceId"])
+        self.assertEqual(selected["record"]["identity"], repeated["record"]["identity"])
+        self.assertEqual(original, cache.read_bytes())
+
+    def test_migratesNativeImapUidAndCacheThenReuses(self):
+        self.clean_profile(False)
+        source = self.marionette.execute_script("""
+            const { MailServices } = ChromeUtils.importESModule(
+              'resource:///modules/MailServices.sys.mjs');
+            const { FileUtils } = ChromeUtils.importESModule(
+              'resource://gre/modules/FileUtils.sys.mjs');
+            Services.io.offline = true;
+            Services.prefs.setBoolPref('network.manage-offline-status', false);
+            Services.prefs.setIntPref('offline.startup_state', 2);
+            const file = new FileUtils.File(PathUtils.join(PathUtils.profileDir,
+              'ImapMail', 's526-imap'));
+            if (!file.parent.exists()) file.parent.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+            file.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+            const server = MailServices.accounts.createIncomingServer(
+              's526', 'imap.invalid', 'imap');
+            server.localPath = file;
+            server.setBoolValue('login_at_startup', false);
+            server.setBoolValue('download_on_biff', false);
+            const account = MailServices.accounts.createAccount();
+            account.incomingServer = server;
+            const root = server.rootFolder.QueryInterface(Ci.nsIMsgImapMailFolder);
+            root.createClientSubfolderInfo('INBOX', '/', 0, true);
+            const folder = server.rootFolder.getChildNamed('INBOX');
+            const imap = folder.QueryInterface(Ci.nsIMsgImapMailFolder);
+            imap.onlineName = 'INBOX';
+            imap.hierarchyDelimiter = '/';
+            const database = folder.msgDatabase;
+            database.dBFolderInfo.setUint32Property('UIDValidity', 526);
+            database.dBFolderInfo.setCharProperty('onlineName', 'INBOX');
+            const header = database.createNewHdrWithSpecificMsgKey(42);
+            header.messageId = 'imap-activation-s526@invalid';
+            header.subject = 'Original IMAP startup migration';
+            header.setUint32Property('uidOnServer', 42);
+            header.setStringProperty('s526-custom', 'imap-retained');
+            database.addNewHdrToDB(header, false);
+            database.summaryValid = true;
+            database.commit(Ci.nsMsgDBCommitType.kLargeCommit);
+            Services.prefs.savePrefFile(null);
+            return {serverKey: server.key, summary: folder.summaryFile.path,
+              flags: (database.dBFolderInfo.flags >>> 0).toString(16),
+              folderName: folder.name, onlineName: imap.onlineName,
+              hierDelim: imap.hierarchyDelimiter.charCodeAt(0).toString(16),
+              boxFlags: '0'};
+        """)
+        self.stop_application()
+        summary = Path(source["summary"])
+        original = summary.read_bytes()
+        cache = self.write_legacy_cache([{"key": str(summary), **{
+            name: source[name] for name in
+            ["flags", "folderName", "onlineName", "hierDelim", "boxFlags"]}}])
+        cache_bytes = cache.read_bytes()
+        self.start_same_profile(True)
+        selected = self.selection()
+        self.assertEqual("migrated", selected["record"]["origin"])
+        self.assertEqual(1, len(selected["record"]["identity"]["imports"]))
+        self.assertEqual(1, len(selected["record"]["identity"]["caches"]))
+        def imported():
+            return self.marionette.execute_script("""
+                const { MailServices } = ChromeUtils.importESModule(
+                  'resource:///modules/MailServices.sys.mjs');
+                const folder = MailServices.accounts.getIncomingServer(arguments[0])
+                  .rootFolder.getChildNamed('INBOX');
+                return [...folder.msgDatabase.enumerateMessages()].map(header => ({
+                  key: header.messageKey, id: header.messageId,
+                  uid: header.getUint32Property('uidOnServer'),
+                  value: header.getStringProperty('s526-custom')}));
+            """, script_args=[source["serverKey"]])
+        messages = imported()
+        self.assertEqual(1, len(messages))
+        self.assertEqual("imap-activation-s526@invalid", messages[0]["id"])
+        self.assertEqual(42, messages[0]["uid"])
+        self.assertEqual("imap-retained", messages[0]["value"])
+        self.assertEqual(original, summary.read_bytes())
+        self.assertEqual(cache_bytes, cache.read_bytes())
+        self.stop_application()
+        self.start_same_profile(True)
+        self.assertEqual(selected["sourceId"], self.selection()["sourceId"])
+        self.assertEqual(messages, imported())
+        self.assertEqual(original, summary.read_bytes())
+        self.assertEqual(cache_bytes, cache.read_bytes())
+
+    def test_activeMigrationRequiresUnchangedCompleteJournal(self):
+        self.clean_profile(False)
+        source = self.create_legacy_message("mbox")
+        self.stop_application()
+        original_summary = Path(source["summary"]).read_bytes()
+        self.start_same_profile(True)
+        selected = self.selection()
+        self.stop_application()
+        record = selected["record"]
+        journal = Path(record["identity"]["journalPath"])
+        original = journal.read_bytes()
+        selector = self.profile / "panorama-profile.json"
+        backup = Path(record["identity"]["backup"]["path"])
+        saved = journal.with_name("journal-original.json")
+        journal.replace(saved)
+        self.assert_startup_refuses([saved, selector, backup])
+        self.assertFalse(journal.exists(), "Missing journal must remain missing")
+        saved.replace(journal)
+        for value in [b'{corrupt journal',
+                      json.dumps({**json.loads(original), "cancelled": True}).encode(),
+                      json.dumps({**json.loads(original), "stage": "validate"}).encode()]:
+            journal.write_bytes(value)
+            self.assert_startup_refuses([journal, selector, backup])
+            self.assertEqual(original_summary, Path(source["summary"]).read_bytes())
+        journal.write_bytes(original)
+        self.start_same_profile(True)
+        self.assertEqual(selected["sourceId"], self.selection()["sourceId"])
+        self.assert_message_after_activation(source)
+        self.assertEqual(original, journal.read_bytes())
 
     def test_empty_profile_initialization_and_repeated_reuse(self):
         self.clean_profile(True)
@@ -626,9 +922,7 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             record["application"] = changed
             selector_path.write_text(json.dumps(record))
             before = selector_path.read_bytes()
-            self.marionette.instance.prefs = {
-                **(self.original_prefs or {}), "mail.panorama.enabled": enabled
-            }
+            self.marionette.instance.profile.set_preferences({"mail.panorama.enabled": enabled})
             self.marionette.instance.start()
             returncode = self.marionette.instance.runner.wait(
                 timeout=self.marionette.startup_timeout
@@ -646,9 +940,7 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
     def assert_startup_refuses(self, files, absent=()):
         """Require an actual stopped application and exact recovery preservation."""
         before = {path: path.read_bytes() for path in files}
-        self.marionette.instance.prefs = {
-            **(self.original_prefs or {}), "mail.panorama.enabled": True
-        }
+        self.marionette.instance.profile.set_preferences({"mail.panorama.enabled": True})
         # Observe the ordinary failed process before session auto-cleanup can
         # remove its disposable profile; inspect the same original files below.
         self.marionette.instance.start()
@@ -710,6 +1002,15 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             self.marionette.instance.restart(prefs=self.original_prefs, clean=True)
             self.marionette.raise_for_port(timeout=self.marionette.startup_timeout)
             self.marionette.start_session()
+            self.marionette.set_context(self.marionette.CONTEXT_CHROME)
+            self.marionette.execute_script("""
+                const service = Cc['@mozilla.org/toolkit/profile-service;1']
+                  .getService(Ci.nsIToolkitProfileService);
+                for (const name of arguments[0]) {
+                  service.getProfileByName(name).remove(false);
+                }
+                service.flush();
+            """, script_args=[sorted(self.registered_profiles)])
             for work in self.created_work:
                 # Remove only this disposable test's exact outside-profile archive.
                 self.assertTrue(work.name.startswith("panorama-migration-"))

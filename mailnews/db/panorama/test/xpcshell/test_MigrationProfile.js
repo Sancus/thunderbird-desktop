@@ -806,3 +806,52 @@ add_task(
     });
   }
 );
+
+add_task(async function test_getMigrationProfileStateRequiresDurableRecovery() {
+  // Reader-only refusal fixture. Actual migrated activation/reuse is exercised
+  // by the registered ordinary Marionette startup cases.
+  const input = await startupSelector("migrated");
+  const journalPath = PathUtils.join(input.profilePath, "journal.json");
+  const backupPath = PathUtils.join(input.profilePath, "manifest.json");
+  const record = input.record;
+  record.identity.journalPath = journalPath;
+  record.identity.backup = { path: backupPath, sha256: "a".repeat(64) };
+  await IOUtils.writeJSON(input.path, record);
+  const selector = await IOUtils.read(input.path);
+  await withApplication(activatingApplication, async () => {
+    await Assert.rejects(
+      getMigrationProfileState(input.profilePath),
+      /exist|found/i,
+      "Missing durable journal is recovery, never active reuse"
+    );
+    for (const value of [
+      "{corrupt journal",
+      JSON.stringify({ version: 7, stage: "import", cancelled: false }),
+      JSON.stringify({ version: 7, stage: "complete", cancelled: true }),
+      JSON.stringify({
+        version: 7,
+        stage: "complete",
+        cancelled: false,
+        profilePath: input.profilePath,
+        startup: {
+          bound: true,
+          databaseSourceId: record.identity.databaseSourceId,
+        },
+        sources: [],
+        books: [],
+        caches: [],
+        backup: record.identity.backup,
+      }),
+    ]) {
+      await IOUtils.writeUTF8(journalPath, value);
+      const journal = await IOUtils.read(journalPath);
+      await Assert.rejects(
+        getMigrationProfileState(input.profilePath),
+        /JSON|recovery|exist|found/i,
+        "Corrupt, incomplete, cancelled or missing-archive progress refuses"
+      );
+      Assert.deepEqual(await IOUtils.read(journalPath), journal);
+      Assert.deepEqual(await IOUtils.read(input.path), selector);
+    }
+  });
+});

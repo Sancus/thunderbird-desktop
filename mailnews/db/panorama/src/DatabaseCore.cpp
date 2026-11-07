@@ -46,6 +46,8 @@
 #include <cmath>
 #include <cstring>
 #include <utility>
+#include <cstdlib>
+#include <type_traits>
 
 #include "DatabaseUtils.h"
 #include "FolderDatabase.h"
@@ -135,7 +137,7 @@ MOZ_GLOBINIT nsTHashMap<nsCString, nsCOMPtr<mozIStorageStatement>>
 struct StartupMailSource {
   nsCString id, path, hash, storePath, serverKey, serverRoot, storeContract;
   nsCString protocol, canonicalPath, onlineName;
-  nsTArray<nsCString> localNames;
+  nsTArray<nsCString> localNames, localLeaves;
   uint64_t size = 0;
   uint32_t boxFlags = 0;
   char delimiter = 0;
@@ -177,6 +179,7 @@ class ProfileStartupOperation final : public nsIAsyncShutdownBlocker {
   nsTHashMap<nsCString, nsCString> backupFiles;
   nsTArray<nsCString> sourceIds;
   nsTArray<nsCOMPtr<nsIMsgFolder>> folders;
+  nsTArray<nsCOMPtr<nsIMsgFolder>> localFolders;
   int32_t schema = -1;
   nsresult firstError = NS_OK, closeError = NS_OK;
   bool selected = false, existing = false, busy = false, opened = false,
@@ -2782,11 +2785,155 @@ bool SameImapImportReceipt(const ImapImportReceipt& a,
 
 }  // namespace
 
+// Decode only the native provenance already committed with the complete unit.
+// This is a readback of our existing frame format, never a script import path.
+// Later startup must not reopen the obsolete Mork files or replay its intent.
+nsresult DatabaseCore::ReadStartupImapProvenance(const nsCString& proof,
+                                                 ImapImportUnit& output) {
+  const char* cursor = proof.BeginReading();
+  const char* end = proof.EndReading();
+  auto text = [&](nsACString& value) -> nsresult {
+    uint32_t length;
+    auto parsed = std::from_chars(cursor, end, length);
+    NS_ENSURE_TRUE(parsed.ec == std::errc() && parsed.ptr != end &&
+                       *parsed.ptr == ':' &&
+                       uint64_t(end - parsed.ptr - 1) >= length,
+                   NS_ERROR_FILE_CORRUPTED);
+    cursor = parsed.ptr + 1;
+    value.Assign(cursor, length);
+    cursor += length;
+    return NS_OK;
+  };
+  auto number = [&](auto& value) -> nsresult {
+    nsAutoCString digits;
+    MOZ_TRY(text(digits));
+    uint64_t parsed;
+    auto result =
+        std::from_chars(digits.BeginReading(), digits.EndReading(), parsed);
+    using T = std::remove_reference_t<decltype(value)>;
+    NS_ENSURE_TRUE(result.ec == std::errc() &&
+                       result.ptr == digits.EndReading() && !digits.IsEmpty() &&
+                       parsed <= uint64_t(std::numeric_limits<T>::max()),
+                   NS_ERROR_FILE_CORRUPTED);
+    value = T(parsed);
+    return NS_OK;
+  };
+  auto count = [&](uint32_t& value) -> nsresult {
+    MOZ_TRY(number(value));
+    NS_ENSURE_TRUE(value <= uint64_t(end - cursor), NS_ERROR_FILE_CORRUPTED);
+    return NS_OK;
+  };
+  auto reference = [&](Maybe<ImapImportReference>& value) -> nsresult {
+    bool present;
+    MOZ_TRY(number(present));
+    if (present) {
+      ImapImportReference item;
+      MOZ_TRY(text(item.token));
+      MOZ_TRY(number(item.sourceKey));
+      NS_ENSURE_TRUE(!item.token.IsEmpty() && item.sourceKey != nsMsgKey_None,
+                     NS_ERROR_FILE_CORRUPTED);
+      value = Some(std::move(item));
+    }
+    return NS_OK;
+  };
+  ImapImportUnit unit;
+  MOZ_TRY(text(unit.token));
+  MOZ_TRY(text(unit.databaseSourceId));
+  uint32_t members;
+  MOZ_TRY(count(members));
+  NS_ENSURE_TRUE(
+      members && !unit.token.IsEmpty() && !unit.databaseSourceId.IsEmpty(),
+      NS_ERROR_FILE_CORRUPTED);
+  for (uint32_t m = 0; m < members; ++m) {
+    auto& member = *unit.folders.AppendElement();
+    auto& id = member.snapshot.identity;
+    for (auto* value : {&id.token, &id.sourceId, &id.databaseSourceId,
+                        &id.sourceSha256, &id.folderPath, &member.uri})
+      MOZ_TRY(text(*value));
+    nsAutoCString path;
+    MOZ_TRY(text(path));
+    CopyUTF8toUTF16(path, id.sourcePath);
+    MOZ_TRY(number(id.folderId));
+    MOZ_TRY(number(member.snapshot.sourceSize));
+    bool windows, epoch;
+    MOZ_TRY(number(windows));
+    // This selected Unix operation cannot adopt a Windows physical receipt.
+    NS_ENSURE_FALSE(windows, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(number(epoch));
+    if (epoch) {
+      uint32_t value;
+      MOZ_TRY(number(value));
+      member.uidValidity = Some(value);
+    }
+    uint32_t length;
+    MOZ_TRY(count(length));
+    for (uint32_t i = 0; i < length; ++i) {
+      auto& uid = *member.serverUids.AppendElement();
+      MOZ_TRY(number(uid.sourceKey));
+      MOZ_TRY(number(uid.uid));
+    }
+    MOZ_TRY(count(length));
+    for (uint32_t i = 0; i < length; ++i) {
+      auto& operation = *member.operations.AppendElement();
+      auto& op = operation.payload;
+      MOZ_TRY(number(operation.sourceKey));
+      MOZ_TRY(number(operation.payloadPresence));
+      NS_ENSURE_TRUE((operation.payloadPresence & ~uint32_t(0xfff)) == 0,
+                     NS_ERROR_FILE_CORRUPTED);
+      for (auto* value : {&op.operation, &op.flagOperation, &op.newFlags,
+                          &op.sourceKey, &op.sourceUid, &op.messageSize})
+        MOZ_TRY(number(*value));
+      MOZ_TRY(number(op.playingBack));
+      NS_ENSURE_FALSE(op.playingBack, NS_ERROR_FILE_CORRUPTED);
+      for (auto* value : {&op.sourceFolderURI, &op.destinationFolderURI,
+                          &op.keywordsToAdd, &op.keywordsToRemove})
+        MOZ_TRY(text(*value));
+      MOZ_TRY(reference(operation.source));
+      MOZ_TRY(reference(operation.destination));
+      uint32_t copies;
+      MOZ_TRY(count(copies));
+      for (uint32_t c = 0; c < copies; ++c) {
+        MOZ_TRY(text(*op.copyDestinations.AppendElement()));
+        MOZ_TRY(reference(*operation.copies.AppendElement()));
+      }
+    }
+    MOZ_TRY(count(length));
+    for (uint32_t i = 0; i < length; ++i) {
+      auto& body = *member.bodies.AppendElement();
+      MOZ_TRY(number(body.sourceKey));
+      MOZ_TRY(number(body.size));
+      MOZ_TRY(text(body.sha256));
+      NS_ENSURE_TRUE(
+          body.sourceKey != nsMsgKey_None && body.sha256.Length() == 64,
+          NS_ERROR_FILE_CORRUPTED);
+      for (char c : body.sha256.View())
+        NS_ENSURE_TRUE((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'),
+                       NS_ERROR_FILE_CORRUPTED);
+    }
+  }
+  NS_ENSURE_TRUE(cursor == end && ImapImportProvenance(unit) == proof,
+                 NS_ERROR_FILE_CORRUPTED);
+  output = std::move(unit);
+  return NS_OK;
+}
+
 nsresult DatabaseCore::ReadImapImportReceipt(const ImapImportUnit& input,
                                              const nsACString& provenance,
-                                             Maybe<ImapImportReceipt>& output) {
+                                             Maybe<ImapImportReceipt>& output,
+                                             bool durableStartup) {
   NS_ENSURE_FALSE(input.folders.IsEmpty(), NS_ERROR_INVALID_ARG);
-  MOZ_TRY(CheckFolderImportIdentity(input.folders[0].snapshot.identity));
+  if (durableStartup) {
+    MOZ_TRY(CheckProfileStartup(ProfileStartupToken(), true));
+    NS_ENSURE_TRUE(mProfileStartup->mode == "reuse"_ns &&
+                       mProfileStartup->opened && mProfileStartup->busy &&
+                       !mProfileStartup->ready,
+                   NS_ERROR_NOT_AVAILABLE);
+    nsCString current;
+    MOZ_TRY(ReadDatabaseSourceId(sConnection, current));
+    NS_ENSURE_TRUE(current == input.databaseSourceId, NS_ERROR_NOT_AVAILABLE);
+  } else {
+    MOZ_TRY(CheckFolderImportIdentity(input.folders[0].snapshot.identity));
+  }
   nsCOMPtr<mozIStorageStatement> stmt;
   MOZ_TRY(GetStatement(
       "ReadImapImportUnit"_ns,
@@ -2821,7 +2968,8 @@ nsresult DatabaseCore::ReadImapImportReceipt(const ImapImportUnit& input,
   for (uint32_t i = 0; i < input.folders.Length(); ++i) {
     const auto& original = input.folders[i];
     Maybe<FolderImportReceipt> member;
-    MOZ_TRY(CheckFolderImportIdentity(original.snapshot.identity));
+    if (!durableStartup)
+      MOZ_TRY(CheckFolderImportIdentity(original.snapshot.identity));
     MOZ_TRY(ReadFolderImportReceipt(original.snapshot.identity, member));
     NS_ENSURE_TRUE(member, NS_ERROR_FILE_CORRUPTED);
     auto& receipt = *result.folders.AppendElement();
@@ -7440,7 +7588,7 @@ nsresult DatabaseCore::ImportFolderCacheMetadataV2(
   MOZ_TRY(selector->Append(u"panorama-profile.json"_ns));
   bool exists;
   MOZ_TRY(selector->Exists(&exists));
-  NS_ENSURE_FALSE(exists, NS_ERROR_NOT_AVAILABLE);
+  if (exists) MOZ_TRY(selectedStartup());
   NS_ENSURE_TRUE(current(), NS_ERROR_NOT_AVAILABLE);
   bool active;
   MOZ_TRY(connection->GetTransactionInProgress(&active));
@@ -8878,6 +9026,135 @@ nsresult StartupBookReadback(JSContext* cx, nsIFile* target, nsIFile* source,
       NS_ERROR_FAILURE);
   return NS_OK;
 }
+// Check the immutable import receipt on reuse, allowing ordinary book edits.
+nsresult StartupStoredBookReceipt(JSContext* cx, nsIFile* file,
+                                  JS::MutableHandle<JS::Value> output) {
+  MOZ_TRY(StartupRegular(file));
+  nsCOMPtr<mozIStorageService> storage =
+      do_GetService("@mozilla.org/storage/service;1");
+  NS_ENSURE_TRUE(storage, NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<mozIStorageConnection> connection;
+  MOZ_TRY(storage->OpenUnsharedDatabase(file, getter_AddRefs(connection)));
+  JS::Rooted<JSObject*> result(cx, JS_NewPlainObject(cx));
+  auto read = [&]() -> nsresult {
+    MOZ_TRY(connection->ExecuteSimpleSQL("PRAGMA query_only=ON"_ns));
+    int32_t version;
+    MOZ_TRY(connection->GetSchemaVersion(&version));
+    NS_ENSURE_TRUE(version == 4 && result, NS_ERROR_NOT_AVAILABLE);
+    for (const char* name :
+         {"migration_source", "migration_records", "migration_properties"}) {
+      bool exists;
+      MOZ_TRY(connection->TableExists(nsDependentCString(name), &exists));
+      NS_ENSURE_TRUE(exists, NS_ERROR_NOT_AVAILABLE);
+    }
+    nsCOMPtr<mozIStorageStatement> source;
+    MOZ_TRY(connection->CreateStatement(
+        "SELECT sourceId,sha256,size,bytes FROM migration_source WHERE version=1"_ns,
+        getter_AddRefs(source)));
+    bool row;
+    MOZ_TRY(source->ExecuteStep(&row));
+    NS_ENSURE_TRUE(row, NS_ERROR_FILE_CORRUPTED);
+    for (uint32_t i : {0u, 1u, 2u, 3u}) {
+      int32_t type;
+      MOZ_TRY(source->GetTypeOfIndex(i, &type));
+      NS_ENSURE_TRUE(
+          type == (i < 2    ? mozIStorageStatement::VALUE_TYPE_TEXT
+                   : i == 2 ? mozIStorageStatement::VALUE_TYPE_INTEGER
+                            : mozIStorageStatement::VALUE_TYPE_BLOB),
+          NS_ERROR_FILE_CORRUPTED);
+    }
+    nsCString token, expected;
+    int64_t size;
+    MOZ_TRY(source->GetUTF8String(0, token));
+    MOZ_TRY(source->GetUTF8String(1, expected));
+    MOZ_TRY(source->GetInt64(2, &size));
+    uint32_t length;
+    uint8_t* bytes = nullptr;
+    MOZ_TRY(source->GetBlob(3, &length, &bytes));
+    auto release = MakeScopeExit([&] { std::free(bytes); });
+    NS_ENSURE_TRUE(size >= 0 && uint64_t(size) == length && !token.IsEmpty(),
+                   NS_ERROR_FILE_CORRUPTED);
+    nsCOMPtr<nsICryptoHash> hash;
+    MOZ_TRY(NS_NewCryptoHash(nsICryptoHash::SHA256, getter_AddRefs(hash)));
+    if (length) MOZ_TRY(hash->Update(bytes, length));
+    nsCString digest, actual;
+    MOZ_TRY(hash->Finish(false, digest));
+    for (unsigned char c : digest.View()) {
+      actual.Append("0123456789abcdef"[c >> 4]);
+      actual.Append("0123456789abcdef"[c & 15]);
+    }
+    NS_ENSURE_TRUE(actual == expected, NS_ERROR_FILE_CORRUPTED);
+    MOZ_TRY(source->ExecuteStep(&row));
+    NS_ENSURE_FALSE(row, NS_ERROR_FILE_CORRUPTED);
+    source = nullptr;
+    NS_ENSURE_TRUE(ImapImportText(cx, result, "sourceId", token) &&
+                       ImapImportText(cx, result, "sourceSha256", actual) &&
+                       JS_DefineProperty(cx, result, "sourceSize",
+                                         double(length), JSPROP_ENUMERATE),
+                   NS_ERROR_OUT_OF_MEMORY);
+    nsTHashSet<nsCString> uids;
+    for (const char* kind : {"card", "list"}) {
+      nsCOMPtr<mozIStorageStatement> records;
+      MOZ_TRY(connection->CreateStatement(
+          "SELECT sourceKey,uid FROM migration_records WHERE kind=:kind ORDER BY CAST(sourceKey AS INTEGER)"_ns,
+          getter_AddRefs(records)));
+      MOZ_TRY(
+          records->BindUTF8StringByName("kind"_ns, nsDependentCString(kind)));
+      JS::Rooted<JSObject*> map(cx, JS::NewArrayObject(cx, 0));
+      NS_ENSURE_TRUE(map, NS_ERROR_OUT_OF_MEMORY);
+      uint32_t ordinal = 0;
+      nsTHashSet<uint32_t> keys;
+      while (true) {
+        MOZ_TRY(records->ExecuteStep(&row));
+        if (!row) break;
+        for (uint32_t c : {0u, 1u}) {
+          int32_t type;
+          MOZ_TRY(records->GetTypeOfIndex(c, &type));
+          NS_ENSURE_TRUE(type == mozIStorageStatement::VALUE_TYPE_TEXT,
+                         NS_ERROR_FILE_CORRUPTED);
+        }
+        nsCString key, uid;
+        MOZ_TRY(records->GetUTF8String(0, key));
+        MOZ_TRY(records->GetUTF8String(1, uid));
+        uint32_t number;
+        auto parsed =
+            std::from_chars(key.BeginReading(), key.EndReading(), number);
+        nsAutoCString canonical;
+        if (parsed.ec == std::errc()) canonical.AppendInt(number);
+        NS_ENSURE_TRUE(!key.IsEmpty() && parsed.ec == std::errc() &&
+                           parsed.ptr == key.EndReading() && canonical == key &&
+                           !uid.IsEmpty() && !keys.Contains(number) &&
+                           !uids.Contains(uid),
+                       NS_ERROR_FILE_CORRUPTED);
+        keys.Insert(number);
+        uids.Insert(uid);
+        JS::Rooted<JSObject*> pair(cx, JS::NewArrayObject(cx, 2));
+        JS::Rooted<JSString*> text(
+            cx,
+            JS_NewStringCopyUTF8N(cx, JS::UTF8Chars(uid.get(), uid.Length())));
+        NS_ENSURE_TRUE(
+            pair && text &&
+                JS_DefineElement(cx, pair, 0, double(number),
+                                 JSPROP_ENUMERATE) &&
+                JS_DefineElement(cx, pair, 1, text, JSPROP_ENUMERATE) &&
+                JS_DefineElement(cx, map, ordinal++, pair, JSPROP_ENUMERATE),
+            NS_ERROR_OUT_OF_MEMORY);
+      }
+      NS_ENSURE_TRUE(JS_DefineProperty(
+                         cx, result, !strcmp(kind, "card") ? "cards" : "lists",
+                         map, JSPROP_ENUMERATE),
+                     NS_ERROR_OUT_OF_MEMORY);
+    }
+    return NS_OK;
+  };
+  nsresult first = read();
+  nsresult closed = connection->Close();
+  MOZ_TRY(first);
+  MOZ_TRY(closed);
+  output.setObject(*result);
+  return NS_OK;
+}
+
 nsresult StartupCopy(JSContext* cx, JS::Handle<JSObject*> from,
                      JS::Handle<JSObject*> to, const char* name,
                      const char* outputName = nullptr) {
@@ -8921,7 +9198,8 @@ nsresult StartupParseFile(JSContext* cx, nsIFile* file, const nsAString& module,
 }
 nsresult StartupMapEntry(JSContext* cx, JS::Handle<JSObject*> parent,
                          const char* name, const nsACString& key,
-                         JS::MutableHandle<JS::Value> output) {
+                         JS::MutableHandle<JS::Value> output,
+                         bool optional = false) {
   JS::Rooted<JSObject*> map(cx);
   MOZ_TRY(StartupObject(cx, parent, name, &map));
   JS::Rooted<JSString*> string(
@@ -8930,7 +9208,7 @@ nsresult StartupMapEntry(JSContext* cx, JS::Handle<JSObject*> parent,
   NS_ENSURE_TRUE(string, NS_ERROR_OUT_OF_MEMORY);
   JS::Rooted<JS::Value> mapKey(cx, JS::StringValue(string));
   NS_ENSURE_TRUE(JS::MapGet(cx, map, mapKey, output), NS_ERROR_FAILURE);
-  NS_ENSURE_FALSE(output.isUndefined(), NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_TRUE(optional || !output.isUndefined(), NS_ERROR_NOT_AVAILABLE);
   return NS_OK;
 }
 nsresult StartupCheckHash(nsIFile* file, const nsACString& expected,
@@ -9045,14 +9323,12 @@ nsresult StartupServer(JSContext* cx, JS::Handle<JSObject*> source,
       NS_ENSURE_TRUE(StringEndsWith(part, last ? ".msf"_ns : ".sbd"_ns),
                      NS_ERROR_NOT_AVAILABLE);
       part.Truncate(part.Length() - 4);
-      nsCString decoded = DecodeFilename(NS_ConvertUTF8toUTF16(part));
-      NS_ENSURE_TRUE(!decoded.IsEmpty() && decoded != "."_ns &&
-                         decoded != ".."_ns && decoded.FindChar(0) < 0 &&
-                         NS_ConvertUTF16toUTF8(EncodeFilename(decoded)) == part,
-                     NS_ERROR_NOT_IMPLEMENTED);
-      output.localNames.AppendElement(decoded);
+      NS_ENSURE_TRUE(!part.IsEmpty() && part != "."_ns && part != ".."_ns &&
+                         part.FindChar(0) < 0,
+                     NS_ERROR_FILE_INVALID_PATH);
+      output.localLeaves.AppendElement(part);
     }
-    NS_ENSURE_FALSE(output.localNames.IsEmpty(), NS_ERROR_NOT_AVAILABLE);
+    NS_ENSURE_FALSE(output.localLeaves.IsEmpty(), NS_ERROR_NOT_AVAILABLE);
     return NS_OK;
   }
   NS_ENSURE_TRUE(provider == "imap-client-discovery"_ns, NS_ERROR_INVALID_ARG);
@@ -9188,6 +9464,131 @@ nsresult StartupServer(JSContext* cx, JS::Handle<JSObject*> source,
 }
 
 }  // namespace
+
+// Decode a retained dbfolderinfo name from byte-string Mork cells. This is
+// source parsing only; publication additionally requires actual store
+// discovery.
+nsresult DatabaseCore::ReadStartupSummaryName(JSContext* cx, nsIFile* file,
+                                              const nsACString& expected,
+                                              Maybe<nsCString>& output) {
+  nsCString hash;
+  MOZ_TRY(StartupHash(file, hash));
+  NS_ENSURE_TRUE(hash == expected, NS_ERROR_NOT_AVAILABLE);
+  JS::Rooted<JSObject*> parsed(cx), source(cx), rows(cx);
+  MOZ_TRY(StartupParseFile(
+      cx, file, u"resource:///modules/panorama/MorkSummaryReader.sys.mjs"_ns,
+      "parseMorkSummary", &parsed));
+  MOZ_TRY(StartupObject(cx, parsed, "source", &source));
+  MOZ_TRY(StartupObject(cx, source, "rows", &rows));
+  JS::Rooted<JS::Value> value(cx);
+  NS_ENSURE_TRUE(JS::MapValues(cx, rows, &value), NS_ERROR_FAILURE);
+  JS::ForOfIterator iterator(cx);
+  NS_ENSURE_TRUE(iterator.init(value), NS_ERROR_FAILURE);
+  bool done, seen = false;
+  Maybe<nsCString> result;
+  while (true) {
+    NS_ENSURE_TRUE(iterator.next(&value, &done), NS_ERROR_FAILURE);
+    if (done) break;
+    NS_ENSURE_TRUE(value.isObject(), NS_ERROR_FILE_CORRUPTED);
+    JS::Rooted<JSObject*> row(cx, &value.toObject());
+    nsCString scope;
+    MOZ_TRY(StartupText(cx, row, "scope", scope));
+    if (scope != "ns:msg:db:row:scope:dbfolderinfo:all"_ns) continue;
+    NS_ENSURE_FALSE(seen, NS_ERROR_NOT_AVAILABLE);
+    seen = true;
+    MOZ_TRY(StartupMapEntry(cx, row, "cells", "folderName"_ns, &value, true));
+    if (value.isUndefined()) continue;
+    nsCString encoded, name;
+    MOZ_TRY(ImportText(cx, value, encoded));
+    nsString units = NS_ConvertUTF8toUTF16(encoded);
+    for (char16_t c : units.View()) {
+      NS_ENSURE_TRUE(c <= 255, NS_ERROR_FILE_CORRUPTED);
+      name.Append(char(c));
+    }
+    NS_ENSURE_TRUE(NS_ConvertUTF16toUTF8(NS_ConvertUTF8toUTF16(name)) == name &&
+                       name.FindChar(0) < 0,
+                   NS_ERROR_FILE_CORRUPTED);
+    if (!name.IsEmpty()) result = Some(std::move(name));
+  }
+  MOZ_TRY(StartupHash(file, hash));
+  NS_ENSURE_TRUE(hash == expected, NS_ERROR_NOT_AVAILABLE);
+  output = std::move(result);
+  return NS_OK;
+}
+
+nsresult DatabaseCore::BindStartupLocalNames(JSContext* cx,
+                                             StartupMailSource& source) {
+  MOZ_TRY(CheckProfileStartup(ProfileStartupToken(), true));
+  auto& operation = *mProfileStartup;
+  nsCOMPtr<nsIFile> base;
+  MOZ_TRY(NS_NewNativeLocalFile(source.serverRoot, getter_AddRefs(base)));
+  for (uint32_t i = 0; i < source.localLeaves.Length(); ++i) {
+    const auto& leaf = source.localLeaves[i];
+    nsCOMPtr<nsIFile> summary;
+    MOZ_TRY(base->Clone(getter_AddRefs(summary)));
+    MOZ_TRY(summary->AppendNative(leaf + ".msf"_ns));
+    nsCString path;
+    MOZ_TRY(summary->GetNativePath(path));
+    Maybe<nsCString> name;
+    if (auto archived = operation.backupFiles.Lookup(path))
+      MOZ_TRY(ReadStartupSummaryName(cx, summary, archived.Data(), name));
+    nsCOMPtr<nsIFile> cache;
+    MOZ_TRY(operation.profile->Clone(getter_AddRefs(cache)));
+    MOZ_TRY(cache->AppendNative("panacea.dat"_ns));
+    nsCString cachePath;
+    MOZ_TRY(cache->GetNativePath(cachePath));
+    if (auto archived = operation.backupFiles.Lookup(cachePath)) {
+      nsCString cacheHash;
+      MOZ_TRY(StartupHash(cache, cacheHash));
+      NS_ENSURE_TRUE(cacheHash == archived.Data(), NS_ERROR_NOT_AVAILABLE);
+      JS::Rooted<JSObject*> parsed(cx), row(cx), values(cx);
+      MOZ_TRY(StartupParseFile(
+          cx, cache, u"resource:///modules/panorama/MorkFolderCache.sys.mjs"_ns,
+          "parseMorkFolderCache", &parsed));
+      nsCString descriptor;
+      MOZ_TRY(summary->GetPersistentDescriptor(descriptor));
+      JS::Rooted<JS::Value> value(cx);
+      MOZ_TRY(StartupMapEntry(cx, parsed, "entries", descriptor, &value, true));
+      if (!value.isUndefined()) {
+        NS_ENSURE_TRUE(value.isObject(), NS_ERROR_FILE_CORRUPTED);
+        row = &value.toObject();
+        MOZ_TRY(StartupObject(cx, row, "values", &values));
+        MOZ_TRY(ImportMember(cx, values, "folderName", &value, true));
+        if (!value.isUndefined()) {
+          nsCString cached;
+          MOZ_TRY(ImportText(cx, value, cached));
+          if (!cached.IsEmpty()) {
+            NS_ENSURE_TRUE(!name || *name == cached, NS_ERROR_NOT_AVAILABLE);
+            name = Some(std::move(cached));
+          }
+        }
+      }
+      MOZ_TRY(StartupHash(cache, cacheHash));
+      NS_ENSURE_TRUE(cacheHash == archived.Data(), NS_ERROR_NOT_AVAILABLE);
+    }
+    if (!name) {
+      // Legacy Mork storage used NS_MsgHashIfNecessary, not the Panorama
+      // filename codec. A literal percent is not an escape in this contract.
+      // A possible shortened/hash suffix needs its actual retained name.
+      bool hashed = leaf.Length() >= 8;
+      nsCString suffix(
+          Substring(leaf, leaf.Length() >= 8 ? leaf.Length() - 8 : 0));
+      for (char c : suffix.View())
+        hashed &= (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+      NS_ENSURE_TRUE(
+          !hashed && NS_ConvertUTF16toUTF8(NS_MsgHashIfNecessary(leaf)) == leaf,
+          NS_ERROR_NOT_AVAILABLE);
+      name = Some(leaf);
+    }
+    NS_ENSURE_TRUE(!name->IsEmpty() && *name != "."_ns && *name != ".."_ns &&
+                       name->FindChar(0) < 0,
+                   NS_ERROR_FILE_CORRUPTED);
+    source.localNames.AppendElement(*name);
+    if (i + 1 < source.localLeaves.Length())
+      MOZ_TRY(base->AppendNative(leaf + ".sbd"_ns));
+  }
+  return CheckProfileStartup(ProfileStartupToken(), true);
+}
 
 nsresult DatabaseCore::DescribeProfileStartup(
     JSContext* cx, JS::MutableHandle<JS::Value> output) {
@@ -9411,6 +9812,8 @@ nsresult DatabaseCore::OpenProfileStartup(JSContext* cx,
         MOZ_TRY(StartupItem(cx, sources, i, &source));
         StartupMailSource native;
         MOZ_TRY(StartupServer(cx, source, operation, native));
+        if (native.protocol == "none"_ns)
+          MOZ_TRY(BindStartupLocalNames(cx, native));
         auto archived = operation.backupFiles.Lookup(native.path);
         NS_ENSURE_TRUE(archived && archived.Data() == native.hash,
                        NS_ERROR_NOT_AVAILABLE);
@@ -9538,12 +9941,82 @@ nsresult DatabaseCore::BuildStartupFolders() {
     MOZ_TRY(server->GetRootFolder(getter_AddRefs(root)));
     NS_ENSURE_TRUE(root, NS_ERROR_NOT_AVAILABLE);
     roots.InsertOrUpdate(source.key, root);
-    if (source.protocol == "none"_ns) {
-      nsCOMPtr<nsIMsgPluggableStore> store;
-      MOZ_TRY(server->GetMsgStore(getter_AddRefs(store)));
-      NS_ENSURE_TRUE(store, NS_ERROR_NOT_AVAILABLE);
-      MOZ_TRY(store->DiscoverSubFolders(root, true));
+  }
+  nsTArray<const StartupMailSource*> local;
+  for (const auto& source : operation.sources)
+    if (source.protocol == "none"_ns) local.AppendElement(&source);
+  local.Sort([](const StartupMailSource* a, const StartupMailSource* b) -> int {
+    if (a->localNames.Length() != b->localNames.Length())
+      return a->localNames.Length() < b->localNames.Length() ? -1 : 1;
+    return Compare(a->storePath, b->storePath);
+  });
+  nsTHashMap<uint64_t, nsCString> physical;
+  nsTHashMap<nsCString, nsCOMPtr<nsIMsgFolder>> localBindings;
+  for (const auto* source : local) {
+    auto root = roots.Lookup(source->serverKey);
+    NS_ENSURE_TRUE(root, NS_ERROR_NOT_AVAILABLE);
+    nsCOMPtr<nsIMsgFolder> parent = root.Data();
+    nsCOMPtr<nsIMsgPluggableStore> store;
+    MOZ_TRY(parent->GetMsgStore(getter_AddRefs(store)));
+    NS_ENSURE_TRUE(store, NS_ERROR_NOT_AVAILABLE);
+    for (uint32_t i = 0; i < source->localNames.Length(); ++i) {
+      nsTArray<nsCString> children;
+      MOZ_TRY(store->DiscoverChildFolders(parent, children));
+      NS_ENSURE_TRUE(children.Contains(DecodeFilename(
+                         NS_ConvertUTF8toUTF16(source->localLeaves[i]))),
+                     NS_ERROR_NOT_AVAILABLE);
+      nsCOMPtr<nsIFile> path;
+      MOZ_TRY(parent->GetFilePath(getter_AddRefs(path)));
+      bool server;
+      MOZ_TRY(parent->GetIsServer(&server));
+      if (!server) {
+        nsAutoString leaf;
+        MOZ_TRY(path->GetLeafName(leaf));
+        MOZ_TRY(path->SetLeafName(leaf + u".sbd"_ns));
+      }
+      MOZ_TRY(path->AppendNative(source->localLeaves[i]));
+      nsCString actual;
+      MOZ_TRY(path->GetNativePath(actual));
+      nsCOMPtr<nsIMsgFolder> child;
+      MOZ_TRY(
+          parent->GetChildNamed(source->localNames[i], getter_AddRefs(child)));
+      if (!child)
+        MOZ_TRY(
+            parent->AddSubfolder(source->localNames[i], getter_AddRefs(child)));
+      NS_ENSURE_TRUE(child, NS_ERROR_NOT_AVAILABLE);
+      nsCString name;
+      MOZ_TRY(child->GetName(name));
+      // Use the same NFC spelling as native InsertFolder. Physical discovery
+      // and the retained leaf remain independent of this logical normalization.
+      nsCString retainedName =
+          MOZ_TRY(DatabaseUtils::Normalize(source->localNames[i]));
+      bool canonical =
+          server &&
+          ((name == "Inbox"_ns &&
+            retainedName.LowerCaseEqualsLiteral("inbox")) ||
+           (name == "Unsent Messages"_ns &&
+            retainedName.LowerCaseEqualsLiteral("unsent messages")) ||
+           (name == "Drafts"_ns &&
+            retainedName.LowerCaseEqualsLiteral("drafts")) ||
+           (name == "Trash"_ns &&
+            retainedName.LowerCaseEqualsLiteral("trash")) ||
+           (name == "Sent"_ns && retainedName.LowerCaseEqualsLiteral("sent")) ||
+           (name == "Templates"_ns &&
+            retainedName.LowerCaseEqualsLiteral("templates")) ||
+           (name == "Archives"_ns &&
+            retainedName.LowerCaseEqualsLiteral("archives")));
+      NS_ENSURE_TRUE(name == retainedName || canonical, NS_ERROR_NOT_AVAILABLE);
+      uint64_t id;
+      MOZ_TRY(child->GetId(&id));
+      NS_ENSURE_TRUE(id, NS_ERROR_NOT_AVAILABLE);
+      if (auto prior = physical.Lookup(id))
+        NS_ENSURE_TRUE(prior.Data() == actual, NS_ERROR_NOT_AVAILABLE);
+      physical.InsertOrUpdate(id, actual);
+      MOZ_TRY(child->SetFilePath(path));
+      operation.localFolders.AppendElement(child);
+      parent = child;
     }
+    localBindings.InsertOrUpdate(source->id, parent);
   }
   nsTArray<const StartupMailSource*> imap;
   for (const auto& source : operation.sources)
@@ -9567,12 +10040,9 @@ nsresult DatabaseCore::BuildStartupFolders() {
     NS_ENSURE_TRUE(root, NS_ERROR_NOT_AVAILABLE);
     nsCOMPtr<nsIMsgFolder> folder = root.Data();
     if (source.protocol == "none"_ns) {
-      for (const auto& name : source.localNames) {
-        nsCOMPtr<nsIMsgFolder> child;
-        MOZ_TRY(folder->GetChildNamed(name, getter_AddRefs(child)));
-        NS_ENSURE_TRUE(child, NS_ERROR_NOT_AVAILABLE);
-        folder = child;
-      }
+      auto binding = localBindings.Lookup(source.id);
+      NS_ENSURE_TRUE(binding, NS_ERROR_NOT_AVAILABLE);
+      folder = binding.Data();
     } else {
       for (const auto& part : source.canonicalPath.Split('/')) {
         nsCOMPtr<nsIMsgFolder> child;
@@ -9710,6 +10180,7 @@ nsresult DatabaseCore::SettleProfileStartup(nsresult failure) {
   if (mMessageDatabase) mMessageDatabase->Shutdown();
   mMessageDatabase = nullptr;
   operation->folders.Clear();
+  operation->localFolders.Clear();
   operation->sourceIds.Clear();
   RefPtr<DatabaseCore> self = this;
   auto finished = [self, operation](nsresult closeError) {
@@ -9878,7 +10349,9 @@ nsresult DatabaseCore::CheckProfileActivation(
   JS::Rooted<JS::Value> callerJournal(cx);
   MOZ_TRY(ImportMember(cx, caller, "journalPath", &callerJournal));
   MOZ_TRY(StartupEqual(cx, callerJournal, declaredJournal));
-  if (operation.mode == "reuse"_ns && !operation.initialSelector.IsEmpty()) {
+  const bool reusing =
+      operation.mode == "reuse"_ns && !operation.initialSelector.IsEmpty();
+  if (reusing) {
     JS::Rooted<JS::Value> original(cx);
     MOZ_TRY(StartupParse(cx, operation.initialSelector, &original));
     JS::Rooted<JSObject*> initial(cx, &original.toObject()), priorIdentity(cx);
@@ -9889,7 +10362,7 @@ nsresult DatabaseCore::CheckProfileActivation(
         StartupFieldsEqual(cx, priorIdentity, identity,
                            {"profilePath", "databaseSourceId", "journalPath",
                             "backup", "imports", "books", "caches"}));
-    return NS_OK;
+    // An unchanged selector does not prove durable recovery state.
   }
   if (origin != "migrated"_ns) {
     NS_ENSURE_TRUE(
@@ -9945,6 +10418,18 @@ nsresult DatabaseCore::CheckProfileActivation(
   JS::Rooted<JSObject*> originalInventory(cx);
   MOZ_TRY(StartupObject(cx, startup, "inventory", &originalInventory));
   JS::Rooted<JS::Value> retainedInventory(cx);
+  if (reusing) {
+    MOZ_TRY(ImportMember(cx, originalInventory, "sources", &retainedInventory));
+    MOZ_TRY(StartupJSON(cx, retainedInventory, operation.retainedSources));
+    for (auto entry : {std::pair{"books", &operation.retainedBooks},
+                       std::pair{"caches", &operation.retainedCaches}}) {
+      JS::Rooted<JSObject*> array(cx);
+      uint32_t length;
+      MOZ_TRY(StartupArray(cx, journal, entry.first, &array, length, true));
+      retainedInventory.setObject(*array);
+      MOZ_TRY(StartupJSON(cx, retainedInventory, *entry.second));
+    }
+  }
   MOZ_TRY(StartupParse(cx, operation.retainedSources, &retainedInventory));
   MOZ_TRY(ImportMember(cx, originalInventory, "sources", &expected));
   MOZ_TRY(StartupEqual(cx, expected, retainedInventory));
@@ -9952,10 +10437,12 @@ nsresult DatabaseCore::CheckProfileActivation(
   uint32_t count, importCount;
   MOZ_TRY(StartupArray(cx, journal, "sources", &sources, count));
   MOZ_TRY(StartupArray(cx, identity, "imports", &imports, importCount));
-  NS_ENSURE_TRUE(count == importCount && count == operation.sources.Length(),
-                 NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_TRUE(
+      count == importCount && (reusing || count == operation.sources.Length()),
+      NS_ERROR_NOT_AVAILABLE);
   nsTHashSet<nsCString> tokens;
   nsTHashSet<uint64_t> folderIds;
+  nsTHashMap<uint64_t, nsCString> retainedLocalPaths;
   for (uint32_t i = 0; i < count; ++i) {
     JS::Rooted<JSObject*> source(cx), declared(cx);
     MOZ_TRY(StartupItem(cx, sources, i, &source));
@@ -9979,21 +10466,55 @@ nsresult DatabaseCore::CheckProfileActivation(
       planned |= retained.id == native.sourceId && retained.path == path &&
                  retained.hash == native.sourceSha256;
     }
+    if (reusing) {
+      auto archived = operation.backupFiles.Lookup(path);
+      NS_ENSURE_TRUE(archived && archived.Data() == native.sourceSha256,
+                     NS_ERROR_NOT_AVAILABLE);
+      JS::Rooted<JSObject*> retained(cx);
+      uint32_t length;
+      MOZ_TRY(ImportArray(cx, retainedInventory, &retained, length));
+      for (uint32_t r = 0; r < length; ++r) {
+        JS::Rooted<JSObject*> item(cx);
+        MOZ_TRY(StartupItem(cx, retained, r, &item));
+        nsCString id, originalPath, hash;
+        MOZ_TRY(StartupText(cx, item, "id", id));
+        MOZ_TRY(StartupText(cx, item, "path", originalPath));
+        MOZ_TRY(StartupText(cx, item, "sha256", hash));
+        planned |= id == native.sourceId && originalPath == path &&
+                   hash == native.sourceSha256;
+      }
+      // Read the import-time spelling from native provenance. A normal later
+      // rename is not permission to reopen or replay the obsolete Mork source.
+      nsCOMPtr<mozIStorageStatement> savedPath;
+      MOZ_TRY(sConnection->CreateStatement(
+          "SELECT folderPath FROM folder_import_receipts WHERE token=:token"_ns,
+          getter_AddRefs(savedPath)));
+      MOZ_TRY(savedPath->BindUTF8StringByName("token"_ns, native.token));
+      bool exists;
+      MOZ_TRY(savedPath->ExecuteStep(&exists));
+      NS_ENSURE_TRUE(exists, NS_ERROR_NOT_AVAILABLE);
+      MOZ_TRY(savedPath->GetUTF8String(0, native.folderPath));
+    } else {
+      native.folderPath = MOZ_TRY(mFolderDatabase->GetFolderPath(folder));
+    }
     NS_ENSURE_TRUE(planned, NS_ERROR_NOT_AVAILABLE);
-    native.folderPath = MOZ_TRY(mFolderDatabase->GetFolderPath(folder));
     NS_ENSURE_TRUE(state == "imported"_ns && !tokens.Contains(native.token) &&
                        !folderIds.Contains(folder),
                    NS_ERROR_NOT_AVAILABLE);
     tokens.Insert(native.token);
     folderIds.Insert(folder);
-    nsCOMPtr<nsIFile> original;
-    MOZ_TRY(
-        StartupContained(operation.profile, path, getter_AddRefs(original)));
-    nsCString hash;
-    MOZ_TRY(StartupHash(original, hash));
-    NS_ENSURE_TRUE(hash == native.sourceSha256, NS_ERROR_NOT_AVAILABLE);
     Maybe<FolderImportReceipt> receipt;
-    MOZ_TRY(GetFolderImportReceipt(native, receipt));
+    if (reusing) {
+      MOZ_TRY(ReadFolderImportReceipt(native, receipt));
+    } else {
+      nsCOMPtr<nsIFile> original;
+      MOZ_TRY(
+          StartupContained(operation.profile, path, getter_AddRefs(original)));
+      nsCString hash;
+      MOZ_TRY(StartupHash(original, hash));
+      NS_ENSURE_TRUE(hash == native.sourceSha256, NS_ERROR_NOT_AVAILABLE);
+      MOZ_TRY(GetFolderImportReceipt(native, receipt));
+    }
     NS_ENSURE_TRUE(receipt, NS_ERROR_NOT_AVAILABLE);
     NS_ENSURE_TRUE(ImportReceiptValue(cx, *receipt, &actual),
                    NS_ERROR_OUT_OF_MEMORY);
@@ -10015,6 +10536,85 @@ nsresult DatabaseCore::CheckProfileActivation(
     MOZ_TRY(
         StartupNumber(cx, declared, "folderId", 1, INT64_MAX, declaredFolder));
     NS_ENSURE_TRUE(declaredFolder == folder, NS_ERROR_NOT_AVAILABLE);
+    if (reusing) {
+      // Only unchanged native locations need the legacy physical spelling.
+      // Normal later rename/move/server-path changes keep their normal paths.
+      nsCOMPtr<mozIStorageStatement> live;
+      MOZ_TRY(sConnection->CreateStatement(
+          "SELECT 1 FROM folders WHERE id=:id"_ns, getter_AddRefs(live)));
+      MOZ_TRY(live->BindInt64ByName("id"_ns, folder));
+      bool exists;
+      MOZ_TRY(live->ExecuteStep(&exists));
+      live = nullptr;
+      if (!exists) continue;
+      nsCString currentPath = MOZ_TRY(mFolderDatabase->GetFolderPath(folder));
+      if (currentPath != receipt->identity.folderPath) continue;
+      JS::Rooted<JSObject*> retained(cx);
+      uint32_t length;
+      MOZ_TRY(ImportArray(cx, retainedInventory, &retained, length));
+      for (uint32_t r = 0; r < length; ++r) {
+        JS::Rooted<JSObject*> item(cx);
+        MOZ_TRY(StartupItem(cx, retained, r, &item));
+        nsCString id, protocol;
+        MOZ_TRY(StartupText(cx, item, "id", id));
+        if (id != native.sourceId) continue;
+        MOZ_TRY(StartupText(cx, item, "protocol", protocol));
+        if (protocol != "none"_ns) continue;
+        nsCString serverKey, serverRoot, relative;
+        MOZ_TRY(StartupText(cx, item, "serverKey", serverKey));
+        MOZ_TRY(StartupText(cx, item, "serverRoot", serverRoot));
+        MOZ_TRY(StartupText(cx, item, "physicalRelativePath", relative));
+        uint64_t root = MOZ_TRY(mFolderDatabase->GetFolderRoot(folder));
+        nsCString actualKey = MOZ_TRY(mFolderDatabase->GetFolderName(root));
+        if (serverKey != actualKey) continue;
+        nsCOMPtr<nsIMsgAccountManager> accounts =
+            do_GetService("@mozilla.org/messenger/account-manager;1");
+        NS_ENSURE_TRUE(accounts, NS_ERROR_NOT_AVAILABLE);
+        AutoRestore<uint32_t> metadata(mStartupMetadataDepth);
+        ++mStartupMetadataDepth;
+        nsCOMPtr<nsIMsgIncomingServer> server;
+        MOZ_TRY(accounts->GetIncomingServer(serverKey, getter_AddRefs(server)));
+        NS_ENSURE_TRUE(server, NS_ERROR_NOT_AVAILABLE);
+        nsCOMPtr<nsIFile> physical;
+        MOZ_TRY(server->GetLocalPath(getter_AddRefs(physical)));
+        nsCString actualRoot;
+        MOZ_TRY(physical->GetNativePath(actualRoot));
+        if (serverRoot != actualRoot) continue;
+        nsTArray<uint64_t> ancestors =
+            MOZ_TRY(mFolderDatabase->GetFolderAncestors(folder));
+        nsTArray<nsCString> leaves;
+        nsCCharSeparatedTokenizer parts(relative, '/');
+        while (parts.hasMoreTokens()) {
+          nsCString leaf(parts.nextToken());
+          bool last = !parts.hasMoreTokens();
+          NS_ENSURE_TRUE(StringEndsWith(leaf, last ? ".msf"_ns : ".sbd"_ns),
+                         NS_ERROR_FILE_CORRUPTED);
+          leaf.Truncate(leaf.Length() - 4);
+          NS_ENSURE_TRUE(!leaf.IsEmpty() && leaf != "."_ns && leaf != ".."_ns &&
+                             leaf.FindChar(0) < 0 && leaf.FindChar('\\') < 0,
+                         NS_ERROR_FILE_INVALID_PATH);
+          leaves.AppendElement(leaf);
+        }
+        NS_ENSURE_TRUE(leaves.Length() == ancestors.Length(),
+                       NS_ERROR_FILE_CORRUPTED);
+        for (uint32_t n = 0; n < leaves.Length(); ++n) {
+          MOZ_TRY(physical->AppendNative(leaves[n]));
+          nsCString body;
+          MOZ_TRY(physical->GetNativePath(body));
+          uint64_t currentId = n + 1 == leaves.Length()
+                                   ? uint64_t(folder)
+                                   : ancestors[ancestors.Length() - 2 - n];
+          if (auto prior = retainedLocalPaths.Lookup(currentId))
+            NS_ENSURE_TRUE(prior.Data() == body, NS_ERROR_NOT_AVAILABLE);
+          retainedLocalPaths.InsertOrUpdate(currentId, body);
+          if (n + 1 < leaves.Length())
+            MOZ_TRY(physical->SetNativeLeafName(leaves[n] + ".sbd"_ns));
+          else
+            NS_ENSURE_TRUE(path.Equals(body + ".msf"_ns),
+                           NS_ERROR_NOT_AVAILABLE);
+        }
+      }
+    }
   }
   // Reconstruct each saved protocol intent from its original raw summaries.
   // The existing converter and native unit reader independently check member,
@@ -10034,6 +10634,46 @@ nsresult DatabaseCore::CheckProfileActivation(
     uint32_t memberCount;
     MOZ_TRY(StartupArray(cx, intent, "folders", &members, memberCount));
     NS_ENSURE_TRUE(memberCount, NS_ERROR_NOT_AVAILABLE);
+    if (reusing) {
+      nsCOMPtr<mozIStorageStatement> stored;
+      MOZ_TRY(sConnection->CreateStatement(
+          "SELECT databaseSourceId,provenance FROM imap_import_units WHERE token=:token"_ns,
+          getter_AddRefs(stored)));
+      MOZ_TRY(stored->BindUTF8StringByName("token"_ns, token));
+      bool exists;
+      MOZ_TRY(stored->ExecuteStep(&exists));
+      NS_ENSURE_TRUE(exists, NS_ERROR_NOT_AVAILABLE);
+      nsCString database, provenance;
+      MOZ_TRY(stored->GetUTF8String(0, database));
+      MOZ_TRY(stored->GetUTF8String(1, provenance));
+      NS_ENSURE_TRUE(database == current, NS_ERROR_NOT_AVAILABLE);
+      stored = nullptr;
+      ImapImportUnit native;
+      MOZ_TRY(ReadStartupImapProvenance(provenance, native));
+      NS_ENSURE_TRUE(native.token == token &&
+                         native.databaseSourceId == current &&
+                         native.folders.Length() == memberCount,
+                     NS_ERROR_NOT_AVAILABLE);
+      for (const auto& member : native.folders) {
+        const auto& id = member.snapshot.identity.sourceId;
+        NS_ENSURE_FALSE(unitMembers.Contains(id), NS_ERROR_NOT_AVAILABLE);
+        unitMembers.Insert(id);
+      }
+      Maybe<ImapImportReceipt> receipt;
+      MOZ_TRY(ReadImapImportReceipt(native, provenance, receipt, true));
+      NS_ENSURE_TRUE(receipt, NS_ERROR_NOT_AVAILABLE);
+      JS::RootedValueArray<2> arguments(cx);
+      arguments[0].setObject(*intent);
+      NS_ENSURE_TRUE(ImapImportReceiptValue(cx, native, *receipt, arguments[1]),
+                     NS_ERROR_OUT_OF_MEMORY);
+      JS::Rooted<JS::Value> checked(cx);
+      MOZ_TRY(StartupModuleCall(
+          cx, u"resource:///modules/panorama/MorkSnapshotAdapter.sys.mjs"_ns,
+          "validateMorkProtocolUnitReceipt", arguments, &checked));
+      MOZ_TRY(ImportMember(cx, unit, "receipt", &expected));
+      MOZ_TRY(StartupEqual(cx, expected, checked));
+      continue;
+    }
     JS::Rooted<JSObject*> entries(cx, JS::NewArrayObject(cx, memberCount));
     NS_ENSURE_TRUE(entries, NS_ERROR_OUT_OF_MEMORY);
     nsCOMPtr<nsIMsgFolder> anchor;
@@ -10170,9 +10810,15 @@ nsresult DatabaseCore::CheckProfileActivation(
       declaredPaths.Insert(path);
       NS_ENSURE_TRUE(state == "imported"_ns, NS_ERROR_NOT_AVAILABLE);
       nsCOMPtr<nsIFile> original;
-      MOZ_TRY(
-          StartupContained(operation.profile, path, getter_AddRefs(original)));
-      MOZ_TRY(StartupCheckHash(original, hash, size));
+      if (reusing) {
+        auto archived = operation.backupFiles.Lookup(path);
+        NS_ENSURE_TRUE(archived && archived.Data() == hash,
+                       NS_ERROR_NOT_AVAILABLE);
+      } else {
+        MOZ_TRY(StartupContained(operation.profile, path,
+                                 getter_AddRefs(original)));
+        MOZ_TRY(StartupCheckHash(original, hash, size));
+      }
       MOZ_TRY(StartupObject(cx, unit, "receipt", &saved));
       if (!strcmp(name, "books")) {
         JS::Rooted<JSObject*> publication(cx), published(cx);
@@ -10217,7 +10863,10 @@ nsresult DatabaseCore::CheckProfileActivation(
         NS_ENSURE_TRUE(
             actualUid == uid && actualPref == pref && actualFile == fileName,
             NS_ERROR_NOT_AVAILABLE);
-        MOZ_TRY(StartupBookReadback(cx, target, original, token, &actual));
+        if (reusing)
+          MOZ_TRY(StartupStoredBookReceipt(cx, target, &actual));
+        else
+          MOZ_TRY(StartupBookReadback(cx, target, original, token, &actual));
         JS::Rooted<JSObject*> readback(cx, &actual.toObject());
         nsCString storageToken, savedToken, savedId, id;
         MOZ_TRY(StartupText(cx, readback, "sourceId", storageToken));
@@ -10249,11 +10898,83 @@ nsresult DatabaseCore::CheckProfileActivation(
             JS_DefineProperty(cx, request, "source", source, JSPROP_ENUMERATE),
             NS_ERROR_OUT_OF_MEMORY);
         actual.setObject(*request);
-        MOZ_TRY(GetFolderCacheImportReceipt(actual, cx, &expected));
+        if (reusing) {
+#ifndef XP_WIN
+          CacheImport input;
+          MOZ_TRY(CacheRequest(cx, actual, input));
+          NS_ENSURE_TRUE(input.databaseId == current, NS_ERROR_NOT_AVAILABLE);
+          JS::Rooted<JSObject*> identity(cx);
+          MOZ_TRY(CacheIdentity(cx, input, &identity));
+          nsCString encoded;
+          MOZ_TRY(CacheJSON(cx, identity, encoded));
+          nsCOMPtr<mozIStorageStatement> stored;
+          MOZ_TRY(sConnection->CreateStatement(
+              "SELECT identity,receipt FROM folder_cache_imports WHERE token=:token OR sourceId=:source OR path=:path"_ns,
+              getter_AddRefs(stored)));
+          MOZ_TRY(stored->BindUTF8StringByName("token"_ns, input.token));
+          MOZ_TRY(stored->BindUTF8StringByName("source"_ns, input.sourceId));
+          MOZ_TRY(stored->BindUTF8StringByName("path"_ns, input.path));
+          bool row;
+          MOZ_TRY(stored->ExecuteStep(&row));
+          NS_ENSURE_TRUE(row, NS_ERROR_NOT_AVAILABLE);
+          for (uint32_t c : {0u, 1u}) {
+            int32_t type;
+            MOZ_TRY(stored->GetTypeOfIndex(c, &type));
+            NS_ENSURE_TRUE(type == mozIStorageStatement::VALUE_TYPE_TEXT,
+                           NS_ERROR_FILE_CORRUPTED);
+          }
+          nsCString retained, receipt;
+          MOZ_TRY(stored->GetUTF8String(0, retained));
+          MOZ_TRY(stored->GetUTF8String(1, receipt));
+          NS_ENSURE_TRUE(retained == encoded, NS_ERROR_NOT_AVAILABLE);
+          MOZ_TRY(stored->ExecuteStep(&row));
+          NS_ENSURE_FALSE(row, NS_ERROR_FILE_CORRUPTED);
+          MOZ_TRY(CacheParseJSON(cx, receipt, &expected));
+#else
+          return NS_ERROR_NOT_AVAILABLE;
+#endif
+        } else {
+          MOZ_TRY(GetFolderCacheImportReceipt(actual, cx, &expected));
+        }
         actual.setObject(*saved);
         MOZ_TRY(StartupEqual(cx, expected, actual));
       }
     }
+  }
+  if (reusing) {
+    // Prepare all native wrappers first; no user getter runs between successful
+    // readback and installing their retained physical paths.
+    struct Binding {
+      nsCOMPtr<nsIMsgFolder> folder;
+      nsCOMPtr<nsIFile> before, after;
+    };
+    nsTArray<Binding> bindings;
+    AutoRestore<uint32_t> metadata(mStartupMetadataDepth);
+    ++mStartupMetadataDepth;
+    for (auto entry = retainedLocalPaths.Iter(); !entry.Done(); entry.Next()) {
+      auto& binding = *bindings.AppendElement();
+      MOZ_TRY(mFolderDatabase->GetMsgFolderForFolder(
+          entry.Key(), getter_AddRefs(binding.folder)));
+      NS_ENSURE_TRUE(binding.folder, NS_ERROR_NOT_AVAILABLE);
+      MOZ_TRY(binding.folder->GetFilePath(getter_AddRefs(binding.before)));
+      MOZ_TRY(
+          NS_NewNativeLocalFile(entry.Data(), getter_AddRefs(binding.after)));
+    }
+    uint32_t installed = 0;
+    auto rollback = MakeScopeExit([&] {
+      for (uint32_t i = 0; i < installed; ++i)
+        (void)bindings[i].folder->SetFilePath(bindings[i].before);
+    });
+    MOZ_TRY(CheckProfileStartup(ProfileStartupToken(), true));
+    for (auto& binding : bindings) {
+      MOZ_TRY(binding.folder->SetFilePath(binding.after));
+      ++installed;
+    }
+    MOZ_TRY(CheckProfileStartup(ProfileStartupToken(), true));
+    for (const auto& binding : bindings)
+      operation.localFolders.AppendElement(binding.folder);
+    rollback.release();
+    return NS_OK;
   }
   nsTArray<nsCString> finalInventory;
   MOZ_TRY(StartupInventory(operation.profile, finalInventory));

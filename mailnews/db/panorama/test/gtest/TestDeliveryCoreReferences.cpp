@@ -3273,6 +3273,11 @@ class DeliveryCoreReferences : public testing::Test {
   }
 
   void FinishSelectedStartup() {
+    auto removeControl = MakeScopeExit([&] {
+      if (mStartupFixtureWork)
+        EXPECT_EQ(NS_OK, mStartupFixtureWork->Remove(true));
+      mStartupFixtureWork = nullptr;
+    });
     if (!mSelectedStartup) return;
     if (mCore && mCore->mProfileStartup) {
       EXPECT_EQ(NS_OK, mCore->SettleProfileStartup(NS_ERROR_ABORT));
@@ -3441,7 +3446,8 @@ class DeliveryCoreReferences : public testing::Test {
     MOZ_TRY(StartupJSONValue(cx, value, bytes));
     return WriteStartupFile("panorama-profile.json", bytes);
   }
-  nsresult CheckStartupActivation(bool complete = false) {
+  nsresult CheckStartupActivation(bool complete = false,
+                                  const nsACString* journal = nullptr) {
     dom::AutoJSAPI jsapi;
     NS_ENSURE_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()), NS_ERROR_FAILURE);
     JS::Rooted<JS::Value> descriptor(jsapi.cx());
@@ -3460,7 +3466,21 @@ class DeliveryCoreReferences : public testing::Test {
     NS_ENSURE_TRUE(
         JS_SetProperty(jsapi.cx(), object, "selectorPath", pathValue),
         NS_ERROR_FAILURE);
-    if (!complete) return mCore->CheckProfileActivation(jsapi.cx(), descriptor);
+    if (journal) {
+      JS::Rooted<JSString*> text(
+          jsapi.cx(), JS_NewStringCopyUTF8N(
+                          jsapi.cx(), JS::UTF8Chars(journal->BeginReading(),
+                                                    journal->Length())));
+      NS_ENSURE_TRUE(text, NS_ERROR_OUT_OF_MEMORY);
+      JS::Rooted<JS::Value> value(jsapi.cx(), JS::StringValue(text));
+      NS_ENSURE_TRUE(JS_SetProperty(jsapi.cx(), object, "journalPath", value),
+                     NS_ERROR_FAILURE);
+    }
+    if (!complete) {
+      nsresult rv = mCore->CheckProfileActivation(jsapi.cx(), descriptor);
+      if (jsapi.HasException()) jsapi.ClearException();
+      return rv;
+    }
     RefPtr<dom::Promise> promise;
     MOZ_TRY(mCore->CompleteProfileStartup(mCore->ProfileStartupToken(),
                                           descriptor, jsapi.cx(),
@@ -3469,7 +3489,203 @@ class DeliveryCoreReferences : public testing::Test {
                    NS_ERROR_FAILURE);
     return NS_OK;
   }
+  static nsresult StartupWriteControl(nsIFile* file, const nsACString& bytes) {
+    nsCOMPtr<nsIOutputStream> stream;
+    MOZ_TRY(NS_NewLocalFileOutputStream(
+        getter_AddRefs(stream), file, PR_WRONLY | PR_CREATE_FILE | PR_TRUNCATE,
+        0600));
+    uint32_t written;
+    nsresult first =
+        stream->Write(bytes.BeginReading(), bytes.Length(), &written);
+    nsresult closed = stream->Close();
+    MOZ_TRY(first);
+    NS_ENSURE_TRUE(written == bytes.Length(), NS_ERROR_FAILURE);
+    return closed;
+  }
+  static nsresult StartupHashControl(const nsACString& bytes,
+                                     nsACString& output) {
+    nsCOMPtr<nsICryptoHash> hash;
+    MOZ_TRY(NS_NewCryptoHash(nsICryptoHash::SHA256, getter_AddRefs(hash)));
+    if (!bytes.IsEmpty())
+      MOZ_TRY(
+          hash->Update(reinterpret_cast<const uint8_t*>(bytes.BeginReading()),
+                       bytes.Length()));
+    nsCString raw;
+    MOZ_TRY(hash->Finish(false, raw));
+    output.Truncate();
+    for (unsigned char c : raw.View()) {
+      output.Append("0123456789abcdef"[c >> 4]);
+      output.Append("0123456789abcdef"[c & 15]);
+    }
+    return NS_OK;
+  }
+  nsresult StartupSummaryName(nsIFile* file, const nsACString& hash,
+                              Maybe<nsCString>& output) {
+    dom::AutoJSAPI jsapi;
+    NS_ENSURE_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()), NS_ERROR_FAILURE);
+    nsresult rv = mCore->ReadStartupSummaryName(jsapi.cx(), file, hash, output);
+    if (jsapi.HasException()) jsapi.ClearException();
+    return rv;
+  }
+  // A native transaction control, not a claim of genuine Mork migration. Both
+  // receipts and maps below come from ImportNativeFile. Whole MDB/parser/store
+  // production is checked by the same issue's ordinary startup tests.
+  nsresult StartupReceiptControl(const FolderImportSnapshot& input,
+                                 const FolderImportReceipt& receipt,
+                                 nsIFile* source, nsIFile** journal,
+                                 nsACString& journalPath,
+                                 nsACString& completeJournal,
+                                 nsACString* selectorOutput = nullptr) {
+    dom::AutoJSAPI jsapi;
+    NS_ENSURE_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()), NS_ERROR_FAILURE);
+    JSContext* cx = jsapi.cx();
+    nsCOMPtr<nsIFile> work, archive, manifest, record;
+    MOZ_TRY(mProfile->GetParent(getter_AddRefs(work)));
+    nsCString leaf;
+    MOZ_TRY(mProfile->GetNativeLeafName(leaf));
+    MOZ_TRY(work->AppendNative("panorama-migration-"_ns + leaf));
+    // Only a newly created unique fixture directory is ever cleaned up.
+    MOZ_TRY(work->Create(nsIFile::DIRECTORY_TYPE, 0700));
+    mStartupFixtureWork = work;
+    MOZ_TRY(work->Clone(getter_AddRefs(archive)));
+    MOZ_TRY(archive->AppendNative("root-0"_ns));
+    MOZ_TRY(archive->Create(nsIFile::DIRECTORY_TYPE, 0700));
+    MOZ_TRY(source->GetNativeLeafName(leaf));
+    MOZ_TRY(source->CopyToNative(archive, leaf));
+    MOZ_TRY(work->Clone(getter_AddRefs(manifest)));
+    MOZ_TRY(manifest->AppendNative("manifest.json"_ns));
+    MOZ_TRY(work->Clone(getter_AddRefs(record)));
+    MOZ_TRY(record->AppendNative("journal.json"_ns));
+    nsCString sourcePath, manifestPath, path, sourceId(input.identity.sourceId),
+        token(input.identity.token), hash(input.identity.sourceSha256),
+        database(input.identity.databaseSourceId), backupHash, appVersion,
+        build;
+    MOZ_TRY(source->GetNativePath(sourcePath));
+    MOZ_TRY(manifest->GetNativePath(manifestPath));
+    MOZ_TRY(record->GetNativePath(path));
+    nsCOMPtr<nsIXULAppInfo> app = do_GetService("@mozilla.org/xre/app-info;1");
+    NS_ENSURE_TRUE(app, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(app->GetVersion(appVersion));
+    MOZ_TRY(app->GetAppBuildID(build));
+    auto expand = [&](nsCString& json) -> nsresult {
+      for (auto entry :
+           {std::pair{"@SOURCE@", &sourcePath},
+            std::pair{"@SOURCEID@", &sourceId}, std::pair{"@TOKEN@", &token},
+            std::pair{"@HASH@", &hash}, std::pair{"@DATABASE@", &database},
+            std::pair{"@MANIFEST@", &manifestPath},
+            std::pair{"@BACKUPHASH@", &backupHash},
+            std::pair{"@JOURNAL@", &path}, std::pair{"@VERSION@", &appVersion},
+            std::pair{"@BUILD@", &build}, std::pair {
+              "@LEAF@",
+              &leaf
+            }}) {
+        JS::Rooted<JSString*> text(
+            cx,
+            JS_NewStringCopyUTF8N(cx, JS::UTF8Chars(entry.second->get(),
+                                                    entry.second->Length())));
+        NS_ENSURE_TRUE(text, NS_ERROR_OUT_OF_MEMORY);
+        JS::Rooted<JS::Value> value(cx, JS::StringValue(text));
+        nsCString quoted;
+        MOZ_TRY(StartupJSONValue(cx, value, quoted));
+        json.ReplaceSubstring(entry.first, quoted.get());
+      }
+      nsAutoCString folder;
+      folder.AppendInt(input.identity.folderId);
+      json.ReplaceSubstring("@FOLDER@", folder.get());
+      return NS_OK;
+    };
+    nsCString document(
+        "{\"version\":1,\"complete\":true,\"roots\":[{\"source\":@PROFILE@,"
+        "\"directory\":\"root-0\",\"entries\":[{\"parts\":[@LEAF@],\"type\":"
+        "\"regular\","
+        "\"size\":0,\"sha256\":@HASH@}]}]}");
+    MOZ_TRY(expand(document));
+    JS::Rooted<JS::Value> value(cx);
+    MOZ_TRY(StartupDocument(cx, document, &value));
+    MOZ_TRY(StartupJSONValue(cx, value, document));
+    MOZ_TRY(StartupWriteControl(manifest, document));
+    MOZ_TRY(StartupHashControl(document, backupHash));
+    auto keys = receipt.keys.Clone();
+    keys.Sort([](const FolderImportKey& a, const FolderImportKey& b) -> int {
+      return a.source < b.source ? -1 : a.source > b.source ? 1 : 0;
+    });
+    nsCString keyMap("[");
+    for (uint32_t i = 0; i < keys.Length(); ++i) {
+      if (i) keyMap.Append(',');
+      keyMap.Append('[');
+      keyMap.AppendInt(keys[i].source);
+      keyMap.Append(',');
+      keyMap.AppendInt(keys[i].destination);
+      keyMap.Append(']');
+    }
+    keyMap.Append(']');
+    nsCString saved(
+        "{\"token\":@TOKEN@,\"sourceSha256\":@HASH@,\"folderId\":@FOLDER@,"
+        "\"keys\":");
+    saved.Append(keyMap);
+    saved.Append('}');
+    nsCString backup("{\"path\":@MANIFEST@,\"sha256\":@BACKUPHASH@}");
+    nsCString inventory(
+        "[{\"id\":@SOURCEID@,\"path\":@SOURCE@,\"sha256\":@HASH@,"
+        "\"protocol\":\"none\",\"serverKey\":\"delivery-references\"}]");
+    nsCString row(
+        "{\"state\":\"imported\",\"id\":@SOURCEID@,\"token\":@TOKEN@,"
+        "\"path\":@SOURCE@,\"sha256\":@HASH@,\"protocol\":\"none\","
+        "\"destinationFolderId\":@FOLDER@,\"receipt\":");
+    row.Append(saved);
+    row.Append('}');
+    document.Assign(
+        "{\"version\":7,\"profilePath\":@PROFILE@,\"stage\":\"complete\","
+        "\"cancelled\":false,\"backup\":");
+    document.Append(backup);
+    document.AppendLiteral(
+        ",\"startup\":{\"bound\":true,"
+        "\"databaseSourceId\":@DATABASE@,\"inventory\":{\"sources\":");
+    document.Append(inventory);
+    document.AppendLiteral("}},\"sources\":[");
+    document.Append(row);
+    document.AppendLiteral(
+        "],\"protocolUnits\":[],\"books\":[],\"caches\":[]}");
+    MOZ_TRY(expand(document));
+    MOZ_TRY(StartupDocument(cx, document, &value));
+    MOZ_TRY(StartupJSONValue(cx, value, completeJournal));
+    MOZ_TRY(StartupWriteControl(record, completeJournal));
+    nsCString selected(
+        "{\"formatVersion\":2,\"backend\":\"panorama\",\"origin\":\"migrated\","
+        "\"state\":\"active\",\"application\":{\"version\":@VERSION@,"
+        "\"buildId\":@BUILD@},"
+        "\"identity\":{\"profilePath\":@PROFILE@,\"databaseSourceId\":@"
+        "DATABASE@,"
+        "\"schemaVersion\":");
+    int32_t schema;
+    MOZ_TRY(mConnection->GetSchemaVersion(&schema));
+    selected.AppendInt(schema);
+    selected.AppendLiteral(",\"journalPath\":@JOURNAL@,\"backup\":");
+    selected.Append(backup);
+    selected.AppendLiteral(
+        ",\"imports\":[{\"id\":@SOURCEID@,\"token\":@TOKEN@,"
+        "\"sha256\":@HASH@,\"folderId\":@FOLDER@,\"receipt\":");
+    selected.Append(saved);
+    selected.AppendLiteral("}],\"books\":[],\"caches\":[]}}");
+    MOZ_TRY(expand(selected));
+    MOZ_TRY(StartupDocument(cx, selected, &value));
+    MOZ_TRY(StartupJSONValue(cx, value, selected));
+    MOZ_TRY(WriteStartupFile("panorama-profile.json", selected));
+    if (selectorOutput) *selectorOutput = selected;
+    journalPath = path;
+    record.forget(journal);
+    return NS_OK;
+  }
+  nsresult StartupDecodeUnit(const nsCString& proof, ImapImportUnit& output) {
+    return mCore->ReadStartupImapProvenance(proof, output);
+  }
+  nsresult StartupReadUnit(const ImapImportUnit& input, const nsACString& proof,
+                           Maybe<ImapImportReceipt>& output,
+                           bool durable = false) {
+    return mCore->ReadImapImportReceipt(input, proof, output, durable);
+  }
   static nsresult sStartupReentry;
+  nsCOMPtr<nsIFile> mStartupFixtureWork;
   nsCOMPtr<nsIFile> mOldStartupProfile, mOldStartupLocal;
   nsCOMPtr<nsIProfileLock> mSelectedLock;
   bool mSelectedStartup = false;
@@ -22259,6 +22475,350 @@ TEST_F(DeliveryCoreReferences, StartupShutdownWaitsForActualSettlement) {
   nsCOMPtr<nsIFile> locked;
   ASSERT_EQ(NS_OK, mSelectedLock->GetDirectory(getter_AddRefs(locked)));
   EXPECT_TRUE(locked);
+}
+
+TEST_F(DeliveryCoreReferences,
+       StartupActiveReuseRequiresCompleteDurableJournal) {
+  ASSERT_EQ(NS_OK, Start());
+  FolderImportSnapshot input;
+  nsCOMPtr<nsIFile> source;
+  ASSERT_EQ(NS_OK, PrepareNativeImport(input, getter_AddRefs(source)));
+  FolderImportReceipt receipt;
+  ASSERT_EQ(NS_OK, ImportNativeFile(source, input, receipt));
+  // A real subsequent native metadata edit must not turn the old Mork source
+  // back into authority on the next startup.
+  ASSERT_EQ(NS_OK, mCore->FolderDB().UpdateName(input.identity.folderId,
+                                                "After import"_ns));
+  nsCOMPtr<nsIFile> journal;
+  nsCString path, valid;
+  ASSERT_EQ(NS_OK, StartupReceiptControl(input, receipt, source,
+                                         getter_AddRefs(journal), path, valid));
+  Stop();
+  ASSERT_EQ(NS_OK, ArmSelectedStartup());
+  nsCString selected;
+  ASSERT_EQ(NS_OK, DescribeStartup(selected));
+  ASSERT_EQ(NS_OK, OpenStartup("reuse"));
+  ASSERT_EQ(NS_OK, CheckStartupActivation(false, &path));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DatabaseCore::CheckAccountStartup());
+  nsCString before;
+  ASSERT_EQ(
+      NS_OK,
+      PublicationCell(
+          mConnection, 1,
+          "SELECT sourceId||':'||(SELECT count(*) FROM messages)||':'||"
+          "(SELECT count(*) FROM folder_import_keys) FROM database_identity WHERE :id>0"_ns,
+          before));
+  for (uint32_t mode = 0; mode < 3; ++mode) {
+    SCOPED_TRACE(mode);
+    nsCString damaged(valid);
+    if (mode == 0)
+      damaged.ReplaceSubstring("\"stage\":\"complete\"",
+                               "\"stage\":\"validate\"");
+    if (mode == 1)
+      damaged.ReplaceSubstring("\"cancelled\":false", "\"cancelled\":true");
+    if (mode == 2)
+      damaged.ReplaceSubstring("\"bound\":true", "\"bound\":false");
+    ASSERT_NE(valid, damaged);
+    ASSERT_EQ(NS_OK, StartupWriteControl(journal, damaged));
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, CheckStartupActivation(false, &path));
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DatabaseCore::CheckAccountStartup());
+  }
+  ASSERT_EQ(NS_OK, StartupWriteControl(journal, "{"_ns));
+  EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, CheckStartupActivation(false, &path));
+  ASSERT_EQ(NS_OK, journal->Remove(false));
+  EXPECT_EQ(NS_ERROR_FILE_NOT_FOUND, CheckStartupActivation(false, &path));
+  ASSERT_EQ(NS_OK, StartupWriteControl(journal, valid));
+  EXPECT_EQ(NS_OK, CheckStartupActivation(false, &path));
+  nsCString after;
+  ASSERT_EQ(
+      NS_OK,
+      PublicationCell(
+          mConnection, 1,
+          "SELECT sourceId||':'||(SELECT count(*) FROM messages)||':'||"
+          "(SELECT count(*) FROM folder_import_keys) FROM database_identity WHERE :id>0"_ns,
+          after));
+  EXPECT_EQ(before, after);
+  bool transaction;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&transaction));
+  EXPECT_FALSE(transaction);
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DatabaseCore::CheckAccountStartup());
+}
+
+TEST_F(DeliveryCoreReferences,
+       StartupReuseChecksNativeReceiptWithoutObsoleteSourceIO) {
+  ASSERT_EQ(NS_OK, Start());
+  FolderImportSnapshot input;
+  nsCOMPtr<nsIFile> source;
+  ASSERT_EQ(NS_OK, PrepareNativeImport(input, getter_AddRefs(source)));
+  FolderImportReceipt receipt;
+  ASSERT_EQ(NS_OK, ImportNativeFile(source, input, receipt));
+  ASSERT_EQ(NS_OK, mCore->FolderDB().UpdateName(input.identity.folderId,
+                                                "After import"_ns));
+  nsCOMPtr<nsIFile> journal;
+  nsCString path, valid;
+  ASSERT_EQ(NS_OK, StartupReceiptControl(input, receipt, source,
+                                         getter_AddRefs(journal), path, valid));
+  Stop();
+  ASSERT_EQ(NS_OK, StartupWriteControl(source, "obsolete Mork has changed"_ns));
+  ASSERT_EQ(NS_OK, ArmSelectedStartup());
+  nsCString selected;
+  ASSERT_EQ(NS_OK, DescribeStartup(selected));
+  ASSERT_EQ(NS_OK, OpenStartup("reuse"));
+  ASSERT_EQ(NS_OK, CheckStartupActivation(false, &path));
+  ASSERT_FALSE(receipt.keys.IsEmpty());
+  const auto pair = receipt.keys[0];
+  nsCOMPtr<mozIStorageStatement> fault;
+  ASSERT_EQ(
+      NS_OK,
+      mConnection->CreateStatement(
+          "DELETE FROM folder_import_keys WHERE token=:token AND sourceKey=:key"_ns,
+          getter_AddRefs(fault)));
+  ASSERT_EQ(NS_OK,
+            fault->BindUTF8StringByName("token"_ns, input.identity.token));
+  ASSERT_EQ(NS_OK, fault->BindInt64ByName("key"_ns, pair.source));
+  ASSERT_EQ(NS_OK, fault->Execute());
+  fault = nullptr;
+  EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, CheckStartupActivation(false, &path));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DatabaseCore::CheckAccountStartup());
+  ASSERT_EQ(
+      NS_OK,
+      mConnection->CreateStatement(
+          "INSERT INTO folder_import_keys(token,sourceKey,destinationKey) VALUES(:token,:key,:destination)"_ns,
+          getter_AddRefs(fault)));
+  ASSERT_EQ(NS_OK,
+            fault->BindUTF8StringByName("token"_ns, input.identity.token));
+  ASSERT_EQ(NS_OK, fault->BindInt64ByName("key"_ns, pair.source));
+  ASSERT_EQ(NS_OK, fault->BindInt64ByName("destination"_ns, pair.destination));
+  ASSERT_EQ(NS_OK, fault->Execute());
+  fault = nullptr;
+  Maybe<FolderImportReceipt> guarded;
+  // Ordinary receipt callers still require their current native location.
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            mCore->GetFolderImportReceipt(input.identity, guarded));
+  EXPECT_FALSE(guarded);
+  ASSERT_EQ(NS_OK, CheckStartupActivation(true, &path));
+  EXPECT_EQ(NS_OK, DatabaseCore::CheckAccountStartup());
+  auto name = mCore->FolderDB().GetFolderName(input.identity.folderId);
+  ASSERT_TRUE(name.isOk());
+  EXPECT_EQ("After import"_ns, name.unwrap());
+  nsCString actual;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(actual));
+  EXPECT_EQ(input.identity.databaseSourceId, actual);
+  int64_t size;
+  ASSERT_EQ(NS_OK, source->GetFileSize(&size));
+  EXPECT_EQ(int64_t(sizeof("obsolete Mork has changed") - 1), size);
+}
+
+TEST_F(DeliveryCoreReferences,
+       StartupPreparedSelectorNeverAuthorizesOrdinaryReuse) {
+  ASSERT_EQ(NS_OK, Start());
+  FolderImportSnapshot input;
+  nsCOMPtr<nsIFile> source;
+  ASSERT_EQ(NS_OK, PrepareNativeImport(input, getter_AddRefs(source)));
+  FolderImportReceipt receipt;
+  ASSERT_EQ(NS_OK, ImportNativeFile(source, input, receipt));
+  nsCOMPtr<nsIFile> journal;
+  nsCString path, valid, selector;
+  ASSERT_EQ(NS_OK, StartupReceiptControl(input, receipt, source,
+                                         getter_AddRefs(journal), path, valid,
+                                         &selector));
+  selector.ReplaceSubstring("\"state\":\"active\"", "\"state\":\"prepared\"");
+  ASSERT_EQ(NS_OK, WriteStartupFile("panorama-profile.json", selector));
+  Stop();
+  int64_t before;
+  ASSERT_EQ(NS_OK, mFile->GetFileSize(&before));
+  ASSERT_EQ(NS_OK, ArmSelectedStartup());
+  nsCString selected;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DescribeStartup(selected));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, OpenStartup("reuse"));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DatabaseCore::CheckAccountStartup());
+  EXPECT_FALSE(mConnection);
+  int64_t after;
+  ASSERT_EQ(NS_OK, mFile->GetFileSize(&after));
+  EXPECT_EQ(before, after);
+}
+
+TEST_F(DeliveryCoreReferences,
+       StartupRetainedLogicalNameIsIndependentOfPhysicalLeaf) {
+  ASSERT_EQ(NS_OK, Start());
+  struct Control {
+    const char* leaf;
+    const char* raw;
+    const char* name;
+    bool nested;
+  };
+  for (const auto& item :
+       {Control{"100% Real.msf", "100% Real", "100% Real", false},
+        Control{"12ab34cd.msf", "Long original $C3$A9 name",
+                "Long original \xC3\xA9 name", false},
+        Control{"nested-child.msf", "Logical/percent%child",
+                "Logical/percent%child", true}}) {
+    SCOPED_TRACE(item.leaf);
+    nsCString bytes(
+        "// <!-- <mdb:mork:z v=\"1.4\"/> -->\n"
+        "< <(a=c)> (80=ns:msg:db:row:scope:msgs:all)"
+        "(81=ns:msg:db:table:kind:msgs)(82=ns:msg:db:row:scope:dbfolderinfo:"
+        "all)"
+        "(83=folderName)>\n{1:^80 {(k^81:c)(s=9)}}\n{2:^82 {(k^81:c)}[1(^83=");
+    bytes.Append(item.raw);
+    bytes.AppendLiteral(")]}\n");
+    nsCOMPtr<nsIFile> file;
+    ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(file)));
+    if (item.nested) {
+      ASSERT_EQ(NS_OK, file->AppendNative("parent.sbd"_ns));
+      ASSERT_EQ(NS_OK, file->Create(nsIFile::DIRECTORY_TYPE, 0700));
+    }
+    ASSERT_EQ(NS_OK, file->AppendNative(nsDependentCString(item.leaf)));
+    ASSERT_EQ(NS_OK, StartupWriteControl(file, bytes));
+    nsCString hash;
+    ASSERT_EQ(NS_OK, StartupHashControl(bytes, hash));
+    Maybe<nsCString> name;
+    ASSERT_EQ(NS_OK, StartupSummaryName(file, hash, name));
+    ASSERT_TRUE(name);
+    EXPECT_EQ(nsDependentCString(item.name), *name);
+    name = Some(nsCString("unchanged sentinel"));
+    EXPECT_EQ(
+        NS_ERROR_NOT_AVAILABLE,
+        StartupSummaryName(
+            file,
+            "0000000000000000000000000000000000000000000000000000000000000000"_ns,
+            name));
+    EXPECT_EQ("unchanged sentinel"_ns, *name);
+  }
+}
+
+TEST_F(DeliveryCoreReferences,
+       StartupConflictingOrNonUtf8RetainedNamePreservesOutput) {
+  ASSERT_EQ(NS_OK, Start());
+  for (bool conflict : {false, true}) {
+    SCOPED_TRACE(conflict);
+    nsCString bytes(
+        "// <!-- <mdb:mork:z v=\"1.4\"/> -->\n"
+        "< <(a=c)> "
+        "(80=ns:msg:db:row:scope:msgs:all)(81=ns:msg:db:table:kind:msgs)"
+        "(82=ns:msg:db:row:scope:dbfolderinfo:all)(83=folderName)>\n"
+        "{1:^80 {(k^81:c)(s=9)}}\n{2:^82 {(k^81:c)}[1(^83=");
+    bytes.Append(conflict ? "first" : "$FF");
+    bytes.AppendLiteral(")]");
+    if (conflict) bytes.AppendLiteral("[2(^83=second)]");
+    bytes.AppendLiteral("}\n");
+    ASSERT_EQ(NS_OK, WriteStartupFile("name-control.msf", bytes));
+    nsCOMPtr<nsIFile> file;
+    ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(file)));
+    ASSERT_EQ(NS_OK, file->AppendNative("name-control.msf"_ns));
+    nsCString hash;
+    ASSERT_EQ(NS_OK, StartupHashControl(bytes, hash));
+    Maybe<nsCString> name = Some(nsCString("unchanged sentinel"));
+    EXPECT_EQ(conflict ? NS_ERROR_NOT_AVAILABLE : NS_ERROR_FILE_CORRUPTED,
+              StartupSummaryName(file, hash, name));
+    ASSERT_TRUE(name);
+    EXPECT_EQ("unchanged sentinel"_ns, *name);
+  }
+}
+
+TEST_F(DeliveryCoreReferences,
+       StartupDurableUnitDecoderReadsOnlyCommittedNativeProvenance) {
+  ASSERT_EQ(NS_OK, Start());
+  ImapImportUnit input;
+  ASSERT_EQ(NS_OK, PrepareImapImport(input, true));
+  ImapImportReceipt committed;
+  ASSERT_EQ(NS_OK, ImportImap(input, committed));
+  nsCOMPtr<mozIStorageStatement> stored;
+  ASSERT_EQ(
+      NS_OK,
+      mConnection->CreateStatement(
+          "SELECT provenance FROM imap_import_units WHERE token=:token"_ns,
+          getter_AddRefs(stored)));
+  ASSERT_EQ(NS_OK, stored->BindUTF8StringByName("token"_ns, input.token));
+  bool row;
+  ASSERT_EQ(NS_OK, stored->ExecuteStep(&row));
+  ASSERT_TRUE(row);
+  nsCString proof;
+  ASSERT_EQ(NS_OK, stored->GetUTF8String(0, proof));
+  stored = nullptr;
+  ImapImportUnit decoded;
+  ASSERT_EQ(NS_OK, StartupDecodeUnit(proof, decoded));
+  EXPECT_EQ(input.token, decoded.token);
+  EXPECT_EQ(input.databaseSourceId, decoded.databaseSourceId);
+  ASSERT_EQ(input.folders.Length(), decoded.folders.Length());
+  for (uint32_t i = 0; i < input.folders.Length(); ++i) {
+    SCOPED_TRACE(i);
+    const auto& expected = input.folders[i];
+    const auto& actual = decoded.folders[i];
+    EXPECT_EQ(expected.snapshot.identity.token, actual.snapshot.identity.token);
+    EXPECT_EQ(expected.snapshot.identity.sourceSha256,
+              actual.snapshot.identity.sourceSha256);
+    EXPECT_EQ(expected.snapshot.identity.sourcePath,
+              actual.snapshot.identity.sourcePath);
+    EXPECT_EQ(expected.uidValidity, actual.uidValidity);
+    ASSERT_EQ(expected.operations.Length(), actual.operations.Length());
+    for (uint32_t o = 0; o < expected.operations.Length(); ++o) {
+      EXPECT_EQ(expected.operations[o].sourceKey,
+                actual.operations[o].sourceKey);
+      EXPECT_EQ(expected.operations[o].payloadPresence,
+                actual.operations[o].payloadPresence);
+      EXPECT_EQ(expected.operations[o].payload.newFlags,
+                actual.operations[o].payload.newFlags);
+      EXPECT_EQ(expected.operations[o].payload.copyDestinations,
+                actual.operations[o].payload.copyDestinations);
+    }
+    // Persisted receipt provenance is not a source snapshot or replay license.
+    EXPECT_FALSE(actual.snapshot.recordsComplete);
+    EXPECT_TRUE(actual.snapshot.messages.IsEmpty());
+  }
+  Maybe<ImapImportReceipt> readback;
+  ASSERT_EQ(NS_OK, StartupReadUnit(decoded, proof, readback));
+  ASSERT_TRUE(readback);
+  ASSERT_EQ(committed.folders.Length(), readback->folders.Length());
+  for (uint32_t i = 0; i < committed.folders.Length(); ++i) {
+    const auto& wanted = committed.folders[i];
+    const auto& actual = readback->folders[i];
+    ASSERT_EQ(wanted.folder.keys.Length(), actual.folder.keys.Length());
+    for (const auto& expected : wanted.folder.keys) {
+      bool found = false;
+      for (const auto& pair : actual.folder.keys) {
+        if (pair.source != expected.source) continue;
+        EXPECT_FALSE(found);
+        found = true;
+        EXPECT_EQ(expected.destination, pair.destination);
+      }
+      EXPECT_TRUE(found);
+    }
+    ASSERT_EQ(wanted.operations.Length(), actual.operations.Length());
+    for (const auto& expected : wanted.operations) {
+      bool found = false;
+      for (const auto& operation : actual.operations) {
+        if (operation.sourceKey != expected.sourceKey) continue;
+        EXPECT_FALSE(found);
+        found = true;
+        EXPECT_EQ(expected.key, operation.key);
+        EXPECT_EQ(expected.id, operation.id);
+        EXPECT_EQ(expected.revision, operation.revision);
+      }
+      EXPECT_TRUE(found);
+    }
+  }
+  readback.reset();
+  // Even valid native data cannot select the private durable-startup arm
+  // without a genuine opened, busy, held-XRE reuse operation.
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            StartupReadUnit(decoded, proof, readback, true));
+  EXPECT_FALSE(readback);
+  for (uint32_t mode = 0; mode < 3; ++mode) {
+    SCOPED_TRACE(mode);
+    nsCString damaged(proof);
+    if (mode == 0) damaged.AppendLiteral("0:");
+    if (mode == 1) damaged.Truncate(damaged.Length() - 1);
+    if (mode == 2) damaged.AssignLiteral("4294967295:x");
+    ImapImportUnit untouched;
+    untouched.token = "unchanged sentinel"_ns;
+    EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, StartupDecodeUnit(damaged, untouched));
+    EXPECT_EQ("unchanged sentinel"_ns, untouched.token);
+    EXPECT_TRUE(untouched.folders.IsEmpty());
+  }
+  bool transaction;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&transaction));
+  EXPECT_FALSE(transaction);
 }
 #endif
 

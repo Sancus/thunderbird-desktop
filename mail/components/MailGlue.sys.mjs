@@ -479,14 +479,23 @@ MailGlue.prototype = {
     }
     const selected = Services.dirsvc.get("ProfDS", Ci.nsIFile).clone();
     selected.append("panorama-profile.json");
-    if (
-      !Services.prefs.getBoolPref("mail.panorama.enabled", false) &&
-      !selected.exists() &&
-      !selected.isSymlink()
-    ) {
-      return;
-    }
     try {
+      if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+        let linked = false;
+        try {
+          linked = selected.isSymlink();
+        } catch (error) {
+          if (
+            error.result !== Cr.NS_ERROR_FILE_NOT_FOUND ||
+            selected.exists()
+          ) {
+            throw error;
+          }
+        }
+        if (!linked && !selected.exists()) {
+          return;
+        }
+      }
       if (!AppConstants.NIGHTLY_BUILD) {
         throw new Error(
           "This application cannot start the selected Panorama profile"

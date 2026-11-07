@@ -137,8 +137,82 @@ export async function getMigrationProfileState(profilePath) {
   const record = await readProfileRecord(profile.path);
   if (record) {
     checkApplicationVersion(record);
+    if (
+      record.formatVersion === 2 &&
+      record.origin === "migrated" &&
+      record.state === "active"
+    ) {
+      await validateStartupRecoveryRecord(record);
+    }
   }
   return { state: record?.state ?? "legacy", record };
+}
+
+/**
+ * Validates the durable journal and archive of an active startup migration.
+ * Reads no original Mork files and does not resume or rewrite migration work.
+ * Core separately checks the retained native receipts before startup completes.
+ *
+ * @param {StartupMigrationProfileRecord} record - Validated active selector.
+ * @returns {Promise<void>} Resolves when the durable recovery state matches.
+ * @throws {Error} For missing, corrupt, cancelled or changed recovery state.
+ */
+async function validateStartupRecoveryRecord(record) {
+  const identity = record.identity;
+  startupProfileDirectory(PathUtils.parent(identity.journalPath));
+  const file = canonicalFile(identity.journalPath);
+  if ((await IOUtils.stat(file.path)).type !== "regular") {
+    throw new Error("Startup recovery journal is not a regular file");
+  }
+  const state = await IOUtils.readJSON(file.path);
+  if (
+    state?.version !== 7 ||
+    state.stage !== "complete" ||
+    state.cancelled !== false ||
+    state.profilePath !== identity.profilePath ||
+    state.startup?.bound !== true ||
+    state.startup.databaseSourceId !== identity.databaseSourceId ||
+    !Array.isArray(state.sources) ||
+    !Array.isArray(state.books ?? []) ||
+    !Array.isArray(state.caches ?? []) ||
+    JSON.stringify(state.backup) !== JSON.stringify(identity.backup)
+  ) {
+    throw new Error("Startup recovery journal is incomplete or changed");
+  }
+  const imports = state.sources.map(source => ({
+    id: source.id,
+    token: source.token,
+    sha256: source.sha256,
+    folderId: source.destinationFolderId,
+    receipt: source.receipt,
+  }));
+  const books = (state.books ?? []).map(book => ({
+    id: book.id,
+    token: book.token,
+    sha256: book.sha256,
+    receipt: book.receipt,
+    publication: book.publication?.receipt,
+  }));
+  const caches = (state.caches ?? []).map(cache => ({
+    id: cache.id,
+    token: cache.token,
+    sha256: cache.sha256,
+    receipt: cache.receipt,
+  }));
+  for (const [name, units] of Object.entries({ imports, books, caches })) {
+    if (JSON.stringify(units) !== JSON.stringify(identity[name])) {
+      throw new Error("Startup recovery journal changed committed units");
+    }
+  }
+  const backup = await verifyMigrationBackup(
+    PathUtils.parent(identity.backup.path)
+  );
+  if (
+    backup.path !== identity.backup.path ||
+    backup.sha256 !== identity.backup.sha256
+  ) {
+    throw new Error("Startup recovery archive identity changed");
+  }
 }
 
 /**

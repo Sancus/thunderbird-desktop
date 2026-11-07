@@ -719,7 +719,11 @@ async function readBoundMorkFolderCacheInput(
         ) ||
       !databaseSourceId ||
       database.sourceId !== databaseSourceId ||
-      !current.sources.length ||
+      (!current.sources.length &&
+        (!startupOperation ||
+          current.version !== 7 ||
+          !current.startup?.bound ||
+          current.startup.databaseSourceId !== databaseSourceId)) ||
       current.sources.some(
         source => source.databaseSourceId !== databaseSourceId
       ) ||
@@ -2791,7 +2795,18 @@ async function validateStartupMigration(journal, native, database, operation) {
       sourceSha256: source.sha256,
       destinationFolderId: source.destinationFolderId,
     });
-    if (JSON.stringify(receipt) !== JSON.stringify(source.receipt)) {
+    // The native adapter has checked the source/database identities. Unix
+    // journals retain only this canonical four-field receipt projection.
+    if (
+      !receipt ||
+      receipt.sourceId !== source.id ||
+      receipt.databaseSourceId !== source.databaseSourceId ||
+      receipt.token !== source.receipt.token ||
+      receipt.sourceSha256 !== source.receipt.sourceSha256 ||
+      receipt.folderId !== source.receipt.folderId ||
+      JSON.stringify(receipt.keys.toSorted((a, b) => a[0] - b[0])) !==
+        JSON.stringify(source.receipt.keys)
+    ) {
       throw new Error("Native import receipt changed before activation");
     }
     startupMigrationDirectory(journal, database, operation);

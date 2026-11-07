@@ -35,6 +35,7 @@ class Promise;
 namespace mozilla::mailnews {
 
 class ProfileStartupOperation;
+struct StartupMailSource;
 class PerFolderDatabase;
 struct CacheImport;
 class DeliveryCoreMessageExistence;
@@ -316,9 +317,12 @@ class DatabaseCore : public nsIDatabaseCore,
       const ImapImportUnit& input, ImapImportReceipt& output,
       const std::function<nsresult(const ImapImportReceipt&)>& prepare = {},
       const std::function<void()>& publish = {});
+  static nsresult ReadStartupImapProvenance(const nsCString& proof,
+                                            ImapImportUnit& output);
   nsresult ReadImapImportReceipt(const ImapImportUnit& input,
                                  const nsACString& provenance,
-                                 Maybe<ImapImportReceipt>& output);
+                                 Maybe<ImapImportReceipt>& output,
+                                 bool durableStartup = false);
 
   static nsresult GetStatement(const nsACString& aName, const nsACString& aSQL,
                                mozIStorageStatement** aStmt);
@@ -338,6 +342,10 @@ class DatabaseCore : public nsIDatabaseCore,
                                   JS::MutableHandle<JS::Value> output);
   nsresult OpenProfileStartup(JSContext* cx, JS::Handle<JS::Value> plan);
   nsresult BuildStartupFolders();
+  static nsresult ReadStartupSummaryName(JSContext* cx, nsIFile* file,
+                                         const nsACString& expected,
+                                         Maybe<nsCString>& output);
+  nsresult BindStartupLocalNames(JSContext* cx, StartupMailSource& source);
   nsresult CheckProfileActivation(JSContext* cx,
                                   JS::Handle<JS::Value> activation);
   nsresult SettleProfileStartup(nsresult firstError);

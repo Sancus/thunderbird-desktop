@@ -9045,6 +9045,31 @@ nsresult StartupInventory(nsIFile* directory, nsTArray<nsCString>& sources,
   close.release();
   return NS_OK;
 }
+// Read only the selected server's existing path preferences. In particular,
+// GetIncomingServer is not a path getter: it also constructs the cold root and
+// recursively reconciles its children before returning the server.
+nsresult StartupConfiguredPath(nsIPrefBranch* prefs, const nsACString& branch,
+                               nsIFile** output) {
+  bool relative;
+  MOZ_TRY(prefs->PrefHasUserValue(nsCString(branch + "directory-rel"_ns).get(),
+                                  &relative));
+  nsCOMPtr<nsIFile> root;
+  if (relative) {
+    nsCOMPtr<nsIRelativeFilePref> value;
+    MOZ_TRY(prefs->GetComplexValue(nsCString(branch + "directory-rel"_ns).get(),
+                                   NS_GET_IID(nsIRelativeFilePref),
+                                   getter_AddRefs(value)));
+    NS_ENSURE_TRUE(value, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(value->GetFile(getter_AddRefs(root)));
+  } else {
+    MOZ_TRY(prefs->GetComplexValue(nsCString(branch + "directory"_ns).get(),
+                                   NS_GET_IID(nsIFile), getter_AddRefs(root)));
+  }
+  NS_ENSURE_TRUE(root, NS_ERROR_NOT_AVAILABLE);
+  root.forget(output);
+  return NS_OK;
+}
+
 nsresult StartupConfiguredRoots(nsIFile* profile,
                                 nsTArray<nsCString>& inventory,
                                 nsTArray<StartupServerRoot>* output = nullptr) {
@@ -9064,20 +9089,7 @@ nsresult StartupConfiguredRoots(nsIFile* profile,
     if (servers.Contains(branch)) continue;
     servers.Insert(branch);
     nsCOMPtr<nsIFile> root;
-    bool relative;
-    MOZ_TRY(prefs->PrefHasUserValue(
-        nsCString(branch + "directory-rel"_ns).get(), &relative));
-    if (relative) {
-      nsCOMPtr<nsIRelativeFilePref> value;
-      MOZ_TRY(prefs->GetComplexValue(
-          nsCString(branch + "directory-rel"_ns).get(),
-          NS_GET_IID(nsIRelativeFilePref), getter_AddRefs(value)));
-      MOZ_TRY(value->GetFile(getter_AddRefs(root)));
-    } else {
-      MOZ_TRY(prefs->GetComplexValue(nsCString(branch + "directory"_ns).get(),
-                                     NS_GET_IID(nsIFile),
-                                     getter_AddRefs(root)));
-    }
+    MOZ_TRY(StartupConfiguredPath(prefs, branch, getter_AddRefs(root)));
     bool inside;
     MOZ_TRY(profile->Contains(root, &inside));
     NS_ENSURE_TRUE(inside, NS_ERROR_FILE_ACCESS_DENIED);
@@ -11692,13 +11704,20 @@ nsresult DatabaseCore::CheckProfileActivation(
         nsCOMPtr<nsIMsgAccountManager> accounts =
             do_GetService("@mozilla.org/messenger/account-manager;1");
         NS_ENSURE_TRUE(accounts, NS_ERROR_NOT_AVAILABLE);
-        nsCOMPtr<nsIMsgIncomingServer> server;
-        MOZ_TRY(accounts->GetIncomingServer(serverKey, getter_AddRefs(server)));
-        NS_ENSURE_TRUE(server, NS_ERROR_NOT_AVAILABLE);
+        // Service Init establishes its real shutdown lifetime, but asking it
+        // for a cold server here would create/reconcile that root before the
+        // complete retained path map exists. Read the same path preferences
+        // without constructing a facade; BindStartupFolderPath later checks
+        // the actual server, protocol, store and path under the complete map.
+        nsCOMPtr<nsIPrefBranch> prefs =
+            do_GetService("@mozilla.org/preferences-service;1");
+        NS_ENSURE_TRUE(prefs, NS_ERROR_NOT_AVAILABLE);
         nsCOMPtr<nsIFile> physical;
-        MOZ_TRY(server->GetLocalPath(getter_AddRefs(physical)));
+        MOZ_TRY(StartupConfiguredPath(prefs,
+                                      "mail.server."_ns + serverKey + "."_ns,
+                                      getter_AddRefs(physical)));
         nsCString actualRoot;
-        MOZ_TRY(physical->GetNativePath(actualRoot));
+        MOZ_TRY(StartupDirectory(physical, actualRoot));
         if (serverRoot != actualRoot) continue;
         nsTArray<uint64_t> ancestors =
             MOZ_TRY(mFolderDatabase->GetFolderAncestors(folder));

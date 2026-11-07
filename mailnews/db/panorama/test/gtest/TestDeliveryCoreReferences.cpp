@@ -3896,8 +3896,11 @@ class DeliveryCoreReferences : public testing::Test {
       nsCOMPtr<nsIFile> summary, storeFile;
       MOZ_TRY(folder->GetId(&id));
       MOZ_TRY(folder->GetIsServer(&isServer));
-      MOZ_TRY(folder->GetSummaryFile(getter_AddRefs(summary)));
       MOZ_TRY(folder->GetFilePath(getter_AddRefs(storeFile)));
+      if (isServer)
+        summary = storeFile;
+      else
+        MOZ_TRY(folder->GetSummaryFile(getter_AddRefs(summary)));
       MOZ_TRY(summary->GetPersistentDescriptor(descriptor));
       MOZ_TRY(summary->GetNativePath(cachePath));
       MOZ_TRY(storeFile->GetNativePath(storePath));
@@ -4938,7 +4941,11 @@ class DeliveryCoreReferences : public testing::Test {
     ASSERT_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()));
     JSContext* cx = jsapi.cx();
     nsCString descriptor, quoted, raw;
-    ASSERT_EQ(NS_OK, summary->GetPersistentDescriptor(descriptor));
+    // A real server cache key is the server directory, not its optional
+    // standalone root summary. Construct the original JSON fixture that way
+    // before backup/hash capture; client folder keys remain summary paths.
+    nsIFile* cacheDescriptor = localName ? summary.get() : rootPath.get();
+    ASSERT_EQ(NS_OK, cacheDescriptor->GetPersistentDescriptor(descriptor));
     ASSERT_EQ(NS_OK, JSONCacheQuote(cx, descriptor, quoted));
     raw = "{"_ns + quoted + ":{\"flags\":0}}"_ns;
     if (localName) {

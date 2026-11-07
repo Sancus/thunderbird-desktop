@@ -10533,8 +10533,8 @@ nsImapMailFolder::CopyMessages(nsIMsgFolder* srcFolder,
     nsCOMPtr<nsIImapMailFolderSink> imapSource = do_QueryInterface(srcFolder);
     // A cross-server stream copy freezes the source body guard when it stages
     // the destination, so the source cache must be finished before streaming.
-    if (!WeAreOffline() && ((sameServer && allowUndo && isMove) ||
-                            (!sameServer && imapSource))) {
+    if (!WeAreOffline() &&
+        ((sameServer && allowUndo && isMove) || (!sameServer && imapSource))) {
       nsTArray<RefPtr<nsIMsgDBHdr>> uncached;
       for (const auto& header : messages) {
         uint32_t flags;
@@ -10566,11 +10566,10 @@ nsImapMailFolder::CopyMessages(nsIMsgFolder* srcFolder,
         completion->mStartFn = [retainedSource](nsIURI* url) {
           return retainedSource->OnStartRunningUrl(url);
         };
-        completion->mStopFn = [self, retainedSource, database, captured,
-                               request, isMove, isFolder, allowUndo,
-                               completed = false](
-                                  nsIURI* url,
-                                  nsresult status) mutable -> nsresult {
+        completion->mStopFn =
+            [self, retainedSource, database, captured, request, isMove,
+             isFolder, allowUndo, completed = false](
+                nsIURI* url, nsresult status) mutable -> nsresult {
           if (completed) return NS_OK;
           completed = true;
           nsresult cleanup = retainedSource->OnStopRunningUrl(url, status);
@@ -10606,9 +10605,9 @@ nsImapMailFolder::CopyMessages(nsIMsgFolder* srcFolder,
             (void)self->OnCopyCompleted(request->m_srcSupport, status);
             return status;
           }
-          return self->CopyMessages(retainedSource, request->m_messages,
-                                    isMove, request->m_msgWindow,
-                                    request->m_listener, isFolder, allowUndo);
+          return self->CopyMessages(retainedSource, request->m_messages, isMove,
+                                    request->m_msgWindow, request->m_listener,
+                                    isFolder, allowUndo);
         };
         MOZ_TRY(source->AcquireSemaphore(static_cast<nsIMsgFolder*>(source),
                                          "native online undo recovery"_ns));

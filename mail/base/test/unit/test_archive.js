@@ -433,10 +433,16 @@ async function createArchiveAccount(username, mailbox, epoch) {
 }
 
 add_task(async function testCrossServerArchiveFailureAndRetry() {
+  const source = await createArchiveAccount("archiveSource", "source", 7301);
+  const destination = await createArchiveAccount(
+    "archiveDestination",
+    "Archives",
+    8401
+  );
+  const targetDaemon = destination.server.daemon;
   const proto = IMAP_RFC3501_handler.prototype;
   const originalAppend = proto.APPEND;
   const originalCreate = proto.CREATE;
-  let targetDaemon;
   let rejectedCommand;
   let refusals = 0;
   proto.APPEND = function (args) {
@@ -457,13 +463,6 @@ add_task(async function testCrossServerArchiveFailureAndRetry() {
     proto.APPEND = originalAppend;
     proto.CREATE = originalCreate;
   });
-  const source = await createArchiveAccount("archiveSource", "source", 7301);
-  const destination = await createArchiveAccount(
-    "archiveDestination",
-    "Archives",
-    8401
-  );
-  targetDaemon = destination.server.daemon;
   const identity = source.account.defaultIdentity;
   identity.archivesFolderURI = destination.folder.URI;
   identity.archiveEnabled = true;

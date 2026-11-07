@@ -973,79 +973,78 @@ async function checkImapFcc(retry) {
   let recovery = Promise.resolve();
   if (retry) {
     imap.daemon.commandToFail = "APPEND";
-    recovery = (async () => {
-      let retryDialog;
-      await BrowserTestUtils.promiseAlertDialog(undefined, undefined, {
-        async callback(alertWindow) {
-          recoveryDialog = alertWindow;
-          await TestUtils.waitForTick();
+    // The protocol alert and the copy recovery prompt come from separate
+    // main-thread events, so either dialog may load first (macOS aarch64
+    // loads the recovery prompt first). Observe both windows once each.
+    recovery = new Promise((resolve, reject) => {
+      let handled = 0;
+      const handle = async win => {
+        recoveryDialog = win;
+        await TestUtils.waitForTick();
+        const text = win.document.getElementById("infoBody").textContent;
+        Assert.equal(
+          imap.daemon.getMailbox("ConfiguredSent")._messages.length,
+          0,
+          "A rejected APPEND has not published a sent message"
+        );
+        Assert.equal(
+          gSentMessages.length,
+          sentCount + 1,
+          "SMTP has already succeeded exactly once"
+        );
+        if (text.includes("APPEND failed.")) {
           protocolAlerts++;
           Assert.equal(
             protocolAlerts,
             1,
             "The rejected APPEND reports one command error"
           );
+        } else {
+          prompts++;
+          Assert.equal(
+            prompts,
+            1,
+            "The real failed APPEND asks once for recovery"
+          );
           Assert.stringContains(
-            alertWindow.document.getElementById("infoBody").textContent,
-            "APPEND failed.",
-            "The original server rejection is shown before copy recovery"
+            text,
+            sent.localizedName,
+            "The real recovery dialog names the configured sent folder"
           );
-          Assert.equal(
-            imap.daemon.getMailbox("ConfiguredSent")._messages.length,
-            0,
-            "The original failed command has not stored an FCC"
+          // Retry the copy, not the already delivered SMTP message.
+          imap.daemon.commandToFail = "";
+        }
+        const closed = BrowserTestUtils.domWindowClosed(win);
+        win.document.querySelector("dialog").getButton("accept").click();
+        await closed;
+      };
+      const observer = {
+        observe(win, topic) {
+          if (topic != "domwindowopened") {
+            return;
+          }
+          win.addEventListener(
+            "load",
+            () => {
+              if (
+                win.document.documentURI !=
+                "chrome://global/content/commonDialog.xhtml"
+              ) {
+                return;
+              }
+              handle(win).then(() => {
+                if (++handled == 2) {
+                  Services.ww.unregisterNotification(observer);
+                  resolve();
+                }
+              }, reject);
+            },
+            { once: true }
           );
-          Assert.equal(
-            gSentMessages.length,
-            sentCount + 1,
-            "The command error occurs after one SMTP send"
-          );
-          // Listen for FCC recovery before dismissing the preceding protocol alert.
-          retryDialog = BrowserTestUtils.promiseAlertDialog(
-            undefined,
-            undefined,
-            {
-              async callback(win) {
-                recoveryDialog = win;
-                await TestUtils.waitForTick();
-                prompts++;
-                Assert.equal(
-                  prompts,
-                  1,
-                  "The real failed APPEND asks once for recovery"
-                );
-                Assert.stringContains(
-                  win.document.getElementById("infoBody").textContent,
-                  sent.localizedName,
-                  "The real recovery dialog names the configured sent folder"
-                );
-                Assert.equal(
-                  imap.daemon.getMailbox("ConfiguredSent")._messages.length,
-                  0,
-                  "A rejected APPEND has not published a sent message"
-                );
-                Assert.equal(
-                  gSentMessages.length,
-                  sentCount + 1,
-                  "SMTP has already succeeded before copy recovery"
-                );
-                imap.daemon.commandToFail = "";
-                // Retry the copy, not the already delivered SMTP message.
-                win.document
-                  .querySelector("dialog")
-                  .getButton("accept")
-                  .click();
-              },
-            }
-          );
-          alertWindow.document
-            .querySelector("dialog")
-            .getButton("accept")
-            .click();
         },
-      });
-      await retryDialog;
-    })();
+      };
+      Services.ww.registerNotification(observer);
+    });
   }
   const extension = ExtensionTestUtils.loadExtension({
     files: {

@@ -1174,10 +1174,13 @@ class MsgOperationObserver {
     this.headerMessageId = msgID.replace(/^<|>$/g, "");
   }
   onGetDraftFolderURI(msgID, folderURI) {
-    // Only called for save operations and sendLater. Collect messageIds and
-    // folders of saved messages.
+    // Copy attempts announce the destination before successful classification.
+    // FCC retries can repeat that hint for the same physical stored message.
     const headerMessageId = msgID.replace(/^<|>$/g, "");
-    this.savedMessages.push(JSON.stringify({ headerMessageId, folderURI }));
+    const key = JSON.stringify({ headerMessageId, folderURI });
+    if (!this.savedMessages.includes(key)) {
+      this.savedMessages.push(key);
+    }
   }
   onSendNotPerformed(msgID, status) {
     if (!Components.isSuccessCode(status)) {

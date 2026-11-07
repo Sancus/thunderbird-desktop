@@ -4091,10 +4091,14 @@ NS_IMETHODIMP MessageEnumerator::GetNext(nsIMsgDBHdr** item) {
   MOZ_TRY(mStatus);
   NS_ENSURE_TRUE(current && mHasNext, NS_ERROR_FAILURE);
   nsMsgKey key = static_cast<nsMsgKey>(mStmt->AsInt64(0));
-  // Enumeration shares the same bounded facade cache as direct lookup.
-  // Re-enumerating a live row must not replace a header retained by its UI.
-  nsCOMPtr<nsIMsgDBHdr> message;
-  MOZ_TRY(mOwner->GetMsgHdrForKey(key, getter_AddRefs(message)));
+  // Re-enumeration must not replace a header retained by its UI. Cached
+  // search hits can belong to another physical folder, so retain the cursor's
+  // original lazy-header behavior instead of a folder-restricted lookup.
+  nsCOMPtr<nsIMsgDBHdr> message = mOwner->mCachedHeaders.Get(key);
+  if (!message) {
+    message = new Message(key);
+    MOZ_TRY(mOwner->CacheHeader(key, message));
+  }
   message.forget(item);
   Advance();
   return NS_OK;

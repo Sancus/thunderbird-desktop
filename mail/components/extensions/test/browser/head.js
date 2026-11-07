@@ -104,7 +104,7 @@ registerCleanupFunction(async () => {
   MailServices.accounts.accounts.forEach(cleanUpAccount);
   let searchDrainError;
   if (
-    AppConstants.MOZ_PANORAMA &&
+    "nsIDatabaseCore" in Ci &&
     Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
       Ci.nsIMsgDBService
     ) instanceof Ci.nsIDatabaseCore

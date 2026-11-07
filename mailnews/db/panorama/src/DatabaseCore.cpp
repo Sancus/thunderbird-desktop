@@ -5313,9 +5313,15 @@ nsresult CheckFullImportRecords(JSContext* cx, JS::Handle<JSObject*> request,
       return NS_ERROR_NOT_IMPLEMENTED;
     }
   }
-  NS_ENSURE_TRUE(messageTable && infoTable && allThreads &&
-                     (imap || !threadTables.IsEmpty()),
-                 NS_ERROR_NOT_IMPLEMENTED);
+  // Native empty local folders have no per-thread table. Only the exact
+  // empty message/allthreads shape with a lone folder-info row can omit it;
+  // every record, info cell and live count is still checked below.
+  NS_ENSURE_TRUE(
+      messageTable && infoTable && allThreads &&
+          (imap || !threadTables.IsEmpty() ||
+           (input.messages.IsEmpty() && messageTable->members.IsEmpty() &&
+            allThreads->members.IsEmpty() && rows.Length() == 1)),
+      NS_ERROR_NOT_IMPLEMENTED);
   NS_ENSURE_TRUE(messageTable->members.Length() == input.messages.Length() &&
                      infoTable->members.Length() == 1,
                  NS_ERROR_INVALID_ARG);
@@ -9643,6 +9649,16 @@ nsresult StartupServerSummaryInput(JSContext* cx, JS::Handle<JSObject*> source,
           "totPendingMsgs", "unreadPendingMsgs", "expungedBytes", "folderSize",
           "highWaterKey", "UIDValidity"}) {
       supported |= name.Equals(known);
+    }
+    if (name == "onlineName"_ns) {
+      // SetOnlineName persists this literal empty cell on the IMAP server
+      // root. A nonempty name denotes a mailbox, not this metadata-only role.
+      JS::Rooted<JS::Value> originalName(cx);
+      MOZ_TRY(StartupMapEntry(cx, info, "cells", name, &originalName));
+      nsCString text;
+      MOZ_TRY(ImportText(cx, originalName, text));
+      NS_ENSURE_TRUE(text.IsEmpty(), NS_ERROR_NOT_IMPLEMENTED);
+      supported = true;
     }
     NS_ENSURE_TRUE(supported, NS_ERROR_NOT_IMPLEMENTED);
   }

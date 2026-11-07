@@ -48,6 +48,7 @@
 #include "nsICommandLineRunner.h"
 #include "nsCommandLine.h"
 #include "nsIPrefBranch.h"
+#include "nsPrintfCString.h"
 #include "nsID.h"
 #include "nsIEventTarget.h"
 #include "nsIFile.h"
@@ -3148,9 +3149,38 @@ class DeliveryCoreReferences : public testing::Test {
     return data;
   }
 
+  // Complete raw-record projection of retained whole014 /0/1.msf (Trash),
+  // SHA256 85323c3afe5ee8c4e7aca0d87b5947ac1df4e6aa0545c525fd8c6e9e158f6b07.
+  // The actual msgs/allthreads tables are empty, not invented per-thread rows.
+  nsString EmptyLocalImportRecords() {
+    return uR"json({
+      "unhandledRecords": [],
+      "folderProperties": [
+        {"name":"version","text":"1","integer":1},
+        {"name":"forceReparse","text":"0","integer":0},
+        {"name":"fixedBadRefThreading","text":"1","integer":1},
+        {"name":"flags","text":"104","integer":260},
+        {"name":"mailboxName","text":"Trash"},
+        {"name":"folderSize","text":"0","integer":0},
+        {"name":"folderDate","text":"6aef215f","integer":1794056543}],
+      "records": {
+        "tables": [
+          {"id":1,"scope":"ns:msg:db:row:scope:msgs:all","cells":[{"k":"k","v":"ns:msg:db:table:kind:msgs"},{"k":"s","v":"9"}],"metaRow":null,"rows":[]},
+          {"id":4294967293,"scope":"ns:msg:db:row:scope:threads:all","cells":[{"k":"k","v":"ns:msg:db:table:kind:allthreads"},{"k":"s","v":"9"}],"metaRow":null,"rows":[]},
+          {"id":1,"scope":"ns:msg:db:row:scope:dbfolderinfo:all","cells":[{"k":"k","v":"ns:msg:db:table:kind:dbfolderinfo"},{"k":"s","v":"9u"}],"metaRow":null,"rows":["1:ns:msg:db:row:scope:dbfolderinfo:all"]}],
+        "rows": [
+          {"id":1,"scope":"ns:msg:db:row:scope:dbfolderinfo:all","cells":[
+            {"k":"version","v":"1"},{"k":"forceReparse","v":"0"},
+            {"k":"fixedBadRefThreading","v":"1"},{"k":"flags","v":"104"},
+            {"k":"mailboxName","v":"Trash"},{"k":"folderSize","v":"0"},
+            {"k":"folderDate","v":"6aef215f"}]}]}
+    })json"_ns;
+  }
+
   nsresult CheckRawImport(const nsAString& data, bool imap = true,
                           bool unread = false,
-                          Maybe<uint32_t> folderFlags = Nothing()) {
+                          Maybe<uint32_t> folderFlags = Nothing(),
+                          bool emptyProjection = false) {
     mozilla::dom::AutoJSAPI jsapi;
     NS_ENSURE_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()), NS_ERROR_FAILURE);
     JSContext* cx = jsapi.cx();
@@ -3177,15 +3207,17 @@ class DeliveryCoreReferences : public testing::Test {
     }
     ImapImportFolder member;
     member.folder = folder;
-    auto& message = *member.snapshot.messages.AppendElement();
-    message.sourceKey = message.rootSourceKey = 5001;
-    message.header.subject = "live"_ns;
-    message.header.flags = unread ? 0 : nsMsgMessageFlags::Read;
-    message.header.priority = nsMsgPriority::notSet;
-    message.header.extras = {{"subject"_ns, "live"_ns},
-                             {"flags"_ns, unread ? "0"_ns : "1"_ns},
-                             {"msgThreadId"_ns, "1389"_ns},
-                             {"threadParent"_ns, "ffffffff"_ns}};
+    if (!emptyProjection) {
+      auto& message = *member.snapshot.messages.AppendElement();
+      message.sourceKey = message.rootSourceKey = 5001;
+      message.header.subject = "live"_ns;
+      message.header.flags = unread ? 0 : nsMsgMessageFlags::Read;
+      message.header.priority = nsMsgPriority::notSet;
+      message.header.extras = {{"subject"_ns, "live"_ns},
+                               {"flags"_ns, unread ? "0"_ns : "1"_ns},
+                               {"msgThreadId"_ns, "1389"_ns},
+                               {"threadParent"_ns, "ffffffff"_ns}};
+    }
     return mCore->CheckImportRecordsForTesting(
         cx, request, folder, member.snapshot, imap ? &member : nullptr);
   }
@@ -3736,7 +3768,7 @@ class DeliveryCoreReferences : public testing::Test {
   // This is a cache transaction proof fixture, not a startup activation claim.
   nsresult JSONCacheCopyTree(JSContext* cx, nsIFile* from, nsIFile* to,
                              nsTArray<nsCString>& parts, nsACString& entries,
-                             bool& first) {
+                             bool& first, nsACString* profileLocks = nullptr) {
     nsCOMPtr<nsIDirectoryEnumerator> children;
     MOZ_TRY(from->GetDirectoryEntries(getter_AddRefs(children)));
     auto close = MakeScopeExit([&] { children->Close(); });
@@ -3746,10 +3778,31 @@ class DeliveryCoreReferences : public testing::Test {
       if (!file) break;
       bool linked, directory;
       MOZ_TRY(file->IsSymlink(&linked));
+      nsCString leaf;
+      if (profileLocks) MOZ_TRY(file->GetNativeLeafName(leaf));
+      if (profileLocks && parts.IsEmpty() &&
+          (leaf == "parent.lock"_ns || leaf == ".parentlock"_ns ||
+           leaf == "lock"_ns)) {
+        bool regular = false;
+        if (!linked) MOZ_TRY(file->IsFile(&regular));
+        if (linked || regular) {
+          // Match MigrationBackup's real selected-profile root exclusions.
+          // Record each actual lock; nested names and every other link fail.
+          nsCString quoted;
+          MOZ_TRY(JSONCacheQuote(cx, leaf, quoted));
+          if (!profileLocks->IsEmpty()) profileLocks->Append(',');
+          profileLocks->Append(quoted);
+          continue;
+        }
+      }
       NS_ENSURE_FALSE(linked, NS_ERROR_FILE_ACCESS_DENIED);
       MOZ_TRY(file->IsDirectory(&directory));
-      nsCString leaf;
-      MOZ_TRY(file->GetNativeLeafName(leaf));
+      if (!profileLocks) MOZ_TRY(file->GetNativeLeafName(leaf));
+      if (profileLocks && !directory) {
+        bool regular;
+        MOZ_TRY(file->IsFile(&regular));
+        NS_ENSURE_TRUE(regular, NS_ERROR_FILE_ACCESS_DENIED);
+      }
       // The new native output is never original legacy backup evidence.
       if (parts.IsEmpty() &&
           (leaf == "panorama.sqlite"_ns || leaf == "panorama.sqlite-wal"_ns ||
@@ -3773,8 +3826,8 @@ class DeliveryCoreReferences : public testing::Test {
         MOZ_TRY(to->Clone(getter_AddRefs(destination)));
         MOZ_TRY(destination->AppendNative(leaf));
         MOZ_TRY(destination->Create(nsIFile::DIRECTORY_TYPE, 0700));
-        MOZ_TRY(
-            JSONCacheCopyTree(cx, file, destination, parts, entries, first));
+        MOZ_TRY(JSONCacheCopyTree(cx, file, destination, parts, entries, first,
+                                  profileLocks));
       } else {
         nsCString bytes, digest, quoted;
         MOZ_TRY(JSONCacheReadFile(file, bytes));
@@ -4521,13 +4574,51 @@ class DeliveryCoreReferences : public testing::Test {
     });
   }
 
+  // Exact retained whole014 IMAP server-root summary, including onlineName="".
+  static nsCString EmptyImapRootSummary() {
+    return "// <!-- <mdb:mork:z v=\"1.4\"/> -->\n"
+           "< <(a=c)> // (f=iso-8859-1)\n"
+           "  "
+           "(80=ns:msg:db:row:scope:msgs:all)(81=subject)(82=sender)(83="
+           "message-id)\n"
+           "  "
+           "(84=references)(85=recipients)(86=date)(87=size)(88=flags)(89="
+           "priority)\n"
+           "  (8A=label)(8B=numLines)(8C=ccList)(8D=bccList)(8E=msgThreadId)\n"
+           "  "
+           "(8F=threadId)(90=threadFlags)(91=threadNewestMsgDate)(92=children)"
+           "\n"
+           "  (93=unreadChildren)(94=threadSubject)(95=msgCharSet)\n"
+           "  (96=ns:msg:db:table:kind:msgs)(97=ns:msg:db:table:kind:thread)\n"
+           "  (98=ns:msg:db:table:kind:allthreads)\n"
+           "  "
+           "(99=ns:msg:db:row:scope:threads:all)(9A=threadParent)(9B="
+           "threadRoot)\n"
+           "  (9C=msgOffset)(9D=offlineMsgSize)(9E=uidOnServer)\n"
+           "  (9F=ns:msg:db:row:scope:dbfolderinfo:all)\n"
+           "  "
+           "(A0=ns:msg:db:table:kind:dbfolderinfo)(A1=numMsgs)(A2=numNewMsgs)\n"
+           "  "
+           "(A3=folderSize)(A4=expungedBytes)(A5=folderDate)(A6=highWaterKey)\n"
+           "  (A7=mailboxName)(A8=UIDValidity)(A9=totPendingMsgs)\n"
+           "  (AA=unreadPendingMsgs)(AB=version)(AC=forceReparse)\n"
+           "  (AD=fixedBadRefThreading)(AE=onlineName)>\n"
+           "{1:^80 {(k^96:c)(s=9)} }\n"
+           "{FFFFFFFD:^99 {(k^98:c)(s=9)} }\n"
+           "\n"
+           "<(80=1)(81=0)(82=)>\n"
+           "{1:^9F {(k^A0:c)(s=9u)} \n"
+           "  [1(^AB=1)(^AC=0)(^AD=1)(^AE=)]}\n"_ns;
+  }
+
   // A real selected migration target with a retained native IMAP root. Its
   // original cache bytes and every physical file have an actual verified copy;
   // no account list is loaded and no readiness/activation receipt is invented.
   void WithPreReadyStartupAccount(
       const std::function<void(nsIMsgAccountManager*, nsIMsgIncomingServer*,
                                Message*, nsIPrefBranch*, const nsCString&)>&
-          action) {
+          action,
+      const nsACString* rootSummary = nullptr, nsresult expectedOpen = NS_OK) {
     nsCOMPtr<nsIMsgAccountManager> manager =
         do_GetService("@mozilla.org/messenger/account-manager;1");
     ASSERT_TRUE(manager);
@@ -4565,6 +4656,8 @@ class DeliveryCoreReferences : public testing::Test {
     ASSERT_EQ(NS_OK, rootPath->Create(nsIFile::DIRECTORY_TYPE, 0700));
     ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(summary)));
     ASSERT_EQ(NS_OK, summary->AppendNative("startup-account-store.msf"_ns));
+    if (rootSummary)
+      ASSERT_EQ(NS_OK, StartupWriteControl(summary, *rootSummary));
     auto set = [&](const char* name, const nsACString& value) {
       return prefs->SetCharPref(
           nsCString(serverPrefix + nsDependentCString(name)).get(), value);
@@ -4625,10 +4718,11 @@ class DeliveryCoreReferences : public testing::Test {
     ASSERT_EQ(NS_OK, copy->AppendNative("root-0"_ns));
     ASSERT_EQ(NS_OK, copy->Create(nsIFile::DIRECTORY_TYPE, 0700));
     nsTArray<nsCString> parts;
-    nsCString entries;
+    nsCString entries, excluded;
     bool first = true;
-    ASSERT_EQ(NS_OK,
-              JSONCacheCopyTree(cx, mProfile, copy, parts, entries, first));
+    ASSERT_EQ(NS_OK, JSONCacheCopyTree(cx, mProfile, copy, parts, entries,
+                                       first, &excluded));
+    EXPECT_FALSE(excluded.IsEmpty());
     ASSERT_EQ(NS_OK, work->Clone(getter_AddRefs(manifest)));
     ASSERT_EQ(NS_OK, manifest->AppendNative("manifest.json"_ns));
     ASSERT_EQ(NS_OK, work->Clone(getter_AddRefs(journal)));
@@ -4644,8 +4738,8 @@ class DeliveryCoreReferences : public testing::Test {
     ASSERT_EQ(
         NS_OK,
         document(
-            "{\"version\":3,\"complete\":true,\"roots\":[{\"source\":@PROFILE@,\"directory\":\"root-0\",\"entries\":["_ns +
-                entries + "]}]}"_ns,
+            "{\"version\":3,\"complete\":true,\"roots\":[{\"source\":@PROFILE@,\"directory\":\"root-0\",\"excluded\":["_ns +
+                excluded + "],\"entries\":["_ns + entries + "]}]}"_ns,
             bytes));
     ASSERT_EQ(NS_OK, StartupWriteControl(manifest, bytes));
     ASSERT_EQ(NS_OK, StartupHashControl(bytes, digest));
@@ -4654,10 +4748,30 @@ class DeliveryCoreReferences : public testing::Test {
     backup = "{\"path\":"_ns + backup + ",\"sha256\":\""_ns + digest + "\"}"_ns;
     ASSERT_EQ(NS_OK, journal->GetNativePath(quoted));
     ASSERT_EQ(NS_OK, JSONCacheQuote(cx, quoted, journalPath));
+    nsCString serverSummaries("[]");
+    if (rootSummary) {
+      nsCString path, serverRoot, server, rootHash;
+      ASSERT_EQ(NS_OK, summary->GetNativePath(quoted));
+      ASSERT_EQ(NS_OK, JSONCacheQuote(cx, quoted, path));
+      ASSERT_EQ(NS_OK, rootPath->GetNativePath(quoted));
+      ASSERT_EQ(NS_OK, JSONCacheQuote(cx, quoted, serverRoot));
+      ASSERT_EQ(NS_OK, JSONCacheQuote(cx, serverKey, server));
+      ASSERT_EQ(NS_OK, StartupHashControl(*rootSummary, rootHash));
+      serverSummaries =
+          "[{\"role\":\"imap-server-root-summary\",\"protocol\":\"imap\","
+          "\"id\":\"server-summary:startup-account-store.msf\",\"path\":"_ns +
+          path + ",\"sha256\":\""_ns + rootHash + "\",\"size\":"_ns +
+          nsPrintfCString("%u", rootSummary->Length()) + ",\"serverKey\":"_ns +
+          server + ",\"serverRoot\":"_ns + serverRoot +
+          ",\"storeContractID\":\"@mozilla.org/msgstore/berkeleystore;1\","
+          "\"storeType\":\"mbox\"}]"_ns;
+    }
+
     ASSERT_EQ(
         NS_OK,
         document(
-            "{\"version\":7,\"profilePath\":@PROFILE@,\"cancelled\":false,\"stage\":\"backup\",\"startup\":{\"inventory\":{\"sources\":[]}}}"_ns,
+            "{\"version\":7,\"profilePath\":@PROFILE@,\"cancelled\":false,\"stage\":\"backup\",\"startup\":{\"inventory\":{\"sources\":[],\"serverSummaries\":"_ns +
+                serverSummaries + "}}}"_ns,
             bytes));
     ASSERT_EQ(NS_OK, StartupWriteControl(journal, bytes));
     nsCOMPtr<nsIXULAppInfo> app = do_GetService("@mozilla.org/xre/app-info;1");
@@ -4681,12 +4795,24 @@ class DeliveryCoreReferences : public testing::Test {
     ASSERT_EQ(NS_OK, StartupHashControl(raw, digest));
     const nsCString plan(
         "{\"profilePath\":@PROFILE@,\"mode\":\"migrate\",\"sources\":[],\"caches\":[{\"path\":"_ns +
-        cachePath + ",\"sha256\":\""_ns + digest + "\"}],\"backup\":"_ns +
+        cachePath + ",\"sha256\":\""_ns + digest +
+        "\"}],\"serverSummaries\":"_ns + serverSummaries + ",\"backup\":"_ns +
         backup + ",\"journalPath\":"_ns + journalPath + "}"_ns);
     JS::Rooted<JS::Value> input(cx), output(cx);
     ASSERT_EQ(NS_OK, StartupDocument(cx, plan, &input));
-    ASSERT_EQ(NS_OK, mCore->OpenProfileStartupTarget(
-                         mCore->ProfileStartupToken(), input, cx, &output));
+    const nsresult opened = mCore->OpenProfileStartupTarget(
+        mCore->ProfileStartupToken(), input, cx, &output);
+    ASSERT_EQ(expectedOpen, opened);
+    if (rootSummary) {
+      nsCString retained;
+      ASSERT_EQ(NS_OK, JSONCacheReadFile(summary, retained));
+      EXPECT_EQ(*rootSummary, retained);
+    }
+    if (NS_FAILED(opened)) {
+      EXPECT_FALSE(Connection());
+      if (jsapi.HasException()) jsapi.ClearException();
+      return;
+    }
     mConnection = Connection();
     ASSERT_TRUE(mConnection);
     nsCOMPtr<nsIMsgIncomingServer> server;
@@ -24810,6 +24936,167 @@ TEST_F(DeliveryCoreReferences,
               manager->FindAccountForServer(server, getter_AddRefs(account)));
     EXPECT_FALSE(account);
   });
+}
+
+TEST_F(DeliveryCoreReferences, NativeEmptyLocalSourceHasNoPerThreadTable) {
+  ASSERT_EQ(NS_OK, Start());
+  const auto records = EmptyLocalImportRecords();
+  EXPECT_EQ(NS_OK, CheckRawImport(records, false, false, Some(260u), true));
+  EXPECT_EQ(records, EmptyLocalImportRecords());
+  uint64_t count = 1;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetTotalCount(&count));
+  EXPECT_EQ(0u, count);
+  // A nonempty typed projection may not omit the original per-thread table.
+  EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED,
+            CheckRawImport(records, false, false, Some(260u), false));
+}
+
+TEST_F(DeliveryCoreReferences, NativeEmptyLocalSourceRetainsEveryRawRecord) {
+  ASSERT_EQ(NS_OK, Start());
+  nsTArray<nsString> invalid;
+  auto changed = EmptyLocalImportRecords();
+  changed.ReplaceSubstring(
+      u"\"rows\": [", u"\"rows\": [{\"id\":7,\"scope\":\"m\",\"cells\":[]},");
+  invalid.AppendElement(changed);
+  changed = EmptyLocalImportRecords();
+  changed.ReplaceSubstring(u"ns:msg:db:table:kind:allthreads",
+                           u"unknown:thread:table");
+  invalid.AppendElement(changed);
+  changed = EmptyLocalImportRecords();
+  changed.ReplaceSubstring(u"\"rows\":[]",
+                           u"\"rows\":[\"7:ns:msg:db:row:scope:msgs:all\"]");
+  invalid.AppendElement(changed);
+  changed = EmptyLocalImportRecords();
+  changed.ReplaceSubstring(u"\"unhandledRecords\": []",
+                           u"\"unhandledRecords\": [\"unaccounted-row\"]");
+  invalid.AppendElement(changed);
+  for (const auto& data : invalid) {
+    ASSERT_NE(EmptyLocalImportRecords(), data);
+    EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED,
+              CheckRawImport(data, false, false, Some(260u), true));
+  }
+}
+
+TEST_F(DeliveryCoreReferences,
+       NativeEmptyLocalSourceKeepsCountsAndFlagsStrict) {
+  ASSERT_EQ(NS_OK, Start());
+  for (uint32_t count : {0u, 1u}) {
+    auto records = EmptyLocalImportRecords();
+    const nsString number(count ? u"1"_ns : u"0"_ns);
+    const nsString property(u"{\"name\":\"numMsgs\",\"text\":\""_ns + number +
+                            u"\",\"integer\":"_ns + number +
+                            u"},{\"name\":\"version\""_ns);
+    const nsString cell(u"{\"k\":\"numMsgs\",\"v\":\""_ns + number +
+                        u"\"},{\"k\":\"version\""_ns);
+    records.ReplaceSubstring(u"{\"name\":\"version\"", property.get());
+    records.ReplaceSubstring(u"{\"k\":\"version\"", cell.get());
+    EXPECT_EQ(count ? NS_ERROR_INVALID_ARG : NS_OK,
+              CheckRawImport(records, false, false, Some(260u), true));
+  }
+  EXPECT_EQ(
+      NS_ERROR_NOT_IMPLEMENTED,
+      CheckRawImport(EmptyLocalImportRecords(), false, false, Some(0u), true));
+}
+
+TEST_F(DeliveryCoreReferences, StartupImapRootRetainsLiteralEmptyOnlineName) {
+  const auto bytes = EmptyImapRootSummary();
+  WithPreReadyStartupAccount(
+      [&](nsIMsgAccountManager*, nsIMsgIncomingServer* server, Message* message,
+          nsIPrefBranch*, const nsCString& key) {
+        nsCString account;
+        ASSERT_EQ(NS_OK, message->GetAccountKey(account));
+        EXPECT_EQ(key, account);
+        nsCOMPtr<nsIMsgFolder> root;
+        ASSERT_EQ(NS_OK, server->GetRootFolder(getter_AddRefs(root)));
+        nsCOMPtr<nsIMsgImapMailFolder> imap = do_QueryInterface(root);
+        ASSERT_TRUE(imap);
+        nsCString name("unchanged");
+        ASSERT_EQ(NS_OK, imap->GetOnlineName(name));
+        EXPECT_TRUE(name.IsEmpty());
+        EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DatabaseCore::CheckAccountStartup());
+      },
+      &bytes);
+}
+
+TEST_F(DeliveryCoreReferences, StartupImapRootRefusesNonemptyOnlineName) {
+  auto bytes = EmptyImapRootSummary();
+  bytes.ReplaceSubstring("(^AE=)", "(^AE=INBOX)");
+  ASSERT_NE(EmptyImapRootSummary(), bytes);
+  WithPreReadyStartupAccount(
+      [](nsIMsgAccountManager*, nsIMsgIncomingServer*, Message*, nsIPrefBranch*,
+         const nsCString&) {
+        FAIL() << "Nonempty root name reached public projection";
+      },
+      &bytes, NS_ERROR_NOT_IMPLEMENTED);
+}
+
+TEST_F(DeliveryCoreReferences, StartupImapRootRefusesUnknownMetadataCell) {
+  auto bytes = EmptyImapRootSummary();
+  bytes.ReplaceSubstring("(AE=onlineName)", "(AE=unknownRootState)");
+  ASSERT_NE(EmptyImapRootSummary(), bytes);
+  WithPreReadyStartupAccount(
+      [](nsIMsgAccountManager*, nsIMsgIncomingServer*, Message*, nsIPrefBranch*,
+         const nsCString&) {
+        FAIL() << "Unknown cell reached public projection";
+      },
+      &bytes, NS_ERROR_NOT_IMPLEMENTED);
+}
+
+TEST_F(DeliveryCoreReferences, StartupImapRootRefusesMessageData) {
+  auto bytes = EmptyImapRootSummary();
+  bytes.ReplaceSubstring("{1:^80 {(k^96:c)(s=9)} }",
+                         "{1:^80 {(k^96:c)(s=9)} [1] }");
+  ASSERT_NE(EmptyImapRootSummary(), bytes);
+  WithPreReadyStartupAccount(
+      [](nsIMsgAccountManager*, nsIMsgIncomingServer*, Message*, nsIPrefBranch*,
+         const nsCString&) {
+        FAIL() << "Message row reached metadata-only projection";
+      },
+      &bytes, NS_ERROR_NOT_IMPLEMENTED);
+}
+
+TEST_F(DeliveryCoreReferences,
+       StartupAccountCopyKeepsNonRootAndOtherLinkRefusals) {
+  ASSERT_EQ(NS_OK, ArmSelectedStartup());
+  ASSERT_EQ(NS_OK, WriteStartupFile("retained.txt", "retained bytes"_ns));
+  nsCOMPtr<nsIFile> target, nested, work;
+  ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(target)));
+  ASSERT_EQ(NS_OK, target->AppendNative("retained.txt"_ns));
+  ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(nested)));
+  ASSERT_EQ(NS_OK, nested->AppendNative("nested"_ns));
+  ASSERT_EQ(NS_OK, nested->Create(nsIFile::DIRECTORY_TYPE, 0700));
+  ASSERT_EQ(NS_OK, mProfile->GetParent(getter_AddRefs(work)));
+  ASSERT_EQ(NS_OK, work->AppendNative("account-copy-refusal"_ns));
+  ASSERT_EQ(NS_OK, work->CreateUnique(nsIFile::DIRECTORY_TYPE, 0700));
+  mStartupFixtureWork = work;
+  nsCString targetPath;
+  ASSERT_EQ(NS_OK, target->GetNativePath(targetPath));
+  dom::AutoJSAPI jsapi;
+  ASSERT_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()));
+  for (bool rootLink : {false, true}) {
+    nsCOMPtr<nsIFile> link, copy;
+    ASSERT_EQ(NS_OK,
+              (rootLink ? mProfile : nested)->Clone(getter_AddRefs(link)));
+    ASSERT_EQ(NS_OK,
+              link->AppendNative(rootLink ? "other-link"_ns : "lock"_ns));
+    nsCString path;
+    ASSERT_EQ(NS_OK, link->GetNativePath(path));
+    ASSERT_EQ(0, symlink(targetPath.get(), path.get()));
+    auto removeLink =
+        MakeScopeExit([&] { EXPECT_EQ(NS_OK, link->Remove(false)); });
+    ASSERT_EQ(NS_OK, work->Clone(getter_AddRefs(copy)));
+    ASSERT_EQ(NS_OK, copy->AppendNative("copy"_ns));
+    ASSERT_EQ(NS_OK, copy->CreateUnique(nsIFile::DIRECTORY_TYPE, 0700));
+    nsTArray<nsCString> parts;
+    nsCString entries, excluded;
+    bool first = true;
+    EXPECT_EQ(NS_ERROR_FILE_ACCESS_DENIED,
+              JSONCacheCopyTree(jsapi.cx(), mProfile, copy, parts, entries,
+                                first, &excluded));
+    nsCString retained;
+    ASSERT_EQ(NS_OK, JSONCacheReadFile(target, retained));
+    EXPECT_EQ("retained bytes"_ns, retained);
+  }
 }
 
 TEST_F(DeliveryCoreReferences, StartupBeginPreservesSettledParserFailure) {

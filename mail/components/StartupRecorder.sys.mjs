@@ -22,11 +22,9 @@ XPCOMUtils.defineLazyPreferenceGetter(
   false
 );
 
-let firstPaintNotification = "widget-first-paint";
-// widget-first-paint fires much later than expected on Linux.
-if (AppConstants.platform == "linux") {
-  firstPaintNotification = "xul-window-visible";
-}
+// Record the first visible mail window even when a headless widget does not
+// deliver widget-first-paint before startup idle tasks finish.
+const firstPaintNotification = "xul-window-visible";
 
 let win, canvas;
 let paints = [];

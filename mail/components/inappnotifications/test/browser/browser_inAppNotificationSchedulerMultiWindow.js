@@ -145,31 +145,40 @@ add_task(async function test_opensInNewWindowWhenFirstWindowMinimized() {
     0,
     "no messages showing"
   );
-  window.minimize();
+  let newWindow;
+  try {
+    window.minimize();
 
-  await waitForMinimize();
+    await waitForMinimize();
 
-  await showNotification();
+    await showNotification();
 
-  const newWindow = await openNewWindow(false);
+    newWindow = await openNewWindow(false);
+    await waitForNotification(true, newWindow);
 
-  Assert.equal(
-    newWindow.document.querySelectorAll("in-app-notification").length,
-    1,
-    "message is shown"
-  );
+    Assert.equal(
+      newWindow.document.querySelectorAll("in-app-notification").length,
+      1,
+      "message is shown"
+    );
 
-  window.restore();
+    window.restore();
 
-  await waitForNotification(true);
+    await waitForNotification(true);
 
-  Assert.equal(
-    document.querySelectorAll("in-app-notification").length,
-    1,
-    "message is shown when restored"
-  );
-
-  await reset();
-
-  await BrowserTestUtils.closeWindow(newWindow);
+    Assert.equal(
+      document.querySelectorAll("in-app-notification").length,
+      1,
+      "message is shown when restored"
+    );
+  } finally {
+    window.restore();
+    try {
+      await reset();
+    } finally {
+      if (newWindow) {
+        await BrowserTestUtils.closeWindow(newWindow);
+      }
+    }
+  }
 });

@@ -718,7 +718,10 @@
         this._lastMessage.whenRead();
       }
 
-      const doc = this.contentDocument;
+      const doc = this.webNavigation?.document;
+      if (!doc) {
+        return;
+      }
       const ruler = doc.getElementById("unread-ruler");
       if (!ruler) {
         return;

@@ -17,9 +17,17 @@ function getTaskbarProgress(window) {
     const winTaskbar = Cc["@mozilla.org/windows-taskbar;1"].getService(
       Ci.nsIWinTaskbar
     );
-    return winTaskbar.available
-      ? winTaskbar.getTaskbarProgress(window.docShell)
-      : null;
+    if (!winTaskbar.available) {
+      return null;
+    }
+    try {
+      return winTaskbar.getTaskbarProgress(window.docShell);
+    } catch (error) {
+      if (error.result == Cr.NS_ERROR_NOT_AVAILABLE) {
+        return null;
+      }
+      throw error;
+    }
   }
   if ("@mozilla.org/widget/macdocksupport;1" in Cc) {
     return Cc["@mozilla.org/widget/macdocksupport;1"].getService(

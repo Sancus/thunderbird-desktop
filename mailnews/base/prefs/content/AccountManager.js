@@ -34,9 +34,6 @@ var { XPCOMUtils } = ChromeUtils.importESModule(
 var { MailUtils } = ChromeUtils.importESModule(
   "resource:///modules/MailUtils.sys.mjs"
 );
-var { Gloda } = ChromeUtils.importESModule(
-  "resource:///modules/gloda/Gloda.sys.mjs"
-);
 var { MailServices } = ChromeUtils.importESModule(
   "resource:///modules/MailServices.sys.mjs"
 );
@@ -907,7 +904,13 @@ function onSetDefault(event) {
   markDefaultServer(currentAccount, previousDefault);
 
   // Update gloda's myContact with the new default account's default identity.
-  Gloda._initMyIdentities();
+  // Only refresh an already loaded Gloda; loading it here would open its
+  // database without the indexer that closes it (Panorama never starts it).
+  if (Cu.isESModuleLoaded("resource:///modules/gloda/Gloda.sys.mjs")) {
+    ChromeUtils.importESModule(
+      "resource:///modules/gloda/Gloda.sys.mjs"
+    ).Gloda._initMyIdentities();
+  }
 
   gAccountTree.load();
 }

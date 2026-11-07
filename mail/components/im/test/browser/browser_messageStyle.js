@@ -108,6 +108,11 @@ add_task(async function testMessageStyleChangeReloadsConversation() {
   );
 
   conversation.close();
+  Assert.notEqual(
+    document.getElementById("tabmail").tabModes.chat.tabs[0].browser,
+    chatConv.convBrowser,
+    "Closing a conversation releases the tab's destroyed browser"
+  );
   account.disconnect();
   IMServices.accounts.deleteAccount(account.id);
   await Promise.resolve(); // Ensure login removal.

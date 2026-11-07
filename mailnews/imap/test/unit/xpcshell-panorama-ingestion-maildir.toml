@@ -1,0 +1,23 @@
+[DEFAULT]
+head = "head_imap_maildir.js"
+
+dupe-manifest = true
+run-sequentially = true
+
+prefs = [
+  "mail.panorama.enabled=true",
+  "mail.serverDefaultStoreContractID=@mozilla.org/msgstore/maildirstore;1",
+  "mail.server.default.storeContractID=@mozilla.org/msgstore/maildirstore;1",
+]
+
+tags = [
+  "maildir",
+  "cpp",
+  "panorama",
+]
+
+["test_bccProperty.js"]
+verbose = true
+
+["test_gmailOfflineMsgStore.js"]
+verbose = true

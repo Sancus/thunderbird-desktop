@@ -271,9 +271,12 @@ async function subtestCopy(folder, newParent) {
   const copyListener = new PromiseTestUtils.PromiseCopyListener();
   MailServices.copy.copyFolder(folder, newParent, false, copyListener, null);
   await copyListener.promise;
-  // Ensure the operation has finished. The copy listener promise resolves when
-  // the target folder is copied, but subfolder operations may still be going.
-  await new Promise(resolve => do_timeout(250, resolve));
+  // The copy listener completes the parent before its descendants. Wait for
+  // the actual subfolder rather than assume it has appeared after a delay.
+  await TestUtils.waitForCondition(
+    () => newParent.getChildNamed(folderName)?.getChildNamed("subfolder"),
+    "waiting for the copied subfolder on the destination server"
+  );
 
   const srcFolder = srcParent.getChildNamed(folderName);
   Assert.ok(

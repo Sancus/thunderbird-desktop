@@ -123,6 +123,7 @@ tags = ["virtualfolders"]
 ["test_mimemaltdetach.js"]
 
 ["test_moveCopyFoldersAcrossServers.js"]
+verbose = true
 
 ["test_msgHdrProperties.js"]
 

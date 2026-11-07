@@ -293,6 +293,21 @@ add_task(async function test_imap_image_reconstruction() {
     ["IMAP Forward", open_compose_with_forward],
     ["IMAP Edit as New", open_compose_with_edit_as_new],
   ]) {
+    let resolvedURL;
+    try {
+      resolvedURL = service.getUrlForUri(
+        operation == "IMAP Edit as New" ? `${uri}?editasnew=true` : uri
+      ).spec;
+    } catch (error) {
+      resolvedURL = `${error.name}: ${error.message}`;
+    }
+    info(
+      `${operation} source: ${JSON.stringify({
+        physicalURI: uri,
+        displayedURI: get_about_message().gMessageURI,
+        resolvedURL,
+      })}`
+    );
     const compose = await open();
     const body = new compose.DOMParser().parseFromString(
       compose.gMsgCompose.compFields.body,

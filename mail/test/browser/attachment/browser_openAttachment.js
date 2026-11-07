@@ -920,6 +920,9 @@ add_task(async function test_imapAttachmentRetainsPhysicalSourceAndPart() {
     "imap"
   );
   account.incomingServer = incoming;
+  const identity = MailServices.accounts.createIdentity();
+  identity.email = "s376-attachment@example.invalid";
+  account.addIdentity(identity);
   incoming.port = server.port;
   incoming.password = "password";
   incoming.QueryInterface(Ci.nsIImapIncomingServer).maximumConnectionsNumber =

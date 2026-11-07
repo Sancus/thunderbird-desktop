@@ -163,6 +163,7 @@ export class AttachmentInfo {
       this.url !== selected.url ||
       this.partID !== selected.part ||
       (selected.part && !/^\d+(?:\.\d+)*$/.test(selected.part)) ||
+      selected.folder.msgDatabase !== selected.database ||
       !selected.database.containsKey(selected.key) ||
       !selected.message.isLive
     ) {
@@ -974,6 +975,7 @@ export class AttachmentInfo {
     const check = () => {
       if (
         !msgHdr.isLive ||
+        folder.msgDatabase !== database ||
         !database.containsKey(key) ||
         msgHdr.folder?.URI !== folder.URI ||
         msgHdr.messageKey !== key ||

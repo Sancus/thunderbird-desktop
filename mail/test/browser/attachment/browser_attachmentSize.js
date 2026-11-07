@@ -482,7 +482,13 @@ add_task(async function test_selectedPhysicalMimePartsRetainNamesAndSizes() {
       const body = `The physical attachment in folder ${index}.`;
       const name = `selected-${index}-\u{1F98A}.txt`;
       const message = create_message({
-        attachments: [{ body, filename: name, format: "" }],
+        attachments: [
+          {
+            body,
+            disposition: `attachment; filename*=UTF-8''${encodeURIComponent(name)}`,
+            format: "",
+          },
+        ],
       });
       message.messageId = "s376-repeated-mime@example.invalid";
       await add_message_to_folder([selectedFolder], message);

@@ -1125,12 +1125,23 @@ add_task(async function test_attachmentDetachCancellationRetainsOriginal() {
     "retain after cancellation"
   );
   const key = header.messageKey;
-  MockFilePicker.init(window.browsingContext);
+  const ownsPicker = !MockFilePicker.factory;
+  if (ownsPicker) {
+    MockFilePicker.init(window.browsingContext);
+  }
+  const oldReturnValue = MockFilePicker.returnValue;
+  const oldShowCallback = MockFilePicker.showCallback;
   MockFilePicker.returnValue = MockFilePicker.returnCancel;
+  MockFilePicker.showCallback = null;
   try {
     await attachment.detachFromMessage(window.browsingContext);
   } finally {
-    MockFilePicker.cleanup();
+    if (ownsPicker) {
+      MockFilePicker.cleanup();
+    } else {
+      MockFilePicker.returnValue = oldReturnValue;
+      MockFilePicker.showCallback = oldShowCallback;
+    }
   }
   Assert.equal(selectedFolder.getTotalMessages(false), 1);
   Assert.ok(selectedFolder.msgDatabase.containsKey(key));
@@ -1263,7 +1274,7 @@ add_task(async function test_detachFailureKeepsOriginalAndCleansStaging() {
   );
   const directory = await s376MenuDirectory();
   const originalService = MailServices.messageServiceFromURI;
-  const originalCopy = MailServices.copy.copyFileMessage;
+  const originalCopy = MailServices.copy;
   const uri = selectedFolder.getUriForMsg(header);
   const failure = Cr.NS_ERROR_FILE_ACCESS_DENIED;
   let stripCalls = 0;
@@ -1283,17 +1294,19 @@ add_task(async function test_detachFailureKeepsOriginalAndCleansStaging() {
       },
     };
   };
-  MailServices.copy.copyFileMessage = (
-    _file,
-    _folder,
-    _header,
-    _draft,
-    _flags,
-    _keywords,
-    listener
-  ) => {
-    copyCalls++;
-    listener.onStopCopy(failure);
+  MailServices.copy = {
+    copyFileMessage(
+      _file,
+      _folder,
+      _header,
+      _draft,
+      _flags,
+      _keywords,
+      listener
+    ) {
+      copyCalls++;
+      listener.onStopCopy(failure);
+    },
   };
   try {
     await Assert.rejects(
@@ -1353,7 +1366,7 @@ add_task(async function test_detachFailureKeepsOriginalAndCleansStaging() {
     );
   } finally {
     MailServices.messageServiceFromURI = originalService;
-    MailServices.copy.copyFileMessage = originalCopy;
+    MailServices.copy = originalCopy;
   }
   Assert.equal(
     new TextDecoder().decode(await attachment.fetchAttachment()),

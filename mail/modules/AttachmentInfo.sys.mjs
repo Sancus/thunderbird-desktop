@@ -429,6 +429,7 @@ export class AttachmentInfo {
     const sourceURI = Services.io.newURI(url);
     if (
       messageURI &&
+      sourceURI.schemeIs("imap") &&
       this.#selection.folder.server.type == "imap" &&
       this.partID
     ) {
@@ -650,11 +651,14 @@ export class AttachmentInfo {
       this.#selection && !reuseTemporaryFile
         ? await this.fetchAttachment()
         : null;
-    const empty = buffer
-      ? buffer.byteLength == 0
-      : this.#selection && reuseTemporaryFile
-        ? false
-        : await this.isEmpty();
+    let empty;
+    if (buffer) {
+      empty = buffer.byteLength == 0;
+    } else if (this.#selection && reuseTemporaryFile) {
+      empty = false;
+    } else {
+      empty = await this.isEmpty();
+    }
     this.#checkSelection();
     const saveAttachment = async (target, isTmp = false) => {
       if (buffer) {

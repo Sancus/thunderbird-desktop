@@ -763,6 +763,10 @@ add_task(async function filenameSanitisedOpen() {
 });
 
 
+const { MailServices } = ChromeUtils.importESModule(
+  "resource:///modules/MailServices.sys.mjs"
+);
+
 let s376FolderNumber = 0;
 let s376Imap;
 let s376News;
@@ -907,6 +911,29 @@ add_task(async function test_imapAttachmentRetainsPhysicalSourceAndPart() {
     Assert.equal(new TextDecoder().decode(await attachment.fetchAttachment()), body,
       "reconnect/cache reuse still names the selected physical part");
   }
+  // A MIME-supplied decoded file remains a file, even when its selected
+  // parent is IMAP. This checks the carrier contract, not crypto decryption.
+  const { AttachmentInfo } = ChromeUtils.importESModule(
+    "resource:///modules/AttachmentInfo.sys.mjs"
+  );
+  const [selected] = [...folders[0].messages];
+  const directory = await s376SaveDirectory();
+  const file = PathUtils.join(directory, "mime-supplied.txt");
+  const decoded = "Decoded bytes supplied by the current MIME reader.";
+  await IOUtils.writeUTF8(file, decoded);
+  const supplied = new AttachmentInfo({
+    contentType: "text/plain",
+    name: "mime-supplied.txt",
+    url: `${PathUtils.toFileURI(file)}?part=1.2`,
+    uri: selected.folder.getUriForMsg(selected),
+    message: selected,
+    isExternalAttachment: false,
+  });
+  Assert.equal(
+    new TextDecoder().decode(await supplied.fetchAttachment()),
+    decoded,
+    "The local MIME-supplied part is not replaced by the IMAP wire part"
+  );
   s376Imap = { server, incoming, folders, generator };
 });
 

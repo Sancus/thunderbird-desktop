@@ -2650,9 +2650,10 @@ add_task(
         ["reset"],
         ["count", 0, -1],
       ]);
-      Assert.greater(
-        BigInt(f.payloads[1].batchId),
-        BigInt(f.payloads[0].batchId)
+      Assert.equal(
+        BigInt(f.payloads[1].batchId) > BigInt(f.payloads[0].batchId),
+        true,
+        "Exact uint64 batch history is strictly increasing"
       );
       Assert.equal(f.events.filter(event => event[0] == "reset").length, 2);
       const count = f.payloads.length;

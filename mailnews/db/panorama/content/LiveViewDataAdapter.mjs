@@ -673,7 +673,7 @@ export class LiveViewDataAdapter extends TreeDataAdapter {
   }
 
   /**
-   * Intercepts the unwired descriptor before any ordinary insertion path.
+   * Consumes a captured descriptor before any ordinary insertion path.
    *
    * @param {object} batch - An ordinary row or captured descriptor.
    * @returns {boolean} Whether this was a descriptor, including stale delivery.

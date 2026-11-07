@@ -1011,3 +1011,83 @@ registerCleanupFunction(() => {
   // Remove created folders.
   folder.deleteSelf(null);
 });
+
+
+/**
+ * Display one real stored attachment for the selected command tests.
+ *
+ * @param {string} name - Unique folder name.
+ * @param {string} body - Exact attachment body.
+ * @returns {Promise<object>} Selected physical folder/header/attachment.
+ */
+async function s376MenuAttachment(name, body) {
+  const selectedFolder = await create_folder(name);
+  registerCleanupFunction(async () => {
+    await be_in_folder(folder);
+    selectedFolder.deleteSelf(null);
+  });
+  const message = create_message({ attachments: [{ body, filename: "selected.txt", format: "" }] });
+  message.messageId = "s376-detach-physical@example.invalid";
+  await add_message_to_folder([selectedFolder], message);
+  await be_in_folder(selectedFolder);
+  await select_click_row(0);
+  aboutMessage = get_about_message();
+  const [header] = [...selectedFolder.messages];
+  const [attachment] = aboutMessage.currentAttachments;
+  Assert.equal(attachment.message.messageKey, header.messageKey);
+  Assert.equal(attachment.message.folder.URI, selectedFolder.URI);
+  return { selectedFolder, header, attachment };
+}
+
+add_task(async function test_nativeDetachKeepsSelectedPhysicalMessage() {
+  const first = await s376MenuAttachment("S376DetachSelected", "selected detach bytes");
+  const other = await s376MenuAttachment("S376DetachControl", "other physical detach bytes");
+  const otherKey = other.header.messageKey;
+  const { AttachmentInfo } = ChromeUtils.importESModule("resource:///modules/AttachmentInfo.sys.mjs");
+  const directory = await IOUtils.createUniqueDirectory(PathUtils.tempDir, "s376-detach");
+  registerCleanupFunction(() => IOUtils.remove(directory, { recursive: true }));
+  await be_in_folder(first.selectedFolder);
+  await select_click_row(0);
+  await AttachmentInfo.detachAttachments(first.header, [first.attachment], directory);
+  Assert.equal(await IOUtils.readUTF8(PathUtils.join(directory, "selected.txt")), "selected detach bytes");
+  Assert.equal(first.selectedFolder.getTotalMessages(false), 1, "replacement settles before the original is deleted");
+  Assert.equal(other.selectedFolder.getTotalMessages(false), 1);
+  Assert.ok(other.selectedFolder.msgDatabase.containsKey(otherKey));
+  await be_in_folder(other.selectedFolder);
+  await select_click_row(0);
+  Assert.equal(new TextDecoder().decode(await get_about_message().currentAttachments[0].fetchAttachment()),
+    "other physical detach bytes", "detach does not touch the repeated-ID physical control");
+});
+
+add_task(async function test_attachmentDetachCancellationRetainsOriginal() {
+  const { selectedFolder, header, attachment } = await s376MenuAttachment("S376DetachCancel", "retain after cancellation");
+  const key = header.messageKey;
+  MockFilePicker.init(window.browsingContext);
+  MockFilePicker.returnValue = MockFilePicker.returnCancel;
+  try {
+    await attachment.detachFromMessage(window.browsingContext);
+  } finally {
+    MockFilePicker.cleanup();
+  }
+  Assert.equal(selectedFolder.getTotalMessages(false), 1);
+  Assert.ok(selectedFolder.msgDatabase.containsKey(key));
+  Assert.equal(new TextDecoder().decode(await attachment.fetchAttachment()), "retain after cancellation");
+});
+
+add_task(async function test_attachmentPermissionsAndEncryptionGatesRemain() {
+  const { selectedFolder, attachment } = await s376MenuAttachment("S376PermissionGate", "unchanged guarded attachment");
+  Assert.ok(aboutMessage.CanDetachAttachments(), "the normal writable selected message permits detach");
+  const contentType = aboutMessage.currentHeaderData["content-type"];
+  const oldValue = contentType.headerValue;
+  try {
+    // Exercise the existing UI policy on its parsed MIME metadata. This makes
+    // no claim of new S/MIME/OpenPGP decryption coverage or a permission bypass.
+    contentType.headerValue = "application/pkcs7-mime; smime-type=enveloped-data";
+    Assert.equal(aboutMessage.CanDetachAttachments(), false);
+  } finally {
+    contentType.headerValue = oldValue;
+  }
+  Assert.ok(aboutMessage.CanDetachAttachments());
+  Assert.equal(selectedFolder.getTotalMessages(false), 1);
+  Assert.equal(new TextDecoder().decode(await attachment.fetchAttachment()), "unchanged guarded attachment");
+});

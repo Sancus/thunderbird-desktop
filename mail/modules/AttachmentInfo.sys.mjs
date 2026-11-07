@@ -39,9 +39,19 @@ export class AttachmentInfo {
    * A cache of message/rfc822 attachments saved to temporary files for display.
    * Saving the same attachment again is avoided.
    *
-   * @type {Map<string, nsIFile>}
+   * @type {Map<string, {file: nsIFile, bodyIdentity: ?string}>}
    */
   #temporaryFiles = new Map();
+
+  /**
+   * The stored parent selected when this attachment was parsed. Standalone and
+   * external attachments keep their existing URL-based behavior.
+   *
+   * @type {?{message: nsIMsgDBHdr, folder: nsIMsgFolder,
+   *   database: nsIMsgDatabase, key: number, messageId: string, uri: string,
+   *   inputURI: string, url: string, part: ?string}}
+   */
+  #selection = null;
 
   /**
    * A function to call when checking to see if an attachment exists or not, so
@@ -110,6 +120,109 @@ export class AttachmentInfo {
       const match = lazy.MIME_PART_RE.exec(url);
       this.partID = match && match[1];
     }
+
+    if (!isExternalAttachment && message?.folder) {
+      const folder = message.folder;
+      this.#selection = {
+        message,
+        folder,
+        database: folder.msgDatabase,
+        key: message.messageKey,
+        messageId: message.messageId,
+        uri: folder.getUriForMsg(message),
+        inputURI: uri,
+        url: this.url,
+        part: this.partID,
+      };
+    }
+  }
+
+  /**
+   * Recheck the retained physical parent before a command or asynchronous
+   * completion. An old database facade must not resolve a reused key in a new
+   * source. Message-ID is only a consistency check, never a lookup key.
+   *
+   * @returns {?string} Current physical message URI, or null for a standalone
+   *   or external attachment.
+   * @throws {Components.Exception} If the selected parent or part changed.
+   */
+  #checkSelection() {
+    const selected = this.#selection;
+    if (!selected) {
+      return null;
+    }
+    const unavailable = () => {
+      throw new Components.Exception(
+        "The selected attachment is no longer available",
+        Cr.NS_ERROR_NOT_AVAILABLE
+      );
+    };
+    if (
+      this.message !== selected.message ||
+      this.uri !== selected.inputURI ||
+      this.url !== selected.url ||
+      this.partID !== selected.part ||
+      (selected.part && !/^\d+(?:\.\d+)*$/.test(selected.part)) ||
+      !selected.database.containsKey(selected.key) ||
+      !selected.message.isLive
+    ) {
+      unavailable();
+    }
+    const current = selected.database.getMsgHdrForKey(selected.key);
+    if (
+      !current ||
+      current.messageKey !== selected.key ||
+      current.folder?.URI !== selected.folder.URI ||
+      current.messageId !== selected.messageId ||
+      selected.message.messageKey !== selected.key ||
+      selected.message.folder?.URI !== selected.folder.URI
+    ) {
+      unavailable();
+    }
+    const uri = selected.folder.getUriForMsg(current);
+    if (
+      /^(mailbox|imap|news)-message:/.test(selected.inputURI) &&
+      selected.inputURI.split("?")[0] !== selected.uri
+    ) {
+      unavailable();
+    }
+
+    const actual = new URL(this.url);
+    if (["mailbox:", "imap:", "news:", "snews:"].includes(actual.protocol)) {
+      const expected = new URL(
+        MailServices.messageServiceFromURI(uri).getUrlForUri(uri).spec
+      );
+      if (
+        actual.protocol !== expected.protocol ||
+        actual.username !== expected.username ||
+        actual.host !== expected.host ||
+        decodeURIComponent(actual.pathname) !==
+          decodeURIComponent(expected.pathname) ||
+        ["number", "group", "key"].some(
+          name => actual.searchParams.get(name) !== expected.searchParams.get(name)
+        )
+      ) {
+        unavailable();
+      }
+    }
+    return uri;
+  }
+
+  /**
+   * @returns {?string} Stored body identity used only to invalidate a temporary
+   *   file after its physical parent or stored bytes change.
+   */
+  #temporaryBodyIdentity() {
+    if (!this.#selection) {
+      return null;
+    }
+    const { message } = this.#selection;
+    return JSON.stringify([
+      this.#checkSelection(),
+      message.storeToken,
+      message.messageSize,
+      message.offlineMessageSize,
+    ]);
   }
 
   /**
@@ -295,9 +408,11 @@ export class AttachmentInfo {
   }
 
   /**
-   * Fetch the attachment.
+   * Fetch the attachment bytes and recheck the selected stored parent before
+   * returning them. Preserve failed stream completion as an exception.
    *
-   * @returns {ArrayBuffer} the attachment data.
+   * @returns {Promise<ArrayBuffer>} Successfully retrieved attachment data.
+   * @throws {Components.Exception} For a changed selection or failed retrieval.
    */
   async fetchAttachment() {
     let url = this.url;
@@ -310,7 +425,78 @@ export class AttachmentInfo {
     ) {
       url += url.includes("?") ? "&outputformat=raw" : "?outputformat=raw";
     }
+    const messageURI = this.#checkSelection();
     const sourceURI = Services.io.newURI(url);
+    if (
+      messageURI &&
+      this.#selection.folder.server.type == "imap" &&
+      this.partID
+    ) {
+      const service = MailServices.messageServiceFromURI(messageURI);
+      const parameters = new URLSearchParams({ part: this.partID });
+      for (const name of ["type", "filename", "header", "outputformat"]) {
+        const value = new URL(url).searchParams.get(name);
+        if (value !== null) {
+          parameters.set(name, value);
+        }
+      }
+      return new Promise((resolve, reject) => {
+        const chunks = [];
+        let length = 0;
+        let settled = false;
+        const listener = {
+          QueryInterface: ChromeUtils.generateQI(["nsIStreamListener"]),
+          onStartRequest() {},
+          onDataAvailable(request, stream, _offset, count) {
+            if (settled) {
+              return;
+            }
+            try {
+              const binary = Cc["@mozilla.org/binaryinputstream;1"].createInstance(
+                Ci.nsIBinaryInputStream
+              );
+              binary.setInputStream(stream);
+              const chunk = binary.readByteArray(count);
+              chunks.push(chunk);
+              length += chunk.length;
+            } catch (error) {
+              settled = true;
+              reject(error);
+              request.cancel(error.result || Cr.NS_ERROR_FAILURE);
+            }
+          },
+          onStopRequest: (_request, status) => {
+            if (settled) {
+              return;
+            }
+            settled = true;
+            if (!Components.isSuccessCode(status)) {
+              reject(new Components.Exception(`Failed to fetch ${url}`, status));
+              return;
+            }
+            try {
+              this.#checkSelection();
+              const bytes = new Uint8Array(length);
+              let offset = 0;
+              for (const chunk of chunks) {
+                bytes.set(chunk, offset);
+                offset += chunk.length;
+              }
+              resolve(bytes.buffer);
+            } catch (error) {
+              reject(error);
+            }
+          },
+        };
+        service.QueryInterface(Ci.nsIMsgMessageFetchPartService).fetchMimePart(
+          service.getUrlForUri(messageURI),
+          `${messageURI}?${parameters}`,
+          listener,
+          null,
+          null
+        );
+      });
+    }
     const buffer = await new Promise((resolve, reject) => {
       lazy.NetUtil.asyncFetch(
         {
@@ -326,6 +512,7 @@ export class AttachmentInfo {
         }
       );
     });
+    this.#checkSelection();
     return buffer;
   }
 
@@ -334,9 +521,24 @@ export class AttachmentInfo {
    *
    * @param {string} target - Path to save to.
    * @param {boolean} [isTmp=false] - Treat it as a temporary file.
+   * @returns {Promise<void>} Resolves after the file has been saved.
    */
   async saveToFile(target, isTmp = false) {
     const buffer = await this.fetchAttachment();
+    await this.#saveBuffer(buffer, target, isTmp);
+  }
+
+  /**
+   * Save bytes whose successful retrieval belongs to this selected attachment.
+   * Recheck after any intervening file picker or handler dialog.
+   *
+   * @param {ArrayBuffer} buffer - Successfully retrieved attachment bytes.
+   * @param {string} target - Destination file path.
+   * @param {boolean} isTmp - Do not add temporary files to saved downloads.
+   * @returns {Promise<void>} Resolves after the file has been saved.
+   */
+  async #saveBuffer(buffer, target, isTmp) {
+    this.#checkSelection();
     const blob = new Blob([new Uint8Array(buffer)], {
       type: "application/octet-stream",
     });
@@ -349,6 +551,7 @@ export class AttachmentInfo {
         target,
         startTime: new Date(),
       });
+      this.#checkSelection();
       await download.start();
       if (!isTmp) {
         const list = await lazy.Downloads.getList(lazy.Downloads.ALL);
@@ -427,14 +630,39 @@ export class AttachmentInfo {
    *
    * @param {BrowsingContext} browsingContext - The browsingContext of the
    *   browser that this attachment is being opened from.
+   * @returns {Promise<void>} Resolves after dispatch to the existing opener or
+   *   handler dialog. Stored-part retrieval must succeed before that dispatch.
+   * @throws {Components.Exception} For a changed selection or failed retrieval.
    */
   async open(browsingContext) {
+    this.#checkSelection();
     if (!this.hasFile) {
       return;
     }
 
     const win = browsingContext.topChromeWindow;
-    const empty = await this.isEmpty();
+    const cached = this.#temporaryFiles.get(this.url);
+    const reuseTemporaryFile =
+      this.contentType == "message/rfc822" &&
+      cached?.file.exists() &&
+      cached.bodyIdentity === this.#temporaryBodyIdentity();
+    const buffer =
+      this.#selection && !reuseTemporaryFile
+        ? await this.fetchAttachment()
+        : null;
+    const empty = buffer
+      ? buffer.byteLength == 0
+      : this.#selection && reuseTemporaryFile
+        ? false
+        : await this.isEmpty();
+    this.#checkSelection();
+    const saveAttachment = async (target, isTmp = false) => {
+      if (buffer) {
+        await this.#saveBuffer(buffer, target, isTmp);
+      } else {
+        await this.saveToFile(target, isTmp);
+      }
+    };
     if (empty) {
       const prompt = await lazy.l10n.formatValue(
         this.isExternalAttachment
@@ -489,8 +717,11 @@ export class AttachmentInfo {
     }
 
     if (this.contentType == "message/rfc822") {
-      let tempFile = this.#temporaryFiles.get(this.url);
-      if (!tempFile?.exists()) {
+      let tempFile = cached?.file;
+      if (
+        !tempFile?.exists() ||
+        cached.bodyIdentity !== this.#temporaryBodyIdentity()
+      ) {
         // Try to use the name of the attachment for the temporary file, so
         // that the name is included in the URI of the message that is
         // opened, and possibly saved as a file later by the user.
@@ -501,11 +732,15 @@ export class AttachmentInfo {
           sanitizedName += ".eml";
         }
         tempFile = await this.setupTempFile(sanitizedName);
-        await this.saveToFile(tempFile.path, true);
+        await saveAttachment(tempFile.path, true);
 
-        this.#temporaryFiles.set(this.url, tempFile);
+        this.#temporaryFiles.set(this.url, {
+          file: tempFile,
+          bodyIdentity: this.#temporaryBodyIdentity(),
+        });
       }
 
+      this.#checkSelection();
       lazy.MailUtils.openEMLFile(
         win,
         tempFile,
@@ -543,10 +778,11 @@ export class AttachmentInfo {
     const createTemporaryFileAndOpen = async fileMimeInfo => {
       const tempFile = await this.setupTempFile(name);
 
-      await this.saveToFile(tempFile.path, true);
+      await saveAttachment(tempFile.path, true);
       // Before opening from the temp dir, make the file read-only so that
       // users don't edit and lose their edits...
       await IOUtils.setPermissions(tempFile.path, 0o400); // Set read-only
+      this.#checkSelection();
       this._openFile(fileMimeInfo, tempFile);
     };
 
@@ -576,7 +812,7 @@ export class AttachmentInfo {
             destFile.append(name);
             destFile.createUnique(Ci.nsIFile.NORMAL_FILE_TYPE, 0o755);
             destFile.remove(false);
-            await this.saveToFile(destFile.path);
+            await saveAttachment(destFile.path);
           } else {
             const filePicker = Cc["@mozilla.org/filepicker;1"].createInstance(
               Ci.nsIFilePicker
@@ -590,7 +826,7 @@ export class AttachmentInfo {
             );
             const rv = await new Promise(resolve => filePicker.open(resolve));
             if (rv != Ci.nsIFilePicker.returnCancel) {
-              await this.saveToFile(filePicker.file.path);
+              await saveAttachment(filePicker.file.path);
             }
           }
           return;
@@ -613,7 +849,6 @@ export class AttachmentInfo {
       "@mozilla.org/helperapplauncherdialog;1"
     ].createInstance(Ci.nsIHelperAppLauncherDialog);
 
-    const attachment = this;
     appLauncherDialog.show(
       {
         QueryInterface: ChromeUtils.generateQI(["nsIHelperAppLauncher"]),
@@ -639,7 +874,7 @@ export class AttachmentInfo {
         /** @param {nsIFile} file */
         async saveDestinationAvailable(file) {
           if (file) {
-            await attachment.saveToFile(file.path);
+            await saveAttachment(file.path);
           }
         },
         setWebProgressListener() {},

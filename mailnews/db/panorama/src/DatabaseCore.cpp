@@ -9034,7 +9034,17 @@ nsresult StartupStoredBookReceipt(JSContext* cx, nsIFile* file,
       do_GetService("@mozilla.org/storage/service;1");
   NS_ENSURE_TRUE(storage, NS_ERROR_NOT_AVAILABLE);
   nsCOMPtr<mozIStorageConnection> connection;
-  MOZ_TRY(storage->OpenUnsharedDatabase(file, getter_AddRefs(connection)));
+  nsCOMPtr<nsIURI> uri;
+  MOZ_TRY(NS_NewFileURI(getter_AddRefs(uri), file));
+  nsAutoCString spec;
+  MOZ_TRY(uri->GetSpec(spec));
+  spec.AppendLiteral("?mode=ro");
+  MOZ_TRY(NS_NewURI(getter_AddRefs(uri), spec));
+  nsCOMPtr<nsIFileURL> url = do_QueryInterface(uri);
+  NS_ENSURE_TRUE(url, NS_ERROR_UNEXPECTED);
+  MOZ_TRY(storage->OpenDatabaseWithFileURL(
+      url, "panorama-import-book.sqlite"_ns,
+      mozIStorageService::CONNECTION_DEFAULT, getter_AddRefs(connection)));
   JS::Rooted<JSObject*> result(cx, JS_NewPlainObject(cx));
   auto read = [&]() -> nsresult {
     MOZ_TRY(connection->ExecuteSimpleSQL("PRAGMA query_only=ON"_ns));

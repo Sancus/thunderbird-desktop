@@ -1188,8 +1188,15 @@ export class MigrationJournal {
     }
     const files = new Map();
     const filesByPath = new Map();
+    const directoriesByPath = new Map();
     for (const root of manifest.roots) {
       for (const entry of root.entries) {
+        if (entry.type == "directory") {
+          const directory = new FileUtils.File(
+            PathUtils.join(root.source, ...entry.parts)
+          );
+          directoriesByPath.set(directory.path, entry.physicalIdentity);
+        }
         if (entry.type == "regular") {
           const matches = files.get(entry.sha256) ?? [];
           const saved = {
@@ -1214,17 +1221,38 @@ export class MigrationJournal {
       if (source.inventory) {
         const measured = validateMorkFolderWindowsInventory(source.inventory);
         const stored = filesByPath.get(measured.store.canonicalPath);
-        if (
-          measured.store.id
-            ? !stored ||
-              stored.physicalIdentity.id !== measured.store.id ||
-              stored.physicalIdentity.parentId !== measured.store.parentId ||
-              (await IOUtils.stat(measured.store.canonicalPath)).size !==
-                stored.size ||
-              (await hashMigrationFile(measured.store.canonicalPath)) !==
-                stored.sha256
-            : !!stored
-        ) {
+        const directory = directoriesByPath.get(measured.store.canonicalPath);
+        let differs;
+        if (!measured.store.id) {
+          differs = !!stored || !!directory;
+        } else if (directory) {
+          // A maildir store is a directory: its identity and every backed-up
+          // message file below it must be unchanged.
+          const root = new FileUtils.File(measured.store.canonicalPath);
+          differs =
+            directory.id !== measured.store.id ||
+            directory.parentId !== measured.store.parentId;
+          for (const saved of filesByPath.values()) {
+            if (differs) {
+              break;
+            }
+            if (root.contains(saved.file)) {
+              differs =
+                (await IOUtils.stat(saved.file.path)).size !== saved.size ||
+                (await hashMigrationFile(saved.file.path)) !== saved.sha256;
+            }
+          }
+        } else {
+          differs =
+            !stored ||
+            stored.physicalIdentity.id !== measured.store.id ||
+            stored.physicalIdentity.parentId !== measured.store.parentId ||
+            (await IOUtils.stat(measured.store.canonicalPath)).size !==
+              stored.size ||
+            (await hashMigrationFile(measured.store.canonicalPath)) !==
+              stored.sha256;
+        }
+        if (differs) {
           throw new Error("Migration body store differs from verified backup");
         }
       }

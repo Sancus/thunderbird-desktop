@@ -1,0 +1,335 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+"use strict";
+
+const { MailServices } = ChromeUtils.importESModule(
+  "resource:///modules/MailServices.sys.mjs"
+);
+const { MessageGenerator } = ChromeUtils.importESModule(
+  "resource://testing-common/mailnews/MessageGenerator.sys.mjs"
+);
+const { GlodaMsgIndexer } = ChromeUtils.importESModule(
+  "resource:///modules/gloda/IndexMsg.sys.mjs"
+);
+const { waitForGlodaDBFlush } = ChromeUtils.importESModule(
+  "resource://testing-common/gloda/GlodaTestHelperFunctions.sys.mjs"
+);
+const { getMailSearchService, closeMailSearch } = ChromeUtils.importESModule(
+  "resource:///modules/panorama/MailSearch.sys.mjs"
+);
+const { be_in_folder } = ChromeUtils.importESModule(
+  "resource://testing-common/mail/FolderDisplayHelpers.sys.mjs"
+);
+const { set_filter_text } = ChromeUtils.importESModule(
+  "resource://testing-common/mail/QuickFilterBarHelpers.sys.mjs"
+);
+const tabmail = document.getElementById("tabmail");
+let fixture;
+
+/**
+ * Read independent physical identities from the actual store or native view.
+ *
+ * @param {nsIMsgDBHdr} header - Physical header.
+ * @returns {string} Folder URI, global key and literal Message-ID.
+ */
+function physicalIdentity(header) {
+  return JSON.stringify([
+    header.folder.URI,
+    header.messageKey,
+    header.messageId,
+  ]);
+}
+
+add_setup(async function setupNativeFacetMessages() {
+  Assert.ok(
+    Services.prefs.getBoolPref("mail.panorama.enabled"),
+    "This suite requires the native backend selected at startup"
+  );
+  Assert.ok(
+    Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+      Ci.nsIMsgDBService
+    ) instanceof Ci.nsIDatabaseCore,
+    "The actual database service is Panorama"
+  );
+  await SpecialPowers.pushPrefEnv({
+    set: [
+      ["gloda.show_as_list_by_default", false],
+      ["mailnews.default_view_flags", 0],
+      ["mailnews.mark_message_read.auto", false],
+    ],
+  });
+  // This fixture drains real Gloda metadata before its native index snapshot.
+  // Native startup deliberately leaves that legacy indexer uninitialized.
+  ChromeUtils.importESModule("resource:///modules/gloda/GlodaPublic.sys.mjs");
+  const root =
+    MailServices.accounts.localFoldersServer.rootFolder.QueryInterface(
+      Ci.nsIMsgLocalMailFolder
+    );
+  const folders = ["First", "Second", "Excluded"].map(name =>
+    root
+      .createLocalSubfolder("NativeFacet" + name)
+      .QueryInterface(Ci.nsIMsgLocalMailFolder)
+  );
+  registerCleanupFunction(async () => {
+    while (tabmail.tabInfo.length > 1) {
+      tabmail.closeTab(1);
+    }
+    await closeMailSearch();
+    for (const folder of folders) {
+      folder.parent.propagateDelete(folder, true);
+    }
+  });
+  const [first, second, excluded] = folders;
+  const generator = new MessageGenerator();
+  // Folder retirement retains physical rows. Keep this fixture's generated IDs
+  // separate from earlier files sharing this native profile, while serializing
+  // the same reply twice below still creates the intended physical duplicates.
+  const messageIdNamespace = Services.uuid
+    .generateUUID()
+    .toString()
+    .slice(1, -1);
+  const makeMessageId = generator.makeMessageId.bind(generator);
+  generator.makeMessageId = message =>
+    `${messageIdNamespace}.${makeMessageId(message)}`;
+  const term = "panoramafacetedphysicalneedle";
+  const parent = generator.makeMessage({
+    subject: "Conversation root outside query",
+    from: ["Root Sender", "facetsender@example.invalid"],
+    to: [["Reply Sender", "facetreply@example.invalid"]],
+  });
+  const rootHeader = first.addMessage(parent.toMessageString());
+  const reply = generator.makeMessage({
+    inReplyTo: parent,
+    subject: term,
+    attachments: [
+      { filename: "retained.pdf", contentType: "application/pdf", body: "pdf" },
+      { filename: "retained.png", contentType: "image/png", body: "image" },
+    ],
+  });
+  reply.subject = term;
+  const secondCopy = second.addMessage(reply.toMessageString());
+  const clicked = first.addMessage(reply.toMessageString());
+  const tailMessage = generator.makeMessage({ inReplyTo: reply });
+  tailMessage.subject = "Conversation tail outside query";
+  const tail = second.addMessage(tailMessage.toMessageString());
+  Assert.equal(
+    clicked.messageId,
+    secondCopy.messageId,
+    "The two physical reply copies retain the same literal Message-ID"
+  );
+  Assert.equal(
+    clicked.getStringReference(0),
+    rootHeader.messageId,
+    "The reply retains its generated root reference"
+  );
+  Assert.equal(
+    tail.getStringReference(tail.numReferences - 1),
+    clicked.messageId,
+    "The tail retains its generated reply reference"
+  );
+  const matches = [secondCopy, clicked];
+  const pagination = gTestPath.endsWith("/browser_panoramaSearchFacets.js");
+  const paddingCount = pagination ? 100 : 1;
+  // The ordinary batch API preserves header order and avoids one mailbox fsync
+  // for every padding message in this pagination fixture.
+  matches.push(
+    ...first.addMessageBatch(
+      Array.from({ length: paddingCount }, () =>
+        generator.makeMessage({ subject: term }).toMessageString()
+      )
+    )
+  );
+  excluded.addMessage(
+    generator
+      .makeMessage({ subject: "Unrelated local control" })
+      .toMessageString()
+  );
+  first.addKeywordsToMessages([clicked], "$label1");
+  first.addKeywordsToMessages([matches[2]], "not-a-ui-tag");
+  second.addKeywordsToMessages([secondCopy], "$label1");
+  first.markMessagesFlagged([clicked], true);
+  // This manifest keeps Gloda enabled. Its asynchronous commit writes gloda-id
+  // on the same physical headers. Drain normal dirty-message indexing without
+  // forcing already indexed padding through a second pass, and finish metadata
+  // before taking
+  // the native index snapshot used by these UI assertions.
+  await Promise.all(
+    folders.map(
+      folder =>
+        new Promise((resolve, reject) => {
+          const queued = GlodaMsgIndexer.indexFolder(folder, {
+            callback(success) {
+              if (!success) {
+                reject(new Error("Fixture Gloda indexing did not complete"));
+                return;
+              }
+              resolve();
+            },
+          });
+          if (!queued) {
+            reject(new Error("Fixture Gloda indexing was not queued"));
+          }
+        })
+    )
+  );
+  // A completed indexing job may leave its transaction waiting for user idle.
+  // Use the existing real commit barrier before snapshotting native metadata.
+  await waitForGlodaDBFlush();
+  const service = await getMailSearchService();
+  let progress;
+  do {
+    progress = await service.update({ limit: 500 });
+  } while (progress.moreWork);
+  if (pagination) {
+    Assert.equal(first.getTotalMessages(false), 102);
+  } else {
+    Assert.equal(first.getTotalMessages(false), 3);
+  }
+  Assert.equal(second.getTotalMessages(false), 2);
+  Assert.equal(excluded.getTotalMessages(false), 1);
+  fixture = {
+    first,
+    second,
+    excluded,
+    term,
+    matches,
+    clicked,
+    secondCopy,
+    conversation: [rootHeader, secondCopy, clicked, tail],
+    generator,
+    service,
+  };
+});
+
+/**
+ * Open the existing facet tab and wait for its native query and widget build.
+ *
+ * @param {string} text - Literal search text.
+ * @returns {Promise<object>} Existing tab and facet context.
+ */
+async function openNativeFacets(text) {
+  // Earlier list selections may update native metadata; query the settled index.
+  let progress;
+  do {
+    progress = await fixture.service.update({ limit: 500 });
+  } while (progress.moreWork);
+  // Retain the actual fail-closed availability facts when a conversation fails.
+  // Reading these test-only facts never repairs or changes reference history.
+  try {
+    const core = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+      Ci.nsIDatabaseCore
+    );
+    const connection = core.connectionForTests;
+    const availability = connection.createStatement(
+      "SELECT EXISTS(SELECT 1 FROM messages WHERE id = :seed) AS seedExists, " +
+        "EXISTS(SELECT 1 FROM messages m LEFT JOIN message_reference_sets s " +
+        "ON s.id = m.id WHERE s.id IS NULL) AS unknownHistory"
+    );
+    try {
+      availability.params.seed = fixture.clicked.messageKey;
+      availability.executeStep();
+      info(
+        "Native conversation availability: " +
+          JSON.stringify({
+            sourceId: core.sourceId,
+            seed: fixture.clicked.messageKey,
+            seedExists: availability.row.seedExists,
+            unknownHistory: availability.row.unknownHistory,
+            transactionInProgress: connection.transactionInProgress,
+          })
+      );
+    } finally {
+      availability.finalize();
+    }
+    const unknown = connection.createStatement(
+      "SELECT m.id, m.folderId, m.messageId FROM messages m " +
+        "LEFT JOIN message_reference_sets s ON s.id = m.id " +
+        "WHERE s.id IS NULL ORDER BY m.id LIMIT 32"
+    );
+    try {
+      while (unknown.executeStep()) {
+        info(
+          "Native conversation unknown row: " +
+            JSON.stringify({
+              id: unknown.row.id,
+              folderId: unknown.row.folderId,
+              messageId: unknown.row.messageId,
+            })
+        );
+      }
+    } finally {
+      unknown.finalize();
+    }
+  } catch (error) {
+    info("Native conversation diagnostic failed: " + error);
+  }
+  const tab = tabmail.openTab("glodaFacet", { mailSearch: { text } });
+  await TestUtils.waitForCondition(
+    () => tab.searchPromise,
+    "The retained facet document starts its native query"
+  );
+  await tab.searchPromise;
+  // Capture the native read preconditions after facet initialization, at the
+  // boundary where the conversation action will use the current native core.
+  const core = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIDatabaseCore
+  );
+  try {
+    info(
+      "Native post-facet conversation keys: " +
+        JSON.stringify(
+          core.messageDB.getConversationMessageKeys(fixture.clicked.messageKey)
+        )
+    );
+  } catch (error) {
+    info("Native post-facet conversation error: " + error);
+    const rows = core.connectionForTests.createStatement(
+      "SELECT m.id,m.folderId,m.threadId,m.messageId,f.id AS existingFolder," +
+        "s.id AS referenceSet FROM messages m LEFT JOIN folders f ON f.id=m.folderId " +
+        "LEFT JOIN message_reference_sets s ON s.id=m.id ORDER BY m.id"
+    );
+    try {
+      while (rows.executeStep()) {
+        info(
+          "Native post-facet conversation row: " +
+            JSON.stringify({
+              id: rows.row.id,
+              folderId: rows.row.folderId,
+              threadId: rows.row.threadId,
+              messageId: rows.row.messageId,
+              existingFolder: rows.row.existingFolder,
+              referenceSet: rows.row.referenceSet,
+            })
+        );
+      }
+    } finally {
+      rows.finalize();
+    }
+  }
+  return { tab, context: tab.browser.contentWindow.FacetContext };
+}
+
+/**
+ * Read the actual completed C++ synthetic search view.
+ *
+ * @param {object} tab - Existing mail3PaneTab.
+ * @returns {Promise<object>} Pane and physical rows.
+ */
+async function readNativeList(tab) {
+  await TestUtils.waitForCondition(() => {
+    const pane = tab.chromeBrowser?.contentWindow;
+    return (
+      pane?.gViewWrapper?.isSynthetic &&
+      pane.dbViewWrapperListener.allMessagesLoaded
+    );
+  }, "Native synthetic list completes");
+  const pane = tab.chromeBrowser.contentWindow;
+  return {
+    pane,
+    identities: Array.from({ length: pane.gDBView.rowCount }, (_, index) =>
+      physicalIdentity(pane.gDBView.getMsgHdrAt(index))
+    ).sort(),
+  };
+}

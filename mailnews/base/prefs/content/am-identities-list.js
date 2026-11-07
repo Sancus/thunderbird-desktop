@@ -2,10 +2,6 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-var { Gloda } = ChromeUtils.importESModule(
-  "resource:///modules/gloda/Gloda.sys.mjs"
-);
-
 var gIdentityListBox; // the root <richlistbox> node
 var gAddButton;
 var gEditButton;
@@ -153,8 +149,14 @@ function onSetDefault() {
   gAccount.defaultIdentity = identity;
   // Rebuilt the identity list and select the moved identity again.
   refreshIdentityList(0);
-  // Update gloda's myContact with the new default identity.
-  Gloda._initMyIdentities();
+  // Update gloda's myContact with the new default identity. Only refresh an
+  // already loaded Gloda; loading it here would open its database without the
+  // indexer that closes it (Panorama never starts it).
+  if (Cu.isESModuleLoaded("resource:///modules/gloda/Gloda.sys.mjs")) {
+    ChromeUtils.importESModule(
+      "resource:///modules/gloda/Gloda.sys.mjs"
+    ).Gloda._initMyIdentities();
+  }
 }
 
 function onDelete() {

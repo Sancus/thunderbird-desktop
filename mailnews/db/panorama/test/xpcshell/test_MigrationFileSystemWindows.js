@@ -121,7 +121,7 @@ add_task(windowsOnly(), function test_closedLeaseMetadataAndValidationRefuse() {
 
 add_task(windowsOnly(), function test_fakeAndForeignLeaseObjectsRefuse() {
   const fake = {
-    QueryInterface: ChromeUtils.generateQI(["nsISupports"]),
+    QueryInterface: ChromeUtils.generateQI([]),
     canonicalPath: original,
     identity: "0".repeat(49),
     exists: true,

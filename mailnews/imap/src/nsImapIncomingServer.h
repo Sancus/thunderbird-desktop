@@ -104,11 +104,11 @@ class nsImapIncomingServer : public nsMsgIncomingServer,
   nsCOMArray<nsIImapUrl> m_urlQueue;
 
   /**
-   * Consumers for the queued urls. The number of elements here should match
-   * that of m_urlQueue. So requests with no consumer should have a nullptr
-   * entry here.
+   * Owning references to consumers for the queued urls. The number of elements
+   * here should match that of m_urlQueue. Requests with no consumer have a
+   * nullptr entry here.
    */
-  nsTArray<nsISupports*> m_urlConsumers;
+  nsTArray<nsCOMPtr<nsISupports>> m_urlConsumers;
 
   nsCOMPtr<nsIStringBundle> m_stringBundle;
   nsCOMArray<nsIMsgFolder>

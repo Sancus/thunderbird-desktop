@@ -91,8 +91,7 @@ add_setup(async function () {
   IMAPPump.incomingServer.useCondStore = false;
   registerCleanupFunction(async () => {
     if (IMAPPump.incomingServer) {
-      // Release unused offline-operation wrappers before closing their stores.
-      await schedulePreciseGCAndForceCC(1);
+      await releaseOfflineOpWrappers();
       teardownIMAPPump();
     }
   });
@@ -190,6 +189,21 @@ async function selectFolder(folder) {
   const listener = new PromiseTestUtils.PromiseUrlListener();
   MailServices.imap.selectFolder(folder, listener, null);
   await listener.promise;
+}
+
+/**
+ * Releases unused offline-operation wrappers before closing their stores.
+ * A wrapper kept alive only by a cycle through cycle-collected objects is
+ * garbage after CC but is collected by the next GC, and XPConnect may release
+ * the collected natives incrementally from an idle task. Otherwise those Mork
+ * rows are released at shutdown, after their stores closed.
+ */
+async function releaseOfflineOpWrappers() {
+  await schedulePreciseGCAndForceCC(3);
+  await new Promise(resolve => Cu.schedulePreciseGC(resolve));
+  await new Promise(resolve =>
+    ChromeUtils.idleDispatch(resolve, { timeout: 1000 })
+  );
 }
 
 async function closeConnections() {
@@ -342,13 +356,16 @@ async function checkLivePendingSource(kind) {
   const key = header.messageKey;
   const bytes = storedBody(folder, header);
   Assert.ok(bytes.includes("Keep this exact pending source body."));
-  const op = queueIntent(folder, header, kind);
-  const intent = [
-    op.operation,
-    op.newFlags,
-    op.destinationFolderURI,
-    op.playingBack,
+  const readOp = queued => [
+    queued.operation,
+    queued.newFlags,
+    queued.destinationFolderURI,
+    queued.playingBack,
   ];
+  // A pending delete/move wrapper held across SELECT stays alive until
+  // shutdown, after teardown has closed its Mork store. Re-read the stored
+  // operation after each SELECT instead of keeping the queued wrapper.
+  const intent = readOp(queueIntent(folder, header, kind));
   Assert.ok(db.containsKey(key));
   const added = [],
     deleted = [];
@@ -391,10 +408,7 @@ async function checkLivePendingSource(kind) {
       Assert.deepEqual(added, []);
       Assert.deepEqual(deleted, [removed.messageKey]);
       Assert.deepEqual(db.listAllOfflineOpIds(), [key]);
-      Assert.deepEqual(
-        [op.operation, op.newFlags, op.destinationFolderURI, op.playingBack],
-        intent
-      );
+      Assert.deepEqual(readOp(db.getOfflineOpForKey(key, false)), intent);
       Assert.deepEqual(
         remote._messages.map(item => item.uid),
         [6101]
@@ -703,8 +717,11 @@ if (panorama) {
     const token = headers[0].storeToken;
     const bytes = storedTokenBody(folder, token);
     Assert.ok(bytes.includes("Keep this exact pending source body."));
-    const op = queueIntent(folder, headers[0], "move");
-    const intent = [op.operation, op.newFlags, op.destinationFolderURI];
+    // Keep no offline-operation wrapper alive across forceClosed().
+    const intent = (() => {
+      const op = queueIntent(folder, headers[0], "move");
+      return [op.operation, op.newFlags, op.destinationFolderURI];
+    })();
     const identity = queuedIdentity(folder, key);
     Assert.deepEqual(identity.slice(2), [7101, 6101]);
     db.deleteMessages([key], null);
@@ -732,6 +749,7 @@ if (panorama) {
     try {
       for (let i = 0; i < 2; i++) {
         await closeConnections();
+        await releaseOfflineOpWrappers();
         folder.msgDatabase.forceClosed();
         await selectFolder(folder);
         const reopened = folder.msgDatabase.QueryInterface(
@@ -1217,7 +1235,6 @@ if (panorama) {
 }
 
 add_task(async function endTest() {
-  // Release unused offline-operation wrappers before closing their stores.
-  await schedulePreciseGCAndForceCC(1);
+  await releaseOfflineOpWrappers();
   teardownIMAPPump();
 });

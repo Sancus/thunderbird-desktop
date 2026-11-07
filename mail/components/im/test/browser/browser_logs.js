@@ -348,11 +348,16 @@ add_task(
   async function test_legacyChatRotationAndStartupSweepKeepPhysicalLogs() {
     const alpha = legacyChat.conversations[0];
     const writer = getLogWriter(alpha);
-    const time = Math.floor(alpha.startDate / 1000000) + 31 * 60;
+    // Rotate on real inactivity with a message stamped now. A message dated
+    // after now would start a log dated in the future, and the log tree keeps a
+    // single "today" row, so within 31 minutes of midnight that future log hid
+    // the original one from later selection.
+    writer._lastMessageTime -= writer.constructor.kInactivityLimit + 60 * 1000;
     alpha.writeMessage("PlainSpeaker", "legacychat rotationneedle", {
       incoming: true,
-      time,
     });
+    // Message appends are queued only after the new log header is initialized.
+    await writer._initialized;
     const paths = await IMServices.logs.getLogPathsForConversation(alpha);
     Assert.equal(paths.length, 2, "Inactivity creates a second real log file");
     Assert.notEqual(paths[0], paths[1]);
@@ -430,6 +435,10 @@ async function openLegacyChatHit(
     facetWindow
   );
   await loaded;
+  Assert.ok(
+    browser.browsingContext.isActive,
+    "The selected log browser is active before displaying and finding text"
+  );
   await TestUtils.waitForCondition(
     () => browser.contentWindow.getSelection().toString() == text,
     "The real findbar selects the clicked result's first matching text"

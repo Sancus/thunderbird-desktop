@@ -23,6 +23,7 @@ config = {
                     "TestMail*:TestMsg*:*XREAppDir*:"
                     "DeliveryCore*:FolderStorageMoveTest.*:"
                     "LocalCopyHeaders.*:MigrationWindowsPath.*:QuarantinedOutputStream.*:"
+                    "DeliveryCompleteHeader.FolderRepair*:"
                     "DeliveryCompleteHeader."
                     "NewsArticleLocationRequiresExactPhysicalBinding:"
                     "DeliveryCompleteHeader."

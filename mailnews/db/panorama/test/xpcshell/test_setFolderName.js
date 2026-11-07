@@ -11,7 +11,7 @@ const { ProfileCreator } = ChromeUtils.importESModule(
   "resource://testing-common/mailnews/ProfileCreator.sys.mjs"
 );
 
-add_task(async function () {
+add_task(async function test_folderNamePreservesProperties() {
   do_get_profile();
   const profile = new ProfileCreator(do_get_profile());
   const server = profile.addLocalServer();
@@ -60,7 +60,9 @@ add_task(async function () {
   stmt.finalize();
   Assert.deepEqual(originalProperties, [
     [5, "mailboxName", "Trash"],
+    [5, "summaryValid", 1],
     [6, "mailboxName", "Unsent Messages"],
+    [6, "summaryValid", 1],
   ]);
 
   folderA.name = "alpha";

@@ -53,7 +53,11 @@ add_task(function test_onHdrAddedWithoutParent() {
         header.messageKey,
         "The root owns its thread"
       );
-      Assert.equal(header.flags, 0, "The callback header has the root flags");
+      Assert.equal(
+        header.flags,
+        Ci.nsMsgMessageFlags.New,
+        "The unread callback header exposes its New-list status"
+      );
       added.push([
         header.messageKey,
         header.folder.URI,
@@ -71,7 +75,15 @@ add_task(function test_onHdrAddedWithoutParent() {
   );
   Assert.deepEqual(
     added,
-    [[root.messageKey, noParentFolder.URI, 0xffffffff, 0, null]],
+    [
+      [
+        root.messageKey,
+        noParentFolder.URI,
+        0xffffffff,
+        Ci.nsMsgMessageFlags.New,
+        null,
+      ],
+    ],
     "Exactly one root addition uses the no-parent notification sentinel"
   );
   noParentDB.removeListener(listener);
@@ -79,8 +91,8 @@ add_task(function test_onHdrAddedWithoutParent() {
 
 add_task(function test_onHdrAddedIncludesParentAndFolder() {
   const first = generator.makeMessage({ subject: "Notification parent" });
-  // The reply subject supplies HasRe; New is tracked in the DB new-message list.
-  const expectedFlags = Ci.nsMsgMessageFlags.HasRe;
+  // The reply subject supplies HasRe and its unread status supplies New.
+  const expectedFlags = Ci.nsMsgMessageFlags.HasRe | Ci.nsMsgMessageFlags.New;
   const root = folder.addMessage(first.toMessageString());
   const otherFolder = rootFolder
     .createLocalSubfolder("other")

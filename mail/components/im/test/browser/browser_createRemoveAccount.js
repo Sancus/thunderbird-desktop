@@ -14,7 +14,7 @@ add_setup(function () {
   });
 });
 
-add_task(async function () {
+add_task(async function test_createAndRemoveChatAccount() {
   const tabInfo = window.openContentTab("about:accountsettings");
   await TestUtils.waitForCondition(
     () => tabInfo.pageLoaded && !tabInfo.busy,
@@ -132,6 +132,13 @@ add_task(async function () {
     contentFrame.contentWindow
   );
   await handleRemoveAccount(await removePromise);
+  await TestUtils.waitForCondition(
+    () =>
+      contentFrame.contentDocument.documentURI ==
+        "chrome://messenger/content/am-serverwithnoidentities.xhtml" &&
+      contentFrame.contentDocument.readyState == "complete",
+    "waiting for the remaining account pane to load"
+  );
 
   // Check the account was successfully removed.
 
@@ -195,11 +202,17 @@ async function handleRemoveAccount(win) {
     "waiting for remove account dialog to load"
   );
   const dialog = win.document.querySelector("dialog");
+  const closed = BrowserTestUtils.waitForEvent(win, "unload");
 
   // Delay here to catch bug 2046647.
   await new Promise(resolve => win.setTimeout(resolve, 100));
   EventUtils.synthesizeMouseAtCenter(dialog.getButton("accept"), {}, win);
   await new Promise(resolve => win.setTimeout(resolve, 100));
+  await TestUtils.waitForCondition(
+    () => !dialog.getButton("accept").disabled,
+    "waiting for account and saved-login removal to finish"
+  );
   EventUtils.synthesizeMouseAtCenter(dialog.getButton("accept"), {}, win);
+  await closed;
   info("remove account dialog closed");
 }

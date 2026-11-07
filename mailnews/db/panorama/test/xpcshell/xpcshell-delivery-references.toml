@@ -20,14 +20,17 @@ prefs = [
 ]
 
 ["test_deliveryCompatibilityReferencesCountFilteredLimit.js"]
+run-sequentially = true
 
 ["test_deliveryCompatibilityReferencesCountLimit.js"]
 
 ["test_deliveryCompatibilityReferencesCountOverflow.js"]
 
 ["test_deliveryCompatibilityReferencesCountOverflow65536Storage.js"]
+run-sequentially = true
 
 ["test_deliveryCompatibilityReferencesCountOverflow65537.js"]
+run-sequentially = true
 
 ["test_deliveryCompatibilityReferencesMissingMessage.js"]
 

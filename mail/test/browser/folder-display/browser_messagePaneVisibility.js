@@ -338,7 +338,10 @@ add_task(async function test_message_pane_restores_stored_size_on_startup() {
     restoredWidth
   );
 
-  const win = await open3PaneWindow(folder);
+  // Allow the stored pane widths and the splitter drag to fit beside the
+  // thread pane minimum, including on a 1024px builder desktop.
+  const windowFeatures = "chrome,all,dialog=no,width=1537,height=988";
+  const win = await open3PaneWindow(folder, windowFeatures);
   try {
     const about3Pane = win.document.getElementById("tabmail").currentAbout3Pane;
     const messagePane = about3Pane.document.getElementById("messagePane");
@@ -445,7 +448,7 @@ add_task(async function test_message_pane_restores_stored_size_on_startup() {
       "the dragged message pane width should be persisted"
     );
 
-    const restoredWin = await open3PaneWindow(folder);
+    const restoredWin = await open3PaneWindow(folder, windowFeatures);
     try {
       const restoredAbout3Pane =
         restoredWin.document.getElementById("tabmail").currentAbout3Pane;

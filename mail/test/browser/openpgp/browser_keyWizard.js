@@ -150,7 +150,16 @@ add_task(async function switch_sections() {
       "the start section should have a height"
     );
   } finally {
-    dialog?.cancelDialog();
+    if (dialog) {
+      // SubDialog removes its frame on the next main-thread turn.
+      const unloaded = BrowserTestUtils.waitForEvent(
+        dialog.documentGlobal,
+        "unload",
+        true
+      );
+      dialog.cancelDialog();
+      await unloaded;
+    }
   }
 });
 
@@ -205,7 +214,16 @@ add_task(async function missing_identity_name() {
       "the Generate key button should still be enabled"
     );
   } finally {
-    dialog?.cancelDialog();
+    if (dialog) {
+      // SubDialog removes its frame on the next main-thread turn.
+      const unloaded = BrowserTestUtils.waitForEvent(
+        dialog.documentGlobal,
+        "unload",
+        true
+      );
+      dialog.cancelDialog();
+      await unloaded;
+    }
     gIdentity.fullName = "Alice";
   }
 });
@@ -384,6 +402,9 @@ add_task(async function import_secret_key() {
   const keyListRadio = tabDocument.getElementById("openPgpKeyListRadio");
   const listItemCount = keyListRadio.itemCount + 1;
 
+  // Observe real teardown before the completion callback closes this frame.
+  const importUnloaded = BrowserTestUtils.waitForEvent(wizard, "unload", false);
+
   // Accept the dialog to close it.
   dialog.acceptDialog();
 
@@ -404,6 +425,8 @@ add_task(async function import_secret_key() {
     1,
     "The previously generated secret key is still selected"
   );
+
+  await importUnloaded;
 
   await OpenPGPTestUtils.removeKeyById(importedKeyId, true);
   // Remove all the previously generated radio options, except the first.
@@ -469,6 +492,13 @@ add_task(async function add_external_key() {
   const keyListRadio = tabDocument.getElementById("openPgpKeyListRadio");
   const listItemCount = keyListRadio.itemCount + 1;
 
+  // Public-key import closes this frame after updating the account UI.
+  const externalUnloaded = BrowserTestUtils.waitForEvent(
+    wizard,
+    "unload",
+    false
+  );
+
   const importButton = doc.getElementById("importPublicKeyButton");
   EventUtils.synthesizeMouseAtCenter(importButton, {}, dialog.documentGlobal);
 
@@ -503,6 +533,8 @@ add_task(async function add_external_key() {
     "The external key was properly set for the current identity"
   );
 
+  await externalUnloaded;
+
   await OpenPGPTestUtils.removeKeyById(EXTERNAL_GNUP_KEY, false);
   await SpecialPowers.popPrefEnv();
 });
@@ -525,6 +557,18 @@ add_task(async function check_for_go_back_button() {
   // Open the key manager from the "OpenPGP Key Manager" button.
   const openPGPKeyManagerButton = tabDocument.getElementById(
     "openOpenPGPKeyManagerButton"
+  );
+  openPGPKeyManagerButton.scrollIntoView({ block: "nearest" });
+  info(
+    "Key manager input: " +
+      JSON.stringify({
+        button: openPGPKeyManagerButton.getBoundingClientRect().toJSON(),
+        viewport: {
+          width: tabWindow.innerWidth,
+          height: tabWindow.innerHeight,
+        },
+        pendingSubDialog: !!gTab.browser.contentWindow.gSubDialog._topDialog,
+      })
   );
   EventUtils.synthesizeMouseAtCenter(openPGPKeyManagerButton, {}, tabWindow);
 

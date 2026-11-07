@@ -43,7 +43,7 @@ searchOnline=true
   MailServices.accounts.accounts;
 });
 
-add_task(async function () {
+add_task(async function test_virtualFolderMigrationRetainsProperties() {
   const rootFolder = MailServices.accounts.localFoldersServer.rootFolder;
   Assert.deepEqual(rootFolder.subFolders.map(f => f.name).toSorted(), [
     "Trash",
@@ -138,11 +138,13 @@ add_task(async function () {
     rows,
     [
       [rootFolder.getChildNamed("Trash").id, "mailboxName", "Trash"],
+      [rootFolder.getChildNamed("Trash").id, "summaryValid", 1],
       [
         rootFolder.getChildNamed("Unsent Messages").id,
         "mailboxName",
         "Unsent Messages",
       ],
+      [rootFolder.getChildNamed("Unsent Messages").id, "summaryValid", 1],
       [allMessagesId, "searchOnline", 0],
       [allMessagesId, "searchStr", "ALL"],
       [testId, "searchOnline", 0],

@@ -10777,7 +10777,7 @@ TEST_F(DeliveryCoreReferences,
                 MOZ_TRY(stmt->GetInt64(1, &id));
                 MOZ_TRY(stmt->GetInt64(2, &revision));
                 EXPECT_EQ(op.key, key);
-                EXPECT_EQ(op.id, id);
+                EXPECT_EQ(static_cast<int64_t>(op.id), id);
                 EXPECT_EQ(op.revision, revision);
                 MOZ_TRY(stmt->ExecuteStep(&more));
                 EXPECT_FALSE(more);

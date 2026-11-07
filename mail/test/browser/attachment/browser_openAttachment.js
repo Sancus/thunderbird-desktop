@@ -1453,6 +1453,7 @@ add_task(async function test_pdfTabUsesSelectedBytesAcrossImapUidReuse() {
   await discovered.promise;
   const selectedFolder = incoming.rootFolder.getChildNamed(name);
   const tabmail = document.getElementById("tabmail");
+  const mailTab = tabmail.currentTabInfo;
   const handlerInfo = mimeService.getFromTypeAndExtension(
     "application/pdf",
     "pdf"
@@ -1474,6 +1475,7 @@ add_task(async function test_pdfTabUsesSelectedBytesAcrossImapUidReuse() {
       "Original physical PDF",
       "Fresh physical PDF",
     ].entries()) {
+      tabmail.switchToTab(mailTab);
       const pdf = s376Pdf(label);
       const message = generator.makeMessage({
         attachments: [
@@ -1588,8 +1590,15 @@ add_task(async function test_pdfTabUsesSelectedBytesAcrossImapUidReuse() {
     handlerInfo.preferredAction = oldHandler.preferredAction;
     handlerInfo.alwaysAskBeforeHandling = oldHandler.alwaysAskBeforeHandling;
     handlerService.store(handlerInfo);
+    tabmail.switchToTab(mailTab);
     for (const tab of tabs) {
-      tabmail.closeTab(tab);
+      try {
+        await SpecialPowers.spawn(tab.browser, [], async () => {
+          await content.wrappedJSObject.PDFViewerApplication.testingClose();
+        });
+      } finally {
+        tabmail.closeTab(tab);
+      }
     }
     for (const path of files) {
       await IOUtils.remove(path, { ignoreAbsent: true });

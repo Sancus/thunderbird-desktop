@@ -6337,7 +6337,12 @@ nsImapMailFolder::NormalEndMsgWriteStream(ImapUid uidOfMessage, bool markRead,
         MOZ_LOG(IMAP, mozilla::LogLevel::Debug,
                 ("Updating stored message size from %u, new size %d", msgSize,
                  updatedMessageSize));
-        sizeResult = msgHeader->SetMessageSize(updatedMessageSize);
+        // An equal rewrite would only advance the row revision and invalidate
+        // a staged native body guard. A zero read may be an absent value.
+        if (msgSize == 0 ||
+            msgSize != static_cast<uint32_t>(updatedMessageSize)) {
+          sizeResult = msgHeader->SetMessageSize(updatedMessageSize);
+        }
         MOZ_LOG(IMAP, mozilla::LogLevel::Debug,
                 ("Completed downloaded message size update: 0x%08x",
                  static_cast<uint32_t>(sizeResult)));
@@ -10546,7 +10551,11 @@ nsImapMailFolder::CopyMessages(nsIMsgFolder* srcFolder,
 #ifdef MOZ_PANORAMA
   if (mail_panorama_enabled_AtStartup()) {
     NS_ENSURE_FALSE(mNativeOnlineCopyPending, NS_ERROR_IN_PROGRESS);
-    if (!WeAreOffline() && sameServer && allowUndo && isMove) {
+    nsCOMPtr<nsIImapMailFolderSink> imapSource = do_QueryInterface(srcFolder);
+    // A cross-server stream copy freezes the source body guard when it stages
+    // the destination, so the source cache must be finished before streaming.
+    if (!WeAreOffline() && ((sameServer && allowUndo && isMove) ||
+                            (!sameServer && imapSource))) {
       nsTArray<RefPtr<nsIMsgDBHdr>> uncached;
       for (const auto& header : messages) {
         uint32_t flags;
@@ -10579,7 +10588,8 @@ nsImapMailFolder::CopyMessages(nsIMsgFolder* srcFolder,
           return retainedSource->OnStartRunningUrl(url);
         };
         completion->mStopFn = [self, retainedSource, database, captured,
-                               request, isFolder, completed = false](
+                               request, isMove, isFolder, allowUndo,
+                               completed = false](
                                   nsIURI* url,
                                   nsresult status) mutable -> nsresult {
           if (completed) return NS_OK;
@@ -10617,9 +10627,9 @@ nsImapMailFolder::CopyMessages(nsIMsgFolder* srcFolder,
             (void)self->OnCopyCompleted(request->m_srcSupport, status);
             return status;
           }
-          return self->CopyMessages(retainedSource, request->m_messages, true,
-                                    request->m_msgWindow, request->m_listener,
-                                    isFolder, true);
+          return self->CopyMessages(retainedSource, request->m_messages,
+                                    isMove, request->m_msgWindow,
+                                    request->m_listener, isFolder, allowUndo);
         };
         MOZ_TRY(source->AcquireSemaphore(static_cast<nsIMsgFolder*>(source),
                                          "native online undo recovery"_ns));

@@ -38,12 +38,12 @@ class SaveAttachmentCallbackListener {
 
 const gCallbackObject = new SaveAttachmentCallbackListener();
 
-add_setup(function () {
-  setupIMAPPump();
-
+add_setup(async function () {
   registerCleanupFunction(() => {
     teardownIMAPPump();
   });
+
+  await setupIMAPPump(undefined, { awaitInbox: true });
 });
 
 add_task(async function testImapAttachmentDetac() {

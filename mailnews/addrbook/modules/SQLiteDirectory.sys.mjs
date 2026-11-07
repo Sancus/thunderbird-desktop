@@ -568,6 +568,50 @@ export class SQLiteDirectory extends AddrBookDirectory {
   }
 
   /**
+   * Rejects links in a migration path. Only a system link outside the
+   * canonical profile that resolves to one of its ancestors, such as macOS
+   * /tmp or /var, is accepted. A link at or inside the profile, or one that
+   * resolves anywhere else, is refused.
+   *
+   * @param {nsIFile} file - Path to check; it need not be canonical.
+   * @param {string} message - Error message for a refused link.
+   * @throws {Error} With message for a refused or unresolvable link.
+   */
+  static checkMigrationPathLinks(file, message) {
+    let profile = null;
+    for (
+      let entry = file.QueryInterface(Ci.nsIFile).clone();
+      entry;
+      entry = entry.parent
+    ) {
+      if (!entry.isSymlink()) {
+        continue;
+      }
+      let accepted = false;
+      try {
+        if (!profile) {
+          profile = Services.dirsvc.get("ProfD", Ci.nsIFile).clone();
+          profile.normalize();
+        }
+        const location = entry.parent.clone();
+        location.normalize();
+        location.append(entry.leafName);
+        const target = entry.clone();
+        target.normalize();
+        accepted =
+          !profile.equals(location) &&
+          !profile.contains(location) &&
+          target.contains(profile);
+      } catch {
+        // An unresolvable link or an unavailable profile is refused below.
+      }
+      if (!accepted) {
+        throw new Error(message);
+      }
+    }
+  }
+
+  /**
    * Reads a completed book and verifies its original bytes and scoped UID maps.
    * Never initializes a schema, imports a row or allocates an identity. A closed
    * stage must have no cached owner or data-bearing WAL/rollback journal.
@@ -601,11 +645,10 @@ export class SQLiteDirectory extends AddrBookDirectory {
       throw new TypeError("Expected original book bytes and storage identity");
     }
     const target = file.QueryInterface(Ci.nsIFile).clone();
-    for (let current = target; current; current = current.parent) {
-      if (current.isSymlink()) {
-        throw new Error("Book validation path contains a link");
-      }
-    }
+    SQLiteDirectory.checkMigrationPathLinks(
+      target,
+      "Book validation path contains a link"
+    );
     if (!target.exists() || !target.isFile()) {
       throw new Error("Book validation requires an existing regular file");
     }

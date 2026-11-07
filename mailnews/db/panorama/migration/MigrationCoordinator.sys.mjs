@@ -2059,29 +2059,26 @@ function captureStartupMigration(signal) {
   selector.append("panorama-profile.json");
   const work = profile.parent.clone();
   work.append("panorama-migration-" + profile.leafName);
-  if ((work.exists() || work.isSymlink()) && !selector.exists()) {
+  const targetExists = startupEntryExists(target);
+  const selectorExists = startupEntryExists(selector);
+  if (startupEntryExists(work) && !selectorExists) {
     throw new Error("Existing migration work requires explicit recovery");
   }
-  if (!target.exists()) {
+  if (!targetExists) {
     for (const suffix of ["-wal", "-shm", "-journal"]) {
       const auxiliary = profile.clone();
       auxiliary.append("panorama.sqlite" + suffix);
-      if (auxiliary.exists() || auxiliary.isSymlink()) {
+      if (startupEntryExists(auxiliary)) {
         throw new Error(
           "Orphan Panorama recovery file is not an absent database"
         );
       }
     }
   }
-  for (const file of [target, selector]) {
-    if (file.isSymlink()) {
-      throw new Error("Panorama startup input contains a link");
-    }
-  }
   if (
     !Services.prefs.getBoolPref("mail.panorama.enabled", false) ||
-    target.exists() ||
-    selector.exists()
+    targetExists ||
+    selectorExists
   ) {
     return { profilePath: profile.path };
   }
@@ -2398,6 +2395,27 @@ function startupFolderOrigin(source, summary, caches) {
     hierarchyDelimiter: hierDelim,
     boxFlags,
   };
+}
+
+/**
+ * Checks one startup leaf below the already validated selected profile/parent.
+ *
+ * @param {nsIFile} file - Selected target, selector, recovery or work entry.
+ * @returns {boolean} Whether the native entry exists.
+ * @throws {Error} For links or any error other than an actually missing leaf.
+ */
+function startupEntryExists(file) {
+  try {
+    if (file.isSymlink()) {
+      throw new Error("Panorama startup input contains a link");
+    }
+  } catch (error) {
+    if (error.result !== Cr.NS_ERROR_FILE_NOT_FOUND || file.exists()) {
+      throw error;
+    }
+    return false;
+  }
+  return file.exists();
 }
 
 /**

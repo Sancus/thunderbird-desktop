@@ -1940,7 +1940,8 @@ add_task(
     // A strict parser fixture, never a native folder/receipt/origin grant.
     await IOUtils.writeUTF8(
       cachePath,
-      "< <(a=c)>(80=ns:msg:db:row:scope:folders:all)" +
+      '// <!-- <mdb:mork:z v="1.4"/> -->\n' +
+        "< <(a=c)>(80=ns:msg:db:row:scope:folders:all)" +
         "(81=ns:msg:db:table:kind:folders)(82=key)" +
         "(8A=boxFlags)(8B=hierDelim)(8C=onlineName)>\n" +
         "{1:^80 {(k^81:c)} [1(^82=" +

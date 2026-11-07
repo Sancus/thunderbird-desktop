@@ -417,7 +417,7 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
 
     def create_legacy_message(self, store):
         """Write genuine Mork/store data through the normal legacy mail API."""
-        result = self.marionette.execute_script("""
+        result = self.marionette.execute_script(r"""
             const { MailServices } = ChromeUtils.importESModule(
               'resource:///modules/MailServices.sys.mjs');
             const { FileUtils } = ChromeUtils.importESModule(

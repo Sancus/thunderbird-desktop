@@ -1257,8 +1257,8 @@ function checkMeta(row, id, members, messages, imap = false) {
     row.scope != "m" ||
     row.cells.size !=
       META_FIELDS.size -
-      Number(imap && !row.cells.has("unreadChildren")) -
-      Number(!row.cells.has("threadNewestMsgDate")) ||
+        Number(imap && !row.cells.has("unreadChildren")) -
+        Number(!row.cells.has("threadNewestMsgDate")) ||
     [...row.cells.keys()].some(name => !META_FIELDS.has(name)) ||
     hex(row.cells.get("threadId")) != id ||
     hex(row.cells.get("threadFlags")) != 0 ||

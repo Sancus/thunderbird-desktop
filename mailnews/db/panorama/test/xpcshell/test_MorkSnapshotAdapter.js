@@ -1206,7 +1206,7 @@ add_task(async function test_imapUnitRejectsUnknownOrAmbiguousBinding() {
 const MISSING_NEWEST_IMAP_SHA256 =
   "740a7bd8d9a44550e72c783df794aeb9e3acab63b42790a91192763507bf2f9d";
 const MISSING_NEWEST_IMAP_SOURCE = [
-  "// <!-- <mdb:mork:z v=\"1.4\"/> -->",
+  '// <!-- <mdb:mork:z v="1.4"/> -->',
   "< <(a=c)> // (f=iso-8859-1)",
   "  (80=ns:msg:db:row:scope:msgs:all)(81=subject)(82=sender)(83=message-id)",
   "  (84=references)(85=recipients)(86=date)(87=size)(88=flags)(89=priority)",
@@ -1242,7 +1242,7 @@ const MISSING_NEWEST_IMAP_SOURCE = [
   "",
   "@$${C{@",
   "@$$}C}@",
-  ""
+  "",
 ].join("\n");
 
 /**
@@ -1253,7 +1253,8 @@ const MISSING_NEWEST_IMAP_SOURCE = [
  *   Ordinary reader input and its source plan for the existing converter.
  */
 async function missingNewestImapEntry() {
-  const root = MailServices.accounts.getIncomingServer(imapServerKey).rootFolder;
+  const root =
+    MailServices.accounts.getIncomingServer(imapServerKey).rootFolder;
   const folder = root.addSubfolder(
     "missing-newest-" + Services.uuid.generateUUID().toString().slice(1, -1)
   );
@@ -1322,7 +1323,11 @@ add_task(async function test_convertsOriginalImapNoNewestDateCache() {
   Assert.equal(member.messages[0].header.date, 0);
   Assert.deepEqual(member.imap.serverUids, [{ sourceKey: 42, uid: 42 }]);
   Assert.deepEqual(member.imap.uidValidity, { present: true, value: 526 });
-  Assert.deepEqual(entry.input, original, "No source cell is inserted or changed");
+  Assert.deepEqual(
+    entry.input,
+    original,
+    "No source cell is inserted or changed"
+  );
   Assert.deepEqual(
     await IOUtils.read(entry.source.path),
     new TextEncoder().encode(MISSING_NEWEST_IMAP_SOURCE)
@@ -1332,7 +1337,11 @@ add_task(async function test_convertsOriginalImapNoNewestDateCache() {
 add_task(async function test_rejectsInvalidMetadataWithNoNewestDateCache() {
   const entry = await missingNewestImapEntry();
   const convertEntry = value =>
-    convertMorkProtocolUnit([value], "missing-newest-refusal", database.sourceId);
+    convertMorkProtocolUnit(
+      [value],
+      "missing-newest-refusal",
+      database.sourceId
+    );
   Assert.equal(convertEntry(entry).folders.length, 1);
   for (const [name, value, expected] of [
     ["threadNewestMsgDate", "1", /Unsupported Mork newest-date cache/],

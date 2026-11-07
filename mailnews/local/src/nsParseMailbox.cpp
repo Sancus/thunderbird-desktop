@@ -1195,11 +1195,12 @@ class CompletedFilterCopyListener final : public CopyServiceListener,
       bool move, const nsTArray<RefPtr<nsIMsgDBHdr>>& source,
       nsIMsgFolder* destination,
       const nsTArray<RefPtr<nsIMsgDBHdr>>& arrived) override {
-    MOZ_LOG(FILTERLOGMODULE, LogLevel::Debug,
-            ("CompletedFilterCopy notify listener=%p started=%d move=%d "
-             "destinationMatch=%d sourceCount=%u arrivedCount=%u sameObject=%d",
-             this, mStarted, move, destination == mDestination, source.Length(),
-             arrived.Length(), source.Length() == 1 && source[0] == mSource));
+    MOZ_LOG(
+        FILTERLOGMODULE, LogLevel::Debug,
+        ("CompletedFilterCopy notify listener=%p started=%d move=%d "
+         "destinationMatch=%d sourceCount=%zu arrivedCount=%zu sameObject=%d",
+         this, mStarted, move, destination == mDestination, source.Length(),
+         arrived.Length(), source.Length() == 1 && source[0] == mSource));
     if (!mStarted || !move || destination != mDestination ||
         source.Length() != 1 || !source[0]) {
       return NS_OK;

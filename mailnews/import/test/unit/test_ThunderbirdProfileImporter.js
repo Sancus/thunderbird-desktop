@@ -16,6 +16,9 @@ Services.prefs.setBoolPref(
 var { MailServices } = ChromeUtils.importESModule(
   "resource:///modules/MailServices.sys.mjs"
 );
+var { MockRegistrar } = ChromeUtils.importESModule(
+  "resource://testing-common/MockRegistrar.sys.mjs"
+);
 var { ThunderbirdProfileImporter } = ChromeUtils.importESModule(
   "resource:///modules/ThunderbirdProfileImporter.sys.mjs"
 );
@@ -455,8 +458,56 @@ add_task(async function test_importAddressBooks() {
   conn.close();
   do_get_file("import.mab").copyTo(tmpProfileDir, "mork.mab");
 
+  const originalMab = await IOUtils.read(do_get_file("import.mab").path);
+  let acquisitions = 0;
+  const refusedMork = () => {
+    acquisitions++;
+    throw Components.Exception(
+      "S603 profile runtime Mork acquisition",
+      Cr.NS_ERROR_FAILURE
+    );
+  };
+  const factories = [
+    MockRegistrar.registerEx(
+      "@mozilla.org/import/import-ab-file;1?type=mab",
+      { shouldCreateInstance: false },
+      refusedMork
+    ),
+    MockRegistrar.registerEx(
+      "@mozilla.org/db/mork;1",
+      { shouldCreateInstance: false },
+      refusedMork
+    ),
+  ];
   const importer = new ThunderbirdProfileImporter();
-  await importer.startImport(tmpProfileDir, { addressBooks: true });
+  try {
+    await importer.startImport(tmpProfileDir, { addressBooks: true });
+    Assert.equal(acquisitions, 0);
+    Assert.deepEqual(
+      await IOUtils.read(PathUtils.join(tmpProfileDir.path, "mork.mab")),
+      originalMab
+    );
+    const book = MailServices.ab.getDirectoryFromId("ldap_2.servers.mab");
+    const cards = book.childCards.filter(card => !card.isMailList);
+    Assert.equal(cards.length, 1);
+    Assert.equal(cards[0].displayName, "contact number one");
+    Assert.equal(cards[0].primaryEmail, "contact1@invalid");
+    Assert.equal(cards[0].getPropertyAsUint32("RecordKey"), 1);
+    Assert.equal(cards[0].getPropertyAsUint32("DbRowID"), 1);
+    const [list] = book.childNodes;
+    Assert.equal(book.childNodes.length, 1);
+    Assert.equal(list.dirName, "list");
+    Assert.equal(list.listNickName, "nick name");
+    Assert.equal(list.description, "a list of cards");
+    Assert.deepEqual(
+      list.childCards.map(card => card.UID),
+      [cards[0].UID]
+    );
+  } finally {
+    for (const cid of factories) {
+      MockRegistrar.unregister(cid);
+    }
+  }
 
   for (const [name, expectedValue] of [
     ["ldap_2.servers.import.description", "Import SQLite"],

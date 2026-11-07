@@ -7,8 +7,11 @@ import { MailServices } from "resource:///modules/MailServices.sys.mjs";
 const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
   MailStringUtils: "resource:///modules/MailStringUtils.sys.mjs",
+  readMorkAddressBookSource:
+    "resource:///modules/panorama/MigrationSource.sys.mjs",
   exportAttributes: "resource:///modules/AddrBookUtils.sys.mjs",
   setTimeout: "resource://gre/modules/Timer.sys.mjs",
+  VCardProperties: "resource:///modules/VCardUtils.sys.mjs",
 });
 
 ChromeUtils.defineLazyGetter(lazy, "d3", () => {
@@ -337,14 +340,89 @@ export class AddrBookFileImporter {
   }
 
   /**
-   * Import the .mab source file into the target directory.
+   * Reads a complete MAB snapshot before adding cards, lists and their members.
+   * Uses normal target projections and maps physical source keys to the cards
+   * actually returned by the target. Never opens or writes a Mork database.
+   *
+   * @throws {Error} For unsupported source data or a target write failure.
+   *   Target failures retain earlier successful writes, without final progress.
    */
   async _importMabFile() {
+    const { book } = await lazy.readMorkAddressBookSource(
+      this._sourceFile.path
+    );
+    const cards = new Map();
+    const uids = new Set();
+    for (const source of book.cards) {
+      const card = Cc["@mozilla.org/addressbook/cardproperty;1"].createInstance(
+        Ci.nsIAbCard
+      );
+      for (const [name, value] of source.properties) {
+        if (name.includes("\0")) {
+          throw new Error("Unsupported legacy card property name");
+        }
+        // Generate the normal vCard from the original fields, not a stale cell.
+        if (name == "_vCard" || (name == "UID" && !value)) {
+          continue;
+        }
+        if (name == "RecordKey") {
+          if (!/^[0-9a-f]{0,8}$/iu.test(value)) {
+            throw new Error("Unrepresentable legacy card RecordKey");
+          }
+          card.setPropertyAsUint32(name, parseInt(value || "0", 16));
+        } else {
+          card.setProperty(name, value);
+        }
+      }
+      card.setPropertyAsUint32("DbRowID", source.sourceKey);
+      const uid = card.UID;
+      if (uid.includes("\0") || uid.includes("/") || uids.has(uid)) {
+        throw new Error("Unsupported or duplicate legacy card UID");
+      }
+      // Validate the normal card projection before any target is changed.
+      lazy.VCardProperties.fromPropertyMap(
+        new Map(
+          Array.from(card.properties, property => [
+            property.name,
+            property.value,
+          ])
+        )
+      );
+      uids.add(uid);
+      cards.set(source.sourceKey, card);
+    }
+    const lists = book.lists.map(source => {
+      const name = source.properties.get("ListName");
+      if (!name || name.includes("  ") || /[,;"<>\0]/u.test(name)) {
+        throw new Error("Unrepresentable legacy mailing list name");
+      }
+      if (
+        new Set(source.members).size != source.members.length ||
+        source.members.some(key => !cards.get(key)?.primaryEmail)
+      ) {
+        // The normal list API ignores a member with no email. Refuse that loss.
+        throw new Error("Unrepresentable legacy mailing list membership");
+      }
+      const list = Cc[
+        "@mozilla.org/addressbook/directoryproperty;1"
+      ].createInstance(Ci.nsIAbDirectory);
+      list.isMailList = true;
+      list.dirName = name;
+      list.listNickName = source.properties.get("ListNickName") ?? "";
+      list.description = source.properties.get("ListDescription") ?? "";
+      return { list, members: source.members };
+    });
+
     this.onProgress(2, 10);
-    const importMab = Cc[
-      "@mozilla.org/import/import-ab-file;1?type=mab"
-    ].createInstance(Ci.nsIImportABFile);
-    importMab.readFileToDirectory(this._sourceFile, this._targetDirectory);
+    for (const [key, card] of cards) {
+      cards.set(key, this._targetDirectory.addCard(card));
+    }
+    for (const { list, members } of lists) {
+      const targetList = this._targetDirectory.addMailList(list);
+      for (const key of members) {
+        targetList.addCard(cards.get(key));
+      }
+    }
     this.onProgress(10, 10);
   }
 }

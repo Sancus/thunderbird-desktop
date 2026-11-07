@@ -6624,9 +6624,10 @@ nsresult CacheRequest(JSContext* cx, JS::Handle<JS::Value> value,
     MOZ_TRY(ImportMember(cx, object, "size", &field));
     MOZ_TRY(ImportNumber(field, 1, UINT32_MAX - 1, number));
     input.manifestSize = number;
-    if (input.version == 3)
-      NS_ENSURE_TRUE(input.path == input.profilePath + "/folderCache.json"_ns,
-                     NS_ERROR_INVALID_ARG);
+    if (input.version == 3) {
+      const nsCString expectedPath(input.profilePath + "/folderCache.json"_ns);
+      NS_ENSURE_TRUE(input.path == expectedPath, NS_ERROR_INVALID_ARG);
+    }
   }
   MOZ_TRY(ImportMember(cx, request, "folders", &field));
   uint32_t length;

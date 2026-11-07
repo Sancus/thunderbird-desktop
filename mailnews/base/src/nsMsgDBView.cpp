@@ -4964,7 +4964,8 @@ nsMsgDBView::OnHdrDeleted(nsIMsgDBHdr* aHdrChanged, nsMsgKey aParentKey,
       NS_ENSURE_SUCCESS(rv, rv);
       nsCOMPtr<nsIMsgThread> thread;
       for (nsMsgViewIndex childIndex = deletedIndex + 1;
-           childIndex < GetSize() && m_levels[childIndex] > m_levels[deletedIndex];
+           childIndex < GetSize() &&
+           m_levels[childIndex] > m_levels[deletedIndex];
            ++childIndex) {
         bool exists;
         rv = m_db->ContainsKey(m_keys[childIndex], &exists);
@@ -4982,9 +4983,9 @@ nsMsgDBView::OnHdrDeleted(nsIMsgDBHdr* aHdrChanged, nsMsgKey aParentKey,
         nsMsgKey childThreadId;
         rv = child->GetThreadId(&childThreadId);
         NS_ENSURE_SUCCESS(rv, rv);
-        NS_ENSURE_TRUE(childFolder == removedFolder &&
-                           childThreadId == removedThreadId,
-                       NS_ERROR_ILLEGAL_VALUE);
+        NS_ENSURE_TRUE(
+            childFolder == removedFolder && childThreadId == removedThreadId,
+            NS_ERROR_ILLEGAL_VALUE);
         rv = m_db->GetThreadContainingMsgHdr(child, getter_AddRefs(thread));
         NS_ENSURE_SUCCESS(rv, rv);
         break;

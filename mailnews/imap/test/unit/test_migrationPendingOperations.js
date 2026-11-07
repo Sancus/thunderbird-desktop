@@ -2136,6 +2136,12 @@ add_task(async function test_importHoldsRefuseUserCopyAndMove() {
     };
   }
 
+  // An earlier task's refused playback can keep ordinary folder syncs queued.
+  // Settle every member with its server state first, so the snapshot measures
+  // only this task's held transfers; a repeated sync then changes nothing.
+  for (const member of members) {
+    await selectFolder(member.folder);
+  }
   const before = custody();
   const flag = before.holds.find(row => row.folderId == members[1].folder.id);
   const move = before.holds.find(row => row.folderId == members[0].folder.id);

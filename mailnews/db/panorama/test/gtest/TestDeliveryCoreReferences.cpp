@@ -4026,7 +4026,7 @@ class DeliveryCoreReferences : public testing::Test {
         [&] { EXPECT_EQ(NS_OK, prefs->DeleteBranch(prefix.get())); });
     auto setText = [&](const char* name, const nsACString& value) -> nsresult {
       nsCString pref(prefix + nsDependentCString(name));
-      return prefs->SetCharPref(pref.get(), PromiseFlatCString(value).get());
+      return prefs->SetCharPref(pref.get(), value);
     };
     ASSERT_EQ(NS_OK, setText("type", protocol));
     ASSERT_EQ(NS_OK, setText("userName", "json-native"_ns));

@@ -1566,7 +1566,9 @@ add_task(async function test_pdfTabUsesSelectedBytesAcrossImapUidReuse() {
           pdfDocument,
           "The ordinary PDF viewer loaded the selected bytes"
         );
-        const text = await (await pdfDocument.getPage(1)).getTextContent();
+        // Promise resolution restores Xrays around the content-defined proxy.
+        const page = Cu.waiveXrays(await pdfDocument.getPage(1));
+        const text = Cu.waiveXrays(await page.getTextContent());
         Assert.ok(text.items.some(item => item.str == expected));
       });
       Assert.equal(await IOUtils.readUTF8(fileURL.file.path), pdf);

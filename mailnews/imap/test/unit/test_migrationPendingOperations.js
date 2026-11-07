@@ -2137,6 +2137,8 @@ add_task(async function test_importHoldsRefuseUserCopyAndMove() {
   }
 
   const before = custody();
+  // DIAG-006: force the server sync that Try observes during the iterations.
+  members[1].folder.updateFolderWithListener(null, null);
   const flag = before.holds.find(row => row.folderId == members[1].folder.id);
   const move = before.holds.find(row => row.folderId == members[0].folder.id);
   Assert.ok(flag && move, "Actual flag-only and MOVE origins remain held");

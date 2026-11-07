@@ -6709,10 +6709,14 @@ bool nsImapMailFolder::IsImportHeldHeader(nsMsgKey key) {
   RefPtr<mozilla::mailnews::DatabaseCore> core =
       mozilla::mailnews::DatabaseCore::GetInstanceForService();
   bool held = false;
-  return core &&
-         NS_SUCCEEDED(core->MessageDB().IsOfflineImportHeld(mFolderId, key,
-                                                            held)) &&
-         held;
+  nsresult rv = core ? core->MessageDB().IsOfflineImportHeld(mFolderId, key,
+                                                             held)
+                     : NS_ERROR_NOT_AVAILABLE;
+  NS_WARNING(nsPrintfCString("DIAG-006 held folder=%" PRIu64
+                             " key=%u rv=0x%08x held=%d",
+                             mFolderId, key, static_cast<uint32_t>(rv), held)
+                 .get());
+  return NS_SUCCEEDED(rv) && held;
 }
 #endif
 
@@ -6733,6 +6737,10 @@ nsresult nsImapMailFolder::NotifyMessageFlagsFromHdr(nsIMsgDBHdr* dbHdr,
   nsCOMPtr<nsIMsgDatabase> database(mDatabase);
   NS_ENSURE_STATE(database);
 
+  NS_WARNING(nsPrintfCString("DIAG-006 flags-from-hdr folder=%" PRIu64
+                             " key=%u server=0x%x",
+                             mFolderId, msgKey, static_cast<uint32_t>(flags))
+                 .get());
   MOZ_TRY(database->MarkRead(msgKey, (flags & kImapMsgSeenFlag) != 0, nullptr));
   MOZ_TRY(database->MarkReplied(msgKey, (flags & kImapMsgAnsweredFlag) != 0,
                                 nullptr));

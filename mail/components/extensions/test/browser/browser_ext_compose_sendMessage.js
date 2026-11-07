@@ -1082,7 +1082,7 @@ async function checkImapFcc(retry) {
         browser.test.assertDeepEq(result.messages, info.messages);
         const [message] = result.messages;
         browser.test.assertEq(config.accountId, message.folder.accountId);
-        browser.test.assertEq("/ConfiguredSent", message.folder.path);
+        browser.test.assertEq("/NegativeSentOracle", message.folder.path);
         browser.test.assertEq(result.headerMessageId, message.headerMessageId);
         const stored = await browser.messages.get(message.id);
         browser.test.assertEq(config.subject, stored.subject);

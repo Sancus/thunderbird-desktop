@@ -5327,7 +5327,22 @@ class DeliveryCoreReferences : public testing::Test {
           ASSERT_EQ(NS_OK, journal->GetNativePath(path));
           ASSERT_EQ(NS_OK, mCore->GetSourceId(sourceId));
           ASSERT_EQ(NS_OK, manager->UnloadAccounts());
-          Stop();
+          // Retain the durable archive/journal while the selected operation
+          // actually settles and releases its profile lock and directory scope.
+          {
+            nsCOMPtr<nsIFile> work = mStartupFixtureWork.forget();
+            auto restoreWork =
+                MakeScopeExit([&] { mStartupFixtureWork = work; });
+            FinishSelectedStartup();
+          }
+          ASSERT_FALSE(HasFailure());
+          ASSERT_FALSE(mSelectedStartup);
+          ASSERT_FALSE(mSelectedLock);
+          ASSERT_FALSE(mCore);
+          ASSERT_FALSE(mConnection);
+          ASSERT_FALSE(Connection());
+          ASSERT_FALSE(DatabaseCore::sInstance);
+          ASSERT_TRUE(mStartupFixtureWork);
           FaultStartupArchive(2);
           ASSERT_FALSE(HasFatalFailure());
           ASSERT_EQ(NS_OK, ArmSelectedStartup());

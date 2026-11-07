@@ -919,17 +919,14 @@ add_task(async function test_getMigrationProfileStateDoesNotReadArchive() {
 });
 
 /**
- * Runs the public coordinator with a fault at the native target-open boundary.
+ * Runs the public coordinator with a fault at its native service boundary.
  * The real source copy, pending journal and prepared selector are persisted.
- * Restores the component and temporary profile inputs before the next case.
+ * Restores the module globals and temporary inputs before the next case.
  *
  * @param {"refused"|"cancelled"|"partial"} failure - Native open outcome.
  * @returns {Promise<void>} Resolves after checking selector and retry behavior.
  */
 async function checkStartupTargetFailure(failure) {
-  const { MockRegistrar } = ChromeUtils.importESModule(
-    "resource://testing-common/MockRegistrar.sys.mjs"
-  );
   const { startPanoramaProfileAtStartup } = ChromeUtils.importESModule(
     "resource:///modules/panorama/MigrationCoordinator.sys.mjs"
   );
@@ -959,9 +956,7 @@ async function checkStartupTargetFailure(failure) {
   const controller = new AbortController();
   let opened = 0;
   let settled = 0;
-  const operation = {
-    QueryInterface: ChromeUtils.generateQI(["nsISupports"]),
-  };
+  const operation = {};
   const fault =
     failure === "cancelled"
       ? new DOMException("Migration cancelled", "AbortError")
@@ -970,7 +965,6 @@ async function checkStartupTargetFailure(failure) {
           Cr.NS_ERROR_NOT_AVAILABLE
         );
   const core = {
-    QueryInterface: ChromeUtils.generateQI(["nsIDatabaseCore"]),
     beginProfileStartup() {
       return Promise.resolve(operation);
     },
@@ -1005,11 +999,25 @@ async function checkStartupTargetFailure(failure) {
       settled++;
     },
   };
-  const cid = MockRegistrar.registerEx(
-    "@mozilla.org/mailnews/database-core;1",
-    { shouldCreateInstance: false },
-    core
-  );
+  // nsIDatabaseCore is builtin-only. Stub the module's service lookup rather
+  // than registering a JavaScript implementation of that native interface.
+  const moduleGlobal = Cu.getGlobalForObject(startPanoramaProfileAtStartup);
+  const originalCc = moduleGlobal.Cc;
+  const mockCc = {
+    "@mozilla.org/mailnews/database-core;1": {
+      getService(iid) {
+        Assert.ok(iid.equals(Ci.nsIDatabaseCore));
+        return core;
+      },
+    },
+  };
+  moduleGlobal.Cc = new Proxy(mockCc, {
+    get(target, property) {
+      return Reflect.has(target, property)
+        ? Reflect.get(target, property)
+        : Reflect.get(originalCc, property);
+    },
+  });
   const originalOpen = MigrationJournal.open;
   MigrationJournal.open = async function (...args) {
     const journal = await originalOpen.apply(this, args);
@@ -1072,7 +1080,8 @@ async function checkStartupTargetFailure(failure) {
   } finally {
     // These process-wide test replacements must be restored before another case.
     MigrationJournal.open = originalOpen;
-    MockRegistrar.unregister(cid);
+    moduleGlobal.Cc = originalCc;
+    Assert.strictEqual(moduleGlobal.Cc, originalCc);
     Services.prefs.deleteBranch(branch);
     if (hadEnabled) {
       Services.prefs.setBoolPref("mail.panorama.enabled", enabled);

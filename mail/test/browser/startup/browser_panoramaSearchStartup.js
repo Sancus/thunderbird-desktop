@@ -59,10 +59,9 @@ add_task(async function test_nativeActivityDoesNotStartTheLegacyIndexer() {
   process.contextType = "panorama-search";
   manager.addActivity(process);
   try {
-    Assert.equal(
-      window.MsgStatusFeedback._observedProcesses.get(process.id),
-      process,
-      "The status bar observes the real native activity"
+    Assert.ok(
+      window.MsgStatusFeedback._activeProcesses.includes(process),
+      "The status bar tracks the real native activity"
     );
     Assert.ok(
       !Cu.isESModuleLoaded(legacyModule),
@@ -73,8 +72,8 @@ add_task(async function test_nativeActivityDoesNotStartTheLegacyIndexer() {
     manager.removeActivity(process.id);
   }
   Assert.ok(
-    !window.MsgStatusFeedback._observedProcesses.has(process.id),
-    "The completed native activity is no longer observed"
+    !window.MsgStatusFeedback._activeProcesses.includes(process),
+    "The completed native activity is no longer tracked"
   );
 });
 

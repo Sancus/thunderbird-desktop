@@ -1157,6 +1157,12 @@ async function ci051ReportAnimations(step) {
     busyRows: about3Pane
       ? [...about3Pane.document.querySelectorAll("[data-is-busy], [busy], .busy")].map(describe)
       : null,
+    throbber: (() => {
+      const toolbar = document.querySelector("unified-toolbar");
+      const throbbers = [...(toolbar?.shadowRoot?.querySelectorAll(".throbber") ?? []),
+        ...document.querySelectorAll(".throbber")];
+      return throbbers.map(t => describe(t));
+    })(),
     documents: [],
   };
   for (const doc of documents) {
@@ -1168,10 +1174,41 @@ async function ci051ReportAnimations(step) {
         state: animation.playState,
       });
     }
-    for (const element of doc.querySelectorAll("*")) {
+    // Walk shadow roots too; toolbar and tree widgets keep their images there.
+    const all = [];
+    const walk = root => {
+      for (const element of root.querySelectorAll("*")) {
+        all.push(element);
+        if (element.shadowRoot) {
+          walk(element.shadowRoot);
+          for (const animation of element.shadowRoot.getAnimations?.() ?? []) {
+            entry.animations.push({
+              target: describe(animation.effect?.target),
+              name: animation.animationName || animation.transitionProperty,
+              state: animation.playState,
+              shadow: true,
+            });
+          }
+        }
+      }
+    };
+    walk(doc);
+    entry.cssImages = {};
+    for (const element of all) {
       for (const pseudo of [null, "::before", "::after"]) {
         const style = doc.defaultView.getComputedStyle(element, pseudo);
         const images = [style.content, style.backgroundImage, style.listStyleImage].join(" ");
+        for (const url of images.match(/url\("[^"]+"\)/g) ?? []) {
+          if (/\.(gif|apng|png|webp)|load|throb|spin|progress/.test(url)) {
+            const rect = element.getBoundingClientRect();
+            const shown = style.visibility != "hidden" && style.display != "none" && rect.width > 0;
+            const key = `${url} ${shown ? "shown" : "hidden"}`;
+            entry.cssImages[key] ??= [];
+            if (entry.cssImages[key].length < 3) {
+              entry.cssImages[key].push(describe(element) + (pseudo ?? ""));
+            }
+          }
+        }
         if (images.includes("loading.svg")) {
           const rect = element.getBoundingClientRect();
           entry.loading.push({
@@ -1191,7 +1228,8 @@ async function ci051ReportAnimations(step) {
         }
       } catch (e) {}
     }
-    if (entry.animations.length || entry.loading.length || entry.animatedImages.length) {
+    if (entry.animations.length || entry.loading.length || entry.animatedImages.length ||
+        Object.keys(entry.cssImages).length) {
       report.documents.push(entry);
     }
   }

@@ -518,6 +518,7 @@ nsImapIncomingServer::GetImapConnectionAndLoadUrl(nsIImapUrl* aImapUrl,
     PR_CEnterMonitor(this);
     m_urlQueue.AppendObject(aImapUrl);
     m_urlConsumers.AppendElement(aConsumer);
+    NS_IF_ADDREF(aConsumer);
     PR_CExitMonitor(this);
     // let's try running it now - maybe the connection is free now.
     bool urlRun;
@@ -595,7 +596,8 @@ nsImapIncomingServer::LoadNextQueuedUrl(nsIImapProtocol* aProtocol,
       NS_ENSURE_SUCCESS(rv, rv);
       // if we didn't doom the url, lets run it.
       if (!removeUrlFromQueue) {
-        nsCOMPtr<nsISupports> aConsumer = m_urlConsumers.ElementAt(0);
+        nsISupports* aConsumer = m_urlConsumers.ElementAt(0);
+        NS_IF_ADDREF(aConsumer);
 
         nsImapProtocol::LogImapUrl(
             "creating protocol instance to play queued url", aImapUrl);
@@ -620,6 +622,7 @@ nsImapIncomingServer::LoadNextQueuedUrl(nsIImapProtocol* aProtocol,
               "failed creating protocol instance to play queued url", aImapUrl);
           keepGoing = false;
         }
+        NS_IF_RELEASE(aConsumer);
       }
       if (removeUrlFromQueue) {
         // Adopt the queue's reference until both parallel entries are removed.

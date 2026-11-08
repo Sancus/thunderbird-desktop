@@ -1241,6 +1241,12 @@ add_task(async function test_settledAuditRecoveryPreservesItsGeneration() {
   Assert.equal(await IOUtils.readUTF8(current), bytes);
   Assert.equal(await IOUtils.readUTF8(audit), bytes);
   await IOUtils.remove(path);
+  await IOUtils.writeUTF8(path + ".tmp", "retained partial request");
+  await Assert.rejects(input.recover("rollback"), /retained partial/);
+  Assert.equal(
+    await IOUtils.readUTF8(path + ".tmp"),
+    "retained partial request"
+  );
   await IOUtils.writeUTF8(audit, bytes + " ");
   await Assert.rejects(input.recover("rollback"), /immutable audit/);
   Assert.ok(!(await IOUtils.exists(path)));
@@ -1249,12 +1255,7 @@ add_task(async function test_settledAuditRecoveryPreservesItsGeneration() {
   await IOUtils.writeUTF8(current, rolledBack);
   await IOUtils.writeUTF8(audit, rolledBack);
   await Assert.rejects(input.recover("retry"), /rolled-back generation/);
-  await IOUtils.writeUTF8(path + ".tmp", "retained partial request");
-  await Assert.rejects(input.recover("rollback"), /retained partial/);
-  Assert.equal(
-    await IOUtils.readUTF8(path + ".tmp"),
-    "retained partial request"
-  );
+  await Assert.rejects(input.recover("rollback"), /rolled-back generation/);
   Assert.ok(!(await IOUtils.exists(path)));
   Assert.equal(await IOUtils.readUTF8(input.original), "newer profile bytes");
   Assert.equal(await IOUtils.readUTF8(input.mail), "newer mail bytes");

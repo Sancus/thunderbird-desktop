@@ -262,7 +262,6 @@ export async function requestMigrationRestore(
       0o700
     ),
   };
-  // Exclusive creation preserves every older failed or completed transaction.
   await writeRestoreRequest(path, request, { mode: "create", flush: true });
   return request;
 }
@@ -325,8 +324,8 @@ export async function requestMigrationRestoreRecovery(
       throw new Error("Restore current index differs from its immutable audit");
     }
   }
-  if (action === "retry" && request.progress?.outcome === "rolled-back") {
-    throw new Error("A rolled-back generation cannot become a new restore");
+  if (request.progress?.outcome === "rolled-back") {
+    throw new Error("A rolled-back generation is final; request a new restore");
   }
   if (action === "retry") {
     const plan = await inspectMigrationRestorePlan(

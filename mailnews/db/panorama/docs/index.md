@@ -158,9 +158,9 @@ exits, run the ordinary command above; it recovers, settles and quits. Only
 complete verified settlement allows a further ordinary process. Others block.
 
 Every rollback attempt copies and verifies each current root, including data
-written since restoration or by an earlier attempt's exit, into a new
-`newer-<root>-<generation>` beside its saved copy, then returns each saved root.
-Keep the archive and all such trees; failed rollback keeps guard, error, data.
+written since restoration or by an earlier exit, into a new `newer-<i>-<gen>`
+beside its saved copy (so it needs free space for every root), then returns each
+saved root. Keep the archive and all such trees. A rolled-back result is final.
 
 ### Validation
 

@@ -1447,8 +1447,7 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         finally:
             offline.rename(backup)
         self.assertEqual("rolled-back", result["progress"]["outcome"])
-        newer = Path(request["stagingParent"]) / f'restore-{request["operationId"]}' / "newer-0"
-        self.assertEqual(b"original complete restore bytes\n", (newer / "s527-original").read_bytes())
+        self.assertEqual(b"original complete restore bytes\n", (next((Path(request["stagingParent"]) / f'restore-{request["operationId"]}').glob("newer-0-*")) / "s527-original").read_bytes())
         for child in later:
             self.assertEqual(b"new child after consent, before native entry\n", child.read_bytes())
         self.assertIn(b'user_pref("s527.retainedNewer", true);', prefs.read_bytes())

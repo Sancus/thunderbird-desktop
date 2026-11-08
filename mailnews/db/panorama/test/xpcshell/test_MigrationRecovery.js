@@ -1170,9 +1170,12 @@ add_task(async function test_unmutatedRetryPreparesFreshAndKeepsLedger() {
   Assert.ok(await IOUtils.exists(request.stagingParent), "Keep failed staging");
   const ledger = PathUtils.join(
     PathUtils.parent(path),
-    `restore-${request.operationId}-2.failed.json`
+    `restore-${request.operationId}-${PathUtils.filename(request.stagingParent)}.failed.json`
   );
   Assert.equal(await IOUtils.readUTF8(ledger), bytes, "Exact failed ledger");
+  await IOUtils.writeJSON(path, { ...fresh, progress: failed.progress });
+  const again = await input.recover("retry");
+  Assert.notEqual(again.stagingParent, fresh.stagingParent, "Second retry");
   failed.progress.roots = [{ phase: 1 }];
   await IOUtils.writeJSON(path, failed);
   Assert.deepEqual(await input.recover("retry"), failed, "Mutated roots stay");

@@ -12533,27 +12533,26 @@ nsresult RestoreExecute(JSContext* cx, ProfileStartupOperation& operation) {
       MOZ_TRY(RestoreTree(state, *root.live, root.after, i == 0));
       MOZ_TRY(RestoreRetired(state, root));
     } else {
-      if (!root.phase)
-        MOZ_TRY(RestoreTree(state, *root.live, root.before, i == 0));
-      else if (root.phase != 6) {
+      if (root.phase != 6) {
+        if (!root.phase)
+          MOZ_TRY(RestoreTree(state, *root.saved, root.before, false));
+        // Every attempt first retains the whole current live root, which
+        // earlier processes may have changed, in fresh custody.
         nsCString leaf("newer-"_ns);
         leaf.AppendInt(i);
-        if (root.phase >= 2 && root.phase <= 4)
-          MOZ_TRY(
-              RestoreChild(state, leaf, root.newerIdentity, root.newer, cx));
-        if (root.phase == 2 || root.phase == 3) {
-          // Retain the whole current, possibly newer, live root first.
-          nsTArray<StartupRestoreEntry> current;
-          MOZ_TRY(
-              RestoreInventory(*root.live, ""_ns, current, i == 0, 0, &state));
-          MOZ_TRY(RestoreCopyTree(state, *root.live, *root.newer, current,
-                                  root.live->identity.permissions,
-                                  root.live->identity.modified, false));
-          root.phase = 4;
-          MOZ_TRY(RestoreProgress(cx, state));
-        }
-        if (root.phase == 4)
-          MOZ_TRY(RestoreRemoveTree(state, *root.live, root.after, i == 0));
+        leaf.Append('-');
+        leaf.AppendInt(state.generation);
+        root.newerIdentity.Truncate();
+        MOZ_TRY(RestoreChild(state, leaf, root.newerIdentity, root.newer, cx));
+        nsTArray<StartupRestoreEntry> current;
+        MOZ_TRY(
+            RestoreInventory(*root.live, ""_ns, current, i == 0, 0, &state));
+        MOZ_TRY(RestoreCopyTree(state, *root.live, *root.newer, current,
+                                root.live->identity.permissions,
+                                root.live->identity.modified, false));
+        root.phase = 4;
+        MOZ_TRY(RestoreProgress(cx, state));
+        MOZ_TRY(RestoreRemoveTree(state, *root.live, root.after, i == 0));
         root.phase = 5;
         MOZ_TRY(RestoreProgress(cx, state));
         MOZ_TRY(RestoreRetired(state, root, true));

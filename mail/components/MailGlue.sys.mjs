@@ -568,9 +568,7 @@ MailGlue.prototype = {
           () => settled || Services.startup.shuttingDown
         );
         for (const name of Services.prefs.getChildList("")) {
-          if (Services.prefs.prefHasUserValue(name)) {
-            Services.prefs.clearUserPref(name);
-          }
+          Services.prefs.clearUserPref(name);
         }
         const prefs = Services.dirsvc.get("PrefF", Ci.nsIFile);
         if (prefs.exists()) {

@@ -27248,6 +27248,8 @@ TEST_F(DeliveryCoreStartupRestore, RestoreRollbackRestoresAllDisplacedRoots) {
   ASSERT_EQ(NS_OK, PrepareRestore(131073, true));
   ASSERT_EQ(NS_OK, RunRestore());
   ExpectRestoreWork(true);
+  // An exiting restore process rewrites profile files before rollback.
+  ASSERT_EQ(NS_OK, WriteStartupFile("restore-exit.txt", "exit bytes"_ns));
   ASSERT_EQ(NS_OK, ChangeRestoreAction("rollback"));
   RetireRestoreOwner();
   ASSERT_EQ(NS_OK, RunRestore());

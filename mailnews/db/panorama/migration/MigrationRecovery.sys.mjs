@@ -353,18 +353,19 @@ export async function requestMigrationRestoreRecovery(
   if (
     action === "retry" &&
     pending &&
-    Array.isArray(roots) &&
-    roots.length &&
+    roots?.length &&
     !request.progress.outcome &&
     roots.every(root => root.phase === 0)
   ) {
     const ledger = restoreFile(
       PathUtils.join(
         PathUtils.parent(path),
-        `restore-${request.operationId}-${request.progress.generation}.failed.json`
+        `restore-${request.operationId}-${PathUtils.filename(request.stagingParent)}.failed.json`
       )
     ).path;
-    await IOUtils.writeUTF8(ledger, before, { mode: "create", flush: true });
+    if ((await IOUtils.readUTF8(ledger).catch(() => null)) !== before) {
+      await IOUtils.writeUTF8(ledger, before, { mode: "create", flush: true });
+    }
     delete request.progress;
     request.stagingParent = await IOUtils.createUniqueDirectory(
       PathUtils.parent(profilePath),

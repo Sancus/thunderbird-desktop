@@ -148,7 +148,7 @@ thunderbird --new-instance --profile /absolute/profile --panorama-restore-rollba
 These actions are mutually exclusive with a new restore request. This process
 rechecks identity, records only the supported action, and quits. Retry requires
 the original verified archive and dependencies; if no root was changed yet, it
-keeps that attempt's staging and exact `restore-<id>-<n>.failed.json` ledger and
+keeps that attempt's staging and `restore-<id>-<staging>.failed.json` ledger and
 prepares the same approved operation in fresh owner-only staging. Rollback can
 use the native-retained verified manifest, stage, saved-before data and custody
 when the original after-input is unavailable. Missing or conflicting retained

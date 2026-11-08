@@ -26,6 +26,7 @@
 class mozIStorageConnection;
 class mozIStorageStatement;
 class nsIFile;
+class nsIAbDirectory;
 class nsIAsyncShutdownBlocker;
 class nsMsgDBFolder;
 namespace mozilla::dom {
@@ -359,6 +360,13 @@ class DatabaseCore : public nsIDatabaseCore,
                                          const nsACString& expected,
                                          Maybe<nsCString>& output);
   nsresult BindStartupLocalNames(JSContext* cx, StartupMailSource& source);
+  // Read-only presence check after the completed migration's durable identity
+  // and receipts have been checked. A null directory means complete retirement.
+  static nsresult ReadStartupReusedBookDirectory(nsIFile* target,
+                                                 const nsACString& pref,
+                                                 const nsACString& uri,
+                                                 const nsACString& uid,
+                                                 nsIAbDirectory** output);
   nsresult CheckProfileActivation(JSContext* cx,
                                   JS::Handle<JS::Value> activation);
   nsresult SettleProfileStartup(nsresult firstError);

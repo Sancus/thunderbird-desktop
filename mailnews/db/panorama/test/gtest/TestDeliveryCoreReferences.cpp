@@ -49,6 +49,8 @@
 #include "nsICommandLineRunner.h"
 #include "nsCommandLine.h"
 #include "nsIPrefBranch.h"
+#include "nsIAbManager.h"
+#include "nsIAbDirectory.h"
 #include "nsPrintfCString.h"
 #include "nsID.h"
 #include "nsIEventTarget.h"
@@ -5370,6 +5372,250 @@ class DeliveryCoreReferences : public testing::Test {
           EXPECT_EQ(1, imports);
         },
         &original, NS_OK, nullptr, false, true);
+  }
+
+  void CheckStartupRetiredImapRootReuse(bool removeAccount) {
+    const auto original = EmptyImapRootSummary();
+    WithPreReadyStartupAccount(
+        [&](nsIMsgAccountManager* manager, nsIMsgIncomingServer* server, auto*,
+            auto*, const nsCString& accountKey) {
+          nsCOMPtr<nsIMsgFolder> root;
+          ASSERT_EQ(NS_OK, server->GetRootFolder(getter_AddRefs(root)));
+          uint64_t rootId;
+          ASSERT_EQ(NS_OK, root->GetId(&rootId));
+          nsCString serverKey, sourceId;
+          ASSERT_EQ(NS_OK, server->GetKey(serverKey));
+          ASSERT_EQ(NS_OK, mCore->GetSourceId(sourceId));
+          nsCOMPtr<nsIFile> journal, selector, cache, summary;
+          ASSERT_EQ(NS_OK, mStartupFixtureWork->Clone(getter_AddRefs(journal)));
+          ASSERT_EQ(NS_OK, journal->AppendNative("journal.json"_ns));
+          ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(selector)));
+          ASSERT_EQ(NS_OK, selector->AppendNative("panorama-profile.json"_ns));
+          ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(cache)));
+          ASSERT_EQ(NS_OK, cache->AppendNative("folderCache.json"_ns));
+          ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(summary)));
+          ASSERT_EQ(NS_OK,
+                    summary->AppendNative("startup-account-store.msf"_ns));
+          nsCString path, savedJournal, savedSelector, savedCache;
+          ASSERT_EQ(NS_OK, journal->GetNativePath(path));
+          ASSERT_EQ(NS_OK, JSONCacheReadFile(journal, savedJournal));
+          ASSERT_EQ(NS_OK, JSONCacheReadFile(selector, savedSelector));
+          ASSERT_EQ(NS_OK, JSONCacheReadFile(cache, savedCache));
+          if (removeAccount) {
+            nsCOMPtr<nsIMsgAccount> account;
+            ASSERT_EQ(NS_OK,
+                      manager->GetAccount(accountKey, getter_AddRefs(account)));
+            ASSERT_TRUE(account);
+            ASSERT_EQ(NS_OK, manager->RemoveAccount(account, false));
+          } else {
+            // A live root at the historical id must retain its actual name.
+            ASSERT_EQ(NS_OK, mCore->FolderDB().UpdateName(
+                                 rootId, serverKey + "-mismatched"_ns));
+          }
+          ASSERT_EQ(NS_OK, manager->UnloadAccounts());
+          auto countRoot = [&]() -> int64_t {
+            nsCOMPtr<mozIStorageStatement> row;
+            if (NS_FAILED(mConnection->CreateStatement(
+                    "SELECT COUNT(*) FROM folders WHERE id=:id"_ns,
+                    getter_AddRefs(row))) ||
+                NS_FAILED(row->BindInt64ByName("id"_ns, rootId)))
+              return -1;
+            bool exists;
+            int64_t count;
+            if (NS_FAILED(row->ExecuteStep(&exists)) || !exists ||
+                NS_FAILED(row->GetInt64(0, &count)))
+              return -1;
+            return count;
+          };
+          EXPECT_EQ(removeAccount ? 0 : 1, countRoot());
+          for (uint32_t restart = 0; restart < (removeAccount ? 2u : 1u);
+               ++restart) {
+            {
+              nsCOMPtr<nsIFile> work = mStartupFixtureWork.forget();
+              auto restore = MakeScopeExit([&] { mStartupFixtureWork = work; });
+              FinishSelectedStartup();
+            }
+            ASSERT_FALSE(HasFailure());
+            ASSERT_FALSE(mSelectedStartup);
+            ASSERT_FALSE(mSelectedLock);
+            ASSERT_FALSE(DatabaseCore::sInstance);
+            ASSERT_EQ(NS_OK, ArmSelectedStartup());
+            nsCString description;
+            ASSERT_EQ(NS_OK, DescribeStartup(description));
+            ASSERT_EQ(NS_OK, OpenStartup("reuse"));
+            EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+                      DatabaseCore::CheckAccountStartup());
+            if (!removeAccount) {
+              EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+                        CheckStartupActivation(false, &path));
+              EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+                        DatabaseCore::CheckAccountStartup());
+              EXPECT_EQ(removeAccount ? 0 : 1, countRoot());
+              return;
+            }
+            ASSERT_EQ(NS_OK, CheckStartupActivation(false, &path));
+            EXPECT_EQ(0, countRoot());
+            ASSERT_EQ(NS_OK, CheckStartupActivation(true, &path));
+            EXPECT_EQ(NS_OK, DatabaseCore::CheckAccountStartup());
+            EXPECT_EQ(0, countRoot());
+            nsCString retained;
+            ASSERT_EQ(NS_OK, mCore->GetSourceId(retained));
+            EXPECT_EQ(sourceId, retained);
+            ASSERT_EQ(NS_OK, JSONCacheReadFile(journal, retained));
+            EXPECT_EQ(savedJournal, retained);
+            ASSERT_EQ(NS_OK, JSONCacheReadFile(selector, retained));
+            EXPECT_EQ(savedSelector, retained);
+            ASSERT_EQ(NS_OK, JSONCacheReadFile(cache, retained));
+            EXPECT_EQ(savedCache, retained);
+            ASSERT_EQ(NS_OK, JSONCacheReadFile(summary, retained));
+            EXPECT_EQ(original, retained);
+            int64_t imports;
+            ASSERT_EQ(NS_OK, JSONCacheImportCount(imports));
+            EXPECT_EQ(1, imports);
+          }
+        },
+        &original, NS_OK, nullptr, false, true);
+  }
+
+  // Exercise the exact read-only presence operation with real manager-owned
+  // SQLite directories and its ordinary asynchronous deletion. The whole
+  // startup tests also bind this operation to actual imported book receipts.
+  void CheckStartupBookRetirementPresence() {
+    nsCOMPtr<nsIAbManager> manager = do_GetService("@mozilla.org/abmanager;1");
+    nsCOMPtr<nsIPrefBranch> prefs =
+        do_GetService("@mozilla.org/preferences-service;1");
+    ASSERT_TRUE(manager && prefs);
+    nsCString pref;
+    ASSERT_EQ(NS_OK, manager->NewAddressBook(
+                         u"Native startup retirement"_ns, ""_ns,
+                         nsIAbManager::JS_DIRECTORY_TYPE,
+                         "native-startup-retirement-uid"_ns, pref));
+    bool deleted = false;
+    nsCOMPtr<nsIAbDirectory> directory;
+    ASSERT_EQ(NS_OK,
+              manager->GetDirectoryFromId(pref, getter_AddRefs(directory)));
+    ASSERT_TRUE(directory);
+    nsCString uri, uid, fileName;
+    ASSERT_EQ(NS_OK, directory->GetURI(uri));
+    ASSERT_EQ(NS_OK, directory->GetUID(uid));
+    ASSERT_EQ(NS_OK, directory->GetFileName(fileName));
+    auto cleanup = MakeScopeExit([&] {
+      if (!deleted) EXPECT_EQ(NS_OK, manager->DeleteAddressBook(uri));
+      EXPECT_EQ(NS_OK, prefs->DeleteBranch((pref + "."_ns).get()));
+    });
+    nsCOMPtr<nsIFile> target, copy;
+    ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(target)));
+    ASSERT_EQ(NS_OK, target->AppendNative(fileName));
+    nsCOMPtr<nsIAbDirectory> read;
+    auto check = [&]() {
+      read = nullptr;
+      return DatabaseCore::ReadStartupReusedBookDirectory(
+          target, pref, uri, uid, getter_AddRefs(read));
+    };
+    ASSERT_EQ(NS_OK, check());
+    ASSERT_TRUE(read);
+    EXPECT_EQ(directory, read);
+    read = nullptr;
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              DatabaseCore::ReadStartupReusedBookDirectory(
+                  target, pref, uri, uid + "-wrong"_ns, getter_AddRefs(read)));
+    EXPECT_FALSE(read);
+    const nsCString filenamePref(pref + ".filename"_ns);
+    ASSERT_EQ(NS_OK,
+              prefs->SetCharPref(filenamePref.get(), "mismatched.sqlite"_ns));
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, check());
+    EXPECT_FALSE(read);
+    ASSERT_EQ(NS_OK, prefs->SetCharPref(filenamePref.get(), fileName));
+    ASSERT_EQ(NS_OK, check());
+    ASSERT_TRUE(read);
+    const nsCString uidPref(pref + ".uid"_ns), typePref(pref + ".dirType"_ns);
+    ASSERT_EQ(NS_OK, prefs->SetCharPref(uidPref.get(), uid + "-changed"_ns));
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, check());
+    EXPECT_FALSE(read);
+    ASSERT_EQ(NS_OK, prefs->SetCharPref(uidPref.get(), uid));
+    ASSERT_EQ(NS_OK, prefs->SetIntPref(typePref.get(),
+                                       nsIAbManager::LDAP_DIRECTORY_TYPE));
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, check());
+    EXPECT_FALSE(read);
+    ASSERT_EQ(NS_OK, prefs->SetIntPref(typePref.get(),
+                                       nsIAbManager::JS_DIRECTORY_TYPE));
+    nsCOMPtr<nsIFile> moved;
+    ASSERT_EQ(NS_OK, target->Clone(getter_AddRefs(moved)));
+    ASSERT_EQ(NS_OK,
+              moved->MoveToNative(mProfile, "moved-live-book.sqlite"_ns));
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, check());
+    EXPECT_FALSE(read);
+    ASSERT_EQ(NS_OK, moved->MoveToNative(mProfile, fileName));
+    ASSERT_EQ(NS_OK, check());
+    ASSERT_TRUE(read);
+    // Save this test's actual physical book, without changing any source or
+    // migration receipt. Restoring only this file must never imply retirement.
+    ASSERT_EQ(NS_OK, target->CopyToNative(mProfile, "retained-book.sqlite"_ns));
+    ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(copy)));
+    ASSERT_EQ(NS_OK, copy->AppendNative("retained-book.sqlite"_ns));
+    ASSERT_EQ(NS_OK, manager->DeleteAddressBook(uri));
+    deleted = true;
+    read = nullptr;
+    directory = nullptr;
+    nsresult settled = NS_OK;
+    ASSERT_TRUE(
+        SpinEventLoopUntil("StartupBookOrdinaryDeletionSettled"_ns, [&] {
+          bool linked;
+          settled = target->IsSymlink(&linked);
+          return NS_FAILED(settled);
+        }));
+    ASSERT_EQ(NS_ERROR_FILE_NOT_FOUND, settled);
+    nsTArray<nsCString> names;
+    ASSERT_EQ(NS_OK, prefs->GetChildList((pref + "."_ns).get(), names));
+    EXPECT_TRUE(names.IsEmpty());
+    for (uint32_t repeat = 0; repeat < 2; ++repeat) {
+      ASSERT_EQ(NS_OK, check());
+      EXPECT_FALSE(read);
+    }
+    const nsCString otherBranch(pref + "_other."_ns);
+    auto removeReservation = MakeScopeExit(
+        [&] { EXPECT_EQ(NS_OK, prefs->DeleteBranch(otherBranch.get())); });
+    for (const auto& field : {"filename"_ns, "uid"_ns}) {
+      const nsCString name(otherBranch + field);
+      ASSERT_EQ(NS_OK,
+                prefs->SetCharPref(name.get(),
+                                   field == "filename"_ns ? fileName : uid));
+      EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, check());
+      EXPECT_FALSE(read);
+      ASSERT_EQ(NS_OK, prefs->DeleteBranch(otherBranch.get()));
+    }
+    ASSERT_EQ(NS_OK, copy->CopyToNative(mProfile, fileName));
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, check());
+    EXPECT_FALSE(read);
+    ASSERT_EQ(NS_OK, target->Remove(false));
+    ASSERT_EQ(NS_OK, prefs->SetCharPref(filenamePref.get(), fileName));
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, check());
+    EXPECT_FALSE(read);
+    ASSERT_EQ(NS_OK, copy->CopyToNative(mProfile, fileName));
+    ASSERT_EQ(NS_OK, prefs->SetCharPref(uidPref.get(), uid));
+    ASSERT_EQ(NS_OK, prefs->SetIntPref(typePref.get(),
+                                       nsIAbManager::JS_DIRECTORY_TYPE));
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, check());
+    EXPECT_FALSE(read);
+    ASSERT_EQ(NS_OK, target->Remove(false));
+    ASSERT_EQ(NS_OK, prefs->DeleteBranch((pref + "."_ns).get()));
+    nsCString nativePath;
+    ASSERT_EQ(NS_OK, target->GetNativePath(nativePath));
+    ASSERT_EQ(0, symlink("missing-book-target", nativePath.get()));
+    EXPECT_EQ(NS_ERROR_FILE_ACCESS_DENIED, check());
+    EXPECT_FALSE(read);
+    ASSERT_EQ(NS_OK, target->Remove(false));
+    ASSERT_EQ(NS_OK, check());
+    EXPECT_FALSE(read);
+    ASSERT_EQ(NS_OK, copy->Remove(false));
+    nsCOMPtr<nsIFile> invalidParent;
+    ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(invalidParent)));
+    ASSERT_EQ(NS_OK, invalidParent->AppendNative("missing-book-parent"_ns));
+    ASSERT_EQ(NS_OK, invalidParent->AppendNative(fileName));
+    EXPECT_EQ(NS_ERROR_FILE_NOT_FOUND,
+              DatabaseCore::ReadStartupReusedBookDirectory(
+                  invalidParent, pref, uri, uid, getter_AddRefs(read)));
+    EXPECT_FALSE(read);
   }
 
   // Real native import/receipt/backup and factory controls. Raw Mork/body
@@ -24601,6 +24847,21 @@ TEST_F(DeliveryCoreReferences, StartupMigratedReuseWithoutCorruptArchive) {
 
 TEST_F(DeliveryCoreReferences, StartupRootSummaryCacheReuseWithoutArchive) {
   CheckStartupRootCacheReuseWithoutArchive();
+}
+
+TEST_F(DeliveryCoreReferences,
+       StartupMigratedReuseAfterOrdinaryImapAccountDeletion) {
+  CheckStartupRetiredImapRootReuse(true);
+}
+
+TEST_F(DeliveryCoreReferences,
+       StartupMigratedReuseRefusesMismatchedLiveImapRoot) {
+  CheckStartupRetiredImapRootReuse(false);
+}
+
+TEST_F(DeliveryCoreReferences,
+       StartupReusedBookDirectoryRequiresCompleteRetirement) {
+  CheckStartupBookRetirementPresence();
 }
 
 TEST_F(DeliveryCoreReferences,

@@ -668,6 +668,58 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.assertEqual(selector, (self.profile / "panorama-profile.json").read_bytes())
         self.assertEqual(original, source.read_bytes())
 
+        # Ordinary deletion retires the publication; historical receipts remain.
+        publication = selected["record"]["identity"]["books"][0]["publication"]
+        journal = Path(selected["record"]["identity"]["journalPath"])
+        original_journal = journal.read_bytes()
+        deleted = self.marionette.execute_async_script("""
+            const uri = arguments[0];
+            const done = arguments[arguments.length - 1];
+            const { MailServices } = ChromeUtils.importESModule(
+              'resource:///modules/MailServices.sys.mjs');
+            const book = MailServices.ab.getDirectory(uri);
+            const uid = book.UID;
+            const prefId = book.dirPrefId;
+            const fileName = book.fileName;
+            const observer = {
+              observe(subject) {
+                if (subject.QueryInterface(Ci.nsIAbDirectory).URI !== uri) {
+                  return;
+                }
+                Services.obs.removeObserver(observer, 'addrbook-directory-deleted');
+                Services.prefs.savePrefFile(null);
+                done({uid, prefId, fileName,
+                  prefKeys: Services.prefs.getChildList(prefId + '.'),
+                  present: [...MailServices.ab.directories].some(dir => dir.URI === uri)});
+              },
+            };
+            Services.obs.addObserver(observer, 'addrbook-directory-deleted');
+            try {
+              MailServices.ab.deleteAddressBook(uri);
+            } catch (error) {
+              Services.obs.removeObserver(observer, 'addrbook-directory-deleted');
+              done({error: String(error)});
+            }
+        """, script_args=[books[0]["uri"]])
+        self.assertNotIn("error", deleted)
+        self.assertEqual(publication["bookUID"], deleted["uid"])
+        self.assertEqual(publication["dirPrefId"], deleted["prefId"])
+        self.assertEqual(publication["fileName"], deleted["fileName"])
+        self.assertEqual([], deleted["prefKeys"])
+        self.assertFalse(deleted["present"])
+        published_file = self.profile / deleted["fileName"]
+        self.assertFalse(published_file.exists())
+        self.assertEqual([], public_book())
+        for _ in range(2):
+            self.stop_application()
+            self.start_same_profile(True)
+            self.assertEqual(selected, self.selection())
+            self.assertEqual([], public_book())
+            self.assertFalse(published_file.exists())
+            self.assertEqual(selector, (self.profile / "panorama-profile.json").read_bytes())
+            self.assertEqual(original_journal, journal.read_bytes())
+            self.assertEqual(original, source.read_bytes())
+
     def test_migratesCacheAndReusesCommittedProjection(self):
         self.clean_profile(False)
         source = self.create_legacy_message("mbox")
@@ -871,6 +923,49 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.assertEqual(messages, imported())
         self.assertEqual(root_original, root_summary.read_bytes())
         self.assertEqual(original_journal, journal.read_bytes())
+
+        # Remove the real account, retaining the user's original on-disk store.
+        selector = (self.profile / "panorama-profile.json").read_bytes()
+        retired = self.marionette.execute_script("""
+            const { MailServices } = ChromeUtils.importESModule(
+              'resource:///modules/MailServices.sys.mjs');
+            const core = Cc['@mozilla.org/mailnews/database-core;1']
+              .getService(Ci.nsIDatabaseCore);
+            const key = arguments[0];
+            const server = MailServices.accounts.getIncomingServer(key);
+            const account = MailServices.accounts.findAccountForServer(server);
+            if (!account) {
+              throw new Error('Migrated account is unavailable before removal');
+            }
+            const before = core.folderDB.getFolderByPath(key);
+            MailServices.accounts.removeAccount(account, false);
+            Services.prefs.savePrefFile(null);
+            return {before, after: core.folderDB.getFolderByPath(key),
+              present: MailServices.accounts.allServers.some(item => item.key === key)};
+        """, script_args=[source["serverKey"]])
+        self.assertEqual(actual_root_id, retired["before"])
+        self.assertEqual(0, retired["after"])
+        self.assertFalse(retired["present"])
+        for _ in range(2):
+            self.stop_application()
+            self.start_same_profile(True)
+            self.assertEqual(selected, self.selection())
+            absent = self.marionette.execute_script("""
+                const { MailServices } = ChromeUtils.importESModule(
+                  'resource:///modules/MailServices.sys.mjs');
+                const core = Cc['@mozilla.org/mailnews/database-core;1']
+                  .getService(Ci.nsIDatabaseCore);
+                return {root: core.folderDB.getFolderByPath(arguments[0]),
+                  present: MailServices.accounts.allServers.some(
+                    item => item.key === arguments[0])};
+            """, script_args=[source["serverKey"]])
+            self.assertEqual({"root": 0, "present": False}, absent)
+            self.assertEqual(selector, (self.profile / "panorama-profile.json").read_bytes())
+            self.assertEqual(original_journal, journal.read_bytes())
+            self.assertEqual(original, summary.read_bytes())
+            self.assertEqual(root_original, root_summary.read_bytes())
+            self.assertEqual(cache_bytes, cache.read_bytes())
+            self.assertEqual(root_original, archived_root.read_bytes())
 
     def test_nativeImapRootSummaryRefusesUnknownAndMessageData(self):
         for case in ["message-data", "unknown-sibling"]:

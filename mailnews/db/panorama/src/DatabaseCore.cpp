@@ -11384,6 +11384,106 @@ nsresult DatabaseCore::BindStartupChildNames(uint64_t parentId,
   return NS_OK;
 }
 
+// Do not use GetDirectory's failure as an absence signal: it also reports
+// malformed state and service errors. Enumerate actual registrations and check
+// all overlapping identity fields before treating ordinary deletion as retired.
+nsresult DatabaseCore::ReadStartupReusedBookDirectory(nsIFile* target,
+                                                      const nsACString& pref,
+                                                      const nsACString& uri,
+                                                      const nsACString& uid,
+                                                      nsIAbDirectory** output) {
+  *output = nullptr;
+  nsCOMPtr<nsIFile> parent;
+  MOZ_TRY(target->GetParent(getter_AddRefs(parent)));
+  nsCString parentPath, fileName;
+  MOZ_TRY(StartupDirectory(parent, parentPath));
+  MOZ_TRY(target->GetNativeLeafName(fileName));
+  bool linked;
+  nsresult status = target->IsSymlink(&linked);
+  const bool missing = status == NS_ERROR_FILE_NOT_FOUND;
+  if (!missing) {
+    MOZ_TRY(status);
+    NS_ENSURE_FALSE(linked, NS_ERROR_FILE_ACCESS_DENIED);
+    MOZ_TRY(StartupRegular(target));
+  }
+  // Inspect the physical/pref pair before initializing AbManager: a cold
+  // SQLite directory initializer may otherwise recreate a missing live file.
+  nsresult service;
+  nsCOMPtr<nsIPrefBranch> prefs =
+      do_GetService("@mozilla.org/preferences-service;1", &service);
+  MOZ_TRY(service);
+  NS_ENSURE_TRUE(prefs, NS_ERROR_NOT_AVAILABLE);
+  nsTArray<nsCString> names;
+  const nsCString branch(pref + "."_ns);
+  MOZ_TRY(prefs->GetChildList(branch.get(), names));
+  const bool missingPrefs = names.IsEmpty();
+  NS_ENSURE_TRUE(missing == missingPrefs, NS_ERROR_NOT_AVAILABLE);
+  auto checkPrefs = [&]() -> nsresult {
+    nsCString configured;
+    const nsCString filenamePref(branch + "filename"_ns);
+    MOZ_TRY(prefs->GetCharPref(filenamePref.get(), configured));
+    NS_ENSURE_TRUE(configured == fileName, NS_ERROR_NOT_AVAILABLE);
+    const nsCString uidPref(branch + "uid"_ns), typePref(branch + "dirType"_ns);
+    MOZ_TRY(prefs->GetCharPref(uidPref.get(), configured));
+    int32_t type;
+    MOZ_TRY(prefs->GetIntPref(typePref.get(), &type));
+    NS_ENSURE_TRUE(configured == uid && type == nsIAbManager::JS_DIRECTORY_TYPE,
+                   NS_ERROR_NOT_AVAILABLE);
+    return NS_OK;
+  };
+  if (!missing) MOZ_TRY(checkPrefs());
+  nsTArray<nsCString> reservations;
+  MOZ_TRY(prefs->GetChildList("ldap_2.servers.", reservations));
+  for (const auto& name : reservations) {
+    if (StringBeginsWith(name, branch)) continue;
+    const bool filename = StringEndsWith(name, ".filename"_ns);
+    if (!filename && !StringEndsWith(name, ".uid"_ns)) continue;
+    nsCString value;
+    MOZ_TRY(prefs->GetCharPref(name.get(), value));
+    NS_ENSURE_TRUE((filename ? value != fileName : value != uid),
+                   NS_ERROR_NOT_AVAILABLE);
+  }
+  nsCOMPtr<nsIAbManager> manager =
+      do_GetService("@mozilla.org/abmanager;1", &service);
+  MOZ_TRY(service);
+  NS_ENSURE_TRUE(manager, NS_ERROR_NOT_AVAILABLE);
+  nsTArray<RefPtr<nsIAbDirectory>> directories;
+  MOZ_TRY(manager->GetDirectories(directories));
+  nsCOMPtr<nsIAbDirectory> found;
+  for (const auto& directory : directories) {
+    nsCString actualPref, actualUri, actualUid, actualFile;
+    MOZ_TRY(directory->GetDirPrefId(actualPref));
+    MOZ_TRY(directory->GetURI(actualUri));
+    MOZ_TRY(directory->GetUID(actualUid));
+    MOZ_TRY(directory->GetFileName(actualFile));
+    if (actualPref == pref || actualUri == uri || actualUid == uid ||
+        actualFile == fileName) {
+      NS_ENSURE_TRUE(!found && actualPref == pref && actualUri == uri &&
+                         actualUid == uid && actualFile == fileName,
+                     NS_ERROR_NOT_AVAILABLE);
+      found = directory;
+    }
+  }
+  names.Clear();
+  MOZ_TRY(prefs->GetChildList(branch.get(), names));
+  NS_ENSURE_TRUE(missingPrefs == names.IsEmpty(), NS_ERROR_NOT_AVAILABLE);
+  // Ordinary deletion clears the preference branch, unregisters the directory,
+  // and removes its closed file. Any partial state remains a startup error.
+  if (missing && !found) {
+    // Service initialization must not turn an earlier ENOENT into permission to
+    // overlook a new occupant or a replaced physical parent.
+    MOZ_TRY(StartupDirectory(parent, parentPath));
+    status = target->IsSymlink(&linked);
+    if (status == NS_ERROR_FILE_NOT_FOUND) return NS_OK;
+    MOZ_TRY(status);
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+  NS_ENSURE_TRUE(!missing && found, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(checkPrefs());
+  found.forget(output);
+  return NS_OK;
+}
+
 nsresult DatabaseCore::CheckProfileActivation(
     JSContext* cx, JS::Handle<JS::Value> activation) {
   MOZ_TRY(CheckProfileStartup(ProfileStartupToken()));
@@ -11579,11 +11679,25 @@ nsresult DatabaseCore::CheckProfileActivation(
     NS_ENSURE_TRUE(id == summary.id && !summaryIds.Contains(id) &&
                        !summaryServers.Contains(summary.serverKey) &&
                        !summaryRoots.Contains(folder) &&
-                       !declaredPaths.Contains(summary.path) &&
-                       !MOZ_TRY(mFolderDatabase->GetFolderParent(folder)) &&
-                       MOZ_TRY(mFolderDatabase->GetFolderName(folder)) ==
-                           summary.serverKey,
+                       !declaredPaths.Contains(summary.path),
                    NS_ERROR_NOT_AVAILABLE);
+    // RetireAccountRoot removes the actual native row on ordinary IMAP account
+    // deletion. Its historical binding remains in the unchanged journal. Check
+    // duplicates above even for retired roots; every live row still must match.
+    nsCOMPtr<mozIStorageStatement> live;
+    MOZ_TRY(sConnection->CreateStatement(
+        "SELECT 1 FROM folders WHERE id=:id"_ns, getter_AddRefs(live)));
+    MOZ_TRY(live->BindInt64ByName("id"_ns, folder));
+    bool exists;
+    MOZ_TRY(live->ExecuteStep(&exists));
+    live = nullptr;
+    NS_ENSURE_TRUE(reusing || exists, NS_ERROR_NOT_AVAILABLE);
+    if (exists) {
+      NS_ENSURE_TRUE(!MOZ_TRY(mFolderDatabase->GetFolderParent(folder)) &&
+                         MOZ_TRY(mFolderDatabase->GetFolderName(folder)) ==
+                             summary.serverKey,
+                     NS_ERROR_NOT_AVAILABLE);
+    }
     if (!reusing) {
       NS_ENSURE_TRUE(
           operation.serverSummaries[i].id == summary.id &&
@@ -11948,6 +12062,7 @@ nsresult DatabaseCore::CheckProfileActivation(
     NS_ENSURE_TRUE((protocol == "imap"_ns) == unitMembers.Contains(id),
                    NS_ERROR_NOT_AVAILABLE);
   }
+  nsTHashSet<nsCString> bookPrefs, bookFiles, bookUris, bookUids, bookIds;
   for (const char* name : {"books", "caches"}) {
     JS::Rooted<JSObject*> declared(cx);
     uint32_t length, declaredLength;
@@ -11980,7 +12095,10 @@ nsresult DatabaseCore::CheckProfileActivation(
       MOZ_TRY(StartupText(cx, unit, "sha256", hash));
       MOZ_TRY(StartupText(cx, unit, "token", token));
       MOZ_TRY(StartupNumber(cx, unit, "size", 1, UINT32_MAX - 1, size));
+      NS_ENSURE_TRUE(!declaredPaths.Contains(path) && !tokens.Contains(token),
+                     NS_ERROR_NOT_AVAILABLE);
       declaredPaths.Insert(path);
+      tokens.Insert(token);
       NS_ENSURE_TRUE(state == "imported"_ns, NS_ERROR_NOT_AVAILABLE);
       nsCOMPtr<nsIFile> original;
       if (!reusing) {
@@ -12017,9 +12135,80 @@ nsresult DatabaseCore::CheckProfileActivation(
             fileName.Equals("panorama-import-"_ns + suffix + ".sqlite"_ns) &&
                 uri.Equals("jsaddrbook://"_ns + fileName),
             NS_ERROR_NOT_AVAILABLE);
+        NS_ENSURE_TRUE(!bookPrefs.Contains(pref) &&
+                           !bookFiles.Contains(fileName) &&
+                           !bookUris.Contains(uri) && !bookUids.Contains(uid),
+                       NS_ERROR_NOT_AVAILABLE);
+        bookPrefs.Insert(pref);
+        bookFiles.Insert(fileName);
+        bookUris.Insert(uri);
+        bookUids.Insert(uid);
+        // Validate the durable unit/publication identity before consulting live
+        // state, including when a user has completely removed the book.
+        nsCString savedToken, savedId, id, savedHash;
+        int64_t savedSize;
+        MOZ_TRY(StartupText(cx, saved, "storageSourceId", savedToken));
+        MOZ_TRY(StartupText(cx, saved, "sourceId", savedId));
+        MOZ_TRY(StartupText(cx, unit, "id", id));
+        MOZ_TRY(StartupText(cx, saved, "sourceSha256", savedHash));
+        MOZ_TRY(StartupNumber(cx, saved, "sourceSize", 1, UINT32_MAX - 1,
+                              savedSize));
+        NS_ENSURE_TRUE(!uid.IsEmpty() && !id.IsEmpty() && !token.IsEmpty() &&
+                           !bookIds.Contains(id) && savedToken == token &&
+                           savedId == id && savedHash == hash &&
+                           savedSize == size && hash.Length() == 64,
+                       NS_ERROR_NOT_AVAILABLE);
+        bookIds.Insert(id);
+        for (char c : hash.View())
+          NS_ENSURE_TRUE((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'),
+                         NS_ERROR_NOT_AVAILABLE);
+        MOZ_TRY(
+            StartupFieldsEqual(cx, saved, published,
+                               {"sourceId", "storageSourceId", "sourceSha256",
+                                "sourceSize", "cards", "lists"}));
         nsCOMPtr<nsIFile> target;
         MOZ_TRY(StartupChild(operation.profile, fileName.get(),
                              getter_AddRefs(target)));
+        if (reusing) {
+          nsCOMPtr<nsIAbDirectory> directory;
+          MOZ_TRY(ReadStartupReusedBookDirectory(target, pref, uri, uid,
+                                                 getter_AddRefs(directory)));
+          if (!directory) {
+            // No live file remains to parse these maps. Keep the native
+            // receipt's original key/UID shape and uniqueness requirements.
+            nsTHashSet<nsCString> uids;
+            for (const char* kind : {"cards", "lists"}) {
+              JS::Rooted<JSObject*> map(cx);
+              uint32_t length;
+              MOZ_TRY(StartupArray(cx, saved, kind, &map, length));
+              nsTHashSet<uint32_t> keys;
+              for (uint32_t n = 0; n < length; ++n) {
+                JS::Rooted<JS::Value> value(cx);
+                NS_ENSURE_TRUE(JS_GetElement(cx, map, n, &value),
+                               NS_ERROR_FAILURE);
+                JS::Rooted<JSObject*> pair(cx);
+                uint32_t fields;
+                MOZ_TRY(ImportArray(cx, value, &pair, fields));
+                NS_ENSURE_TRUE(fields == 2, NS_ERROR_FILE_CORRUPTED);
+                NS_ENSURE_TRUE(JS_GetElement(cx, pair, 0, &value),
+                               NS_ERROR_FAILURE);
+                int64_t key;
+                MOZ_TRY(ImportNumber(value, 0, UINT32_MAX, key));
+                NS_ENSURE_TRUE(JS_GetElement(cx, pair, 1, &value),
+                               NS_ERROR_FAILURE);
+                nsCString uid;
+                MOZ_TRY(ImportText(cx, value, uid));
+                NS_ENSURE_TRUE(!uid.IsEmpty() &&
+                                   !keys.Contains(uint32_t(key)) &&
+                                   !uids.Contains(uid),
+                               NS_ERROR_FILE_CORRUPTED);
+                keys.Insert(uint32_t(key));
+                uids.Insert(uid);
+              }
+            }
+            continue;
+          }
+        }
         MOZ_TRY(StartupRegular(target));
         nsCOMPtr<nsIAbManager> manager =
             do_GetService("@mozilla.org/abmanager;1");
@@ -12039,11 +12228,8 @@ nsresult DatabaseCore::CheckProfileActivation(
         else
           MOZ_TRY(StartupBookReadback(cx, target, original, token, &actual));
         JS::Rooted<JSObject*> readback(cx, &actual.toObject());
-        nsCString storageToken, savedToken, savedId, id;
+        nsCString storageToken;
         MOZ_TRY(StartupText(cx, readback, "sourceId", storageToken));
-        MOZ_TRY(StartupText(cx, saved, "storageSourceId", savedToken));
-        MOZ_TRY(StartupText(cx, saved, "sourceId", savedId));
-        MOZ_TRY(StartupText(cx, unit, "id", id));
         NS_ENSURE_TRUE(
             storageToken == token && savedToken == token && savedId == id,
             NS_ERROR_NOT_AVAILABLE);

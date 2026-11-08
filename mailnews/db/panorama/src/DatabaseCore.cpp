@@ -11678,6 +11678,7 @@ nsresult RestoreProgress(JSContext* cx, ProfileRestoreState& state) {
                         std::pair{"firstError", double(state.failure)}})
     NS_ENSURE_TRUE(JS_DefineProperty(cx, progress, key, n, JSPROP_ENUMERATE),
                    NS_ERROR_FAILURE);
+  MOZ_TRY(RestoreText(cx, request, "mode", "restore"_ns));
   MOZ_TRY(RestoreText(cx, request, "action", state.action));
   for (auto pair :
        {std::pair{"plan", &state.plan}, std::pair{"outcome", &state.outcome},
@@ -11840,7 +11841,7 @@ nsresult RestoreDependencies(JSContext* cx, ProfileRestoreState& state,
         int64_t modified;
         MOZ_TRY(RestoreEntries(cx, root, rows, mode, modified, state.prefix,
                                r == 0, version != 1));
-        MOZ_TRY(RestoreTree(state, *held, rows, false));
+        MOZ_TRY(RestoreTree(state, *held, rows, false, false, false));
         for (const auto& row : rows)
           if (!row.directory) {
             nsCOMPtr<nsIFile> sourceFile;

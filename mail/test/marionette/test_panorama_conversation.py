@@ -185,6 +185,20 @@ class TestPanoramaConversation(MarionetteTestCase):
         finally:
             super().tearDown()
 
+    def restart_clean_profile(self):
+        """Continue on a fresh ordinary profile with the original preferences.
+
+        The pref-enabled restart selected Panorama for the test profile, and a
+        selected profile does not return to Mork by preference.
+        """
+        if self.marionette.session:
+            self.marionette.set_context(self.marionette.CONTEXT_CHROME)
+            self.marionette.quit(in_app=True)
+        self.marionette.instance.restart(prefs=self.instance_prefs, clean=True)
+        self.marionette.raise_for_port(timeout=self.marionette.startup_timeout)
+        self.marionette.start_session()
+        self.marionette.set_context(self.marionette.CONTEXT_CHROME)
+
     def restart_same_profile(self):
         """Gracefully stop and relaunch the managed application with its profile."""
         old_pid = self.marionette.execute_script("return Services.appinfo.processID;")
@@ -784,12 +798,5 @@ class TestPanoramaConversation(MarionetteTestCase):
                 self.marionette.close_chrome_window()
             self.marionette.switch_to_window(self.marionette.chrome_window_handles[0])
         self.marionette.instance.prefs = self.instance_prefs
-        for name, previous in self.saved_prefs.items():
-            if previous["user"]:
-                self.marionette.set_pref(name, previous["value"])
-            else:
-                self.marionette.clear_pref(name)
         if self.saved_prefs:
-            # Keep the same profile; restore startup backend selection too.
-            self.restart_same_profile()
-            self.marionette.set_context(self.marionette.CONTEXT_CHROME)
+            self.restart_clean_profile()

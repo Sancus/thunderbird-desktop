@@ -83,6 +83,20 @@ class TestPanoramaSendLater(MarionetteTestCase):
         self.assertNotIn("error", result, result)
         return result["value"]
 
+    def restart_clean_profile(self):
+        """Continue on a fresh ordinary profile with the original preferences.
+
+        The pref-enabled restart selected Panorama for the test profile, and a
+        selected profile does not return to Mork by preference.
+        """
+        if self.marionette.session:
+            self.marionette.set_context(self.marionette.CONTEXT_CHROME)
+            self.marionette.quit(in_app=True)
+        self.marionette.instance.restart(prefs=self.instance_prefs, clean=True)
+        self.marionette.raise_for_port(timeout=self.marionette.startup_timeout)
+        self.marionette.start_session()
+        self.marionette.set_context(self.marionette.CONTEXT_CHROME)
+
     def restart_same_profile(self):
         """Restart the application process with the same persistent profile."""
         old_pid = self.marionette.execute_script("return Services.appinfo.processID;")
@@ -216,10 +230,5 @@ class TestPanoramaSendLater(MarionetteTestCase):
             self.perform("cleanup")
         finally:
             self.marionette.instance.prefs = self.instance_prefs
-            for name, previous in self.saved_prefs.items():
-                if previous["user"]:
-                    self.marionette.set_pref(name, previous["value"])
-                else:
-                    self.marionette.clear_pref(name)
             if self.saved_prefs:
-                self.restart_same_profile()
+                self.restart_clean_profile()

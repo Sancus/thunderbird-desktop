@@ -26969,8 +26969,9 @@ class DeliveryCoreStartupRestore : public DeliveryCoreReferences {
     ASSERT_EQ(NS_OK,
               RestoreChildFile(external, "body.bin"_ns, getter_AddRefs(file)));
     ASSERT_EQ(NS_OK, JSONCacheReadFile(file, bytes));
-    EXPECT_EQ(original ? mArchivedBody : "newer retained external bytes"_ns,
-              bytes);
+    // Never print the binary body: non-UTF-8 output stops the gtest harness.
+    EXPECT_TRUE(bytes == (original ? mArchivedBody
+                                   : "newer retained external bytes"_ns));
   }
   void ExpectRestoreWork(bool archived, bool saved = false) {
     nsCOMPtr<nsIFile> root = mStartupFixtureWork, file;

@@ -1328,12 +1328,10 @@ add_task(async function test_accounts_events() {
         onCreatedLog,
         "captured onCreated events are correct"
       );
+      // The IMAP test account keeps its creation login, so there is no
+      // rename update before the identity updates.
       window.assertDeepEqual(
         [
-          {
-            id: "account7",
-            changed: { id: "account7", name: "Mail for user@localhost" },
-          },
           {
             id: "account7",
             changed: {

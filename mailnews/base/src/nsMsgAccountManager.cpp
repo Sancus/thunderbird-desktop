@@ -14,6 +14,7 @@
 #include "nscore.h"
 #include "mozilla/RefPtr.h"
 #include "nsIComponentManager.h"
+#include "nsIServiceManager.h"
 #include "prmem.h"
 #include "prcmon.h"
 #include "prthread.h"
@@ -76,6 +77,7 @@
 #ifdef MOZ_PANORAMA
 #  include "nsIComponentRegistrar.h"
 #  include "DatabaseCore.h"
+#  include "nsIFolderDatabase.h"
 #  include "VirtualFolderWrapper.h"
 #endif  // MOZ_PANORAMA
 
@@ -152,11 +154,29 @@ static nsCOMPtr<nsIAsyncShutdownClient> GetProfileBeforeChange() {
   return barrier;
 }
 
+// This build must refuse a durable native selection even when Panorama is not
+// compiled in or the preference would otherwise fall back to Mork.
+static nsresult CheckSelectedAccountStartup(bool metadata = false,
+                                            const nsACString* key = nullptr) {
+#ifdef MOZ_PANORAMA
+  return mozilla::mailnews::DatabaseCore::CheckAccountStartup(metadata, key);
+#else
+  nsCOMPtr<nsIFile> profile;
+  MOZ_TRY(NS_GetSpecialDirectory(NS_APP_USER_PROFILE_50_DIR,
+                                 getter_AddRefs(profile)));
+  MOZ_TRY(profile->Append(u"panorama-profile.json"_ns));
+  bool exists;
+  MOZ_TRY(profile->Exists(&exists));
+  return exists ? NS_ERROR_NOT_AVAILABLE : NS_OK;
+#endif
+}
+
 nsresult nsMsgAccountManager::Init() {
   AUTO_PROFILER_LABEL("nsMsgAccountManager::Init", MAILNEWS);
   if (!XRE_IsParentProcess()) {
     return NS_ERROR_NOT_AVAILABLE;
   }
+  MOZ_TRY(CheckSelectedAccountStartup(true));
 
 #ifdef MOZ_PANORAMA
   if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
@@ -174,8 +194,14 @@ nsresult nsMsgAccountManager::Init() {
         do_GetService("@mozilla.org/msgDatabase/msgDBService;1", &rv);
     NS_ENSURE_SUCCESS(rv, rv);
 
-    rv = databaseCore->Startup();
-    NS_ENSURE_SUCCESS(rv, rv);
+    // Verified startup may already own the migration-only target. A second
+    // Startup would replace neither that connection nor its native identity.
+    nsCOMPtr<nsIFolderDatabase> folders;
+    databaseCore->GetFolderDB(getter_AddRefs(folders));
+    if (!folders) {
+      rv = databaseCore->Startup();
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
 
     componentRegistrar->RegisterFactory(
         nsID::GenerateUUID(), "",
@@ -197,6 +223,10 @@ nsresult nsMsgAccountManager::Init() {
       this, NS_LITERAL_STRING_FROM_CSTRING(__FILE__), __LINE__,
       u"nsMsgAccountManager shutdown"_ns);
 
+#ifdef MOZ_PANORAMA
+  mozilla::mailnews::DatabaseCore::RetainStartupAccount(this);
+#endif
+
   // Make sure PSM gets initialized before any accounts use certificates.
   net_EnsurePSMInit();
 
@@ -208,8 +238,18 @@ nsresult nsMsgAccountManager::Shutdown() {
     return NS_OK;
 
   nsresult rv;
+  nsresult firstError = NS_OK;
+  auto remember = [&](nsresult error) {
+    if (NS_SUCCEEDED(error)) return;
+    if (NS_SUCCEEDED(firstError))
+      firstError = error;
+    else
+      NS_WARNING("Secondary account shutdown failure");
+  };
 
-  SaveVirtualFolders();
+  // Metadata-only startup has not loaded ordinary account services or virtual
+  // folders. Cleanup must not load them merely to save an untouched view.
+  if (m_accountsLoaded) remember(SaveVirtualFolders());
 
   if (m_dbService) {
     nsTObserverArray<RefPtr<VirtualFolderChangeListener>>::ForwardIterator iter(
@@ -218,38 +258,55 @@ nsresult nsMsgAccountManager::Shutdown() {
 
     while (iter.HasMore()) {
       listener = iter.GetNext();
-      m_dbService->UnregisterPendingListener(listener);
+      remember(m_dbService->UnregisterPendingListener(listener));
     }
 
     m_dbService = nullptr;
   }
   m_virtualFolders.Clear();
-  if (m_msgFolderCache) WriteToFolderCache(m_msgFolderCache);
-  (void)ShutdownServers();
-  (void)UnloadAccounts();
+  if (m_msgFolderCache) remember(WriteToFolderCache(m_msgFolderCache));
+  remember(ShutdownServers());
+  remember(UnloadAccounts());
 
-  // shutdown removes nsIIncomingServer listener from biff manager, so do it
-  // after accounts have been unloaded
-  nsCOMPtr<nsIMsgBiffManager> biffService =
-      do_GetService("@mozilla.org/messenger/biffManager;1", &rv);
-  if (NS_SUCCEEDED(rv) && biffService) biffService->Shutdown();
-
-  // shutdown removes nsIIncomingServer listener from purge service, so do it
-  // after accounts have been unloaded
-  nsCOMPtr<nsIMsgPurgeService> purgeService =
-      do_GetService("@mozilla.org/messenger/purgeService;1", &rv);
-  if (NS_SUCCEEDED(rv) && purgeService) purgeService->Shutdown();
+  // Close only actual initialized ordinary services. do_GetService alone
+  // would construct new biff/purge services during metadata-only failure.
+  nsCOMPtr<nsIServiceManager> services;
+  remember(NS_GetServiceManager(getter_AddRefs(services)));
+  bool instantiated = false;
+  if (services) {
+    rv = services->IsServiceInstantiatedByContractID(
+        "@mozilla.org/messenger/biffManager;1", NS_GET_IID(nsIMsgBiffManager),
+        &instantiated);
+    remember(rv);
+    if (NS_SUCCEEDED(rv) && instantiated) {
+      nsCOMPtr<nsIMsgBiffManager> biff =
+          do_GetService("@mozilla.org/messenger/biffManager;1", &rv);
+      remember(rv);
+      if (biff) remember(biff->Shutdown());
+    }
+    instantiated = false;
+    rv = services->IsServiceInstantiatedByContractID(
+        "@mozilla.org/messenger/purgeService;1", NS_GET_IID(nsIMsgPurgeService),
+        &instantiated);
+    remember(rv);
+    if (NS_SUCCEEDED(rv) && instantiated) {
+      nsCOMPtr<nsIMsgPurgeService> purge =
+          do_GetService("@mozilla.org/messenger/purgeService;1", &rv);
+      remember(rv);
+      if (purge) remember(purge->Shutdown());
+    }
+  }
 
   if (m_msgFolderCache) {
     // The DTOR is meant to do the flushing, but observed behaviour is
     // that it doesn't always get called. So flush explicitly.
-    m_msgFolderCache->Flush();
+    remember(m_msgFolderCache->Flush());
     m_msgFolderCache = nullptr;
   }
 
   m_haveShutdown = true;
-  GetProfileBeforeChange()->RemoveBlocker(this);
-  return NS_OK;
+  remember(GetProfileBeforeChange()->RemoveBlocker(this));
+  return firstError;
 }
 
 NS_IMETHODIMP
@@ -370,6 +427,7 @@ nsMsgAccountManager::GetUniqueServerKey(nsACString& aResult) {
 }
 
 nsresult nsMsgAccountManager::CreateIdentity(nsIMsgIdentity** _retval) {
+  MOZ_TRY(CheckSelectedAccountStartup());
   AUTO_PROFILER_LABEL("nsMsgAccountManager::CreateIdentity", MAILNEWS);
   NS_ENSURE_ARG_POINTER(_retval);
   nsresult rv;
@@ -428,6 +486,7 @@ nsMsgAccountManager::CreateIncomingServer(const nsACString& username,
                                           const nsACString& type,
                                           nsIMsgIncomingServer** _retval) {
   AUTO_PROFILER_LABEL("nsMsgAccountManager::CreateIncomingServer", MAILNEWS);
+  MOZ_TRY(CheckSelectedAccountStartup());
   NS_ENSURE_ARG_POINTER(_retval);
 
   // Make sure the hostname is usable when creating a new incoming server.
@@ -472,6 +531,7 @@ nsMsgAccountManager::CreateIncomingServer(const nsACString& username,
 NS_IMETHODIMP
 nsMsgAccountManager::GetIncomingServer(const nsACString& key,
                                        nsIMsgIncomingServer** _retval) {
+  MOZ_TRY(CheckSelectedAccountStartup(true, &key));
   NS_ENSURE_ARG_POINTER(_retval);
   nsresult rv;
 
@@ -1198,10 +1258,11 @@ nsMsgAccountManager::GetAllServers(
 }
 
 nsresult nsMsgAccountManager::LoadAccounts() {
-  nsresult rv;
-
-  // for now safeguard multiple calls to this function
+  // Returning already loaded state also serves the existing synchronous
+  // shutdown save. It does not admit new account/service construction.
   if (m_accountsLoaded) return NS_OK;
+  MOZ_TRY(CheckSelectedAccountStartup());
+  nsresult rv;
 
   // If we have code trying to do things after we've unloaded accounts,
   // ignore it.
@@ -1944,6 +2005,7 @@ nsresult nsMsgAccountManager::createKeyedAccount(const nsCString& key,
 
 NS_IMETHODIMP
 nsMsgAccountManager::CreateAccount(nsIMsgAccount** _retval) {
+  MOZ_TRY(CheckSelectedAccountStartup());
   NS_ENSURE_ARG_POINTER(_retval);
 
   nsAutoCString key;
@@ -2019,9 +2081,21 @@ NS_IMETHODIMP
 nsMsgAccountManager::FindServerByURI(nsIURI* aURI,
                                      nsIMsgIncomingServer** aResult) {
   NS_ENSURE_ARG_POINTER(aURI);
+  NS_ENSURE_ARG_POINTER(aResult);
 
-  nsresult rv = LoadAccounts();
-  NS_ENSURE_SUCCESS(rv, rv);
+  bool retainedStartupMetadata = false;
+#ifdef MOZ_PANORAMA
+  // Native folder protocol getters may resolve a retained server before
+  // ordinary account loading is admitted. No new account/root is constructed;
+  // the exact matched server key is checked below against native selection.
+  retainedStartupMetadata =
+      !m_accountsLoaded && NS_FAILED(CheckSelectedAccountStartup());
+#endif
+  nsresult rv;
+  if (!retainedStartupMetadata) {
+    rv = LoadAccounts();
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
 
   // Get username and hostname and port so we can get the server
   nsAutoCString username;
@@ -2061,6 +2135,17 @@ nsMsgAccountManager::FindServerByURI(nsIURI* aURI,
     if (NS_SUCCEEDED(rv) && (port == -1)) port = 0;
   }
 
+  if (retainedStartupMetadata) {
+    nsCOMPtr<nsIMsgIncomingServer> server;
+    MOZ_TRY(findServerInternal(username, hostname, type, port,
+                               getter_AddRefs(server)));
+    NS_ENSURE_TRUE(server, NS_ERROR_NOT_AVAILABLE);
+    nsCString key;
+    MOZ_TRY(server->GetKey(key));
+    MOZ_TRY(CheckSelectedAccountStartup(true, &key));
+    server.forget(aResult);
+    return NS_OK;
+  }
   return findServerInternal(username, hostname, type, port, aResult);
 }
 
@@ -2204,6 +2289,55 @@ nsMsgAccountManager::FindAccountForServer(nsIMsgIncomingServer* server,
   rv = server->GetKey(key);
   NS_ENSURE_SUCCESS(rv, rv);
 
+#ifdef MOZ_PANORAMA
+  if (NS_FAILED(CheckSelectedAccountStartup())) {
+    // Pre-ready message projection needs the persisted account key, not normal
+    // account loading (which starts biff/purge and rewrites account prefs).
+    // Only the exact server retained by native startup may use this metadata
+    // read.
+    *aResult = nullptr;
+    MOZ_TRY(CheckSelectedAccountStartup(true, &key));
+    nsCOMPtr<nsIMsgIncomingServer> retained;
+    m_incomingServers.Get(key, getter_AddRefs(retained));
+    NS_ENSURE_TRUE(retained == server, NS_ERROR_NOT_AVAILABLE);
+    nsCString accountList;
+    MOZ_TRY(Preferences::GetCString(PREF_MAIL_ACCOUNTMANAGER_ACCOUNTS,
+                                    accountList));
+    nsTArray<nsCString> accounts;
+    ParseString(accountList, ACCOUNT_DELIMITER, accounts);
+    for (const auto& accountKey : accounts) {
+      nsCString pref("mail.account."_ns + accountKey + ".server"_ns);
+      nsCString serverKey;
+      // Match LoadAccounts' first persisted account for this server, including
+      // its treatment of missing server prefs and duplicate account entries.
+      if (NS_FAILED(Preferences::GetCString(pref.get(), serverKey)) ||
+          serverKey != key)
+        continue;
+      nsCOMPtr<nsIMsgAccount> account =
+          do_CreateInstance("@mozilla.org/messenger/account;1", &rv);
+      MOZ_TRY(rv);
+      MOZ_TRY(account->SetKey(accountKey));
+      // SetKey reads identities only. Do not CreateServer, SetIncomingServer,
+      // append to m_accounts or mark accounts loaded: ordinary loading must
+      // still perform its existing activation after the whole target is ready.
+      MOZ_TRY(CheckSelectedAccountStartup(true, &key));
+      nsCString currentList, currentServer;
+      MOZ_TRY(Preferences::GetCString(PREF_MAIL_ACCOUNTMANAGER_ACCOUNTS,
+                                      currentList));
+      MOZ_TRY(Preferences::GetCString(pref.get(), currentServer));
+      NS_ENSURE_TRUE(currentList == accountList && currentServer == key,
+                     NS_ERROR_NOT_AVAILABLE);
+      nsCOMPtr<nsIMsgIncomingServer> current;
+      m_incomingServers.Get(key, getter_AddRefs(current));
+      NS_ENSURE_TRUE(current == server, NS_ERROR_NOT_AVAILABLE);
+      account.forget(aResult);
+      return NS_OK;
+    }
+    // This is not an empty-key fallback. A missing persisted mapping must
+    // propagate an error before Message::GetAccountKey can dereference it.
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+#endif
   findAccountByServerKey(key, aResult);
   return NS_OK;
 }

@@ -1241,7 +1241,8 @@ function accountRecords(request, folderFlags, imap = false) {
 }
 
 /**
- * Checks only the known legacy thread metadata; no active thread flags are lost.
+ * Checks the known legacy thread metadata without changing original cells.
+ * Reads an omitted newest-date cache as zero, as the native thread reader does.
  *
  * @param {object} row - Original metadata row.
  * @param {number} id - Original thread table ID.
@@ -1255,7 +1256,9 @@ function checkMeta(row, id, members, messages, imap = false) {
     !row ||
     row.scope != "m" ||
     row.cells.size !=
-      META_FIELDS.size - Number(imap && !row.cells.has("unreadChildren")) ||
+      META_FIELDS.size -
+        Number(imap && !row.cells.has("unreadChildren")) -
+        Number(!row.cells.has("threadNewestMsgDate")) ||
     [...row.cells.keys()].some(name => !META_FIELDS.has(name)) ||
     hex(row.cells.get("threadId")) != id ||
     hex(row.cells.get("threadFlags")) != 0 ||
@@ -1272,7 +1275,7 @@ function checkMeta(row, id, members, messages, imap = false) {
   if (members.length ? !members.includes(root) : imap && root !== id) {
     throw new Error("Missing Mork semantic root");
   }
-  const newest = hex(row.cells.get("threadNewestMsgDate"));
+  const newest = hex(row.cells.get("threadNewestMsgDate") ?? "0");
   const expected = members.reduce(
     (latest, key) =>
       Math.max(latest, messages.get(key).message.header.date / 1000000),

@@ -31,10 +31,13 @@ const { prepareMorkFolderCacheImport, resumeMorkCacheImports } =
     "resource:///modules/panorama/MigrationCoordinator.sys.mjs"
   );
 
-const { createMorkFolderCacheRequest, validateMorkFolderCacheReceipt } =
-  ChromeUtils.importESModule(
-    "resource:///modules/panorama/MorkFolderCache.sys.mjs"
-  );
+const {
+  parseJSONFolderCache,
+  createMorkFolderCacheRequest,
+  validateMorkFolderCacheReceipt,
+} = ChromeUtils.importESModule(
+  "resource:///modules/panorama/MorkFolderCache.sys.mjs"
+);
 
 const CACHE_FILE = "panacea.dat";
 const OLD_ROOT = "/foo/bar/profile-default/";
@@ -1460,5 +1463,250 @@ add_task(
     } finally {
       folderDB.updateName(folder.id, originalName);
     }
+  }
+);
+
+add_task(function test_JSONCacheRetainsDescriptorIdentityAndTypedPresence() {
+  const key = PathUtils.join(PathUtils.profileDir, "Original ☃.msf");
+  const input = {
+    [key]: {
+      flags: 0,
+      pendingMsgs: -1,
+      userSortOrder: 0xffffffff,
+      folderSize: 9007199254740991,
+      folderName: "Original ☃",
+      empty: "",
+      unknownText: "unchanged",
+    },
+  };
+  const bytes = new TextEncoder().encode(JSON.stringify(input));
+  const before = bytes.slice();
+  const parsed = parseJSONFolderCache(bytes);
+  Assert.equal(parsed.format, "json");
+  Assert.deepEqual([...parsed.entries.keys()], [key]);
+  const row = parsed.entries.get(key);
+  Assert.ok(!Object.hasOwn(row, "sourceKey"), "JSON has no Mork row ID");
+  Assert.equal(row.properties.get("key"), key);
+  Assert.equal(row.properties.get("flags"), "0");
+  Assert.equal(row.values.flags, 0, "Explicit numeric zero stays present");
+  Assert.equal(row.properties.get("pendingMsgs"), "ffffffff");
+  Assert.equal(row.values.pendingMsgs, -1);
+  Assert.equal(row.properties.get("userSortOrder"), "ffffffff");
+  Assert.equal(row.values.userSortOrder, 0xffffffff);
+  const defaultOrder = parseJSONFolderCache(
+    new TextEncoder().encode(JSON.stringify({ [key]: { userSortOrder: 0 } }))
+  ).entries.get(key);
+  Assert.equal(defaultOrder.properties.get("userSortOrder"), "0");
+  Assert.equal(defaultOrder.values.userSortOrder, 0);
+  const missingOrder = parseJSONFolderCache(
+    new TextEncoder().encode(JSON.stringify({ [key]: {} }))
+  ).entries.get(key);
+  Assert.ok(!missingOrder.properties.has("userSortOrder"));
+  Assert.ok(!Object.hasOwn(missingOrder.values, "userSortOrder"));
+  Assert.equal(row.properties.get("folderSize"), "1fffffffffffff");
+  Assert.equal(row.values.folderSize, 9007199254740991);
+  Assert.equal(row.properties.get("folderName"), "Original ☃");
+  Assert.equal(row.properties.get("empty"), "");
+  Assert.equal(row.properties.get("unknownText"), "unchanged");
+  Assert.ok(!row.properties.has("absent"));
+  Assert.deepEqual(parsed.source, input, "Original JSON rows remain JSON");
+  Assert.deepEqual(bytes, before, "Parsing never rewrites original bytes");
+  const empty = parseJSONFolderCache(new TextEncoder().encode("{}"));
+  Assert.equal(
+    empty.entries.size,
+    0,
+    "Only an actual empty object has zero rows"
+  );
+  Assert.deepEqual(empty.source, {});
+});
+
+add_task(function test_JSONCacheRefusesUnsafeOrAmbiguousCellTypes() {
+  const key = PathUtils.join(PathUtils.profileDir, "Original.msf");
+  const encode = value => new TextEncoder().encode(JSON.stringify(value));
+  for (const value of [null, [], 0, "rows"]) {
+    Assert.throws(
+      () => parseJSONFolderCache(encode(value)),
+      /requires an object/
+    );
+  }
+  for (const row of [null, [], true]) {
+    Assert.throws(
+      () => parseJSONFolderCache(encode({ [key]: row })),
+      /cache row/
+    );
+  }
+  for (const row of [
+    { flags: -1 },
+    { userSortOrder: -1 },
+    { userSortOrder: 0x100000000 },
+    { userSortOrder: "0" },
+    { flags: 0x100000000 },
+    { totalMsgs: 0x80000000 },
+    { totalMsgs: -0x80000001 },
+    { folderSize: 9007199254740992 },
+    { flags: "0" },
+    { flags: 0.5 },
+  ]) {
+    Assert.throws(
+      () => parseJSONFolderCache(encode({ [key]: row })),
+      /cache number/
+    );
+  }
+  for (const row of [
+    { folderName: true },
+    { folderName: null },
+    { folderName: [] },
+    { folderName: {} },
+    { unknownNumber: 1 },
+    { folderName: "nul\0value" },
+    { folderName: "\ud800" },
+  ]) {
+    Assert.throws(
+      () => parseJSONFolderCache(encode({ [key]: row })),
+      /cache text/
+    );
+  }
+  Assert.throws(
+    () => parseJSONFolderCache(encode({ relative: {} })),
+    /cache row/
+  );
+  Assert.throws(
+    () => parseJSONFolderCache(encode({ [key]: { key: "replacement" } })),
+    /cache property/
+  );
+  Assert.throws(() => parseJSONFolderCache(new Uint8Array([0xff])), /./);
+  Assert.throws(
+    () => parseJSONFolderCache(new TextEncoder().encode("{broken")),
+    /./
+  );
+});
+
+add_task(
+  function test_JSONCacheReceiptKeepsOriginalAndNativeUserOrderSeparate() {
+    const key = PathUtils.join(PathUtils.profileDir, "NativeInbox.msf");
+    const unit = {
+      requestVersion: 3,
+      sourceFormat: "json",
+      id: "json-user-order",
+      token: "json-user-order-token",
+      databaseSourceId: "json-user-order-database",
+      path: PathUtils.join(PathUtils.profileDir, "folderCache.json"),
+      size: 2,
+      sha256: "a".repeat(64),
+      proof: {
+        profilePath: PathUtils.profileDir,
+        manifest: {
+          path: PathUtils.join(PathUtils.profileDir, "backup", "manifest.json"),
+          size: 1,
+          sha256: "b".repeat(64),
+        },
+      },
+      folders: [
+        {
+          originalKey: key,
+          id: 1,
+          isServer: false,
+          descriptor: key,
+          cachePath: key,
+          storePath: PathUtils.join(PathUtils.profileDir, "NativeInbox"),
+          originalSummaryPath: key,
+          protocol: "none",
+          storeType: "mbox",
+          properties: [
+            { name: "key", text: key },
+            { name: "userSortOrder", text: "ffffffff", integer: 0xffffffff },
+          ],
+        },
+      ],
+    };
+    const request = createMorkFolderCacheRequest(unit);
+    const receipt = {
+      identity: {
+        version: 3,
+        sourceFormat: "json",
+        policy: "native-reconciled-json-v3",
+        token: unit.token,
+        sourceId: unit.id,
+        databaseSourceId: unit.databaseSourceId,
+        path: unit.path,
+        size: unit.size,
+        sha256: unit.sha256,
+        proof: request.proof,
+        folders: request.folders,
+      },
+      cells: [
+        {
+          id: 1,
+          name: "key",
+          text: key,
+          target: "key",
+          disposition: "binding",
+        },
+        {
+          id: 1,
+          name: "userSortOrder",
+          text: "ffffffff",
+          integer: 0xffffffff,
+          target: "userSortOrder",
+          disposition: "applied",
+          nativeInteger: 0xffffffff,
+        },
+      ],
+    };
+    Assert.deepEqual(validateMorkFolderCacheReceipt(unit, receipt), receipt);
+    const existing = structuredClone(receipt);
+    existing.cells[1].disposition = "existing";
+    existing.cells[1].nativeInteger = 7;
+    Assert.deepEqual(
+      validateMorkFolderCacheReceipt(unit, existing),
+      existing,
+      "The original sentinel remains retained when native order7 already exists"
+    );
+    for (const mutate of [
+      cell => {
+        cell.nativeInteger = 7;
+      },
+      cell => {
+        cell.nativeInteger = -1;
+      },
+      cell => {
+        cell.nativeInteger = 0x100000000;
+      },
+      cell => {
+        cell.nativeText = "ffffffff";
+      },
+      cell => {
+        cell.eligibleMask = 0;
+      },
+      cell => {
+        cell.disposition = "native-authoritative";
+      },
+      cell => {
+        delete cell.integer;
+      },
+      cell => {
+        cell.integer = 0x100000000;
+      },
+      cell => {
+        cell.text = "0ffffffff";
+      },
+      cell => {
+        cell.target = "sortOrder";
+      },
+    ]) {
+      const invalid = structuredClone(receipt);
+      mutate(invalid.cells[1]);
+      Assert.throws(
+        () => validateMorkFolderCacheReceipt(unit, invalid),
+        /cache/
+      );
+    }
+    const incomplete = structuredClone(receipt);
+    incomplete.cells.pop();
+    Assert.throws(
+      () => validateMorkFolderCacheReceipt(unit, incomplete),
+      /cells changed/,
+      "Native receipt cannot omit the original user order cell"
+    );
   }
 );

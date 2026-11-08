@@ -513,3 +513,51 @@ add_task(async function test_folderRetirementKeepsFreshSearchIdentity() {
   Assert.strictEqual(service.resolveDocument(String(keys[0])).eligible, false);
   Assert.strictEqual(await readMailSearchResult(service, oldHit), null);
 });
+
+add_task(function test_selectedStartupCannotAdoptAlreadyOpenCore() {
+  const connection = database.connectionForTests;
+  const sourceId = database.sourceId;
+  Assert.throws(
+    () => database.beginProfileStartup(),
+    error => error.result === Cr.NS_ERROR_NOT_AVAILABLE,
+    "A selected startup operation cannot adopt an already open ordinary core"
+  );
+  Assert.strictEqual(database.connectionForTests, connection);
+  Assert.strictEqual(database.sourceId, sourceId);
+  Assert.ok(connection.connectionReady);
+});
+
+add_task(function test_foreignSelectedContextCannotMutateOrCloseCore() {
+  const connection = database.connectionForTests;
+  const sourceId = database.sourceId;
+  const foreign = do_get_profile();
+  for (const attempt of [
+    () => database.validateProfileStartup(foreign),
+    () => database.openProfileStartupTarget(foreign, {}),
+    () => database.completeProfileStartup(foreign, {}),
+    () => database.failProfileStartup(foreign, Cr.NS_ERROR_ABORT),
+  ]) {
+    Assert.throws(
+      attempt,
+      error => error.result === Cr.NS_ERROR_NOT_AVAILABLE,
+      "An ordinary nsISupports object conveys no selected-profile authority"
+    );
+    Assert.strictEqual(database.connectionForTests, connection);
+    Assert.strictEqual(database.sourceId, sourceId);
+    Assert.ok(connection.connectionReady);
+  }
+  const server = MailServices.accounts.createIncomingServer(
+    "after-refused-startup",
+    "ordinary.invalid",
+    "none"
+  );
+  registerCleanupFunction(() =>
+    MailServices.accounts.removeIncomingServer(server, false)
+  );
+  Assert.greater(
+    server.rootFolder.id,
+    0,
+    "Ordinary native discovery still works"
+  );
+  Assert.strictEqual(database.sourceId, sourceId);
+});

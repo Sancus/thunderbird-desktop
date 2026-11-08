@@ -26,10 +26,17 @@
 class mozIStorageConnection;
 class mozIStorageStatement;
 class nsIFile;
+class nsIAbDirectory;
+class nsIAsyncShutdownBlocker;
 class nsMsgDBFolder;
+namespace mozilla::dom {
+class Promise;
+}
 
 namespace mozilla::mailnews {
 
+class ProfileStartupOperation;
+struct StartupMailSource;
 class PerFolderDatabase;
 struct CacheImport;
 class DeliveryCoreMessageExistence;
@@ -207,6 +214,15 @@ class DatabaseCore : public nsIDatabaseCore,
 
   static already_AddRefed<DatabaseCore> GetInstanceForService();
 
+  // Account construction may bind verified metadata; ordinary loading may not
+  // run while selected startup is unresolved. Never creates a database.
+  static nsresult CheckAccountStartup(bool metadata = false,
+                                      const nsACString* serverKey = nullptr);
+
+  // Retains the actual initialized account shutdown owner for selected native
+  // startup. No account service is created by failure/shutdown settlement.
+  static void RetainStartupAccount(nsIAsyncShutdownBlocker* account);
+
   // Retires SQL folder identities only; never opens a core or removes files.
   static nsresult RetireAccountRoot(uint64_t folderId,
                                     const nsACString& serverKey,
@@ -236,7 +252,7 @@ class DatabaseCore : public nsIDatabaseCore,
                                   Maybe<FolderImportReceipt>& output);
 
  protected:
-  virtual ~DatabaseCore() {};
+  virtual ~DatabaseCore();
 
  private:
   friend class ::nsMsgDBFolder;
@@ -261,6 +277,8 @@ class DatabaseCore : public nsIDatabaseCore,
   static bool sDatabaseIsNew;  // If the database was created in this session.
   nsCString mCacheOriginGeneration;  // Empty after reopening an existing DB.
 #ifndef XP_WIN
+  nsresult CheckStartupCachePublication(JSContext* cx,
+                                        const CacheImport& input);
   nsresult ImportFolderCacheMetadataV2(CacheImport& input, JSContext* cx,
                                        JS::MutableHandle<JS::Value> output);
 #endif
@@ -300,9 +318,12 @@ class DatabaseCore : public nsIDatabaseCore,
       const ImapImportUnit& input, ImapImportReceipt& output,
       const std::function<nsresult(const ImapImportReceipt&)>& prepare = {},
       const std::function<void()>& publish = {});
+  static nsresult ReadStartupImapProvenance(const nsCString& proof,
+                                            ImapImportUnit& output);
   nsresult ReadImapImportReceipt(const ImapImportUnit& input,
                                  const nsACString& provenance,
-                                 Maybe<ImapImportReceipt>& output);
+                                 Maybe<ImapImportReceipt>& output,
+                                 bool durableStartup = false);
 
   static nsresult GetStatement(const nsACString& aName, const nsACString& aSQL,
                                mozIStorageStatement** aStmt);
@@ -315,6 +336,51 @@ class DatabaseCore : public nsIDatabaseCore,
       const nsTArray<uint64_t>& capturedFolders);
   bool HasFailedFolderRelocationRecovery() const;
   nsTArray<RefPtr<FolderRelocationRecovery>> mFolderRelocationRecoveries;
+
+  nsresult ArmProfileStartup(nsIFile* profile, nsIFile* localProfile);
+  nsresult CheckProfileStartup(nsISupports* operation, bool metadata = false);
+  nsresult DescribeProfileStartup(JSContext* cx,
+                                  JS::MutableHandle<JS::Value> output);
+  nsresult OpenProfileStartup(JSContext* cx, JS::Handle<JS::Value> plan);
+  nsresult BuildStartupFolders();
+  // Only the validated activation readback lends these bindings to the native
+  // folder initializer. They never grant ordinary writer admission.
+  nsresult BindStartupFolderPath(uint64_t folderId, nsCOMPtr<nsIFile>& path);
+  nsresult BindStartupChildNames(uint64_t parentId, nsIFile* parentPath,
+                                 nsTArray<nsCString>& childNames);
+  const nsTHashMap<uint64_t, nsCString>* mStartupLocalPaths = nullptr;
+  static nsresult ReadStartupMailSource(JSContext* cx,
+                                        JS::Handle<JSObject*> source,
+                                        ProfileStartupOperation& operation,
+                                        StartupMailSource& output);
+  static nsresult CheckStartupMailStore(const nsACString& path,
+                                        const nsACString& contract,
+                                        bool remote);
+  static nsresult ReadStartupSummaryName(JSContext* cx, nsIFile* file,
+                                         const nsACString& expected,
+                                         Maybe<nsCString>& output);
+  nsresult BindStartupLocalNames(JSContext* cx, StartupMailSource& source);
+  // Read-only presence check after the completed migration's durable identity
+  // and receipts have been checked. A null directory means complete retirement.
+  static nsresult ReadStartupReusedBookDirectory(nsIFile* target,
+                                                 const nsACString& pref,
+                                                 const nsACString& uri,
+                                                 const nsACString& uid,
+                                                 nsIAbDirectory** output);
+  nsresult CheckProfileActivation(JSContext* cx,
+                                  JS::Handle<JS::Value> activation);
+  nsresult SettleProfileStartup(nsresult firstError);
+  nsISupports* ProfileStartupToken();
+  RefPtr<ProfileStartupOperation> mProfileStartup;
+  nsTArray<RefPtr<mozilla::dom::Promise>> mStartupBegins;
+  nsCOMPtr<nsIAsyncShutdownBlocker> mStartupAccount;
+  bool mStartupBeginRequested = false;
+  bool mStartupManaged = false;
+  bool mStartupObserved = false;
+  nsresult mStartupFailure = NS_OK;
+  bool mStartupOpening = false;
+  bool mStartupClosePending = false;
+  uint32_t mStartupMetadataDepth = 0;
 
   bool mShuttingDown = false;
   RefPtr<FolderDatabase> mFolderDatabase;

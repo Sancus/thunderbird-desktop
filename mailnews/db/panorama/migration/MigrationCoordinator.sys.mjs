@@ -28,6 +28,7 @@ import { getMorkThreadRelations } from "resource:///modules/panorama/MigrationMe
 import { verifyMigrationBackup } from "resource:///modules/panorama/MigrationBackup.sys.mjs";
 
 import {
+  parseJSONFolderCache,
   createMorkFolderCacheRequest,
   getMorkFolderCacheCells,
   validateMorkFolderCacheReceipt,
@@ -537,6 +538,9 @@ export async function resumeMorkBookImportsAndPublish(
  *   Every original key with its admitted canonical native cache descriptor.
  * @param {number} [requestVersion=2] - Reconciled version2; explicit1 retains
  *   original provenance-only plan semantics without upgrading old receipts.
+ *   An original native JSON input uses explicit version3 reconciliation.
+ * @param {?nsISupports} [startupOperation=null] - Native operation for the
+ *   distinct startup caller; otherwise profileLock must be a genuine held lock.
  * @returns {Promise<object>} Owned source bytes/raw records and exact folder
  *   bindings/properties. This is read-only input, never an import completion.
  * @throws {Error} For unsupported paths, changed identity or incomplete mapping.
@@ -547,9 +551,10 @@ export async function prepareMorkFolderCacheImport(
   profileLock,
   path,
   bindings,
-  requestVersion = 2
+  requestVersion = 2,
+  startupOperation = null
 ) {
-  if (requestVersion !== 1 && requestVersion !== 2) {
+  if (![1, 2, 3].includes(requestVersion)) {
     throw new Error("Unsupported native cache request version");
   }
   const database = core.QueryInterface(Ci.nsIDatabaseCore);
@@ -557,7 +562,8 @@ export async function prepareMorkFolderCacheImport(
     journal,
     core,
     profileLock,
-    path
+    path,
+    startupOperation
   );
   const {
     databaseSourceId,
@@ -569,6 +575,14 @@ export async function prepareMorkFolderCacheImport(
     checkTarget,
     checkInput,
   } = input;
+  if (cache.format === "json") {
+    if (requestVersion === 1) {
+      throw new Error("Native JSON cache requires reconciled version3");
+    }
+    requestVersion = 3;
+  } else if (requestVersion === 3) {
+    throw new Error("Version3 requires an original JSON cache");
+  }
   if (
     Object.prototype.toString.call(bindings) != "[object Map]" ||
     bindings.size != cache.entries.size
@@ -616,7 +630,7 @@ export async function prepareMorkFolderCacheImport(
       descriptors.add(descriptor);
       return {
         originalKey: key,
-        ...(requestVersion === 2
+        ...(requestVersion >= 2
           ? { originalSummaryPath: isServer ? "" : cachePath }
           : {}),
         id,
@@ -655,9 +669,95 @@ export async function prepareMorkFolderCacheImport(
     source: identity,
     bytes,
     records: structuredClone(cache.source),
-    ...(requestVersion === 2 ? { requestVersion, proof } : {}),
+    ...(requestVersion >= 2 ? { requestVersion, proof } : {}),
+    ...(requestVersion === 3 ? { sourceFormat: "json" } : {}),
     folders: folders.map(folder => bindMorkFolderCacheRecord(folder, cache)),
   };
+}
+
+/**
+ * Reads native JSON cache bytes under the existing selected-profile admission.
+ * Historical Mork files keep their original parser and source identity.
+ *
+ * @param {string} path - Admitted original cache file.
+ * @returns {Promise<{cache: object, bytes: Uint8Array, identity: object}>}
+ *   Complete original rows, bytes and checked path/size/SHA-256.
+ * @throws {Error} For changed input, malformed rows or unsupported cell values.
+ */
+async function readStartupFolderCacheSource(path) {
+  if (PathUtils.filename(path) !== "folderCache.json") {
+    return readMorkFolderCacheSource(path);
+  }
+  const file = startupSourceFile(path);
+  const before = await IOUtils.stat(file.path);
+  const limit = 64 * 1024 * 1024;
+  if (before.type !== "regular" || before.size > limit) {
+    throw new Error("Unsupported native JSON cache file");
+  }
+  const bytes = await IOUtils.read(file.path, { maxBytes: limit + 1 });
+  const hash = Cc["@mozilla.org/security/hash;1"].createInstance(
+    Ci.nsICryptoHash
+  );
+  hash.init(Ci.nsICryptoHash.SHA256);
+  hash.update(bytes, bytes.length);
+  const sha256 = Array.from(hash.finish(false), byte =>
+    byte.charCodeAt(0).toString(16).padStart(2, "0")
+  ).join("");
+  const after = await IOUtils.stat(file.path);
+  if (
+    startupSourceFile(path).path !== file.path ||
+    bytes.length !== before.size ||
+    after.type !== "regular" ||
+    after.size !== before.size ||
+    after.lastModified !== before.lastModified ||
+    (await hashMigrationFile(file.path)) !== sha256
+  ) {
+    throw new Error("Native JSON cache changed while reading");
+  }
+  return {
+    cache: parseJSONFolderCache(bytes),
+    bytes,
+    identity: { path: file.path, size: bytes.length, sha256 },
+  };
+}
+
+/**
+ * Classifies a fully parsed empty JSON cache before the startup backup decision.
+ * Native startup independently rechecks its unchanged bytes before any create.
+ *
+ * @param {string} path - Closed selected-profile original JSON cache.
+ * @returns {boolean} Whether the complete original cache contains no rows.
+ * @throws {Error} For links, changed files, malformed JSON or unsupported values.
+ */
+function startupJSONCacheIsEmpty(path) {
+  const file = startupSourceFile(path);
+  const size = file.fileSize;
+  const modified = file.lastModifiedTime;
+  if (!file.isFile() || size < 0 || size > 64 * 1024 * 1024) {
+    throw new Error("Unsupported startup JSON cache file");
+  }
+  const stream = Cc["@mozilla.org/network/file-input-stream;1"].createInstance(
+    Ci.nsIFileInputStream
+  );
+  stream.init(file, 0x01, 0, 0);
+  try {
+    const binary = Cc["@mozilla.org/binaryinputstream;1"].createInstance(
+      Ci.nsIBinaryInputStream
+    );
+    binary.setInputStream(stream);
+    const bytes = new Uint8Array(binary.readByteArray(size));
+    const parsed = parseJSONFolderCache(bytes);
+    if (
+      startupSourceFile(path).path !== file.path ||
+      file.fileSize !== size ||
+      file.lastModifiedTime !== modified
+    ) {
+      throw new Error("Startup JSON cache changed during classification");
+    }
+    return parsed.entries.size === 0;
+  } finally {
+    stream.close();
+  }
 }
 
 /**
@@ -669,17 +769,26 @@ export async function prepareMorkFolderCacheImport(
  * @param {nsIDatabaseCore} core - Current native database incarnation.
  * @param {nsIProfileLock} profileLock - Held selected profile lock.
  * @param {string} path - Original backed-up cache path.
+ * @param {?nsISupports} [startupOperation=null] - Actual native startup owner.
  * @returns {Promise<object>} Original bytes, parsed cells, proof and recheck callback.
  * @throws {Error} For changed inputs, backup, lock or database identity.
  */
-async function readBoundMorkFolderCacheInput(journal, core, profileLock, path) {
+async function readBoundMorkFolderCacheInput(
+  journal,
+  core,
+  profileLock,
+  path,
+  startupOperation = null
+) {
   if (AppConstants.platform == "win") {
     throw new Error(
       "Windows cache migration requires native reparse admission"
     );
   }
   const database = core.QueryInterface(Ci.nsIDatabaseCore);
-  const lock = profileLock.QueryInterface(Ci.nsIProfileLock);
+  const lock = startupOperation
+    ? null
+    : profileLock.QueryInterface(Ci.nsIProfileLock);
   const state = journal.state;
   const databaseSourceId = database.sourceId;
   const roots = [state.profilePath, ...state.mailPaths].map(
@@ -688,7 +797,9 @@ async function readBoundMorkFolderCacheInput(journal, core, profileLock, path) {
   const checkTarget = () => {
     const current = journal.state;
     const selected = new FileUtils.File(PathUtils.profileDir);
-    const directory = lock.directory.clone();
+    const directory = startupOperation
+      ? startupMigrationDirectory(journal, database, startupOperation)
+      : lock.directory.clone();
     if (directory.isSymlink() || selected.isSymlink()) {
       throw new Error("Migration cache profile contains a link");
     }
@@ -704,7 +815,11 @@ async function readBoundMorkFolderCacheInput(journal, core, profileLock, path) {
         ) ||
       !databaseSourceId ||
       database.sourceId !== databaseSourceId ||
-      !current.sources.length ||
+      (!current.sources.length &&
+        (!startupOperation ||
+          current.version !== 7 ||
+          !current.startup?.bound ||
+          current.startup.databaseSourceId !== databaseSourceId)) ||
       current.sources.some(
         source => source.databaseSourceId !== databaseSourceId
       ) ||
@@ -722,7 +837,8 @@ async function readBoundMorkFolderCacheInput(journal, core, profileLock, path) {
   }
   const original = new FileUtils.File(path);
   const canonical = admittedFolderPath(original, roots);
-  const { cache, bytes, identity } = await readMorkFolderCacheSource(canonical);
+  const { cache, bytes, identity } =
+    await readStartupFolderCacheSource(canonical);
   const backup = await verifyMigrationBackup(state.backupPath);
   if (
     backup.path !== state.backup?.path ||
@@ -803,7 +919,9 @@ function bindMorkFolderCacheRecord(folder, cache) {
   }
   return {
     ...folder,
-    sourceKey: entry.sourceKey,
+    ...(Object.hasOwn(entry, "sourceKey")
+      ? { sourceKey: entry.sourceKey }
+      : {}),
     properties: [...entry.properties].map(([name, text]) => ({
       name,
       text,
@@ -818,6 +936,7 @@ function bindMorkFolderCacheRecord(folder, cache) {
  * Applies supported cache cells through native SQL receipts, then checkpoints.
  * The caller retains the selected profile lock and quiesces source/target writers.
  * Version2 reconciles eligible fields against native origin and source proof.
+ * Version3 applies the same checks to explicit native JSON cache entries.
  * Committed version1 plans retain their original provenance-only semantics.
  *
  * @param {MigrationJournal} journal - Explicit version5 cache plan.
@@ -825,6 +944,7 @@ function bindMorkFolderCacheRecord(folder, cache) {
  * @param {nsIProfileLock} profileLock - Held selected profile lock.
  * @param {function(string): Map<string, object>} resolveBindings - Exact original-key bindings.
  * @param {AbortSignal} [signal] - Cancellation at settled commit boundaries.
+ * @param {?nsISupports} [startupOperation=null] - Native startup operation.
  * @returns {Promise<void>} Supported cache units checkpointed; no activation.
  */
 export async function resumeMorkCacheImports(
@@ -832,7 +952,8 @@ export async function resumeMorkCacheImports(
   core,
   profileLock,
   resolveBindings,
-  signal
+  signal,
+  startupOperation = null
 ) {
   const database = core.QueryInterface(Ci.nsIDatabaseCore);
   if (
@@ -859,12 +980,13 @@ export async function resumeMorkCacheImports(
   try {
     for (const cache of journal.state.caches) {
       await checkCancelled();
-      if (cache.requestVersion === 2) {
+      if (cache.requestVersion >= 2) {
         const input = await readBoundMorkFolderCacheInput(
           journal,
           database,
           profileLock,
-          cache.path
+          cache.path,
+          startupOperation
         );
         if (input.cache.entries.size !== cache.folders.length) {
           throw new Error("Cache snapshot differs from the journal plan");
@@ -907,14 +1029,15 @@ export async function resumeMorkCacheImports(
         profileLock,
         cache.path,
         await resolveBindings(cache.id),
-        cache.requestVersion ?? 1
+        cache.requestVersion ?? 1,
+        startupOperation
       );
       const current = {
         ...cache,
         ...snapshot.source,
         folders: snapshot.folders,
         databaseSourceId: snapshot.databaseSourceId,
-        ...(snapshot.requestVersion === 2 ? { proof: snapshot.proof } : {}),
+        ...(snapshot.requestVersion >= 2 ? { proof: snapshot.proof } : {}),
       };
       const request = createMorkFolderCacheRequest(cache);
       const actual = createMorkFolderCacheRequest(current);
@@ -929,9 +1052,9 @@ export async function resumeMorkCacheImports(
       }
       await checkCancelled();
       await journal.beginCacheImport(cache.id);
-      const directory = profileLock
-        .QueryInterface(Ci.nsIProfileLock)
-        .directory.clone();
+      const directory = startupOperation
+        ? startupMigrationDirectory(journal, database, startupOperation)
+        : profileLock.QueryInterface(Ci.nsIProfileLock).directory.clone();
       directory.normalize();
       if (
         !directory.equals(new FileUtils.File(journal.state.profilePath)) ||
@@ -1398,6 +1521,7 @@ export function createWindowsPanoramaMigrationTarget(
  * @param {Function} resolveFolder - Actual original-folder resolver.
  * @param {nsIProfileLock} profileLock - Held selected-profile lock.
  * @param {boolean} windows - Explicit version2 admission, never a startup gate.
+ * @param {?function(): nsIFile} [checkStartup=null] - Actual native startup owner check.
  * @returns {object} Checked native receipt/import methods.
  */
 function bindPanoramaMigrationTarget(
@@ -1405,7 +1529,8 @@ function bindPanoramaMigrationTarget(
   core,
   resolveFolder,
   profileLock,
-  windows
+  windows,
+  checkStartup = null
 ) {
   const database = core.QueryInterface(Ci.nsIDatabaseCore);
   if (
@@ -1422,7 +1547,9 @@ function bindPanoramaMigrationTarget(
       "Windows migration import requires native reparse admission"
     );
   }
-  const lock = profileLock.QueryInterface(Ci.nsIProfileLock);
+  const lock = checkStartup
+    ? null
+    : profileLock.QueryInterface(Ci.nsIProfileLock);
   const databaseSourceId = database.sourceId;
   const checkIdentity = () => {
     if (
@@ -1438,6 +1565,10 @@ function bindPanoramaMigrationTarget(
     }
   };
   const checkLock = () => {
+    if (checkStartup) {
+      checkStartup();
+      return;
+    }
     const directory = lock.directory.clone();
     if (windows) {
       const state = journal.state;
@@ -1560,7 +1691,7 @@ function bindPanoramaMigrationTarget(
   };
   const checkedReceipt = (folder, request, receipt) => {
     const result = validateMorkFolderReceipt(request, receipt);
-    if (journal.state.stage == "import") {
+    if (journal.state.stage == "import" || journal.state.version === 7) {
       verifyNativeMessageProjection(database, folder, request, result);
     }
     checkIdentity();
@@ -1635,7 +1766,7 @@ function bindPanoramaMigrationTarget(
       checkLock();
       if (receipt !== null) {
         const checked = validateMorkProtocolUnitReceipt(request, receipt);
-        if (unit.state !== "imported") {
+        if (unit.state !== "imported" || journal.state.version === 7) {
           for (let index = 0; index < members.length; index++) {
             const { folder, source } = members[index];
             checkPaths(folder, source, request.folders[index]);
@@ -1974,4 +2105,950 @@ function admittedFolderPath(original, roots) {
     }
   }
   throw new Error("Migration folder path has no admitted ancestor");
+}
+
+/**
+ * Binds mail imports to the genuine native startup operation.
+ * Existing caller-held nsIProfileLock entry points keep their original meaning.
+ *
+ * @param {MigrationJournal} journal - Bound startup import journal.
+ * @param {nsIDatabaseCore} core - Actual startup target.
+ * @param {function(string): nsIMsgFolder} resolveFolder - Actual native folders.
+ * @param {nsISupports} operation - Native-owned selected startup operation.
+ * @returns {object} Existing receipt/import methods with native owner checks.
+ */
+export function createStartupPanoramaMigrationTarget(
+  journal,
+  core,
+  resolveFolder,
+  operation
+) {
+  return bindPanoramaMigrationTarget(
+    journal,
+    core,
+    resolveFolder,
+    null,
+    false,
+    () => startupMigrationDirectory(journal, core, operation)
+  );
+}
+
+/**
+ * Checks the native startup owner and exact journal/database incarnation.
+ *
+ * @param {MigrationJournal} journal - Retained bound journal.
+ * @param {nsIDatabaseCore} core - Actual target service.
+ * @param {nsISupports} operation - Live native startup operation.
+ * @returns {nsIFile} Actual selected profile directory.
+ */
+function startupMigrationDirectory(journal, core, operation) {
+  const database = core.QueryInterface(Ci.nsIDatabaseCore);
+  const selected = database.validateProfileStartup(operation);
+  if (
+    AppConstants.platform === "win" ||
+    selected.phase !== "target-open" ||
+    selected.profilePath !== journal.state.profilePath ||
+    !selected.databaseSourceId ||
+    selected.databaseSourceId !== database.sourceId ||
+    journal.state.sources.some(
+      source => source.databaseSourceId !== selected.databaseSourceId
+    )
+  ) {
+    throw new Error("Migration startup operation or target identity changed");
+  }
+  return new FileUtils.File(selected.profilePath);
+}
+
+/**
+ * Starts the ordinary selected-profile operation from MailGlue app-startup.
+ * Captures supported persisted input paths and copies legacy data synchronously
+ * before the first await and later profile notifications. It does not pump the
+ * event loop, reacquire XRE's lock or open AccountManager to discover sources.
+ *
+ * @param {AbortSignal} [signal] - Cancellation at settled IO boundaries.
+ * @returns {Promise<object>} Native ready result, or the original recovery error.
+ */
+export function startPanoramaProfileAtStartup(signal) {
+  const database = Cc["@mozilla.org/mailnews/database-core;1"].getService(
+    Ci.nsIDatabaseCore
+  );
+  const pending = database.beginProfileStartup();
+  let captured;
+  let captureError;
+  try {
+    captured = captureStartupMigration(signal);
+  } catch (error) {
+    captureError = error;
+  }
+  return finishPanoramaProfileStartup(
+    database,
+    pending,
+    captured,
+    captureError,
+    signal
+  );
+}
+
+/**
+ * Captures actual persisted input paths and a closed-writer startup backup.
+ *
+ * @param {AbortSignal} [signal] - Cancellation checked during the copy.
+ * @returns {object} Selected root, native-file presence and optional copy inputs.
+ * @throws {Error} For unsafe roots, unconfigured data or unsupported protocols.
+ */
+function captureStartupMigration(signal) {
+  if (signal?.aborted) {
+    throw new DOMException("Migration cancelled", "AbortError");
+  }
+  const profile = startupSourceFile(
+    Services.dirsvc.get("ProfDS", Ci.nsIFile).path
+  );
+  const target = profile.clone();
+  target.append("panorama.sqlite");
+  const selector = profile.clone();
+  selector.append("panorama-profile.json");
+  const work = profile.parent.clone();
+  work.append("panorama-migration-" + profile.leafName);
+  const targetExists = startupEntryExists(target);
+  const selectorExists = startupEntryExists(selector);
+  if (startupEntryExists(work) && !selectorExists) {
+    throw new Error("Existing migration work requires explicit recovery");
+  }
+  if (!targetExists) {
+    for (const suffix of ["-wal", "-shm", "-journal"]) {
+      const auxiliary = profile.clone();
+      auxiliary.append("panorama.sqlite" + suffix);
+      if (startupEntryExists(auxiliary)) {
+        throw new Error(
+          "Orphan Panorama recovery file is not an absent database"
+        );
+      }
+    }
+  }
+  if (
+    !Services.prefs.getBoolPref("mail.panorama.enabled", false) ||
+    targetExists ||
+    selectorExists
+  ) {
+    return { profilePath: profile.path };
+  }
+  if (AppConstants.platform === "win") {
+    throw new Error(
+      "Windows startup migration requires native activation admission"
+    );
+  }
+  const { collectMigrationRoots, createMigrationBackupAtStartup } =
+    ChromeUtils.importESModule(
+      "resource:///modules/panorama/MigrationBackup.sys.mjs"
+    );
+  const roots = collectMigrationRoots();
+  if (roots.profilePath !== profile.path) {
+    throw new Error("Startup inventory selects another profile");
+  }
+  for (const path of roots.mailPaths) {
+    const directory = startupSourceFile(path);
+    if (!profile.equals(directory) && !profile.contains(directory)) {
+      throw new Error(
+        "External mail root has no closed-writer startup ownership"
+      );
+    }
+  }
+  const servers = [];
+  const branches = new Set();
+  for (const name of Services.prefs.getChildList("mail.server.")) {
+    const match = /^mail\.server\.([^.]+)\.directory(?:-rel)?$/.exec(name);
+    if (match && match[1] !== "default") {
+      branches.add(match[1]);
+    }
+  }
+  for (const key of [...branches].sort()) {
+    const branch = "mail.server." + key + ".";
+    const directory = Services.prefs.prefHasUserValue(branch + "directory-rel")
+      ? Services.prefs.getComplexValue(
+          branch + "directory-rel",
+          Ci.nsIRelativeFilePref
+        ).file
+      : Services.prefs.getComplexValue(branch + "directory", Ci.nsIFile);
+    const root = startupSourceFile(directory.path);
+    const protocol = Services.prefs.getCharPref(branch + "type");
+    const contract = Services.prefs.getCharPref(
+      branch + "storeContractID",
+      "@mozilla.org/msgstore/berkeleystore;1"
+    );
+    const storeType = {
+      "@mozilla.org/msgstore/berkeleystore;1": "mbox",
+      "@mozilla.org/msgstore/maildirstore;1": "maildir",
+    }[contract];
+    if (
+      !storeType ||
+      !["none", "pop3", "imap", "rss", "nntp"].includes(protocol)
+    ) {
+      throw new Error(
+        "Unsupported startup migration protocol or message store"
+      );
+    }
+    servers.push({
+      key,
+      root: root.path,
+      protocol,
+      storeType,
+      storeContractID: contract,
+    });
+  }
+  const files = [];
+  const visit = directory => {
+    for (const entry of directory.directoryEntries) {
+      const file = entry.QueryInterface(Ci.nsIFile);
+      if (
+        directory.equals(profile) &&
+        ["parent.lock", ".parentlock", "lock"].includes(file.leafName)
+      ) {
+        continue;
+      }
+      if (file.isSymlink()) {
+        throw new Error("Startup inventory contains a link");
+      }
+      if (file.isDirectory()) {
+        visit(file);
+      } else if (file.isFile()) {
+        files.push(file.clone());
+      } else {
+        throw new Error("Startup inventory contains a nonregular file");
+      }
+    }
+  };
+  visit(profile);
+  const summaries = [];
+  const serverSummaries = [];
+  const books = [];
+  const caches = [];
+  for (const file of files) {
+    if (file.leafName.endsWith(".msf")) {
+      const matches = servers.filter(server =>
+        new FileUtils.File(server.root).contains(file)
+      );
+      const rootMatches = servers.filter(
+        server =>
+          server.protocol === "imap" && file.path === server.root + ".msf"
+      );
+      if (rootMatches.length === 1 && matches.length === 0) {
+        const server = rootMatches[0];
+        serverSummaries.push({
+          id: "server-summary:" + file.getRelativePath(profile),
+          role: "imap-server-root-summary",
+          path: file.path,
+          serverKey: server.key,
+          serverRoot: server.root,
+          protocol: server.protocol,
+          storeContractID: server.storeContractID,
+          storeType: server.storeType,
+        });
+        continue;
+      }
+      if (matches.length !== 1 || rootMatches.length) {
+        throw new Error(
+          "Mork summary has no unique persisted server root: " +
+            file.path +
+            " (matches " +
+            matches.length +
+            ")"
+        );
+      }
+      const server = matches[0];
+      if (!["none", "imap"].includes(server.protocol)) {
+        throw new Error("Native Mork migration does not support this protocol");
+      }
+      summaries.push({
+        id: "mail:" + file.getRelativePath(profile),
+        path: file.path,
+        storePath: file.path.slice(0, -4),
+        serverKey: server.key,
+        serverRoot: server.root,
+        storeContractID: server.storeContractID,
+        protocol: server.protocol,
+        storeType: server.storeType,
+        physicalRelativePath: file.getRelativePath(
+          new FileUtils.File(server.root)
+        ),
+      });
+    } else if (file.leafName.endsWith(".mab")) {
+      books.push({
+        id: "book:" + file.getRelativePath(profile),
+        path: file.path,
+      });
+    } else if (
+      file.parent.equals(profile) &&
+      ["panacea.dat", "folderCache.json"].includes(file.leafName)
+    ) {
+      caches.push({
+        id: "cache:" + file.getRelativePath(profile),
+        path: file.path,
+      });
+    }
+  }
+  const activeJSON = caches.find(
+    cache => PathUtils.filename(cache.path) === "folderCache.json"
+  );
+  if (activeJSON) {
+    // Follow native legacy JSON precedence. The complete backup preserves an
+    // obsolete Mork cache; its stale fields never override the active JSON.
+    caches.splice(
+      0,
+      caches.length,
+      ...(startupJSONCacheIsEmpty(activeJSON.path) ? [] : [activeJSON])
+    );
+  }
+  for (const file of files) {
+    const server = servers.find(item =>
+      new FileUtils.File(item.root).contains(file)
+    );
+    if (!server || file.leafName.endsWith(".msf")) {
+      continue;
+    }
+    if (
+      [
+        "msgFilterRules.dat",
+        "popstate.dat",
+        "feeds.json",
+        "feeditems.json",
+      ].includes(file.leafName)
+    ) {
+      continue;
+    }
+    const matched = summaries.some(
+      source =>
+        source.storePath === file.path ||
+        (source.storeType === "maildir" &&
+          new FileUtils.File(source.storePath).contains(file))
+    );
+    if (!matched) {
+      throw new Error("Message-store data has no supported Mork summary");
+    }
+  }
+  if (books.length) {
+    const profiles = Cc["@mozilla.org/toolkit/profile-service;1"].getService(
+      Ci.nsIToolkitProfileService
+    );
+    if (
+      !profiles.currentProfile ||
+      !profiles.currentProfile.rootDir.equals(profile)
+    ) {
+      throw new Error(
+        "Address-book migration requires the actual named startup profile"
+      );
+    }
+    const names = new Map();
+    for (const pref of Services.prefs.getChildList("ldap_2.servers.")) {
+      if (!pref.endsWith(".filename")) {
+        continue;
+      }
+      const filename = Services.prefs.getStringPref(pref);
+      const file = PathUtils.isAbsolute(filename)
+        ? startupSourceFile(filename)
+        : startupSourceFile(PathUtils.join(profile.path, filename));
+      if (!profile.contains(file)) {
+        throw new Error(
+          "External address book has no closed-writer startup ownership"
+        );
+      }
+      if (names.has(file.path)) {
+        throw new Error(
+          "Address book has ambiguous persisted directory identity"
+        );
+      }
+      const description = pref.slice(0, -"filename".length) + "description";
+      let name = Services.prefs.getStringPref(description, "");
+      if (name.startsWith("chrome://")) {
+        name = Services.prefs.getComplexValue(
+          description,
+          Ci.nsIPrefLocalizedString
+        ).data;
+      }
+      if (!name || name.includes("\0")) {
+        throw new Error("Address book has no supported persisted display name");
+      }
+      names.set(file.path, name);
+    }
+    for (const book of books) {
+      if (!names.has(book.path)) {
+        throw new Error("Mork address book has no unique persisted directory");
+      }
+      book.dirName = names.get(book.path);
+    }
+  }
+  if (
+    !summaries.length &&
+    !serverSummaries.length &&
+    !books.length &&
+    !caches.length
+  ) {
+    return {
+      profilePath: profile.path,
+      servers,
+      summaries,
+      serverSummaries,
+      books,
+      caches,
+    };
+  }
+  // The stable outside-profile path preserves discoverable failed attempts.
+  // Never create another archive to conceal an existing journal/partial copy.
+  work.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+  const backupPath = PathUtils.join(work.path, "backup");
+  const backup = createMigrationBackupAtStartup(
+    profile.path,
+    roots.mailPaths,
+    backupPath,
+    signal
+  );
+  return {
+    profilePath: profile.path,
+    servers,
+    summaries,
+    serverSummaries,
+    books,
+    caches,
+    workPath: work.path,
+    backupPath,
+    backup,
+  };
+}
+
+/**
+ * Retains original native discovery inputs without deriving remote hierarchy
+ * from body-store filenames. The native provider resolves URI and folder IDs.
+ *
+ * @param {object} source - Captured summary and persisted server/store identity.
+ * @param {object} summary - Parsed original Mork summary, including raw rows.
+ * @param {object[]} caches - Parsed caches with their original file identities.
+ * @returns {object} Exact provider input, never native discovery authority.
+ * @throws {Error} For absent, conflicting or unsupported retained IMAP metadata.
+ */
+function startupFolderOrigin(source, summary, caches) {
+  if (source.protocol === "none") {
+    return { provider: "local-store-discovery" };
+  }
+  if (source.protocol !== "imap") {
+    throw new Error("No native startup discovery provider for this protocol");
+  }
+  // Use the same strict UTF-8 cache-key projection as the existing importer.
+  // persistentDescriptor is an ACString byte sequence, not JavaScript text.
+  const originalKey = new TextDecoder("utf-8", {
+    fatal: true,
+    ignoreBOM: true,
+  }).decode(
+    MailStringUtils.byteStringToUint8Array(
+      new FileUtils.File(source.path).persistentDescriptor
+    )
+  );
+  const matches = caches.flatMap(({ identity, input }) => {
+    const row = input.entries.get(originalKey);
+    return row ? [{ identity, row, format: input.format }] : [];
+  });
+  if (matches.length !== 1) {
+    throw new Error("IMAP summary has no unique original folder-cache entry");
+  }
+  const { identity, row, format } = matches[0];
+  const { onlineName, hierDelim, boxFlags } = row.values;
+  if (
+    !["onlineName", "hierDelim", "boxFlags"].every(name =>
+      row.properties.has(name)
+    ) ||
+    typeof onlineName !== "string" ||
+    !onlineName ||
+    onlineName.includes("\0") ||
+    !Number.isInteger(hierDelim) ||
+    hierDelim <= 0 ||
+    hierDelim > 127 ||
+    [94, 124].includes(hierDelim) ||
+    !Number.isInteger(boxFlags) ||
+    boxFlags < 0 ||
+    boxFlags > 0xffffffff
+  ) {
+    // '^' and '|' are the native unknown/NIL sentinels, not real delimiters.
+    throw new Error(
+      "IMAP discovery requires retained name, delimiter and flags"
+    );
+  }
+  const rows = [...summary.source.rows.values()].filter(
+    item => item.scope === "ns:msg:db:row:scope:dbfolderinfo:all"
+  );
+  if (rows.length > 1) {
+    throw new Error("IMAP summary has ambiguous folder metadata");
+  }
+  const raw = rows[0]?.cells.get("onlineName");
+  if (raw !== undefined) {
+    const name = new TextDecoder("utf-8", { fatal: true }).decode(
+      MailStringUtils.byteStringToUint8Array(raw)
+    );
+    if (name !== onlineName) {
+      throw new Error("IMAP summary and retained cache online names differ");
+    }
+  }
+  return {
+    provider: "imap-client-discovery",
+    cache: {
+      ...identity,
+      originalKey,
+      ...(format === "json"
+        ? { sourceFormat: "json" }
+        : { sourceKey: row.sourceKey }),
+    },
+    originalCells: Object.fromEntries(
+      ["onlineName", "hierDelim", "boxFlags"].map(name => [
+        name,
+        row.properties.get(name),
+      ])
+    ),
+    onlineName,
+    hierarchyDelimiter: hierDelim,
+    boxFlags,
+  };
+}
+
+/**
+ * Checks one startup leaf below the already validated selected profile/parent.
+ *
+ * @param {nsIFile} file - Selected target, selector, recovery or work entry.
+ * @returns {boolean} Whether the native entry exists.
+ * @throws {Error} For links or any error other than an actually missing leaf.
+ */
+function startupEntryExists(file) {
+  try {
+    if (file.isSymlink()) {
+      throw new Error("Panorama startup input contains a link");
+    }
+  } catch (error) {
+    if (error.result !== Cr.NS_ERROR_FILE_NOT_FOUND || file.exists()) {
+      throw error;
+    }
+    return false;
+  }
+  return file.exists();
+}
+
+/**
+ * Rejects aliased startup source paths without creating defaults.
+ *
+ * @param {string} path - Existing absolute source directory.
+ * @returns {nsIFile} Canonical unlinked file.
+ */
+function startupSourceFile(path) {
+  const file = new FileUtils.File(path);
+  for (let part = file; part; part = part.parent) {
+    if (part.isSymlink()) {
+      throw new Error("Startup source path contains a link");
+    }
+  }
+  file.normalize();
+  return file;
+}
+
+/**
+ * Completes the native selected-profile operation without releasing XRE's lock.
+ *
+ * @param {nsIDatabaseCore} database - Actual native service.
+ * @param {Promise<nsISupports>} pending - Native app-startup admission.
+ * @param {object} captured - Synchronous inventory and optional verified copy.
+ * @param {Error} captureError - Original synchronous inventory/copy failure.
+ * @param {AbortSignal} signal - Cancellation requested by the startup owner.
+ * @returns {Promise<object>} Native ready identity.
+ */
+async function finishPanoramaProfileStartup(
+  database,
+  pending,
+  captured,
+  captureError,
+  signal
+) {
+  const {
+    getMigrationProfileState,
+    prepareStartupMigrationProfile,
+    activateStartupMigrationProfile,
+    requireStartupProfileRecovery,
+  } = ChromeUtils.importESModule(
+    "resource:///modules/panorama/MigrationProfile.sys.mjs"
+  );
+  let operation;
+  let journal;
+  let createdSelection = false;
+  let target;
+  try {
+    operation = await pending;
+    if (captureError) {
+      throw captureError;
+    }
+    if (signal?.aborted) {
+      throw new DOMException("Migration cancelled", "AbortError");
+    }
+    const selected = database.validateProfileStartup(operation);
+    if (selected.profilePath !== captured.profilePath) {
+      throw new Error("Native startup selects another profile");
+    }
+    const initial = await getMigrationProfileState(selected.profilePath);
+    if (
+      initial.record &&
+      (initial.state !== "active" || initial.record.formatVersion !== 2)
+    ) {
+      throw new Error(
+        "Existing migration selection requires explicit recovery"
+      );
+    }
+    let origin;
+    if (selected.mode === "migrate") {
+      if (!captured.backup) {
+        throw new Error(
+          "Legacy startup migration has no verified closed-writer copy"
+        );
+      }
+      const books = [];
+      for (const [index, book] of captured.books.entries()) {
+        const { identity } = await readMorkAddressBookSource(book.path);
+        books.push({
+          ...book,
+          ...identity,
+          stagingPath: PathUtils.join(
+            captured.workPath,
+            "book-" + index + ".sqlite"
+          ),
+        });
+        database.validateProfileStartup(operation);
+      }
+      const caches = [];
+      const cacheInputs = [];
+      for (const cache of captured.caches) {
+        const { identity, cache: input } = await readStartupFolderCacheSource(
+          cache.path
+        );
+        caches.push({
+          ...cache,
+          ...identity,
+          cacheKeys: [...input.entries.keys()],
+          ...(input.format === "json" ? { sourceFormat: "json" } : {}),
+        });
+        cacheInputs.push({ identity, input });
+        database.validateProfileStartup(operation);
+      }
+      const serverSummaries = [];
+      for (const source of captured.serverSummaries) {
+        const { identity, summary } = await readMorkMigrationSource(
+          source.path
+        );
+        const rows = [...summary.source.rows.values()];
+        if (
+          summary.messages.length ||
+          rows.length !== 1 ||
+          rows[0].scope !== "ns:msg:db:row:scope:dbfolderinfo:all"
+        ) {
+          throw new Error(
+            "Unsupported data in native IMAP server-root summary"
+          );
+        }
+        serverSummaries.push({ ...source, ...identity });
+        database.validateProfileStartup(operation);
+      }
+      const sources = [];
+      for (const source of captured.summaries) {
+        const { identity, summary } = await readMorkMigrationSource(
+          source.path
+        );
+        sources.push({
+          ...source,
+          ...identity,
+          origin: startupFolderOrigin(source, summary, cacheInputs),
+        });
+        database.validateProfileStartup(operation);
+      }
+      const journalPath = PathUtils.join(captured.workPath, "journal.json");
+      journal = await MigrationJournal.create(journalPath, {
+        profilePath: selected.profilePath,
+        mailPaths: [],
+        backupPath: captured.backupPath,
+        sources: [],
+        ...(books.length ? { books } : {}),
+        startupInventory: { sources, caches, serverSummaries },
+      });
+      journal.close();
+      await prepareStartupMigrationProfile(
+        selected.profilePath,
+        journalPath,
+        captured.backup
+      );
+      createdSelection = true;
+      journal = await MigrationJournal.open(journalPath, selected.profilePath);
+      if (signal?.aborted) {
+        throw new DOMException("Migration cancelled", "AbortError");
+      }
+      target = database.openProfileStartupTarget(operation, {
+        mode: "migrate",
+        profilePath: selected.profilePath,
+        journalPath,
+        backup: captured.backup,
+        sources,
+        books,
+        caches,
+        serverSummaries,
+      });
+      await journal.bindStartupTarget(database, operation, target.folders);
+      await journal.recordBackup(captured.backup);
+      const folders = new Map(
+        target.folders.map(binding => [binding.sourceId, binding.folder])
+      );
+      const resolveFolder = id => {
+        startupMigrationDirectory(journal, database, operation);
+        const folder = folders.get(id);
+        if (!folder) {
+          throw new Error("Startup import has no actual native folder binding");
+        }
+        return folder;
+      };
+      const bindings = caches.length
+        ? startupCacheBindings(captured, database, folders)
+        : new Map();
+      const cacheBindings = new Map();
+      for (const cache of caches) {
+        const mapping = new Map(
+          cache.cacheKeys.map(key => {
+            const binding = bindings.get(key);
+            if (!binding) {
+              throw new Error(
+                "Original cache key has no exact native folder binding"
+              );
+            }
+            return [key, binding];
+          })
+        );
+        const snapshot = await prepareMorkFolderCacheImport(
+          journal,
+          database,
+          null,
+          cache.path,
+          mapping,
+          2,
+          operation
+        );
+        await journal.planCacheImport(cache.id, snapshot);
+        cacheBindings.set(cache.id, mapping);
+      }
+      const native = createStartupPanoramaMigrationTarget(
+        journal,
+        database,
+        resolveFolder,
+        operation
+      );
+      await resumeMorkImports(journal, native, signal);
+      if (books.length) {
+        const profiles = Cc[
+          "@mozilla.org/toolkit/profile-service;1"
+        ].getService(Ci.nsIToolkitProfileService);
+        if (!profiles.currentProfile) {
+          throw new Error(
+            "Address-book migration requires a named selected profile"
+          );
+        }
+        startupMigrationDirectory(journal, database, operation);
+        await resumeMorkBookImportsAndPublish(
+          journal,
+          profiles.currentProfile,
+          new Map(books.map(book => [book.id, book.dirName])),
+          signal
+        );
+        startupMigrationDirectory(journal, database, operation);
+      }
+      if (caches.length) {
+        await resumeMorkCacheImports(
+          journal,
+          database,
+          null,
+          id => cacheBindings.get(id),
+          signal,
+          operation
+        );
+      }
+      await validateStartupMigration(journal, native, database, operation);
+      await journal.finishStage("validate");
+      origin = "migrated";
+    } else {
+      if (!["reuse", "initialize"].includes(selected.mode)) {
+        throw new Error("Unsupported native startup selection mode");
+      }
+      const mode = selected.mode;
+      if (mode === "initialize" && captured.backup) {
+        throw new Error("Native empty initialization omitted legacy inventory");
+      }
+      target = database.openProfileStartupTarget(operation, {
+        mode,
+        profilePath: selected.profilePath,
+      });
+      origin =
+        initial.record?.origin ??
+        (mode === "reuse" ? "adopted-existing" : "initialized-empty");
+    }
+    if (!initial.record || (origin === "migrated" && createdSelection)) {
+      await activateStartupMigrationProfile(
+        database,
+        operation,
+        origin,
+        journal
+      );
+      createdSelection = true;
+    } else if (
+      initial.record.identity.databaseSourceId !== target.databaseSourceId ||
+      initial.record.identity.schemaVersion !== target.schemaVersion
+    ) {
+      throw new Error(
+        "Existing Panorama selection differs from its native target"
+      );
+    }
+    await database.completeProfileStartup(operation, {
+      profilePath: selected.profilePath,
+      selectorPath: PathUtils.join(
+        selected.profilePath,
+        "panorama-profile.json"
+      ),
+      journalPath: journal
+        ? PathUtils.join(captured.workPath, "journal.json")
+        : (initial.record?.identity.journalPath ?? null),
+    });
+    return {
+      profilePath: selected.profilePath,
+      mode: selected.mode,
+      databaseSourceId: target.databaseSourceId,
+    };
+  } catch (error) {
+    if (journal) {
+      try {
+        await journal.recordError(error);
+      } catch (secondary) {
+        console.error(
+          "Could not checkpoint startup migration error",
+          secondary
+        );
+      }
+    }
+    if (createdSelection) {
+      try {
+        const databaseFile = new FileUtils.File(
+          PathUtils.join(captured.profilePath, "panorama.sqlite")
+        );
+        if (!target && !startupEntryExists(databaseFile)) {
+          // This operation alone created the prepared selector. No target was
+          // created, so legacy can still use the untouched original profile.
+          // Retained work continues to require explicit recovery on opt-in.
+          await IOUtils.remove(
+            PathUtils.join(captured.profilePath, "panorama-profile.json")
+          );
+        } else {
+          await requireStartupProfileRecovery(captured.profilePath);
+        }
+      } catch (secondary) {
+        console.error(
+          "Could not persist startup recovery selection",
+          secondary
+        );
+      }
+    }
+    journal?.close();
+    if (operation) {
+      try {
+        await database.failProfileStartup(
+          operation,
+          error.result ?? Cr.NS_ERROR_FAILURE
+        );
+      } catch (secondary) {
+        console.error("Could not settle failed native startup", secondary);
+      }
+    }
+    throw error;
+  } finally {
+    journal?.close();
+  }
+}
+
+/**
+ * Binds cache keys only to their exact current physical native descriptors.
+ * Ambiguous/moved keys are left unmapped so the existing complete-map check fails.
+ *
+ * @param {object} captured - Persisted native server-root inventory.
+ * @param {nsIDatabaseCore} database - Actual started migration target.
+ * @param {Map<string, nsIMsgFolder>} folders - Native summary-bound folders.
+ * @returns {Map<string, object>} Exact physical cache-key/native-folder bindings.
+ */
+function startupCacheBindings(captured, database, folders) {
+  const actual = [...folders.values()];
+  for (const server of captured.servers) {
+    const id = database.folderDB.getFolderByPath(server.key);
+    if (id) {
+      actual.push(database.folderDB.getMsgFolderForFolder(id));
+    }
+  }
+  const result = new Map();
+  for (const folder of actual) {
+    const file = (
+      folder.isServer ? folder.filePath : folder.summaryFile
+    ).clone();
+    file.normalize();
+    const descriptor = new TextDecoder("utf-8", {
+      fatal: true,
+      ignoreBOM: true,
+    }).decode(
+      MailStringUtils.byteStringToUint8Array(file.persistentDescriptor)
+    );
+    if (result.has(descriptor) && result.get(descriptor).folder !== folder) {
+      throw new Error("Native cache descriptor is ambiguous");
+    }
+    result.set(descriptor, { folder, descriptor });
+  }
+  return result;
+}
+
+/**
+ * Reads every committed native mail receipt again before activation.
+ * Book/cache import paths already read back and validate their actual publication.
+ *
+ * @param {MigrationJournal} journal - Completely imported startup journal.
+ * @param {object} native - Checked startup native receipt adapter.
+ * @param {nsIDatabaseCore} database - Actual target.
+ * @param {nsISupports} operation - Retained native startup operation.
+ * @returns {Promise<void>} Full matching native mail receipt readback.
+ */
+async function validateStartupMigration(journal, native, database, operation) {
+  if (journal.state.stage !== "validate" || journal.state.cancelled) {
+    throw new Error("Startup migration imports have not completed");
+  }
+  for (const unit of journal.state.protocolUnits ?? []) {
+    const receipt = await native.findProtocolUnitReceipt(
+      unit.token,
+      unit.sourceIds
+    );
+    if (JSON.stringify(receipt) !== JSON.stringify(unit.receipt)) {
+      throw new Error("Native protocol receipt changed before activation");
+    }
+    startupMigrationDirectory(journal, database, operation);
+  }
+  for (const source of journal.state.sources) {
+    if (source.protocol === "imap") {
+      continue;
+    }
+    const receipt = await native.findReceipt(source.token, {
+      sourceId: source.id,
+      sourceSha256: source.sha256,
+      destinationFolderId: source.destinationFolderId,
+    });
+    // The native adapter has checked the source/database identities. Unix
+    // journals retain only this canonical four-field receipt projection.
+    if (
+      !receipt ||
+      receipt.sourceId !== source.id ||
+      receipt.databaseSourceId !== source.databaseSourceId ||
+      receipt.token !== source.receipt.token ||
+      receipt.sourceSha256 !== source.receipt.sourceSha256 ||
+      receipt.folderId !== source.receipt.folderId ||
+      JSON.stringify(receipt.keys.toSorted((a, b) => a[0] - b[0])) !==
+        JSON.stringify(source.receipt.keys)
+    ) {
+      throw new Error("Native import receipt changed before activation");
+    }
+    startupMigrationDirectory(journal, database, operation);
+  }
 }

@@ -417,7 +417,18 @@ MailGlue.afterStartUp = new Promise(resolve => {
   MailGlue.resolveAfterStartUp = resolve;
 });
 
+/** @type {?Promise<object>} Native selected-profile startup completion. */
+MailGlue.panoramaStartup = null;
+
 MailGlue.prototype = {
+  /** @type {?AbortController} Cancellation for the selected startup operation. */
+  _panoramaStartupController: null,
+  _panoramaStartupFailed: false,
+  _panoramaStartupSurvival: false,
+  _finalUIStartupObserved: false,
+  _panoramaFailureQuitScheduled: false,
+  _fogInitialized: false,
+
   _isNewProfile: undefined,
 
   /**
@@ -454,6 +465,146 @@ MailGlue.prototype = {
   /** @type {?function(): Promise<void>} Pending-open profile blocker. */
   _chatSearchShutdownBlocker: null,
   _chatSearchShuttingDown: false,
+
+  /**
+   * Starts native profile selection before ordinary mail entry points run.
+   * The operation retains the actual XRE lock; this caller never reacquires it.
+   *
+   * @param {nsICommandLine} commandLine - Actual app-startup command line.
+   */
+  _startPanoramaProfile(commandLine) {
+    const chrome = commandLine.findFlag("chrome", true);
+    if (
+      chrome >= 0 &&
+      chrome + 1 < commandLine.length &&
+      commandLine.getArgument(chrome + 1) ===
+        MailGlue.BROWSER_TOOLBOX_WINDOW_URL
+    ) {
+      return;
+    }
+    const selected = Services.dirsvc.get("ProfDS", Ci.nsIFile).clone();
+    selected.append("panorama-profile.json");
+    try {
+      if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+        let linked = false;
+        try {
+          linked = selected.isSymlink();
+        } catch (error) {
+          if (
+            error.result !== Cr.NS_ERROR_FILE_NOT_FOUND ||
+            selected.exists()
+          ) {
+            throw error;
+          }
+        }
+        if (!linked && !selected.exists()) {
+          return;
+        }
+      }
+      // Keep failed selection alive until its explicit failure quit. The
+      // command handler releases its own survival area when its promise settles.
+      Services.startup.enterLastWindowClosingSurvivalArea();
+      this._panoramaStartupSurvival = true;
+      if (!AppConstants.NIGHTLY_BUILD) {
+        throw new Error(
+          "This application cannot start the selected Panorama profile"
+        );
+      }
+      const { startPanoramaProfileAtStartup } = ChromeUtils.importESModule(
+        "resource:///modules/panorama/MigrationCoordinator.sys.mjs"
+      );
+      // The call captures legacy input synchronously before its first await.
+      this._panoramaStartupController = new AbortController();
+      MailGlue.panoramaStartup = startPanoramaProfileAtStartup(
+        this._panoramaStartupController.signal
+      );
+    } catch (error) {
+      if (!this._panoramaStartupSurvival) {
+        Services.startup.enterLastWindowClosingSurvivalArea();
+        this._panoramaStartupSurvival = true;
+      }
+      MailGlue.panoramaStartup = Promise.reject(error);
+    }
+    // Handle the rejection without replacing the promise seen by real callers.
+    MailGlue.panoramaStartup.then(
+      () => this._releasePanoramaStartupSurvival(),
+      error => {
+        console.error("Panorama startup requires recovery", error);
+        Services.obs.notifyObservers(
+          null,
+          "panorama-startup-failed",
+          String(error)
+        );
+        this._panoramaStartupFailed = true;
+        this._quitAfterPanoramaStartupFailure();
+      }
+    );
+  },
+
+  /**
+   * Releases MailGlue's survival area after selection or its explicit failure quit.
+   */
+  _releasePanoramaStartupSurvival() {
+    if (this._panoramaStartupSurvival) {
+      this._panoramaStartupSurvival = false;
+      Services.startup.exitLastWindowClosingSurvivalArea();
+    }
+  },
+
+  /**
+   * Initializes ordinary telemetry once, before either normal idle or shutdown.
+   *
+   * @throws {Error} When the existing FOG initialization fails.
+   */
+  _initializeFOG() {
+    if (!this._fogInitialized) {
+      Services.fog.initializeFOG(undefined, "thunderbird.desktop");
+      this._fogInitialized = true;
+    }
+  },
+
+  /**
+   * Requests the failure exit after XRE has finished its startup notification.
+   * Initializes FOG before shutdown without running successful mail startup.
+   * The original rejected promise and native admission gate remain unchanged.
+   */
+  _quitAfterPanoramaStartupFailure() {
+    if (!this._finalUIStartupObserved || this._panoramaFailureQuitScheduled) {
+      return;
+    }
+    this._panoramaFailureQuitScheduled = true;
+    Services.tm.dispatchToMainThread(() => {
+      try {
+        this._initializeFOG();
+      } catch (error) {
+        console.error(
+          "Telemetry initialization before failed startup quit",
+          error
+        );
+      } finally {
+        try {
+          // nsIAppStartup accepts a process exit code in the range 0-255.
+          Services.startup.quit(Ci.nsIAppStartup.eForceQuit, 5);
+        } finally {
+          this._releasePanoramaStartupSurvival();
+        }
+      }
+    });
+  },
+
+  /**
+   * Runs an ordinary MailGlue action after actual native startup completion.
+   * Legacy startup keeps its synchronous call order.
+   *
+   * @param {function():void} action - Existing ordinary startup action.
+   */
+  _afterPanoramaStartup(action) {
+    if (!MailGlue.panoramaStartup) {
+      action();
+      return;
+    }
+    MailGlue.panoramaStartup.then(action, () => {}).catch(console.error);
+  },
 
   // init (called at app startup)
   _init() {
@@ -558,6 +709,7 @@ MailGlue.prototype = {
             console.error("Panorama startup backup failed", error);
           }
         }
+        this._startPanoramaProfile(aSubject);
         break;
       }
       case "command-line-startup": {
@@ -585,29 +737,37 @@ MailGlue.prototype = {
         break;
       }
       case "final-ui-startup":
-        // Initialise the permission manager. If this happens before telling
-        // the folder service that strings are available, it's a *much* less
-        // expensive operation than if it happens afterwards, because if
-        // strings are available, some types of mail URL go looking for things
-        // in message databases, causing massive amounts of I/O.
-        Services.perms.all;
+        this._finalUIStartupObserved = true;
+        if (this._panoramaStartupFailed) {
+          this._quitAfterPanoramaStartupFailure();
+          break;
+        }
+        this._afterPanoramaStartup(() => {
+          // Initialise the permission manager. If this happens before telling
+          // the folder service that strings are available, it's a *much* less
+          // expensive operation than if it happens afterwards, because if
+          // strings are available, some types of mail URL go looking for things
+          // in message databases, causing massive amounts of I/O.
+          Services.perms.all;
 
-        // Force early registration of the IMAP protocol handler to avoid
-        // session restore failures.
-        Cc["@mozilla.org/network/protocol;1?name=imap"].getService();
+          // Force early registration of the IMAP protocol handler to avoid
+          // session restore failures.
+          Cc["@mozilla.org/network/protocol;1?name=imap"].getService();
 
-        Cc["@mozilla.org/msgFolder/msgFolderService;1"]
-          .getService(Ci.nsIMsgFolderService)
-          .initializeFolderStrings();
-        Cc["@mozilla.org/msgDBView/msgDBViewService;1"]
-          .getService(Ci.nsIMsgDBViewService)
-          .initializeDBViewStrings();
-        this._beforeUIStartup();
+          Cc["@mozilla.org/msgFolder/msgFolderService;1"]
+            .getService(Ci.nsIMsgFolderService)
+            .initializeFolderStrings();
+          Cc["@mozilla.org/msgDBView/msgDBViewService;1"]
+            .getService(Ci.nsIMsgDBViewService)
+            .initializeDBViewStrings();
+          this._beforeUIStartup();
+        });
         break;
       case "sessionstore-windows-restored":
-        this._onWindowsRestored();
+        this._afterPanoramaStartup(() => this._onWindowsRestored());
         break;
       case "quit-application-granted":
+        this._panoramaStartupController?.abort();
         this._shutdownMailSearch().catch(console.error);
         this._shutdownChatSearch().catch(console.error);
         Services.startup.trackStartupCrashEnd();
@@ -629,7 +789,7 @@ MailGlue.prototype = {
         }
         break;
       case "mail-startup-done":
-        this._onFirstWindowLoaded();
+        this._afterPanoramaStartup(() => this._onFirstWindowLoaded());
         Services.obs.removeObserver(this, "mail-startup-done");
         break;
       case "xpcom-shutdown":
@@ -1258,9 +1418,7 @@ MailGlue.prototype = {
       // pre-init buffer.
       {
         name: "initializeFOG",
-        task: () => {
-          Services.fog.initializeFOG(undefined, "thunderbird.desktop");
-        },
+        task: () => this._initializeFOG(),
       },
       {
         name: "checkInstalledExtensions",

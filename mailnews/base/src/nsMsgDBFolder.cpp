@@ -3003,6 +3003,9 @@ nsresult nsMsgDBFolder::InitWithFolderId(
   if (!mIsServer) {
     mPath->Append(EncodeFilename(mName));
   }
+  // Committed startup receipts can retain an older physical spelling. Bind it
+  // before this wrapper or any descendant discovers its actual body store.
+  MOZ_TRY(dbCore->BindStartupFolderPath(folderId, mPath));
 
   // Set up the URI.
 
@@ -3038,6 +3041,7 @@ nsresult nsMsgDBFolder::InitWithFolderId(
     nsTArray<nsCString> childNames;
     rv = store->DiscoverChildFolders(this, childNames);
     NS_ENSURE_SUCCESS(rv, rv);
+    MOZ_TRY(dbCore->BindStartupChildNames(folderId, mPath, childNames));
 
     MOZ_TRY(folderDB.ReconcileCacheDiscoveryChildren(mFolderDatabaseSourceId,
                                                      folderId, childNames));

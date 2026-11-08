@@ -20,6 +20,8 @@ const {
   activateMigrationProfile,
   getMigrationProfileState,
   stageMigrationProfileRestore,
+  prepareStartupMigrationProfile,
+  requireStartupProfileRecovery,
 } = ChromeUtils.importESModule(
   "resource:///modules/panorama/MigrationProfile.sys.mjs"
 );
@@ -585,3 +587,531 @@ add_task(async function test_restoreRequiredKeepsFloorAndRecoveryState() {
     Assert.deepEqual(await IOUtils.read(input.journalPath), journal);
   });
 });
+
+/**
+ * Creates a selector-reader fixture, without claiming a native database import.
+ *
+ * @param {string} origin - Empty initialization or existing-database adoption.
+ * @returns {Promise<{profilePath: string, path: string, record: object}>} Fixture.
+ */
+async function startupSelector(origin = "initialized-empty") {
+  const profilePath = await IOUtils.createUniqueDirectory(
+    PathUtils.tempDir,
+    "native-profile-selector-"
+  );
+  registerCleanupFunction(() =>
+    IOUtils.remove(profilePath, { recursive: true })
+  );
+  const path = PathUtils.join(profilePath, "panorama-profile.json");
+  const record = {
+    formatVersion: 2,
+    backend: "panorama",
+    origin,
+    state: "active",
+    application: { ...activatingApplication },
+    identity: {
+      profilePath,
+      databaseSourceId: "selector-reader-unit-identity",
+      schemaVersion: 21,
+      journalPath: null,
+      backup: null,
+      imports: [],
+      books: [],
+      caches: [],
+    },
+  };
+  await IOUtils.writeJSON(path, record);
+  return { profilePath, path, record };
+}
+
+add_task(async function test_getMigrationProfileStateWithNativeOrigins() {
+  for (const origin of ["initialized-empty", "adopted-existing"]) {
+    const input = await startupSelector(origin);
+    const before = await IOUtils.read(input.path);
+    await withApplication(activatingApplication, async () => {
+      const result = await getMigrationProfileState(input.profilePath);
+      Assert.equal(result.state, "active");
+      Assert.equal(result.record.backend, "panorama");
+      Assert.equal(result.record.origin, origin);
+      Assert.strictEqual(result.record.identity.journalPath, null);
+      Assert.strictEqual(result.record.identity.backup, null);
+      Assert.deepEqual(result.record.application, activatingApplication);
+    });
+    Assert.deepEqual(
+      await IOUtils.read(input.path),
+      before,
+      "Reading native selection does not invent or rewrite migration progress"
+    );
+    Assert.deepEqual((await IOUtils.getChildren(input.profilePath)).sort(), [
+      input.path,
+    ]);
+  }
+});
+
+add_task(
+  async function test_getMigrationProfileStateRefusesInvalidNativeSelection() {
+    const input = await startupSelector();
+    for (const change of [
+      record => {
+        record.backend = "mork";
+      },
+      record => {
+        record.origin = "unknown";
+      },
+      record => {
+        record.identity.databaseSourceId = null;
+      },
+      record => {
+        record.identity.schemaVersion = -1;
+      },
+      record => {
+        record.identity.journalPath = input.path;
+      },
+      record => {
+        record.identity.backup = { path: input.path, sha256: "a".repeat(64) };
+      },
+      record => {
+        record.identity.imports = [{ id: "fabricated" }];
+      },
+      record => {
+        record.identity.serverSummaries = null;
+      },
+      record => {
+        record.identity.serverSummaries = [
+          { sourceId: "unbound-root", folderId: 1 },
+        ];
+      },
+    ]) {
+      const record = structuredClone(input.record);
+      change(record);
+      await IOUtils.writeJSON(input.path, record);
+      const before = await IOUtils.read(input.path);
+      await withApplication(activatingApplication, async () => {
+        await Assert.rejects(
+          getMigrationProfileState(input.profilePath),
+          /native profile|must not invent|committed-unit/,
+          "An inconsistent backend/origin/identity cannot authorize startup"
+        );
+      });
+      Assert.deepEqual(await IOUtils.read(input.path), before);
+    }
+  }
+);
+
+add_task(
+  async function test_getMigrationProfileStateWithNativeDowngradeFloor() {
+    const input = await startupSelector();
+    const before = await IOUtils.read(input.path);
+    for (const application of [
+      { version: "161.1.9", buildId: "20261101000000" },
+      { version: "161.2.0", buildId: "20261028123455" },
+    ]) {
+      await withApplication(application, async () => {
+        await Assert.rejects(
+          getMigrationProfileState(input.profilePath),
+          /compatible application/
+        );
+      });
+      Assert.deepEqual(
+        await IOUtils.read(input.path),
+        before,
+        "Downgrade does not write the native selection"
+      );
+    }
+    await withApplication(
+      { version: "161.3.0", buildId: "20261001000000" },
+      async () => {
+        const selected = await getMigrationProfileState(input.profilePath);
+        Assert.deepEqual(
+          selected.record.application,
+          activatingApplication,
+          "A newer reader preserves the first preparing minimum"
+        );
+      }
+    );
+    Assert.deepEqual(await IOUtils.read(input.path), before);
+  }
+);
+
+add_task(
+  { skip_if: () => AppConstants.platform === "win" },
+  async function test_prepareStartupMigrationProfileRetainsActualRecoveryInputs() {
+    const root = await IOUtils.createUniqueDirectory(
+      PathUtils.tempDir,
+      "startup-profile-"
+    );
+    registerCleanupFunction(() => IOUtils.remove(root, { recursive: true }));
+    const profilePath = PathUtils.join(root, "profile");
+    const work = PathUtils.join(root, "work");
+    await IOUtils.makeDirectory(profilePath);
+    await IOUtils.makeDirectory(work);
+    const source = PathUtils.join(profilePath, "Inbox.msf");
+    await IOUtils.copy(do_get_file("data/migration.msf").path, source);
+    const backupPath = PathUtils.join(root, "backup");
+    const backup = await createMigrationBackup(profilePath, [], backupPath);
+    const journalPath = PathUtils.join(work, "journal.json");
+    const journal = await MigrationJournal.create(journalPath, {
+      profilePath,
+      mailPaths: [],
+      backupPath,
+      sources: [],
+      startupInventory: {
+        sources: [
+          {
+            id: "original",
+            serverKey: "server1",
+            serverRoot: profilePath,
+            protocol: "none",
+            storeType: "mbox",
+            storeContractID: "@mozilla.org/msgstore/berkeleystore;1",
+            storePath: source.slice(0, -4),
+            origin: { provider: "local-store-discovery" },
+            path: source,
+            sha256: await IOUtils.computeHexDigest(source, "sha256"),
+            size: (await IOUtils.stat(source)).size,
+          },
+        ],
+        caches: [],
+      },
+    });
+    journal.close();
+    const rawJournal = await IOUtils.read(journalPath);
+    await withApplication(activatingApplication, async () => {
+      const record = await prepareStartupMigrationProfile(
+        profilePath,
+        journalPath,
+        backup
+      );
+      Assert.equal(record.state, "prepared");
+      Assert.equal(record.origin, "migrated");
+      Assert.strictEqual(
+        record.identity.databaseSourceId,
+        null,
+        "No native incarnation is invented before actual target bootstrap"
+      );
+      Assert.equal(record.identity.journalPath, journalPath);
+      Assert.deepEqual(record.identity.backup, backup);
+      Assert.ok(
+        !(await IOUtils.exists(PathUtils.join(profilePath, "panorama.sqlite")))
+      );
+      const selectorPath = PathUtils.join(profilePath, "panorama-profile.json");
+      const rawSelector = await IOUtils.read(selectorPath);
+      await Assert.rejects(
+        prepareStartupMigrationProfile(profilePath, journalPath, backup),
+        /requires recovery/
+      );
+      Assert.deepEqual(
+        await IOUtils.read(selectorPath),
+        rawSelector,
+        "Repeated startup does not replace existing recovery state"
+      );
+      await requireStartupProfileRecovery(profilePath);
+      Assert.equal(
+        (await getMigrationProfileState(profilePath)).state,
+        "restore-required"
+      );
+      Assert.deepEqual(await IOUtils.read(journalPath), rawJournal);
+    });
+  }
+);
+
+add_task(async function test_getMigrationProfileStateRequiresDurableRecovery() {
+  // Reader-only refusal fixture. Actual migrated activation/reuse is exercised
+  // by the registered ordinary Marionette startup cases.
+  const input = await startupSelector("migrated");
+  const journalPath = PathUtils.join(input.profilePath, "journal.json");
+  const backupPath = PathUtils.join(input.profilePath, "manifest.json");
+  const record = input.record;
+  record.identity.journalPath = journalPath;
+  record.identity.backup = { path: backupPath, sha256: "a".repeat(64) };
+  await IOUtils.writeJSON(input.path, record);
+  const selector = await IOUtils.read(input.path);
+  await withApplication(activatingApplication, async () => {
+    await Assert.rejects(
+      getMigrationProfileState(input.profilePath),
+      /exist|found/i,
+      "Missing durable journal is recovery, never active reuse"
+    );
+    for (const value of [
+      "{corrupt journal",
+      JSON.stringify({ version: 7, stage: "import", cancelled: false }),
+      JSON.stringify({ version: 7, stage: "complete", cancelled: true }),
+      JSON.stringify({
+        version: 7,
+        stage: "complete",
+        cancelled: false,
+        profilePath: input.profilePath,
+        startup: {
+          bound: true,
+          databaseSourceId: record.identity.databaseSourceId,
+        },
+        sources: [],
+        books: [],
+        caches: [],
+        backup: { ...record.identity.backup, sha256: "b".repeat(64) },
+      }),
+    ]) {
+      await IOUtils.writeUTF8(journalPath, value);
+      const journal = await IOUtils.read(journalPath);
+      await Assert.rejects(
+        getMigrationProfileState(input.profilePath),
+        /JSON|recovery|exist|found/i,
+        "Corrupt, incomplete, cancelled or changed-identity progress refuses"
+      );
+      Assert.deepEqual(await IOUtils.read(journalPath), journal);
+      Assert.deepEqual(await IOUtils.read(input.path), selector);
+    }
+  });
+});
+
+add_task(async function test_getMigrationProfileStateDoesNotReadArchive() {
+  // Reader-only identities; ordinary startup tests cover actual native reuse.
+  const input = await startupSelector("migrated");
+  const journalPath = PathUtils.join(input.profilePath, "journal.json");
+  const backupPath = PathUtils.join(input.profilePath, "manifest.json");
+  input.record.identity.journalPath = journalPath;
+  input.record.identity.backup = { path: backupPath, sha256: "a".repeat(64) };
+  await IOUtils.writeJSON(input.path, input.record);
+  const state = {
+    version: 7,
+    stage: "complete",
+    cancelled: false,
+    profilePath: input.profilePath,
+    startup: {
+      bound: true,
+      databaseSourceId: input.record.identity.databaseSourceId,
+    },
+    sources: [],
+    books: [],
+    caches: [],
+    backup: input.record.identity.backup,
+  };
+  await IOUtils.writeJSON(journalPath, state);
+  const selector = await IOUtils.read(input.path);
+  const journal = await IOUtils.read(journalPath);
+  await withApplication(activatingApplication, async () => {
+    Assert.ok(!(await IOUtils.exists(backupPath)));
+    Assert.equal(
+      (await getMigrationProfileState(input.profilePath)).state,
+      "active"
+    );
+    await IOUtils.writeUTF8(
+      backupPath,
+      "Archive contents are not startup inputs"
+    );
+    const archive = await IOUtils.read(backupPath);
+    Assert.equal(
+      (await getMigrationProfileState(input.profilePath)).state,
+      "active"
+    );
+    Assert.deepEqual(await IOUtils.read(backupPath), archive);
+    Assert.deepEqual(await IOUtils.read(input.path), selector);
+    Assert.deepEqual(await IOUtils.read(journalPath), journal);
+    const changed = structuredClone(state);
+    changed.backup.sha256 = "b".repeat(64);
+    await IOUtils.writeJSON(journalPath, changed);
+    await Assert.rejects(
+      getMigrationProfileState(input.profilePath),
+      /incomplete or changed/,
+      "The durable backup identity remains mandatory without reading its archive"
+    );
+  });
+});
+
+/**
+ * Runs the public coordinator with a fault at its native service boundary.
+ * The real source copy, pending journal and prepared selector are persisted.
+ * Restores the module globals and temporary inputs before the next case.
+ *
+ * @param {"refused"|"cancelled"|"partial"} failure - Native open outcome.
+ * @returns {Promise<void>} Resolves after checking selector and retry behavior.
+ */
+async function checkStartupTargetFailure(failure) {
+  const { startPanoramaProfileAtStartup } = ChromeUtils.importESModule(
+    "resource:///modules/panorama/MigrationCoordinator.sys.mjs"
+  );
+  const profile = do_get_profile();
+  const profilePath = profile.path;
+  const directory = PathUtils.join(profilePath, "startup-open-failure");
+  const work = PathUtils.join(
+    profile.parent.path,
+    "panorama-migration-" + profile.leafName
+  );
+  const selector = PathUtils.join(profilePath, "panorama-profile.json");
+  const databasePath = PathUtils.join(profilePath, "panorama.sqlite");
+  const journalPath = PathUtils.join(work, "journal.json");
+  const branch = "mail.server.startupOpenFailure.";
+  const hadEnabled = Services.prefs.prefHasUserValue("mail.panorama.enabled");
+  const enabled = Services.prefs.getBoolPref("mail.panorama.enabled", false);
+  Assert.ok(!(await IOUtils.exists(work)));
+  Assert.ok(!(await IOUtils.exists(selector)));
+  Assert.ok(!(await IOUtils.exists(databasePath)));
+  await IOUtils.makeDirectory(directory);
+  const summary = PathUtils.join(directory, "Inbox.msf");
+  const body = PathUtils.join(directory, "Inbox");
+  await IOUtils.copy(do_get_file("data/migration.msf").path, summary);
+  await IOUtils.copy(do_get_file("data/migration").path, body);
+  const originalSummary = await IOUtils.read(summary);
+  const originalBody = await IOUtils.read(body);
+  const controller = new AbortController();
+  let opened = 0;
+  let settled = 0;
+  const operation = {};
+  const fault =
+    failure === "cancelled"
+      ? new DOMException("Migration cancelled", "AbortError")
+      : Components.Exception(
+          "Native target admission refused",
+          Cr.NS_ERROR_NOT_AVAILABLE
+        );
+  const core = {
+    beginProfileStartup() {
+      return Promise.resolve(operation);
+    },
+    validateProfileStartup(actual) {
+      Assert.strictEqual(actual, operation);
+      return { profilePath, mode: "migrate" };
+    },
+    openProfileStartupTarget(actual) {
+      Assert.strictEqual(actual, operation);
+      Assert.ok(
+        new FileUtils.File(selector).exists(),
+        "Fault follows preparation"
+      );
+      Assert.ok(
+        new FileUtils.File(journalPath).exists(),
+        "Pending journal exists"
+      );
+      opened++;
+      if (failure === "partial") {
+        // A native open can create the target and then throw before returning it.
+        new FileUtils.File(databasePath).create(
+          Ci.nsIFile.NORMAL_FILE_TYPE,
+          0o600
+        );
+      } else if (failure === "cancelled") {
+        controller.abort();
+      }
+      throw fault;
+    },
+    async failProfileStartup(actual) {
+      Assert.strictEqual(actual, operation);
+      settled++;
+    },
+  };
+  // nsIDatabaseCore is builtin-only. Stub the module's service lookup rather
+  // than registering a JavaScript implementation of that native interface.
+  const moduleGlobal = Cu.getGlobalForObject(startPanoramaProfileAtStartup);
+  const originalCc = moduleGlobal.Cc;
+  const mockCc = {
+    "@mozilla.org/mailnews/database-core;1": {
+      getService(iid) {
+        Assert.ok(iid.equals(Ci.nsIDatabaseCore));
+        return core;
+      },
+    },
+  };
+  moduleGlobal.Cc = new Proxy(mockCc, {
+    get(target, property) {
+      return Reflect.has(target, property)
+        ? Reflect.get(target, property)
+        : Reflect.get(originalCc, property);
+    },
+  });
+  const originalOpen = MigrationJournal.open;
+  MigrationJournal.open = async function (...args) {
+    const journal = await originalOpen.apply(this, args);
+    if (failure === "cancelled" && new FileUtils.File(selector).exists()) {
+      controller.abort();
+    }
+    return journal;
+  };
+  try {
+    Services.prefs.setBoolPref("mail.panorama.enabled", true);
+    Services.prefs.setComplexValue(
+      branch + "directory",
+      Ci.nsIFile,
+      new FileUtils.File(directory)
+    );
+    Services.prefs.setCharPref(branch + "type", "none");
+    await Assert.rejects(
+      startPanoramaProfileAtStartup(controller.signal),
+      error =>
+        failure === "cancelled"
+          ? error.name === "AbortError"
+          : error.result === Cr.NS_ERROR_NOT_AVAILABLE,
+      "The original native refusal or cancellation is propagated"
+    );
+    const expectedOpens = failure === "cancelled" ? 0 : 1;
+    Assert.equal(opened, expectedOpens);
+    Assert.equal(settled, 1);
+    Assert.deepEqual(await IOUtils.read(summary), originalSummary);
+    Assert.deepEqual(await IOUtils.read(body), originalBody);
+    const journal = await IOUtils.read(journalPath);
+    Assert.equal((await IOUtils.readJSON(journalPath)).stage, "backup");
+    Assert.ok((await IOUtils.readJSON(journalPath)).lastError);
+    if (failure === "partial") {
+      Assert.ok(await IOUtils.exists(databasePath));
+      Assert.equal(
+        (await getMigrationProfileState(profilePath)).state,
+        "restore-required",
+        "A created target always requires recovery"
+      );
+    } else {
+      Assert.ok(!(await IOUtils.exists(databasePath)));
+      Assert.ok(!(await IOUtils.exists(selector)));
+      Services.prefs.setBoolPref("mail.panorama.enabled", false);
+      Assert.equal(
+        (await getMigrationProfileState(profilePath)).state,
+        "legacy",
+        "Untouched original data can start through the default legacy gate"
+      );
+    }
+    Services.prefs.setBoolPref("mail.panorama.enabled", true);
+    await Assert.rejects(
+      startPanoramaProfileAtStartup(),
+      /requires explicit recovery/,
+      "Retained migration work still forbids a silent opt-in retry"
+    );
+    Assert.equal(opened, expectedOpens, "A retry never opens another target");
+    Assert.deepEqual(await IOUtils.read(journalPath), journal);
+    Assert.deepEqual(await IOUtils.read(summary), originalSummary);
+    Assert.deepEqual(await IOUtils.read(body), originalBody);
+  } finally {
+    // These process-wide test replacements must be restored before another case.
+    MigrationJournal.open = originalOpen;
+    moduleGlobal.Cc = originalCc;
+    Assert.strictEqual(moduleGlobal.Cc, originalCc);
+    Services.prefs.deleteBranch(branch);
+    if (hadEnabled) {
+      Services.prefs.setBoolPref("mail.panorama.enabled", enabled);
+    } else {
+      Services.prefs.clearUserPref("mail.panorama.enabled");
+    }
+    await IOUtils.remove(work, { recursive: true, ignoreAbsent: true });
+    await IOUtils.remove(directory, { recursive: true, ignoreAbsent: true });
+    await IOUtils.remove(selector, { ignoreAbsent: true });
+    await IOUtils.remove(databasePath, { ignoreAbsent: true });
+  }
+}
+
+add_task(
+  { skip_if: () => AppConstants.platform === "win" },
+  async function test_startPanoramaProfileAtStartupWithPreTargetRefusal() {
+    await checkStartupTargetFailure("refused");
+  }
+);
+
+add_task(
+  { skip_if: () => AppConstants.platform === "win" },
+  async function test_startPanoramaProfileAtStartupWithPreTargetCancellation() {
+    await checkStartupTargetFailure("cancelled");
+  }
+);
+
+add_task(
+  { skip_if: () => AppConstants.platform === "win" },
+  async function test_startPanoramaProfileAtStartupWithPartialTarget() {
+    await checkStartupTargetFailure("partial");
+  }
+);

@@ -4,6 +4,7 @@
 
 import { AppConstants } from "resource://gre/modules/AppConstants.sys.mjs";
 import { FileUtils } from "resource://gre/modules/FileUtils.sys.mjs";
+import { MailStringUtils } from "resource:///modules/MailStringUtils.sys.mjs";
 import {
   verifyMigrationBackup,
   captureWindowsMigrationRoots,
@@ -31,6 +32,7 @@ import {
   validateMorkProtocolUnitReceipt,
 } from "resource:///modules/panorama/MorkSnapshotAdapter.sys.mjs";
 
+const STARTUP_VERSION = 7;
 const PROTOCOL_VERSION = 6;
 const CACHE_VERSION = 5;
 const PHYSICAL_VERSION = 4;
@@ -56,7 +58,9 @@ export class MigrationJournal {
    *
    * @param {string} path - Absolute journal path in a private work directory.
    * @param {{profilePath: string, backupPath: string, mailPaths: string[],
-   *   sources: object[], books?: object[]}} plan - Mail sources retain version1
+   *   sources: object[], books?: object[],
+   *   startupInventory?: {sources: object[], caches: object[],
+   *   serverSummaries?: object[]}}} plan - Mail sources retain version1
    *   fields. Books have id, path, sha256, size, cardKeys, listKeys and stagingPath.
    *   Each stage is a fresh .sqlite child of the private journal directory.
    *   Windows version4 requires original roots and each mail source.inventory (version2),
@@ -85,8 +89,25 @@ export class MigrationJournal {
       if (plan.sources.some(source => source.protocol === "imap")) {
         version = PROTOCOL_VERSION;
       }
+      if (plan.startupInventory !== undefined) {
+        if (AppConstants.platform == "win" || plan.sources.length) {
+          throw new Error("Startup planning requires unbound Unix sources");
+        }
+        version = STARTUP_VERSION;
+      }
       const state = {
-        ...(version === PROTOCOL_VERSION ? { protocolUnits: [] } : {}),
+        ...([PROTOCOL_VERSION, STARTUP_VERSION].includes(version)
+          ? { protocolUnits: [] }
+          : {}),
+        ...(version === STARTUP_VERSION
+          ? {
+              startup: {
+                inventory: structuredClone(plan.startupInventory),
+                bound: false,
+                databaseSourceId: null,
+              },
+            }
+          : {}),
         ...(originalRoots ? { originalRoots } : {}),
         version,
         profilePath: normalizedPath(plan.profilePath),
@@ -475,7 +496,7 @@ export class MigrationJournal {
    */
   #protocolSources(state, ids) {
     if (
-      state.version !== PROTOCOL_VERSION ||
+      ![PROTOCOL_VERSION, STARTUP_VERSION].includes(state.version) ||
       !Array.isArray(ids) ||
       !ids.length ||
       ids.some(id => typeof id !== "string") ||
@@ -729,7 +750,7 @@ export class MigrationJournal {
    */
   async planCacheImport(id, snapshot) {
     if (
-      ![1, 2].includes(
+      ![1, 2, 3].includes(
         snapshot.requestVersion === undefined ? 1 : snapshot.requestVersion
       )
     ) {
@@ -744,8 +765,11 @@ export class MigrationJournal {
       databaseSourceId: snapshot.databaseSourceId,
       ...snapshot.source,
       folders: snapshot.folders,
-      ...(snapshot.requestVersion === 2
-        ? { requestVersion: 2, proof: snapshot.proof }
+      ...(snapshot.requestVersion >= 2
+        ? { requestVersion: snapshot.requestVersion, proof: snapshot.proof }
+        : {}),
+      ...(snapshot.requestVersion === 3
+        ? { sourceFormat: snapshot.sourceFormat }
         : {}),
       token: Services.uuid.generateUUID().toString(),
       state: "pending",
@@ -779,8 +803,11 @@ export class MigrationJournal {
         return false;
       }
       this.#requireActive(state, "import");
-      state.version =
-        state.version === PROTOCOL_VERSION ? PROTOCOL_VERSION : CACHE_VERSION;
+      state.version = [PROTOCOL_VERSION, STARTUP_VERSION].includes(
+        state.version
+      )
+        ? state.version
+        : CACHE_VERSION;
       (state.caches ??= []).push(cache);
       await this.#checkSource(cache);
       await this.#checkBackup(state, state.backup);
@@ -856,7 +883,11 @@ export class MigrationJournal {
       ) {
         throw new Error("Migration imports are incomplete");
       }
-      if (stage != "import" && (state.books?.length || state.caches?.length)) {
+      if (
+        stage != "import" &&
+        state.version !== STARTUP_VERSION &&
+        (state.books?.length || state.caches?.length)
+      ) {
         throw new Error(
           "Book/cache publication and activation are not supported"
         );
@@ -864,9 +895,130 @@ export class MigrationJournal {
       if (!["import", "validate", "activate"].includes(stage)) {
         throw new Error("Invalid migration stage transition");
       }
+      if (state.version === STARTUP_VERSION && stage !== "import") {
+        this.#requireStartupReadiness(state);
+      }
       state.stage = STAGES[STAGES.indexOf(stage) + 1];
       return true;
     });
+  }
+
+  /**
+   * Binds retained startup inputs to actual native folders after target creation.
+   * No destination ID or database incarnation is invented before this point.
+   *
+   * @param {nsIDatabaseCore} core - Actual selected startup target.
+   * @param {nsISupports} operation - Live native startup operation.
+   * @param {{sourceId: string, folderId: number, folder: nsIMsgFolder}[]} bindings -
+   *   Actual native message-folder bindings. Native server-root IDs come from
+   *   the same validated operation and are retained separately in the journal.
+   * @returns {Promise<void>} Durable native target binding before backup advance.
+   * @throws {Error} For changed inventory, foreign folders or rebinding.
+   */
+  async bindStartupTarget(core, operation, bindings) {
+    const database = core.QueryInterface(Ci.nsIDatabaseCore);
+    const selected = database.validateProfileStartup(operation);
+    if (
+      selected.phase !== "target-open" ||
+      !selected.databaseSourceId ||
+      database.sourceId !== selected.databaseSourceId ||
+      !Array.isArray(bindings)
+    ) {
+      throw new Error("Startup journal requires the actual native target");
+    }
+    const serverBindings =
+      selected.serverSummaries === undefined ? [] : selected.serverSummaries;
+    if (!Array.isArray(serverBindings)) {
+      throw new Error(
+        "Startup target has invalid native server-summary bindings"
+      );
+    }
+    const folders = new Map();
+    for (const binding of bindings) {
+      const folder = binding.folder.QueryInterface(Ci.nsIMsgFolder);
+      if (
+        folders.has(binding.sourceId) ||
+        folder.id !== binding.folderId ||
+        !Number.isSafeInteger(folder.id) ||
+        folder.id <= 0
+      ) {
+        throw new Error("Invalid startup native folder binding");
+      }
+      folders.set(binding.sourceId, folder);
+    }
+    await this.#change(state => {
+      if (
+        state.version !== STARTUP_VERSION ||
+        state.stage !== "backup" ||
+        state.cancelled ||
+        state.profilePath !== selected.profilePath ||
+        state.startup.bound ||
+        folders.size !== state.startup.inventory.sources.length
+      ) {
+        throw new Error("Startup journal cannot change its target binding");
+      }
+      state.sources = state.startup.inventory.sources.map(source => {
+        const folder = folders.get(source.id);
+        if (
+          !folder ||
+          folder.server.key !== source.serverKey ||
+          !folder.server.localPath.equals(
+            new FileUtils.File(source.serverRoot)
+          ) ||
+          !folder.summaryFile.equals(new FileUtils.File(source.path)) ||
+          !folder.filePath.equals(new FileUtils.File(source.storePath)) ||
+          (source.folderURI !== undefined && folder.URI !== source.folderURI)
+        ) {
+          throw new Error("Startup native folder differs from retained source");
+        }
+        if (source.protocol === "imap") {
+          const imapFolder = folder.QueryInterface(Ci.nsIMsgImapMailFolder);
+          if (
+            imapFolder.onlineName !== source.origin.onlineName ||
+            imapFolder.hierarchyDelimiter.charCodeAt(0) !==
+              source.origin.hierarchyDelimiter
+          ) {
+            throw new Error("Native IMAP discovery changed retained identity");
+          }
+        }
+        return {
+          ...source,
+          destinationFolderId: folder.id,
+          folderURI: folder.URI,
+          ...(source.protocol === "imap"
+            ? { originalFolderURI: folder.URI }
+            : {}),
+          databaseSourceId: selected.databaseSourceId,
+          token: Services.uuid.generateUUID().toString(),
+          state: "pending",
+          receipt: null,
+        };
+      });
+      const summaries = state.startup.inventory.serverSummaries ?? [];
+      if (serverBindings.length !== summaries.length) {
+        throw new Error("Startup target omitted a native server-root binding");
+      }
+      const rootIds = new Set();
+      state.startup.serverSummaries = serverBindings.map((binding, index) => {
+        if (
+          binding.sourceId !== summaries[index].id ||
+          !Number.isSafeInteger(binding.folderId) ||
+          binding.folderId <= 0 ||
+          rootIds.has(binding.folderId) ||
+          state.sources.some(
+            source => source.destinationFolderId === binding.folderId
+          )
+        ) {
+          throw new Error("Invalid startup native server-root binding");
+        }
+        rootIds.add(binding.folderId);
+        return { sourceId: binding.sourceId, folderId: binding.folderId };
+      });
+      state.startup.bound = true;
+      state.startup.databaseSourceId = selected.databaseSourceId;
+      return true;
+    });
+    database.validateProfileStartup(operation);
   }
 
   /**
@@ -1340,7 +1492,7 @@ export class MigrationJournal {
    * @returns {void}
    */
   #validateProtocolUnits(state) {
-    if (state.version !== PROTOCOL_VERSION) {
+    if (![PROTOCOL_VERSION, STARTUP_VERSION].includes(state.version)) {
       if (
         "protocolUnits" in state ||
         state.sources.some(
@@ -1353,7 +1505,8 @@ export class MigrationJournal {
     }
     if (
       !Array.isArray(state.protocolUnits) ||
-      !state.sources.some(source => source.protocol === "imap")
+      (!state.sources.some(source => source.protocol === "imap") &&
+        (state.version === PROTOCOL_VERSION || state.protocolUnits.length))
     ) {
       throw new Error("Invalid migration protocol journal");
     }
@@ -1428,6 +1581,183 @@ export class MigrationJournal {
     }
   }
 
+  /** @param {object} state - Retained startup plan and native bindings. */
+  #validateStartup(state) {
+    if (state.version !== STARTUP_VERSION) {
+      if (state.startup !== undefined) {
+        throw new Error("Startup plan requires its version7 journal");
+      }
+      return;
+    }
+    const startup = state.startup;
+    if (
+      AppConstants.platform === "win" ||
+      !startup ||
+      typeof startup.bound !== "boolean" ||
+      !Array.isArray(startup.inventory?.sources) ||
+      !Array.isArray(startup.inventory?.caches)
+    ) {
+      throw new Error("Invalid startup migration inventory");
+    }
+    const serverSummaries =
+      startup.inventory.serverSummaries === undefined
+        ? []
+        : startup.inventory.serverSummaries;
+    if (!Array.isArray(serverSummaries)) {
+      throw new Error("Invalid startup server-summary inventory");
+    }
+    const ids = new Set();
+    const paths = new Set();
+    for (const input of [
+      ...startup.inventory.sources,
+      ...startup.inventory.caches,
+      ...serverSummaries,
+    ]) {
+      if (
+        typeof input.id !== "string" ||
+        !input.id ||
+        ids.has(input.id) ||
+        !PathUtils.isAbsolute(input.path) ||
+        normalizedPath(input.path) !== input.path ||
+        paths.has(input.path) ||
+        !isDigest(input.sha256) ||
+        !Number.isSafeInteger(input.size) ||
+        input.size < 0
+      ) {
+        throw new Error("Invalid retained startup source identity");
+      }
+      ids.add(input.id);
+      paths.add(input.path);
+    }
+    for (const source of startup.inventory.sources) {
+      validateStartupFolderOrigin(source, startup.inventory.caches);
+    }
+    const servers = new Set();
+    for (const source of serverSummaries) {
+      if (
+        source.role !== "imap-server-root-summary" ||
+        source.protocol !== "imap" ||
+        source.size <= 0 ||
+        source.size >= 0xffffffff ||
+        typeof source.serverKey !== "string" ||
+        !source.serverKey ||
+        /[.\0]/.test(source.serverKey) ||
+        servers.has(source.serverKey) ||
+        !PathUtils.isAbsolute(source.serverRoot) ||
+        normalizedPath(source.serverRoot) !== source.serverRoot ||
+        !new FileUtils.File(state.profilePath).contains(
+          new FileUtils.File(source.serverRoot)
+        ) ||
+        source.path !== source.serverRoot + ".msf" ||
+        source.storeContractID !==
+          {
+            mbox: "@mozilla.org/msgstore/berkeleystore;1",
+            maildir: "@mozilla.org/msgstore/maildirstore;1",
+          }[source.storeType] ||
+        !["mbox", "maildir"].includes(source.storeType) ||
+        !Array.isArray(source.messageKeys) ||
+        source.messageKeys.length
+      ) {
+        throw new Error("Invalid retained startup server-summary origin");
+      }
+      servers.add(source.serverKey);
+    }
+    const serverBindings =
+      startup.serverSummaries === undefined ? [] : startup.serverSummaries;
+    if (!Array.isArray(serverBindings)) {
+      throw new Error("Invalid startup server-root binding array");
+    }
+    if (!startup.bound) {
+      if (
+        state.stage !== "backup" ||
+        state.sources.length ||
+        serverBindings.length ||
+        startup.databaseSourceId !== null
+      ) {
+        throw new Error("Startup migration has no native target binding");
+      }
+      return;
+    }
+    if (
+      typeof startup.databaseSourceId !== "string" ||
+      !startup.databaseSourceId ||
+      state.sources.length !== startup.inventory.sources.length ||
+      serverBindings.length !== serverSummaries.length
+    ) {
+      throw new Error("Startup migration lost its native incarnation");
+    }
+    const rootIds = new Set();
+    for (const [index, binding] of serverBindings.entries()) {
+      if (
+        binding.sourceId !== serverSummaries[index].id ||
+        !Number.isSafeInteger(binding.folderId) ||
+        binding.folderId <= 0 ||
+        rootIds.has(binding.folderId) ||
+        state.sources.some(
+          source => source.destinationFolderId === binding.folderId
+        )
+      ) {
+        throw new Error("Invalid retained startup native server-root binding");
+      }
+      rootIds.add(binding.folderId);
+    }
+    for (let index = 0; index < state.sources.length; index++) {
+      const source = state.sources[index];
+      const original = startup.inventory.sources[index];
+      if (
+        source.databaseSourceId !== startup.databaseSourceId ||
+        Object.keys(original).some(
+          key => JSON.stringify(source[key]) !== JSON.stringify(original[key])
+        )
+      ) {
+        throw new Error("Startup migration inventory or incarnation changed");
+      }
+    }
+    if (["validate", "activate", "complete"].includes(state.stage)) {
+      const caches = state.caches ?? [];
+      if (
+        caches.length !== startup.inventory.caches.length ||
+        startup.inventory.caches.some(
+          input =>
+            !caches.some(cache =>
+              ["id", "path", "sha256", "size"].every(
+                key => cache[key] === input[key]
+              )
+            )
+        )
+      ) {
+        throw new Error("Startup migration omitted a retained cache source");
+      }
+    }
+    if (["activate", "complete"].includes(state.stage)) {
+      this.#requireStartupReadiness(state);
+    }
+  }
+
+  /** @param {object} state - Complete imported and published startup units. */
+  #requireStartupReadiness(state) {
+    if (
+      !state.startup.bound ||
+      state.cancelled ||
+      [...state.sources, ...(state.books ?? []), ...(state.caches ?? [])].some(
+        unit => unit.state !== "imported" || !unit.receipt
+      ) ||
+      (state.books ?? []).some(
+        book =>
+          book.publication?.state !== "published" || !book.publication.receipt
+      ) ||
+      (state.caches ?? []).some(
+        cache =>
+          ![2, 3].includes(cache.requestVersion) ||
+          cache.databaseSourceId !== state.startup.databaseSourceId
+      )
+    ) {
+      throw new Error(
+        "Startup activation requires complete native publication"
+      );
+    }
+  }
+
   #validate(state) {
     if (
       !state ||
@@ -1437,9 +1767,11 @@ export class MigrationJournal {
         PHYSICAL_VERSION,
         CACHE_VERSION,
         PROTOCOL_VERSION,
+        STARTUP_VERSION,
       ].includes(state.version) ||
       (state.version == CACHE_VERSION ||
-      (state.version === PROTOCOL_VERSION && "caches" in state)
+      ([PROTOCOL_VERSION, STARTUP_VERSION].includes(state.version) &&
+        "caches" in state)
         ? !Array.isArray(state.caches) || !state.caches.length
         : "caches" in state) ||
       ("books" in state &&
@@ -1465,6 +1797,7 @@ export class MigrationJournal {
       throw new Error("Invalid or unsupported migration journal");
     }
     const file = new FileUtils.File(this.#path);
+    this.#validateStartup(state);
     this.#validatePhysicalIdentities(state, file);
     const roots = [state.profilePath, ...state.mailPaths].map(
       path => new FileUtils.File(path)
@@ -1611,7 +1944,7 @@ export class MigrationJournal {
       createMorkFolderCacheRequest(cache);
       getMorkFolderCacheCells(cache.folders);
       if (
-        cache.requestVersion === 2 &&
+        cache.requestVersion >= 2 &&
         (cache.proof.profilePath !== state.profilePath ||
           cache.proof.manifest.path !== state.backup?.path ||
           cache.proof.manifest.sha256 !== state.backup.sha256)
@@ -1628,7 +1961,12 @@ export class MigrationJournal {
         !roots.some(root => root.contains(source)) ||
         files.some(other => source.equals(other)) ||
         source.parent.contains(file) ||
-        !state.sources.length ||
+        (!state.sources.length &&
+          !(
+            state.version === STARTUP_VERSION &&
+            state.startup?.bound &&
+            state.startup.databaseSourceId === cache.databaseSourceId
+          )) ||
         state.sources.some(
           s => s.databaseSourceId !== cache.databaseSourceId
         ) ||
@@ -1642,7 +1980,7 @@ export class MigrationJournal {
           [
             folder.cachePath,
             folder.storePath,
-            ...(cache.requestVersion === 2 && !folder.isServer
+            ...(cache.requestVersion >= 2 && !folder.isServer
               ? [folder.originalSummaryPath]
               : []),
           ].some(path => {
@@ -1736,6 +2074,7 @@ export class MigrationJournal {
       throw new Error("Windows migration activation remains held");
     }
     if (
+      state.version !== STARTUP_VERSION &&
       (state.books?.length || state.caches?.length) &&
       ["activate", "complete"].includes(state.stage)
     ) {
@@ -1861,4 +2200,83 @@ function samePhysical(left, right) {
     left.id === right.id &&
     left.parentId === right.parentId
   );
+}
+
+/**
+ * Validates retained discovery inputs independently of native target outputs.
+ * Native startup also verifies their original backed-up bytes and provider.
+ *
+ * @param {object} source - Original summary/store and persisted server identity.
+ * @param {object[]} caches - Complete retained original cache file identities.
+ * @throws {Error} For incomplete or contradictory discovery inputs.
+ */
+function validateStartupFolderOrigin(source, caches) {
+  const contract = {
+    mbox: "@mozilla.org/msgstore/berkeleystore;1",
+    maildir: "@mozilla.org/msgstore/maildirstore;1",
+  }[source.storeType];
+  if (
+    typeof source.serverKey !== "string" ||
+    !source.serverKey ||
+    source.serverKey.includes("\0") ||
+    !PathUtils.isAbsolute(source.serverRoot) ||
+    normalizedPath(source.serverRoot) !== source.serverRoot ||
+    !new FileUtils.File(source.serverRoot).contains(
+      new FileUtils.File(source.path)
+    ) ||
+    !source.path.endsWith(".msf") ||
+    source.storePath !== source.path.slice(0, -4) ||
+    !contract ||
+    source.storeContractID !== contract ||
+    !["none", "imap"].includes(source.protocol) ||
+    source.origin?.provider !==
+      (source.protocol === "none"
+        ? "local-store-discovery"
+        : "imap-client-discovery")
+  ) {
+    throw new Error("Invalid retained startup folder origin");
+  }
+  if (source.protocol === "none") {
+    return;
+  }
+  const origin = source.origin;
+  const cache = origin.cache;
+  if (
+    !cache ||
+    !caches.some(
+      input =>
+        ["path", "sha256", "size"].every(key => input[key] === cache[key]) &&
+        input.cacheKeys?.includes(cache.originalKey) &&
+        (cache.sourceFormat === "json"
+          ? input.sourceFormat === "json"
+          : !Object.hasOwn(input, "sourceFormat"))
+    ) ||
+    cache.originalKey !==
+      new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
+        MailStringUtils.byteStringToUint8Array(
+          new FileUtils.File(source.path).persistentDescriptor
+        )
+      ) ||
+    (cache.sourceFormat === "json"
+      ? Object.hasOwn(cache, "sourceKey")
+      : Object.hasOwn(cache, "sourceFormat") ||
+        !Number.isInteger(cache.sourceKey) ||
+        cache.sourceKey < 0 ||
+        cache.sourceKey > 0xffffffff) ||
+    !["onlineName", "hierDelim", "boxFlags"].every(
+      key => typeof origin.originalCells?.[key] === "string"
+    ) ||
+    typeof origin.onlineName !== "string" ||
+    !origin.onlineName ||
+    origin.onlineName.includes("\0") ||
+    !Number.isInteger(origin.hierarchyDelimiter) ||
+    origin.hierarchyDelimiter <= 0 ||
+    origin.hierarchyDelimiter > 127 ||
+    [94, 124].includes(origin.hierarchyDelimiter) ||
+    !Number.isInteger(origin.boxFlags) ||
+    origin.boxFlags < 0 ||
+    origin.boxFlags > 0xffffffff
+  ) {
+    throw new Error("Invalid retained startup IMAP cache origin");
+  }
 }

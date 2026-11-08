@@ -6,6 +6,7 @@ import { AppConstants } from "resource://gre/modules/AppConstants.sys.mjs";
 import { FileUtils } from "resource://gre/modules/FileUtils.sys.mjs";
 import { MailStringUtils } from "resource:///modules/MailStringUtils.sys.mjs";
 import {
+  captureMorkFolderWindowsInventory,
   readMorkFolderImport,
   validateMorkFolderWindowsInventory,
 } from "resource:///modules/panorama/MorkFolderImport.sys.mjs";
@@ -17,6 +18,8 @@ import {
   validateMorkProtocolUnitReceipt,
 } from "resource:///modules/panorama/MorkSnapshotAdapter.sys.mjs";
 import {
+  admitWindowsMigrationPath,
+  migrationPhysicalIdentity,
   readMorkMigrationSource,
   readMorkAddressBookSource,
   readMorkFolderCacheSource,
@@ -380,11 +383,14 @@ export async function resumeMorkBookImportsAndPublish(
   bookNames,
   signal
 ) {
-  if (AppConstants.platform == "win") {
-    throw new Error("Windows book migration requires native reparse admission");
-  }
   if (!(journal instanceof MigrationJournal)) {
     throw new TypeError("An actual migration journal is required");
+  }
+  // Only the selected-startup version7 journal is admitted on Windows. It is
+  // a physical journal: every book checkpoint re-admits the source and stage
+  // through native leases and compares their retained file IDs.
+  if (AppConstants.platform == "win" && journal.state.version !== 7) {
+    throw new Error("Windows book migration requires native reparse admission");
   }
   return lazy.withMigrationAddressBookPublication(
     profile,
@@ -688,36 +694,56 @@ async function readStartupFolderCacheSource(path) {
     return readMorkFolderCacheSource(path);
   }
   const file = startupSourceFile(path);
-  const before = await IOUtils.stat(file.path);
-  const limit = 64 * 1024 * 1024;
-  if (before.type !== "regular" || before.size > limit) {
-    throw new Error("Unsupported native JSON cache file");
-  }
-  const bytes = await IOUtils.read(file.path, { maxBytes: limit + 1 });
-  const hash = Cc["@mozilla.org/security/hash;1"].createInstance(
-    Ci.nsICryptoHash
+  // Windows retains the same no-reparse, writer-denying source lease as Mork
+  // cache reads; a physical journal binds its full file ID.
+  const lease = admitWindowsMigrationPath(
+    file,
+    Ci.nsIPanoramaMigrationFileSystem.KIND_FILE
   );
-  hash.init(Ci.nsICryptoHash.SHA256);
-  hash.update(bytes, bytes.length);
-  const sha256 = Array.from(hash.finish(false), byte =>
-    byte.charCodeAt(0).toString(16).padStart(2, "0")
-  ).join("");
-  const after = await IOUtils.stat(file.path);
-  if (
-    startupSourceFile(path).path !== file.path ||
-    bytes.length !== before.size ||
-    after.type !== "regular" ||
-    after.size !== before.size ||
-    after.lastModified !== before.lastModified ||
-    (await hashMigrationFile(file.path)) !== sha256
-  ) {
-    throw new Error("Native JSON cache changed while reading");
+  try {
+    if (lease && lease.canonicalPath !== file.path) {
+      throw new Error("Native JSON cache spelling differs from its admission");
+    }
+    const before = await IOUtils.stat(file.path);
+    const limit = 64 * 1024 * 1024;
+    if (before.type !== "regular" || before.size > limit) {
+      throw new Error("Unsupported native JSON cache file");
+    }
+    const bytes = await IOUtils.read(file.path, { maxBytes: limit + 1 });
+    const hash = Cc["@mozilla.org/security/hash;1"].createInstance(
+      Ci.nsICryptoHash
+    );
+    hash.init(Ci.nsICryptoHash.SHA256);
+    hash.update(bytes, bytes.length);
+    const sha256 = Array.from(hash.finish(false), byte =>
+      byte.charCodeAt(0).toString(16).padStart(2, "0")
+    ).join("");
+    const after = await IOUtils.stat(file.path);
+    if (
+      startupSourceFile(path).path !== file.path ||
+      bytes.length !== before.size ||
+      after.type !== "regular" ||
+      after.size !== before.size ||
+      after.lastModified !== before.lastModified ||
+      (await hashMigrationFile(file.path)) !== sha256
+    ) {
+      throw new Error("Native JSON cache changed while reading");
+    }
+    return {
+      cache: parseJSONFolderCache(bytes),
+      bytes,
+      identity: {
+        path: file.path,
+        size: bytes.length,
+        sha256,
+        ...(lease
+          ? { physicalIdentity: migrationPhysicalIdentity(lease) }
+          : {}),
+      },
+    };
+  } finally {
+    lease?.close();
   }
-  return {
-    cache: parseJSONFolderCache(bytes),
-    bytes,
-    identity: { path: file.path, size: bytes.length, sha256 },
-  };
 }
 
 /**
@@ -779,7 +805,10 @@ async function readBoundMorkFolderCacheInput(
   path,
   startupOperation = null
 ) {
-  if (AppConstants.platform == "win") {
+  // A caller-held nsIProfileLock has no Windows original-path admission. The
+  // native selected-startup operation retains profile/database leases, and the
+  // cache bytes below are read under their own native file lease.
+  if (AppConstants.platform == "win" && !startupOperation) {
     throw new Error(
       "Windows cache migration requires native reparse admission"
     );
@@ -956,7 +985,7 @@ export async function resumeMorkCacheImports(
 ) {
   const database = core.QueryInterface(Ci.nsIDatabaseCore);
   if (
-    AppConstants.platform == "win" ||
+    (AppConstants.platform == "win" && !startupOperation) ||
     typeof database.importFolderCacheMetadata != "function" ||
     typeof database.getFolderCacheImportReceipt != "function"
   ) {
@@ -2122,12 +2151,25 @@ export function createStartupPanoramaMigrationTarget(
   resolveFolder,
   operation
 ) {
+  const windows = AppConstants.platform == "win";
+  if (
+    windows &&
+    (!(journal instanceof MigrationJournal) ||
+      journal.state.version !== 7 ||
+      !journal.state.originalRoots?.length ||
+      !journal.state.backup)
+  ) {
+    throw new Error("Windows startup import requires a physical journal7");
+  }
+  // Windows reuses the explicit version2 receiver: retained original-path
+  // inventory, backup3 checks and native FolderImportAdmission leases. The
+  // live native startup operation, not an nsIProfileLock, owns the profile.
   return bindPanoramaMigrationTarget(
     journal,
     core,
     resolveFolder,
     null,
-    false,
+    windows,
     () => startupMigrationDirectory(journal, core, operation)
   );
 }
@@ -2142,9 +2184,10 @@ export function createStartupPanoramaMigrationTarget(
  */
 function startupMigrationDirectory(journal, core, operation) {
   const database = core.QueryInterface(Ci.nsIDatabaseCore);
+  // On Windows validateProfileStartup re-walks the retained profile, local
+  // and database leases (volume serial and file IDs) before returning.
   const selected = database.validateProfileStartup(operation);
   if (
-    AppConstants.platform === "win" ||
     selected.phase !== "target-open" ||
     selected.profilePath !== journal.state.profilePath ||
     !selected.databaseSourceId ||
@@ -2485,21 +2528,38 @@ function captureStartupMigration(signal) {
       caches,
     };
   }
-  if (AppConstants.platform === "win") {
-    // Empty initialization and reuse need no legacy input. The startup
-    // journal, folder, cache and book imports have no Windows original-path
-    // admission yet, so legacy data is refused before any copy or selection.
-    throw new Error(
-      "Windows startup migration requires native activation admission"
+  const windows = AppConstants.platform === "win";
+  if (windows) {
+    // Native IMAP protocol units have Windows import admission, but ordinary
+    // reuse revalidates their unit receipts (validateMorkFolderReceipt) by
+    // re-admitting the original summary/offline-store identities. Refuse
+    // before any copy or selection rather than let a later offline download
+    // or folder removal block every subsequent startup.
+    if (
+      serverSummaries.length ||
+      summaries.some(source => source.protocol !== "none")
+    ) {
+      throw new Error("Windows startup IMAP migration requires reuse admission");
+    }
+    // Every retained identity below (journal4/7 normalizedPath, native target
+    // descriptors and receipts) uses the admitted final spelling. A short-name,
+    // case or other alias spelling would only fail after the work directory
+    // exists, so require the actual physical spelling before creating it.
+    checkWindowsStartupSpelling(
+      [profile.path, ...servers.map(server => server.root)],
+      [...summaries, ...books, ...caches].map(input => input.path)
     );
   }
   // The stable outside-profile path preserves discoverable failed attempts.
   // Never create another archive to conceal an existing journal/partial copy.
   work.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
   const backupPath = PathUtils.join(work.path, "backup");
+  // Startup already requires every configured mail root inside the selected
+  // profile, so the profile is the only backup root. On Windows the journal7
+  // inventory and backup3 originalRoots must then be the same profile spelling.
   const backup = createMigrationBackupAtStartup(
     profile.path,
-    roots.mailPaths,
+    windows ? [] : roots.mailPaths,
     backupPath,
     signal
   );
@@ -2647,6 +2707,34 @@ function startupSourceFile(path) {
 }
 
 /**
+ * Requires each captured Windows startup path to be its own admitted spelling.
+ * Admission refuses reparse/offline components; the leases close on return.
+ *
+ * @param {string[]} directories - Selected profile and configured server roots.
+ * @param {string[]} files - Captured summary, book and cache files.
+ * @throws {Error} For an alias spelling or any native admission refusal.
+ */
+function checkWindowsStartupSpelling(directories, files) {
+  for (const [paths, kind] of [
+    [directories, Ci.nsIPanoramaMigrationFileSystem.KIND_DIRECTORY],
+    [files, Ci.nsIPanoramaMigrationFileSystem.KIND_FILE],
+  ]) {
+    for (const path of paths) {
+      const lease = admitWindowsMigrationPath(new FileUtils.File(path), kind);
+      try {
+        if (lease.canonicalPath !== path) {
+          throw new Error(
+            "Windows startup input spelling differs from its physical path"
+          );
+        }
+      } finally {
+        lease.close();
+      }
+    }
+  }
+}
+
+/**
  * Admits only an operating-system alias of the selected profile's location
  * (macOS /var to /private/var): a link above the profile whose canonical
  * target contains it. A link at or inside the profile is never admitted.
@@ -2786,6 +2874,19 @@ async function finishPanoramaProfileStartup(
           ...source,
           ...identity,
           origin: startupFolderOrigin(source, summary, cacheInputs),
+          // The existing retained Windows inventory version2: original
+          // summary/store spellings and file IDs under the selected profile,
+          // the journal7 originalRoots entry. Core re-admits it per import.
+          ...(AppConstants.platform === "win"
+            ? {
+                inventory: captureMorkFolderWindowsInventory(
+                  new FileUtils.File(source.path),
+                  new FileUtils.File(selected.profilePath),
+                  new FileUtils.File(source.storePath),
+                  new FileUtils.File(selected.profilePath)
+                ),
+              }
+            : {}),
         });
         database.validateProfileStartup(operation);
       }

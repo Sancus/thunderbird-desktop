@@ -2117,3 +2117,36 @@ add_task(
     }
   }
 );
+
+add_task(
+  { skip_if: () => AppConstants.platform != "win" },
+  async function test_windowsStartupJournalIsPhysical() {
+    // The selected-startup journal7 keeps journal4's Windows physical
+    // admission: original roots plus profile and work directory file IDs.
+    const { plan, path } = await migrationFiles();
+    const journal = await MigrationJournal.create(path, {
+      profilePath: plan.profilePath,
+      mailPaths: [],
+      backupPath: plan.backupPath,
+      sources: [],
+      startupInventory: { sources: [], caches: [], serverSummaries: [] },
+    });
+    registerCleanupFunction(() => journal.close());
+    const state = journal.state;
+    Assert.equal(state.version, 7);
+    Assert.equal(state.stage, "backup");
+    Assert.deepEqual(
+      state.originalRoots.map(root => root.canonicalPath),
+      [canonicalRoot(plan.profilePath)]
+    );
+    Assert.equal(state.profilePhysicalIdentity.version, 1);
+    Assert.equal(state.workPhysicalIdentity.version, 1);
+    journal.close();
+    const reopened = await MigrationJournal.open(path, plan.profilePath);
+    try {
+      Assert.deepEqual(reopened.state, state);
+    } finally {
+      reopened.close();
+    }
+  }
+);

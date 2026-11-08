@@ -146,21 +146,21 @@ thunderbird --new-instance --profile /absolute/profile --panorama-restore-rollba
 ```
 
 These actions are mutually exclusive with a new restore request. This process
-rechecks identity, records only the supported action, and quits. Retry requires
-the original verified archive and dependencies; if no root was changed yet, it
-keeps that attempt's staging and `restore-<id>-<staging>.failed.json` ledger and
-prepares the same approved operation in fresh owner-only staging. Rollback can
-use the native-retained verified manifest, stage, saved-before data and custody
-when the original after-input is unavailable. Missing or conflicting retained
+rechecks identity, records only the supported action, and quits. Retry always
+requires the original verified archive and dependencies. If no root changed yet,
+both keep that attempt's staging and exact request bytes as
+`restore-<id>-<staging>.failed.json`: retry prepares the same approved operation
+in fresh owner-only staging; rollback ends the request, even with no archive, so
+the next ordinary process starts normally. Otherwise rollback uses the retained
+native manifest, stage, saved-before data and custody. Missing or conflicting
 proof refuses; JSON or timestamps alone grant no authority. After the request
 exits, run the ordinary command above; it recovers, settles and quits. Only
-complete verified settlement allows a further ordinary process. Other changed,
-unknown or mixed states block.
+complete verified settlement allows a further ordinary process. Others block.
 
-Full rollback first copies and verifies each current root, including data
-written since restoration, into `newer-<n>` beside its saved copy, then returns
-every saved root without mixing attempts. Failed rollback keeps its guard, first
-error and all data. Archive and retained evidence are never discarded.
+Every rollback attempt copies and verifies each current root, including data
+written since restoration or by an earlier attempt's exit, into a new
+`newer-<root>-<generation>` beside its saved copy, then returns each saved root.
+Keep the archive and all such trees; failed rollback keeps guard, error, data.
 
 ### Validation
 

@@ -781,13 +781,11 @@ function startupProfileDirectory(path) {
 
 /**
  * Validates an archived selector at its original path and pins its dependencies.
- * Copies no data and never changes selectors, receipts or migration journals.
  *
  * @param {string} profilePath - Original selected profile directory.
  * @param {string} archivedProfilePath - Verified archive's profile root.
  * @param {{source: string, archived: string}[]} roots - Complete restore roots.
- * @returns {Promise<{record: object|null, dependencies: object[]}>} Original
- *   selector and retained journal/archive identities required before cutover.
+ * @returns {Promise<{record: object|null, dependencies: object[]}>} Pins.
  * @throws {Error} For unsupported selectors or missing/conflicting dependencies.
  */
 export async function getMigrationRestoreDependencies(
@@ -817,8 +815,7 @@ export async function getMigrationRestoreDependencies(
       journalPath = archived.path;
     }
   }
-  // Independently retained sibling journals must describe the archived selector,
-  // not a later database incarnation. No import is resumed during this check.
+  // Sibling journals must describe the archived selector; nothing resumes.
   startupProfileDirectory(PathUtils.parent(journalPath));
   const file = canonicalFile(journalPath);
   if ((await IOUtils.stat(file.path)).type !== "regular") {

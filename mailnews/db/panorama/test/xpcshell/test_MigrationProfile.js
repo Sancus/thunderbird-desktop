@@ -1122,10 +1122,8 @@ const { getMigrationRestoreDependencies } = ChromeUtils.importESModule(
 
 /**
  * Archives an actual selector with its retained unit-boundary journal/archive.
- * Does not model native receipt validation, which runs in ordinary process tests.
  *
- * @param {boolean} [nested=false] - Archive the journal inside an external root
- *   that is backed up but is not one of the journal's own source mail roots.
+ * @param {boolean} [nested=false] - Archive the journal inside a foreign root.
  * @returns {Promise<object>} Original selector and complete verified root copies.
  */
 async function archivedSelectorInput(nested = false) {

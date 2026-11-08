@@ -2161,11 +2161,9 @@ function startupMigrationDirectory(journal, core, operation) {
 
 /**
  * Prepares an explicitly approved request and exits before native restoration.
- * Never stages or copies a live root. The next process owns native execution.
  *
  * @param {nsICommandLine} commandLine - Original startup command line.
- * @returns {Promise<object>|null} Restore-only request result, or null for an
- *   ordinary command. Rejection leaves all live roots and older requests intact.
+ * @returns {Promise<object>|null} Request result, or null for ordinary commands.
  */
 export function startPanoramaRestoreCommand(commandLine) {
   const flags = [

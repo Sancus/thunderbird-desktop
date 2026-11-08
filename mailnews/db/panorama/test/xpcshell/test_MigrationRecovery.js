@@ -1012,7 +1012,6 @@ const {
 
 /**
  * Creates a real locked profile and independent external roots for request tests.
- * The native process tests separately exercise destructive execution and custody.
  *
  * @returns {Promise<object>} Exact root paths, retained bytes and verified archive.
  */
@@ -1134,6 +1133,14 @@ add_task(async function test_restoreRejectsAnotherProfileAndChangedArchive() {
 add_task(async function test_restoreRecoveryChangesOnlyTheRequestedAction() {
   const input = await restoreRequestInput();
   const request = await input.request();
+  await Assert.rejects(
+    input.recover("ready"),
+    /Invalid restore recovery action/
+  );
+  await Assert.rejects(
+    requestMigrationRestoreRecovery(input.profilePath, input.root, "retry"),
+    /another operation/
+  );
   for (const action of ["retry", "rollback"]) {
     const changed = await input.recover(action);
     Assert.deepEqual(changed, {
@@ -1143,14 +1150,6 @@ add_task(async function test_restoreRecoveryChangesOnlyTheRequestedAction() {
     Assert.equal(await IOUtils.readUTF8(input.original), "newer profile bytes");
     Assert.equal(await IOUtils.readUTF8(input.mail), "newer mail bytes");
   }
-  await Assert.rejects(
-    input.recover("ready"),
-    /Invalid restore recovery action/
-  );
-  await Assert.rejects(
-    requestMigrationRestoreRecovery(input.profilePath, input.root, "retry"),
-    /another operation/
-  );
   Assert.deepEqual(await IOUtils.read(input.backup.path), input.manifest);
 });
 
@@ -1176,6 +1175,9 @@ add_task(async function test_unmutatedRetryPreparesFreshAndKeepsLedger() {
   await IOUtils.writeJSON(path, { ...fresh, progress: failed.progress });
   const again = await input.recover("retry");
   Assert.notEqual(again.stagingParent, fresh.stagingParent, "Second retry");
+  await IOUtils.writeJSON(path, { ...again, progress: failed.progress });
+  await input.recover("rollback");
+  Assert.ok(!(await IOUtils.exists(path)), "Unchanged rollback ends");
   failed.progress.roots = [{ phase: 1 }];
   await IOUtils.writeJSON(path, failed);
   Assert.deepEqual(await input.recover("retry"), failed, "Mutated roots stay");
@@ -1195,6 +1197,12 @@ add_task(async function test_changedArchiveCannotAuthorizeRestoreRetry() {
     action: "rollback",
   });
   Assert.equal(await IOUtils.readUTF8(input.mail), "newer mail bytes");
+  Assert.ok(!(await IOUtils.exists(path)), "Startup is no longer blocked");
+  const ledger = `restore-${rollback.operationId}-${PathUtils.filename(rollback.stagingParent)}.failed.json`;
+  Assert.deepEqual(
+    await IOUtils.read(PathUtils.join(PathUtils.parent(path), ledger)),
+    before
+  );
 });
 
 add_task(async function test_settledAuditRecoveryPreservesItsGeneration() {
@@ -1202,7 +1210,6 @@ add_task(async function test_settledAuditRecoveryPreservesItsGeneration() {
   const request = await input.request();
   const path = migrationRestoreRequestPath(input.profilePath);
   const directory = PathUtils.parent(path);
-  // Request-boundary fixture only: real custody and settlement are native tests.
   const completed = {
     ...request,
     nativeSettlement: 1,

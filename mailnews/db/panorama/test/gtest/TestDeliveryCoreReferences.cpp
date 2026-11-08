@@ -27251,6 +27251,22 @@ TEST_F(DeliveryCoreStartupRestore, RestoreRollbackRestoresAllDisplacedRoots) {
   // An exiting restore process rewrites profile files before rollback.
   ASSERT_EQ(NS_OK, WriteStartupFile("restore-exit.txt", "exit bytes"_ns));
   ASSERT_EQ(NS_OK, ChangeRestoreAction("rollback"));
+  // A link stops rollback at root 1 after root 0 returned; that process's exit
+  // rewrites root 0 again, which the resumed rollback must retain and return.
+  nsCOMPtr<nsIFile> link, file;
+  nsCString linkPath, bytes;
+  ASSERT_EQ(NS_OK, RestoreChildFile(mRestoreExternal, "stop"_ns,
+                                    getter_AddRefs(link)));
+  ASSERT_EQ(NS_OK, link->GetNativePath(linkPath));
+  ASSERT_EQ(0, symlink("missing-target", linkPath.get()));
+  RetireRestoreOwner();
+  EXPECT_TRUE(NS_FAILED(RunRestore()));
+  ASSERT_EQ(NS_OK, RestoreChildFile(mProfile, "restore-message.txt"_ns,
+                                    getter_AddRefs(file)));
+  ASSERT_EQ(NS_OK, JSONCacheReadFile(file, bytes));
+  EXPECT_EQ("newer retained profile bytes"_ns, bytes);
+  ASSERT_EQ(0, unlink(linkPath.get()));
+  ASSERT_EQ(NS_OK, WriteStartupFile("restore-exit.txt", "second exit"_ns));
   RetireRestoreOwner();
   ASSERT_EQ(NS_OK, RunRestore());
   ExpectRestoreBytes(false);

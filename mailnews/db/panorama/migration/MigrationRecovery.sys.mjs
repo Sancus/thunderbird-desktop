@@ -139,7 +139,6 @@ export function migrationRestoreRequestPath(profilePath) {
 
 /**
  * Verifies a complete restore archive and its original destination/dependency set.
- * Does not stage or copy files and does not authorize startup or live writes.
  *
  * @param {string} profilePath - Selected original profile directory.
  * @param {string} localProfilePath - Selected XRE local directory.
@@ -213,7 +212,6 @@ export async function inspectMigrationRestorePlan(
 /**
  * Writes an approved restore request for the next closed-writer native startup.
  * Consent covers EVERY original root and retention of its current child entries.
- * The request process must quit normally before the native executor can run.
  *
  * @param {string} profilePath - Exact selected profile directory.
  * @param {string} localProfilePath - Exact selected local directory.
@@ -271,9 +269,8 @@ export async function requestMigrationRestore(
 
 /**
  * Requests retry or complete rollback of the retained native transaction.
- * Preserves the operation, root set, progress, first error and retained bytes.
- * Retry verifies original inputs; rollback delegates retained custody to native
- * validation even when the original after-input archive is unavailable.
+ * Rollback of an unchanged operation keeps its ledger and staging and ends it.
+ * Retry re-verifies the archive; rollback relies on native retained custody.
  *
  * @param {string} profilePath - Selected original profile directory.
  * @param {string} localProfilePath - Selected original local directory.
@@ -349,13 +346,13 @@ export async function requestMigrationRestoreRecovery(
   if ((await IOUtils.readUTF8(source)) !== before) {
     throw new Error("Restore progress changed during recovery request");
   }
+  // Native persists phase 1 before any live change; phase 0 proves none.
   const roots = request.progress?.roots;
   if (
-    action === "retry" &&
     pending &&
-    roots?.length &&
-    !request.progress.outcome &&
-    roots.every(root => root.phase === 0)
+    !request.progress?.outcome &&
+    (request.progress ? roots?.length : action === "rollback") &&
+    (roots ?? []).every(root => root.phase === 0)
   ) {
     const ledger = restoreFile(
       PathUtils.join(
@@ -365,6 +362,10 @@ export async function requestMigrationRestoreRecovery(
     ).path;
     if ((await IOUtils.readUTF8(ledger).catch(() => null)) !== before) {
       await IOUtils.writeUTF8(ledger, before, { mode: "create", flush: true });
+    }
+    if (action === "rollback") {
+      await IOUtils.remove(path);
+      return { ...request, action };
     }
     delete request.progress;
     request.stagingParent = await IOUtils.createUniqueDirectory(
@@ -439,7 +440,6 @@ function restoreFile(path) {
 
 /**
  * Flushes request JSON while retaining its real Windows parent admission.
- * The native executor separately retains all live/source/output custody.
  *
  * @param {string} path - Fixed sibling request path.
  * @param {object} request - Verified request or same-operation recovery action.

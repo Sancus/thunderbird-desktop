@@ -10,6 +10,43 @@ Services.scriptloader.loadSubScript(
   this
 );
 
+/**
+ * Starts the input's native completion on a current native projection.
+ * Native message row updates that send no header notification (for example
+ * conversation threading after an insert) still journal new generations, and
+ * completion withholds those hits until the next update. Retry only when the
+ * source moved during the completion; on an unchanged projection the result
+ * is final.
+ *
+ * @param {HTMLInputElement} input - The real global search input.
+ * @param {string} text - The completion text.
+ * @returns {Promise<object>} The settled native result.
+ */
+async function currentNativeCompletion(input, text) {
+  for (let attempt = 1; ; attempt++) {
+    let progress;
+    do {
+      progress = await fixture.service.update({ limit: 500 });
+    } while (progress.moreWork);
+    Assert.equal(progress.pending, 0, JSON.stringify(progress));
+    Assert.equal(progress.acceptedThrough, progress.sourceWatermark);
+    const previous = provider.curResult;
+    input.controller.startSearch(text);
+    await TestUtils.waitForCondition(
+      () => provider.curResult != previous,
+      "The current input owns a fresh native completion"
+    );
+    const result = await completionResult(text);
+    const after = await fixture.service.update({ limit: 500 });
+    if (after.acceptedThrough == progress.acceptedThrough || attempt == 5) {
+      return result;
+    }
+    info(
+      `The native source moved from ${progress.acceptedThrough} to ${after.acceptedThrough} during completion`
+    );
+  }
+}
+
 add_task(
   async function test_nativeResultInputSurvivesControllerStopBeforeEnter() {
     await SpecialPowers.pushPrefEnv({
@@ -128,22 +165,10 @@ add_task(async function test_nativeInputClearCancelsDeferredTypedSelection() {
     await TestUtils.waitForCondition(() => owner.searchPromise);
     await owner.searchPromise;
     const input = owner.panel.querySelector(".remote-gloda-search");
-    // Use the current native projection, including work queued by the owner tab.
-    let progress;
-    do {
-      progress = await fixture.service.update({ limit: 500 });
-    } while (progress.moreWork);
-    Assert.equal(progress.pending, 0, JSON.stringify(progress));
-    Assert.equal(progress.acceptedThrough, progress.sourceWatermark);
     input.focus();
     input.value = "completionperson";
-    const previous = provider.curResult;
-    input.controller.startSearch("completionperson");
-    await TestUtils.waitForCondition(
-      () => provider.curResult != previous,
-      "The current input owns a fresh native completion"
-    );
-    const result = await completionResult("completionperson");
+    // Use the current native projection, including work queued by the owner tab.
+    const result = await currentNativeCompletion(input, "completionperson");
     assertCompletionInputOwnership(input);
     const index = result.rows.findIndex(row => row.type == "person");
     Assert.greaterOrEqual(index, 0, "The native completion has a person row");

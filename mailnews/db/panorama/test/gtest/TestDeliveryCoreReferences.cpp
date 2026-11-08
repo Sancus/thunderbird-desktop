@@ -27159,8 +27159,7 @@ TEST_F(DeliveryCoreStartupRestore,
   ASSERT_EQ(NS_OK, ArmSelectedStartup());
   nsCString profile;
   ASSERT_EQ(NS_OK, mProfile->GetNativePath(profile));
-  struct stat before {
-  }, after{}, lockBefore{}, lockAfter{};
+  struct stat before{}, after{}, lockBefore{}, lockAfter{};
   ASSERT_EQ(0, lstat(profile.get(), &before));
   nsCString lock;
   for (const char* leaf : {"parent.lock", ".parentlock", "lock"}) {
@@ -27197,7 +27196,7 @@ TEST_F(DeliveryCoreStartupRestore, RestoreRetainsDisplacedNewerData) {
   ASSERT_EQ(NS_OK, mRestoreExternal->Create(nsIFile::DIRECTORY_TYPE, 0700));
   nsCString descriptor;
   EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, ValidateRestore(descriptor));
-  struct stat retained {};
+  struct stat retained{};
   EXPECT_EQ(0, lstat(held.get(), &retained));
 }
 TEST_F(DeliveryCoreStartupRestore,
@@ -27302,8 +27301,7 @@ TEST_F(DeliveryCoreStartupRestore,
   int oldDatabase = open(databasePath.get(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
   ASSERT_GE(oldDatabase, 0);
   auto closeOld = MakeScopeExit([&] { EXPECT_EQ(0, close(oldDatabase)); });
-  struct stat before {
-  }, after{};
+  struct stat before{}, after{};
   ASSERT_EQ(0, fstat(oldDatabase, &before));
   ASSERT_EQ(NS_OK, RunRestore());
   ASSERT_EQ(0, lstat(databasePath.get(), &after));

@@ -29,12 +29,8 @@
 #include "nsIObserver.h"
 #include "nsTHashMap.h"
 
-#define DATABASE_CORE_CID                            \
-  {                                                  \
-    0xbb308d0b, 0xbb99, 0x4699, {                    \
-      0x89, 0xde, 0x42, 0x82, 0x65, 0x2d, 0x0e, 0x16 \
-    }                                                \
-  }
+#define DATABASE_CORE_CID \
+  {0xbb308d0b, 0xbb99, 0x4699, {0x89, 0xde, 0x42, 0x82, 0x65, 0x2d, 0x0e, 0x16}}
 
 class mozIStorageConnection;
 class mozIStorageStatement;

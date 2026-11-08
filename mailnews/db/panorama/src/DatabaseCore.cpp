@@ -213,8 +213,7 @@ class ProfileStartupOperation final : public nsIAsyncShutdownBlocker {
   bool auditCandidate = false;
 #ifndef XP_WIN
   int profileFD = -1, localFD = -1, databaseFD = -1;
-  struct stat profileIdentity {
-  }, localIdentity{}, databaseIdentity{};
+  struct stat profileIdentity{}, localIdentity{}, databaseIdentity{};
 #endif
 
  private:
@@ -354,7 +353,7 @@ nsresult RestorePending(nsIFile* profile, bool& pending,
   MOZ_TRY(request->Exists(&pending));
   pending |= link;
 #else
-  struct stat st {};
+  struct stat st{};
   nsCString requestPath(path + "/"_ns + nsDependentCString(leaf));
   if (!lstat(requestPath.get(), &st))
     pending = true;
@@ -428,8 +427,7 @@ nsresult DatabaseCore::CheckProfileStartup(nsISupports* token, bool metadata) {
   if (operation.profileLease) MOZ_TRY(RestorePin(*operation.profileLease));
   if (operation.localLease) MOZ_TRY(RestorePin(*operation.localLease));
 #ifndef XP_WIN
-  struct stat profile {
-  }, local{};
+  struct stat profile{}, local{};
   NS_ENSURE_TRUE(!lstat(operation.profilePath.get(), &profile) &&
                      !lstat(operation.localPath.get(), &local) &&
                      profile.st_dev == operation.profileIdentity.st_dev &&
@@ -441,7 +439,7 @@ nsresult DatabaseCore::CheckProfileStartup(nsISupports* token, bool metadata) {
 #endif
 #ifndef XP_WIN
   if (operation.databaseFD >= 0) {
-    struct stat database {};
+    struct stat database{};
     nsAutoCString path(operation.profilePath + "/panorama.sqlite"_ns);
     NS_ENSURE_TRUE(!lstat(path.get(), &database) && S_ISREG(database.st_mode) &&
                        database.st_dev == operation.databaseIdentity.st_dev &&
@@ -9508,8 +9506,7 @@ nsresult RestoreMeasure(StartupRestoreFD& node, StartupRestoreStamp& stamp) {
   else
     MOZ_TRY(node.lease->GetIdentity(stamp.id));
 #else
-  struct stat held {
-  }, current{};
+  struct stat held{}, current{};
   NS_ENSURE_TRUE(node.fd >= 0 && !fstat(node.fd, &held) &&
                      !lstat(node.path.get(), &current) &&
                      held.st_dev == current.st_dev &&
@@ -9520,7 +9517,7 @@ nsresult RestoreMeasure(StartupRestoreFD& node, StartupRestoreStamp& stamp) {
   stamp.id.Append(':');
   stamp.id.AppendInt(uint64_t(held.st_ino));
   if (node.io) {
-    struct stat opened {};
+    struct stat opened{};
     NS_ENSURE_TRUE(!fstat(PR_FileDesc2NativeHandle(node.io), &opened) &&
                        held.st_dev == opened.st_dev &&
                        held.st_ino == opened.st_ino,
@@ -9617,7 +9614,7 @@ nsresult RestorePrivate(StartupRestoreFD& node, bool stage) {
   // Admission rejects reparse/offline/shared roots before any IO.
   return RestorePin(node);
 #else
-  struct stat st {};
+  struct stat st{};
   NS_ENSURE_TRUE(
       !fstat(node.fd, &st) && st.st_uid == geteuid() &&
           (stage ? !(st.st_mode & 077) : (st.st_mode & 0722) == 0700),
@@ -9973,7 +9970,7 @@ nsresult RestoreRename(StartupRestoreFD& output, StartupRestoreFD& parent,
   nsCString oldLeaf, flat(leaf);
   MOZ_TRY(output.file->GetNativeLeafName(oldLeaf));
   if (!replace) {
-    struct stat exists {};
+    struct stat exists{};
     NS_ENSURE_TRUE(
         fstatat(parent.fd, flat.get(), &exists, AT_SYMLINK_NOFOLLOW) &&
             errno == ENOENT,
@@ -10031,7 +10028,7 @@ nsresult RestoreDrop(StartupRestoreFD& parent, const nsACString& leaf,
   NS_ENSURE_TRUE(CloseHandle(handle), NS_ERROR_FAILURE);
 #else
   nsCString name(leaf);
-  struct stat st {};
+  struct stat st{};
   NS_ENSURE_TRUE(!fstatat(parent.fd, name.get(), &st, AT_SYMLINK_NOFOLLOW),
                  NS_ERROR_NOT_AVAILABLE);
   nsCString id;

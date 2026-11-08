@@ -11375,20 +11375,8 @@ nsresult DatabaseCore::ReadStartupMailSource(JSContext* cx,
       do_GetService("@mozilla.org/preferences-service;1");
   NS_ENSURE_TRUE(prefs, NS_ERROR_NOT_AVAILABLE);
   nsCString branch("mail.server."_ns + output.serverKey + "."_ns);
-  bool relative;
-  MOZ_TRY(prefs->PrefHasUserValue(nsCString(branch + "directory-rel"_ns).get(),
-                                  &relative));
-  if (relative) {
-    nsCOMPtr<nsIRelativeFilePref> pref;
-    MOZ_TRY(prefs->GetComplexValue(nsCString(branch + "directory-rel"_ns).get(),
-                                   NS_GET_IID(nsIRelativeFilePref),
-                                   getter_AddRefs(pref)));
-    MOZ_TRY(pref->GetFile(getter_AddRefs(storedRoot)));
-  } else {
-    MOZ_TRY(prefs->GetComplexValue(nsCString(branch + "directory"_ns).get(),
-                                   NS_GET_IID(nsIFile),
-                                   getter_AddRefs(storedRoot)));
-  }
+  // The configured root in its canonical spelling, as the retained root is.
+  MOZ_TRY(StartupConfiguredPath(prefs, branch, getter_AddRefs(storedRoot)));
   bool same;
   MOZ_TRY(root->Equals(storedRoot, &same));
   NS_ENSURE_TRUE(same, NS_ERROR_NOT_AVAILABLE);

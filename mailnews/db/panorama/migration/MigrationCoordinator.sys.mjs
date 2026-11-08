@@ -2231,11 +2231,6 @@ function captureStartupMigration(signal) {
   ) {
     return { profilePath: profile.path };
   }
-  if (AppConstants.platform === "win") {
-    throw new Error(
-      "Windows startup migration requires native activation admission"
-    );
-  }
   const { collectMigrationRoots, createMigrationBackupAtStartup } =
     ChromeUtils.importESModule(
       "resource:///modules/panorama/MigrationBackup.sys.mjs"
@@ -2489,6 +2484,14 @@ function captureStartupMigration(signal) {
       books,
       caches,
     };
+  }
+  if (AppConstants.platform === "win") {
+    // Empty initialization and reuse need no legacy input. The startup
+    // journal, folder, cache and book imports have no Windows original-path
+    // admission yet, so legacy data is refused before any copy or selection.
+    throw new Error(
+      "Windows startup migration requires native activation admission"
+    );
   }
   // The stable outside-profile path preserves discoverable failed attempts.
   // Never create another archive to conceal an existing journal/partial copy.

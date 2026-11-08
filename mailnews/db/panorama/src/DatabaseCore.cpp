@@ -2998,8 +2998,29 @@ nsresult DatabaseCore::ReadStartupImapProvenance(const nsCString& proof,
     MOZ_TRY(number(member.snapshot.sourceSize));
     bool windows, epoch;
     MOZ_TRY(number(windows));
+#ifdef XP_WIN
+    // A Windows startup unit always committed its measured version2
+    // admission. Reuse reads it back only to compare it with the durable
+    // folder_import_windows row (ReadFolderImportReceipt); it never re-admits
+    // the obsolete original summary or offline store.
+    NS_ENSURE_TRUE(windows, NS_ERROR_NOT_AVAILABLE);
+    FolderImportWindowsIdentity paths;
+    for (auto* path : {&paths.summary, &paths.store}) {
+      for (auto* value : {&path->originalPath, &path->originalRoot,
+                          &path->canonicalPath, &path->canonicalRoot}) {
+        nsAutoCString utf8;
+        MOZ_TRY(text(utf8));
+        CopyUTF8toUTF16(utf8, *value);
+      }
+      for (auto* value : {&path->id, &path->parentId, &path->rootId})
+        MOZ_TRY(text(*value));
+    }
+    NS_ENSURE_FALSE(paths.summary.id.IsEmpty(), NS_ERROR_FILE_CORRUPTED);
+    id.windows = Some(std::move(paths));
+#else
     // This selected Unix operation cannot adopt a Windows physical receipt.
     NS_ENSURE_FALSE(windows, NS_ERROR_NOT_AVAILABLE);
+#endif
     MOZ_TRY(number(epoch));
     if (epoch) {
       uint32_t value;
@@ -12222,9 +12243,14 @@ nsresult DatabaseCore::CheckProfileActivation(
       NS_ENSURE_TRUE(ImapImportReceiptValue(cx, native, *receipt, arguments[1]),
                      NS_ERROR_OUT_OF_MEMORY);
       JS::Rooted<JS::Value> checked(cx);
+      // Ordinary reuse must not depend on the obsolete originals, which a
+      // later offline download, compaction or removal may legitimately change.
+      // On Windows the retained check compares the measured admission with the
+      // journal intent instead of re-admitting those files; the durable rows
+      // were already matched above (POSIX receipts carry no admission).
       MOZ_TRY(StartupModuleCall(
           cx, u"resource:///modules/panorama/MorkSnapshotAdapter.sys.mjs"_ns,
-          "validateMorkProtocolUnitReceipt", arguments, &checked));
+          "validateRetainedMorkProtocolUnitReceipt", arguments, &checked));
       MOZ_TRY(ImportMember(cx, unit, "receipt", &expected));
       MOZ_TRY(StartupEqual(cx, expected, checked));
       continue;
@@ -12274,6 +12300,13 @@ nsresult DatabaseCore::CheckProfileActivation(
       NS_ENSURE_TRUE(original, NS_ERROR_OUT_OF_MEMORY);
       for (const char* name : {"version", "token", "folder", "source"})
         MOZ_TRY(StartupCopy(cx, member, original, name));
+#ifdef XP_WIN
+      // The retained Windows member is a version2 request. Rebuild it with its
+      // original admission, which the converter compares with the journal
+      // source inventory (re-admitting the originals) and the native unit
+      // lookup re-acquires (FolderImportAdmission), as for a local source.
+      MOZ_TRY(StartupCopy(cx, member, original, "windowsAdmission"));
+#endif
       for (const char* name : {"messages", "records"})
         MOZ_TRY(StartupCopy(cx, data, original, name));
       JS::Rooted<JSObject*> binding(cx);

@@ -498,9 +498,12 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.clean_profile(False)
         source = self.create_legacy_message(store)
         self.stop_application()
-        source_root = Path(source["root"])
+        # Compare physical paths: macOS reaches the runner profile through a
+        # /var or /tmp link, and the server root keeps that spelling.
+        source_root = Path(source["root"]).resolve()
+        summary = Path(source["summary"]).resolve()
         before = {path: path.read_bytes() for path in source_root.rglob("*") if path.is_file()}
-        self.assertIn(Path(source["summary"]), before)
+        self.assertIn(summary, before)
         self.assertFalse((self.profile / "panorama.sqlite").exists())
         self.start_same_profile(True)
         selected = self.selection()
@@ -529,8 +532,8 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.assertEqual(headers, self.assert_message_after_activation(source))
         self.assertEqual(selector, (self.profile / "panorama-profile.json").read_bytes())
         self.assertEqual(journal, journal_path.read_bytes())
-        self.assertEqual(before[Path(source["summary"])],
-                         (backup.parent / "root-0" / Path(source["summary"]).relative_to(self.profile)).read_bytes())
+        self.assertEqual(before[summary],
+                         (backup.parent / "root-0" / summary.relative_to(self.profile)).read_bytes())
 
         # Normal reuse consumes native data and durable identities, not the archive.
         self.stop_application()

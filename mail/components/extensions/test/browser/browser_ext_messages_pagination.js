@@ -4,6 +4,10 @@
 
 "use strict";
 
+// The paged native queries take 75-85s on ordinary builds and about 190s on
+// Windows ASan.
+requestLongerTimeout(2);
+
 let account, rootFolder, subFolders;
 
 /**

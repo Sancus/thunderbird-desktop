@@ -1743,7 +1743,7 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         journal_state = json.loads(journal.read_bytes())
         self.assertEqual("complete", journal_state["stage"],
                          "Validation and activation finished before the failed publication")
-        self.assertIn("lastError", journal_state, "The interrupted cutover is recorded")
+        self.assertIsNotNone(journal_state["lastError"], "The interrupted cutover is recorded")
         mappings = self.native_unit_mappings()
         # Default local folders commit their own empty units beside these.
         for folder_id, count, keys, messages in mappings.values():
@@ -1773,17 +1773,20 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         """S7-15.4: cut the real native restore copy; never claim completion."""
         backup, markers, archive = self.external_restore_point()
         external = [marker.parent for marker in markers[1:]]
+        request = self.approve_restore(backup)
+        self.marionette.instance.app_args = self.original_args
+        # Closed-writer entry captures children created after the request.
         limit = self.largest_file_limit([self.profile, backup, *external])
         newer = self.profile / "s715-newer-before-restore"
         digest = self.write_large_file(newer, 4 * limit)
         archived = self.file_digests(backup)
-        request = self.approve_restore(backup)
-        self.marionette.instance.app_args = self.original_args
         self.start_with_file_size_limit(limit)
 
         self.assert_cut_copy(request["stagingParent"], newer, limit)
         pending = self.restore_request_path()
-        self.assertEqual(request["operationId"], json.loads(pending.read_text())["operationId"])
+        interrupted = json.loads(pending.read_text())
+        self.assertEqual(request["operationId"], interrupted["operationId"])
+        self.assertIn("progress", interrupted, "Progress precedes the first custody copy")
         self.assertFalse(pending.with_name("restore-current.json").exists())
         self.assertFalse(list(pending.parent.glob("restore-*.complete.json")))
         self.assertEqual(archive, (backup / "manifest.json").read_bytes())
@@ -1795,19 +1798,16 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.stop_application()
         self.marionette.instance.start()
         code = self.marionette.instance.runner.wait(timeout=self.marionette.startup_timeout)
-        if code == 5:
-            # Interrupted work blocks; the documented exact-operation retry follows.
-            self.assertEqual(request["operationId"],
-                             json.loads(pending.read_text())["operationId"])
-            self.assertFalse(pending.with_name("restore-current.json").exists())
-            for marker in markers:
-                self.assertEqual(b"newer retained restore bytes\n", marker.read_bytes())
-            self.restore_exit(["--panorama-restore-retry"])
-            self.assertTrue(list(pending.parent.glob(
-                f'restore-{request["operationId"]}-*.failed.json')))
-            self.restore_exit()
-        else:
-            self.assertEqual(0, code, "Restart either refuses or settles the restore")
+        self.assertEqual(5, code, "Unfinished interrupted work blocks ordinary startup")
+        self.assertEqual(request["operationId"], json.loads(pending.read_text())["operationId"])
+        self.assertFalse(pending.with_name("restore-current.json").exists())
+        for marker in markers:
+            self.assertEqual(b"newer retained restore bytes\n", marker.read_bytes())
+        # The documented exact-operation retry, then one ordinary settlement.
+        self.restore_exit(["--panorama-restore-retry"])
+        self.assertTrue(list(pending.parent.glob(
+            f'restore-{request["operationId"]}-*.failed.json')))
+        self.restore_exit()
         result = self.restore_result()
         self.assertEqual(request["operationId"], result["operationId"])
         self.assertEqual("restored", result["progress"]["outcome"])

@@ -8980,6 +8980,21 @@ void nsImapProtocol::Copy(const char* messageList,
 #ifdef MOZ_PANORAMA
     auto* preparedUrl = static_cast<nsImapUrl*>(m_runningUrl.get());
     auto onlineInputs = preparedUrl->CopyNativeOnlineCopyInputs();
+    nsTArray<nsCOMPtr<nsIFile>> wireSnapshots;
+    auto removeWireSnapshots = [&]() -> nsresult {
+      nsresult result = NS_OK;
+      for (const auto& file : wireSnapshots) {
+        nsresult removed = file->Remove(false);
+        if (NS_SUCCEEDED(result)) result = removed;
+      }
+      wireSnapshots.Clear();
+      return result;
+    };
+    auto wireCleanup = mozilla::MakeScopeExit([&] {
+      nsresult removed = removeWireSnapshots();
+      if (NS_FAILED(removed) && NS_SUCCEEDED(m_mailboxUpdateResult))
+        m_mailboxUpdateResult = removed;
+    });
     if (preparedUrl->HasNativeOnlineCopyTargets() &&
         !(GetServerStateParser().GetCapabilityFlag() & kUidplusCapability)) {
       uint32_t sourceEpoch = GetServerStateParser().FolderUIDValidity();
@@ -8988,11 +9003,25 @@ void nsImapProtocol::Copy(const char* messageList,
         return;
       }
       for (auto& input : onlineInputs) {
-        if (input.snapshotReady) continue;
         bool inChunk = false;
         for (uint32_t i = msgsHandled - msgsToHandle; i < msgsHandled; ++i)
           inChunk |= msgUids[i] == input.sourceUid;
         if (!inChunk) continue;
+        if (input.snapshotReady) {
+          // Provider recovery includes local store headers, not wire bytes.
+          // Keep it intact and attest an independent source FETCH snapshot.
+          nsCOMPtr<nsIFile> wire;
+          nsresult created = input.snapshot->Clone(getter_AddRefs(wire));
+          if (NS_SUCCEEDED(created))
+            created = wire->CreateUnique(nsIFile::NORMAL_FILE_TYPE, 00600);
+          if (NS_FAILED(created)) {
+            m_mailboxUpdateResult = created;
+            return;
+          }
+          wireSnapshots.AppendElement(wire);
+          input.snapshot = wire;
+          input.snapshotReady = false;
+        }
         nsresult captured = VerifyNativeAppendReadback(
             input.snapshot, input.sourceUid, sourceEpoch, true);
         if (NS_FAILED(captured)) {
@@ -9108,6 +9137,8 @@ void nsImapProtocol::Copy(const char* messageList,
               recorded = NS_ERROR_NOT_AVAILABLE;
           }
         }
+        nsresult removed = removeWireSnapshots();
+        if (NS_SUCCEEDED(recorded)) recorded = removed;
         if (NS_SUCCEEDED(recorded) && m_imapMailFolderSink)
           recorded = m_imapMailFolderSink->SetCopyResponseUid("", m_runningUrl);
       }
@@ -9125,6 +9156,13 @@ void nsImapProtocol::Copy(const char* messageList,
       if (NS_SUCCEEDED(m_mailboxUpdateResult)) m_mailboxUpdateResult = rv;
       return;
     }
+#ifdef MOZ_PANORAMA
+    nsresult removed = removeWireSnapshots();
+    if (NS_FAILED(removed)) {
+      m_mailboxUpdateResult = removed;
+      return;
+    }
+#endif
   } while (msgCountLeft > 0 && !DeathSignalReceived());
 }
 

@@ -18,7 +18,8 @@ add_task(
     skip_if: () => IS_NNTP,
   },
   async function setup() {
-    const account = await createAccount();
+    // Returning a copy beside its original requires an actual COPYUID mapping.
+    const account = await createAccount(undefined, { extensions: ["RFC4315"] });
     const rootFolder = account.incomingServer.rootFolder;
     gSubFolders = {
       test1: await createSubfolder(rootFolder, "test1"),

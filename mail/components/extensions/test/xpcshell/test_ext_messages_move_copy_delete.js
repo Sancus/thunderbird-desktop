@@ -662,12 +662,34 @@ add_task(
           .getChildNamed(foldername)
           .QueryInterface(Ci.nsIMsgImapMailFolder);
 
-        const listener = new PromiseTestUtils.PromiseUrlListener();
+        const makeListener = phase =>
+          new PromiseTestUtils.PromiseUrlListener({
+            OnStopRunningUrl(url, status) {
+              if (Components.isSuccessCode(status)) {
+                return;
+              }
+              const details = { phase, status, folder: folder.URI };
+              try {
+                const imapUrl = url.QueryInterface(Ci.nsIImapUrl);
+                Object.assign(details, {
+                  url: url.spec,
+                  action: imapUrl.imapAction,
+                  uids: imapUrl.listOfMessageIds,
+                  epoch: folder.msgDatabase.dBFolderInfo.imapUidValidity,
+                  keys: [...folder.messages].slice(0, 16).map(h => h.messageKey),
+                });
+              } catch (ex) {
+                details.captureError = String(ex);
+              }
+              info(`forceServerUpdate failure: ${JSON.stringify(details)}`);
+            },
+          });
+        const listener = makeListener("updateFolderWithListener");
         folder.updateFolderWithListener(null, listener);
         await listener.promise;
 
         // ...and download for offline use.
-        const promiseUrlListener = new PromiseTestUtils.PromiseUrlListener();
+        const promiseUrlListener = makeListener("downloadAllForOffline");
         folder.downloadAllForOffline(promiseUrlListener, null);
         await promiseUrlListener.promise;
       }

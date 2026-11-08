@@ -88,6 +88,7 @@
 #ifdef MOZ_PANORAMA
 #  include "../../local/src/nsLocalUtils.h"
 #  include "DatabaseCore.h"
+#  include "DetachedMsgHdr.h"
 #  include "nsDirectoryServiceDefs.h"
 #  include "Message.h"
 #  include "PerFolderDatabase.h"
@@ -6537,8 +6538,18 @@ nsresult nsImapMailFolder::HandleCustomFlags(nsMsgKey msgKey,
     MOZ_TRY(
         mDatabase->SetStringPropertyByHdr(dbHdr, "junkscore", msgJunkScore));
   } else if (CaseInsensitiveFindInReadable("Junk"_ns, keywords)) {
-    uint32_t newFlags;
-    MOZ_TRY(dbHdr->AndFlags(~nsMsgMessageFlags::New, &newFlags));
+    bool clearNew = true;
+#ifdef MOZ_PANORAMA
+    if (mail_panorama_enabled_AtStartup()) {
+      RefPtr<mozilla::mailnews::DetachedMsgHdr> parsed = do_QueryObject(dbHdr);
+      // A keyword refresh of a published member does not reclassify New.
+      clearNew = bool(parsed);
+    }
+#endif
+    if (clearNew) {
+      uint32_t newFlags;
+      MOZ_TRY(dbHdr->AndFlags(~nsMsgMessageFlags::New, &newFlags));
+    }
     nsAutoCString msgJunkScore;
     msgJunkScore.AppendInt(nsIJunkMailPlugin::IS_SPAM_SCORE);
     MOZ_TRY(
@@ -7136,12 +7147,34 @@ nsImapMailFolder::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
       nsCOMPtr<nsIMsgFolderNotificationService> notifier =
           mozilla::components::FolderNotification::Service();
       if (m_copyState) {
-        if (imapAction == nsIImapUrl::nsImapOnlineMove) {
+        nsTArray<RefPtr<nsIMsgDBHdr>> destinationHeaders;
+        bool notifyCopy = true;
+#ifdef MOZ_PANORAMA
+        if (static_cast<nsImapUrl*>(imapUrl.get())->HasNativeOnlineCopyTargets()) {
+          notifyCopy = NS_SUCCEEDED(aExitCode);
+          if (notifyCopy) {
+            for (const auto& entry : m_copyState->m_nativeOnlineCopies) {
+              if (!entry->settled || !entry->live) {
+                aExitCode = NS_ERROR_NOT_AVAILABLE;
+                notifyCopy = false;
+                break;
+              }
+              RefPtr<nsIMsgDBHdr> header = entry->live.get();
+              destinationHeaders.AppendElement(std::move(header));
+            }
+            if (destinationHeaders.Length() != m_copyState->m_messages.Length()) {
+              aExitCode = NS_ERROR_NOT_AVAILABLE;
+              notifyCopy = false;
+            }
+          }
+        }
+#endif
+        if (notifyCopy && imapAction == nsIImapUrl::nsImapOnlineMove) {
           notifier->NotifyMsgsMoveCopyCompleted(true, m_copyState->m_messages,
-                                                this, {});
-        } else if (imapAction == nsIImapUrl::nsImapOnlineCopy) {
+                                                this, destinationHeaders);
+        } else if (notifyCopy && imapAction == nsIImapUrl::nsImapOnlineCopy) {
           notifier->NotifyMsgsMoveCopyCompleted(false, m_copyState->m_messages,
-                                                this, {});
+                                                this, destinationHeaders);
         } else if (imapAction == nsIImapUrl::nsImapDeleteMsg) {
           notifier->NotifyMsgsDeleted(m_copyState->m_messages);
         }

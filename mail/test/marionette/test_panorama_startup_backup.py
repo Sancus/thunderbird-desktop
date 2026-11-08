@@ -1777,10 +1777,13 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
                          "Validation and activation finished before the failed publication")
         self.assertIn("lastError", journal_state, "The interrupted cutover is recorded")
         mappings = self.native_unit_mappings()
-        self.assertEqual(len(summaries), len(mappings))
+        # Default local folders commit their own empty units beside these.
         for folder_id, count, keys, messages in mappings.values():
-            self.assertEqual((1, 1, 1), (count, len(keys), messages),
+            self.assertEqual((count, count), (len(keys), messages),
                              "Each committed unit keeps exactly one physical mapping")
+        self.assertEqual(len(summaries), sum(value[1] for value in mappings.values()))
+        self.assertEqual(len(summaries), len([v for v in mappings.values() if v[1] == 1]),
+                         "Every original message has one committed unit mapping")
         self.assertEqual(len(mappings), len({value[0] for value in mappings.values()}))
         for path, contents in originals.items():
             self.assertEqual(contents, path.read_bytes())

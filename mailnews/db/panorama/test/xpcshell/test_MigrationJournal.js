@@ -1910,10 +1910,16 @@ add_task(
 add_task(
   { skip_if: () => AppConstants.platform === "win" },
   async function test_startupJournalRetainsUnicodeCacheDescriptor() {
-    const root = await IOUtils.createUniqueDirectory(
-      PathUtils.tempDir,
-      "startup-journal-unicode-"
+    // Retained startup paths are normalized physical paths, and the macOS
+    // temporary directory is reached through a /tmp link.
+    const rootFile = new FileUtils.File(
+      await IOUtils.createUniqueDirectory(
+        PathUtils.tempDir,
+        "startup-journal-unicode-"
+      )
     );
+    rootFile.normalize();
+    const root = rootFile.path;
     registerCleanupFunction(() => IOUtils.remove(root, { recursive: true }));
     const profilePath = PathUtils.join(root, "\u90ae\u4ef6-e\u0301");
     const work = PathUtils.join(root, "work");

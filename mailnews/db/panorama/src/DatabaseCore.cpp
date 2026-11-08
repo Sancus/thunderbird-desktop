@@ -6758,10 +6758,12 @@ namespace {
 constexpr auto kCacheJSONLeaf = "\\folderCache.json"_ns;
 constexpr auto kCacheDatabaseLeaf = "\\panorama.sqlite"_ns;
 constexpr auto kCacheSelectorLeaf = "\\panorama-profile.json"_ns;
+constexpr auto kCachePanaceaLeaf = "\\panacea.dat"_ns;
 #else
 constexpr auto kCacheJSONLeaf = "/folderCache.json"_ns;
 constexpr auto kCacheDatabaseLeaf = "/panorama.sqlite"_ns;
 constexpr auto kCacheSelectorLeaf = "/panorama-profile.json"_ns;
+constexpr auto kCachePanaceaLeaf = "/panacea.dat"_ns;
 #endif
 
 bool CacheText(JSContext* cx, JS::Handle<JSObject*> object, const char* name,
@@ -13345,11 +13347,12 @@ nsresult DatabaseCore::OpenProfileStartup(JSContext* cx,
       // Every observed summary/book/cache must have a declared retained unit.
       // Physical store files are accounted by the source store, never imported
       // as a remote hierarchy or substituted for an original summary.
+      // Inventory paths use the platform separator (GetComparablePath).
       for (const auto& path : inventory) {
         if (StringEndsWith(path, ".msf"_ns) ||
             StringEndsWith(path, ".mab"_ns) ||
-            StringEndsWith(path, "/panacea.dat"_ns) ||
-            StringEndsWith(path, "/folderCache.json"_ns)) {
+            StringEndsWith(path, kCachePanaceaLeaf) ||
+            StringEndsWith(path, kCacheJSONLeaf)) {
           NS_ENSURE_TRUE(paths.Contains(path), NS_ERROR_NOT_AVAILABLE);
         }
       }
@@ -15237,8 +15240,8 @@ nsresult DatabaseCore::CheckProfileActivation(
                                  &operation.retiredPaths));
   for (const auto& path : finalInventory) {
     if (StringEndsWith(path, ".msf"_ns) || StringEndsWith(path, ".mab"_ns) ||
-        StringEndsWith(path, "/panacea.dat"_ns) ||
-        StringEndsWith(path, "/folderCache.json"_ns))
+        StringEndsWith(path, kCachePanaceaLeaf) ||
+        StringEndsWith(path, kCacheJSONLeaf))
       NS_ENSURE_TRUE(declaredPaths.Contains(path), NS_ERROR_NOT_AVAILABLE);
   }
   MOZ_TRY(

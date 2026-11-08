@@ -447,10 +447,17 @@ export function getMorkProtocolUnitIntent(request) {
  *
  * @param {object} request - Converted unit or its retained journal intent.
  * @param {object} receipt - Actual native committed version3 receipt.
+ * @param {object} [options] - Validation mode.
+ * @param {boolean} [options.retained=false] - Compare Windows admission with
+ *   the retained intent instead of re-admitting the original files.
  * @returns {object} Independent canonical receipt with all checked protocol data.
  * @throws {Error} For changed identity, incomplete maps or conflicting payload.
  */
-export function validateMorkProtocolUnitReceipt(request, receipt) {
+export function validateMorkProtocolUnitReceipt(
+  request,
+  receipt,
+  { retained = false } = {}
+) {
   const intent = getMorkProtocolUnitIntent(request);
   if (
     receipt?.version !== 3 ||
@@ -466,7 +473,7 @@ export function validateMorkProtocolUnitReceipt(request, receipt) {
   const allocated = new Set();
   const folders = intent.folders.map((member, index) => {
     const native = receipt.folders[index];
-    const checked = validateMorkFolderReceipt(member, native);
+    const checked = validateMorkFolderReceipt(member, native, { retained });
     if (
       maps.has(member.sourceId) ||
       native.imap?.version !== 1 ||
@@ -856,6 +863,24 @@ export async function importMorkFolderSnapshot(core, folder, source) {
 }
 
 /**
+ * Checks a committed unit receipt during ordinary selected-startup reuse.
+ * After activation Panorama owns the folders: the obsolete original summary
+ * and offline store may legitimately be compacted, replaced or removed. On
+ * Windows the measured admission is therefore compared with the retained
+ * journal intent (and, by the native caller, with the durable
+ * folder_import_windows rows), never re-admitted. All other checks are those
+ * of validateMorkProtocolUnitReceipt.
+ *
+ * @param {object} request - Retained journal unit intent.
+ * @param {object} receipt - Actual durable native version3 receipt.
+ * @returns {object} Independent canonical receipt with all checked protocol data.
+ * @throws {Error} For changed identity, incomplete maps or conflicting payload.
+ */
+export function validateRetainedMorkProtocolUnitReceipt(request, receipt) {
+  return validateMorkProtocolUnitReceipt(request, receipt, { retained: true });
+}
+
+/**
  * Validates every returned original/global key pair without allocation-order or
  * Message-ID inference. Keeps source-unit/database identity for reconciliation.
  * Windows version2 additionally retains all measured admission/physical fields
@@ -863,11 +888,21 @@ export async function importMorkFolderSnapshot(core, folder, source) {
  *
  * @param {object} request - Complete checked version1/2 snapshot.
  * @param {object} receipt - Native committed receipt, not a hash-only marker.
+ * @param {object} [options] - Validation mode.
+ * @param {boolean} [options.retained=false] - On Windows, compare the receipt's
+ *   measured admission with the request's retained admission and canonical
+ *   binding instead of re-admitting the original files (startup reuse only).
  * @returns {object} Independent receipt in canonical original-key order.
  */
-export function validateMorkFolderReceipt(request, receipt) {
+export function validateMorkFolderReceipt(
+  request,
+  receipt,
+  { retained = false } = {}
+) {
   const windows = request.version === 2 && AppConstants.platform == "win";
-  if (windows) {
+  if (windows && retained) {
+    validateRetainedWindowsReceipt(request, receipt);
+  } else if (windows) {
     if (!request.windowsAdmission) {
       throw new Error(
         "Unsupported native Mork receipt version/physical admission"
@@ -951,6 +986,64 @@ export function validateMorkFolderReceipt(request, receipt) {
         }
       : {}),
   };
+}
+
+/**
+ * Compares a Windows version2 receipt with its request's retained admission.
+ * Every original/ID field must equal the retained intent, each canonical path
+ * the request's canonical folder binding, and the source physical identity the
+ * retained summary identity. Reads no file and holds no lease.
+ *
+ * @param {object} request - Retained version2 member request.
+ * @param {object} receipt - Durable native version2 receipt.
+ * @throws {Error} For any missing, extra or changed admission field.
+ */
+function validateRetainedWindowsReceipt(request, receipt) {
+  const retained = ["originalPath", "originalRoot", "id", "parentId", "rootId"];
+  const canonical = {
+    summary: request.folder?.summaryPath,
+    store: request.folder?.storePath,
+  };
+  const saved = request.windowsAdmission;
+  const source = request.source?.physicalIdentity;
+  if (
+    !saved ||
+    Object.keys(saved).length != 2 ||
+    typeof canonical.summary != "string" ||
+    typeof canonical.store != "string" ||
+    request.source?.path !== canonical.summary ||
+    source?.version !== 1 ||
+    source.id !== saved.summary?.id ||
+    source.parentId !== saved.summary?.parentId ||
+    receipt?.version !== 2 ||
+    !receipt.windowsAdmission ||
+    Object.keys(receipt.windowsAdmission).length != 2 ||
+    ["summary", "store"].some(kind => {
+      const value = receipt.windowsAdmission[kind];
+      return (
+        !saved[kind] ||
+        Object.keys(saved[kind]).length != retained.length ||
+        !value ||
+        Object.keys(value).length != retained.length + 2 ||
+        retained.some(
+          name =>
+            typeof saved[kind][name] != "string" ||
+            value[name] !== saved[kind][name]
+        ) ||
+        value.canonicalPath !== canonical[kind] ||
+        typeof value.canonicalRoot != "string" ||
+        !value.canonicalRoot
+      );
+    }) ||
+    receipt.sourcePhysicalIdentity?.version !== 1 ||
+    Object.keys(receipt.sourcePhysicalIdentity).length != 3 ||
+    receipt.sourcePhysicalIdentity.id !== source.id ||
+    receipt.sourcePhysicalIdentity.parentId !== source.parentId
+  ) {
+    throw new Error(
+      "Native Windows migration receipt differs from its retained intent"
+    );
+  }
 }
 
 /**

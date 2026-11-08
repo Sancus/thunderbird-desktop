@@ -417,8 +417,8 @@ add_task(
       async background() {
         const accounts = await browser.accounts.list();
         const selected = accounts
-          .flatMap(account => account.folders)
-          .find(folder => folder.name == "compactIdentity");
+          .flatMap(item => item.folders)
+          .find(item => item.name == "compactIdentity");
         const original = (await browser.messages.list(selected.id)).messages;
         browser.test.assertEq(3, original.length);
         await browser.messages.delete([original[0].id], {

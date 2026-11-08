@@ -1573,6 +1573,16 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             if path.is_file() and not path.is_symlink()
         }
 
+    def assert_cut_copy(self, parent, source, limit):
+        """Prove the kernel stopped the real copy of `source` at exactly `limit`."""
+        cut = [path for path in Path(parent).rglob("*")
+               if path.is_file() and not path.is_symlink() and path.stat().st_size == limit]
+        self.assertEqual(1, len(cut), "Exactly one copy stopped at the limit")
+        with open(source, "rb") as original:
+            self.assertEqual(original.read(limit), cut[0].read_bytes(),
+                             "The stopped write is the oversized input's own copy")
+        return cut[0]
+
     def start_with_file_size_limit(self, limit):
         """Start the stopped process so the kernel stops its first write past limit."""
         import resource
@@ -1740,8 +1750,7 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
                             if Path(root["source"]).resolve() == self.profile)
         self.assertFalse((backup / profile_root["directory"] / large.name).exists(),
                          "The cut file is never installed in the archive")
-        partial = [path.stat().st_size for path in (backup / "scratch").iterdir()]
-        self.assertTrue(partial and max(partial) <= limit, partial)
+        self.assert_cut_copy(backup / "scratch", large, limit)
         for absent in (work / "journal.json", self.profile / "panorama-profile.json",
                        self.profile / "panorama.sqlite"):
             self.assertFalse(absent.exists(), "No migration state follows a partial copy")
@@ -1828,6 +1837,7 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.marionette.instance.app_args = self.original_args
         self.start_with_file_size_limit(limit)
 
+        self.assert_cut_copy(request["stagingParent"], newer, limit)
         pending = self.restore_request_path()
         self.assertEqual(request["operationId"], json.loads(pending.read_text())["operationId"])
         self.assertFalse(pending.with_name("restore-current.json").exists())

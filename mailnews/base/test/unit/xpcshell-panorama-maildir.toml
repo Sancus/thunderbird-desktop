@@ -15,3 +15,4 @@ tags = ["panorama", "maildir"]
 
 ["test_moveCopyFoldersAcrossServers.js"]
 verbose = true
+run-sequentially = true # Times out in parallel runs; passes well within the limit alone.

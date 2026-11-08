@@ -214,12 +214,15 @@ async function createImapAccount(offline) {
 
 /** @returns {nsIMsgLocalMailFolder} The Local Folders root, created if needed. */
 function localRoot() {
-  if (!MailServices.accounts.localFoldersServer) {
-    MailServices.accounts.createLocalMailAccount();
-  }
-  return MailServices.accounts.localFoldersServer.rootFolder.QueryInterface(
-    Ci.nsIMsgLocalMailFolder
+  // The localFoldersServer getter throws until a Local Folders account exists.
+  let server = [...MailServices.accounts.allServers].find(
+    s => s.type == "none"
   );
+  if (!server) {
+    MailServices.accounts.createLocalMailAccount();
+    server = MailServices.accounts.localFoldersServer;
+  }
+  return server.rootFolder.QueryInterface(Ci.nsIMsgLocalMailFolder);
 }
 
 /**

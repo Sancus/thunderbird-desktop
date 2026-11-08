@@ -10,6 +10,23 @@ Services.scriptloader.loadSubScript(
   this
 );
 
+// DIAG-013 (diagnostic only, never a candidate): native revision state of both fixture copies.
+function diagStates(label) {
+  const states = fixture.expected.map(([uri, key]) => {
+    const s = fixture.service.resolveDocument(String(key));
+    return s && {
+      id: s.id,
+      eligible: s.eligible,
+      generation: s.generation,
+      policyRevision: s.policyRevision,
+      contentRevision: s.contentRevision,
+      location: s.location,
+      uri,
+    };
+  });
+  info("DIAG013 " + label + " " + JSON.stringify(states));
+}
+
 add_task(
   async function test_nativeResultInputSurvivesControllerStopBeforeEnter() {
     await SpecialPowers.pushPrefEnv({
@@ -88,6 +105,7 @@ add_task(
         }
       }
       await SpecialPowers.popPrefEnv();
+      diagStates("after-test1");
     }
   }
 );
@@ -117,6 +135,7 @@ add_task(
     Assert.equal(fixture.folders[0].getTotalMessages(false), 1);
     Assert.equal(fixture.folders[1].getTotalMessages(false), 1);
     Assert.equal(fixture.folders[2].getTotalMessages(false), 1);
+    diagStates("after-test2");
   }
 );
 
@@ -128,11 +147,13 @@ add_task(async function test_nativeInputClearCancelsDeferredTypedSelection() {
     await TestUtils.waitForCondition(() => owner.searchPromise);
     await owner.searchPromise;
     const input = owner.panel.querySelector(".remote-gloda-search");
+    diagStates("test3-before-update");
     // Use the current native projection, including work queued by the owner tab.
     let progress;
     do {
       progress = await fixture.service.update({ limit: 500 });
     } while (progress.moreWork);
+    diagStates("test3-after-update");
     Assert.equal(progress.pending, 0, JSON.stringify(progress));
     Assert.equal(progress.acceptedThrough, progress.sourceWatermark);
     input.focus();
@@ -144,6 +165,18 @@ add_task(async function test_nativeInputClearCancelsDeferredTypedSelection() {
       "The current input owns a fresh native completion"
     );
     const result = await completionResult("completionperson");
+    diagStates("test3-after-completion");
+    info("DIAG013 rows " + JSON.stringify(result.rows));
+    if (!result.rows.some(row => row.type == "person")) {
+      info("DIAG013 direct " + JSON.stringify(await fixture.service.complete("completionperson")));
+      let more;
+      do {
+        more = await fixture.service.update({ limit: 500 });
+      } while (more.moreWork);
+      info("DIAG013 update-again " + JSON.stringify(more));
+      diagStates("test3-after-update-again");
+      info("DIAG013 direct-again " + JSON.stringify(await fixture.service.complete("completionperson")));
+    }
     assertCompletionInputOwnership(input);
     const index = result.rows.findIndex(row => row.type == "person");
     Assert.greaterOrEqual(index, 0, "The native completion has a person row");

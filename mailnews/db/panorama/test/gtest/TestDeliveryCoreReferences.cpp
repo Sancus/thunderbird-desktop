@@ -16,6 +16,7 @@
 #ifndef XP_WIN
 #  include "../../../../../../toolkit/xre/nsAppRunner.h"
 #  include <unistd.h>
+#  include <fcntl.h>
 #endif
 #include "FolderDatabase.h"
 #include "js/JSON.h"
@@ -26498,6 +26499,975 @@ TEST_F(DeliveryCoreReferences, StartupColdReuseRefusesMissingPhysicalStore) {
   nsCString name("Original logical name ");
   for (uint32_t i = 0; i < 45; ++i) name.AppendLiteral("long");
   CheckCommittedColdLocalReuse(name, true, 3);
+}
+
+// Stock gtest process partition: these cases operate on genuinely locked,
+// unique temporary profiles. Archives/inventories are produced independently
+// through nsIFile, not by the restore executor being tested.
+class DeliveryCoreStartupRestore : public DeliveryCoreReferences {
+ protected:
+  void SetUp() override {
+    DeliveryCoreReferences::SetUp();
+    if (HasFatalFailure()) return;
+    (void)StaticPrefs::mail_panorama_enabled_AtStartup();
+    mRestorePref = MakeUnique<AutoRestore<bool>>(
+        StaticPrefs::sMirror_mail_panorama_enabled_AtStartup);
+    StaticPrefs::sMirror_mail_panorama_enabled_AtStartup = true;
+  }
+  void TearDown() override {
+    DeliveryCoreReferences::TearDown();
+    if (mRestoreControl) EXPECT_EQ(NS_OK, mRestoreControl->Remove(true));
+  }
+  nsresult RunArmedRestore() {
+    dom::AutoJSAPI jsapi;
+    NS_ENSURE_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()), NS_ERROR_FAILURE);
+    return mCore->RunProfileRestore(jsapi.cx());
+  }
+  nsresult RestoreStartupError() { return mCore->mStartupFailure; }
+  bool RestoreManaged() { return mCore->mStartupManaged; }
+  nsresult RestoreReadReceipt(const FolderImportIdentity& identity,
+                              Maybe<FolderImportReceipt>& result) {
+    return mCore->ReadFolderImportReceipt(identity, result);
+  }
+  void TearDown() override {
+    DeliveryCoreReferences::TearDown();
+    if (mRestoreControl) EXPECT_EQ(NS_OK, mRestoreControl->Remove(true));
+  }
+  nsresult RestoreChildFile(nsIFile* directory, const nsACString& name,
+                            nsIFile** result) {
+    MOZ_TRY(directory->Clone(result));
+    return (*result)->AppendNative(name);
+  }
+  nsresult RestoreQuote(JSContext* cx, const nsACString& text,
+                        nsACString& result) {
+    return JSONCacheQuote(cx, text, result);
+  }
+  nsresult RestoreListing(JSContext* cx, nsIFile* directory,
+                          nsTArray<nsCString>& parts, nsACString& entries,
+                          bool& first, bool profile) {
+    nsCOMPtr<nsIDirectoryEnumerator> iterator;
+    MOZ_TRY(directory->GetDirectoryEntries(getter_AddRefs(iterator)));
+    auto close = MakeScopeExit([&] { iterator->Close(); });
+    nsTArray<nsCOMPtr<nsIFile>> children;
+    for (;;) {
+      nsCOMPtr<nsIFile> child;
+      MOZ_TRY(iterator->GetNextFile(getter_AddRefs(child)));
+      if (!child) break;
+      children.AppendElement(child);
+    }
+    MOZ_TRY(iterator->Close());
+    close.release();
+    children.Sort([](const nsCOMPtr<nsIFile>& a, const nsCOMPtr<nsIFile>& b) {
+      nsCString x, y;
+      MOZ_ALWAYS_SUCCEEDS(a->GetNativeLeafName(x));
+      MOZ_ALWAYS_SUCCEEDS(b->GetNativeLeafName(y));
+      return Compare(NS_ConvertUTF8toUTF16(x), NS_ConvertUTF8toUTF16(y));
+    });
+    for (const auto& child : children) {
+      nsCString name, quoted;
+      MOZ_TRY(child->GetNativeLeafName(name));
+      if (profile && parts.IsEmpty() &&
+          (name == "parent.lock"_ns || name == "lock"_ns ||
+           name == ".parentlock"_ns))
+        continue;
+      bool directoryChild, linked;
+      MOZ_TRY(child->IsSymlink(&linked));
+      NS_ENSURE_FALSE(linked, NS_ERROR_FILE_ACCESS_DENIED);
+      MOZ_TRY(child->IsDirectory(&directoryChild));
+      uint32_t mode;
+      int64_t modified;
+      MOZ_TRY(child->GetPermissions(&mode));
+      MOZ_TRY(child->GetLastModifiedTime(&modified));
+      if (!first) entries.Append(',');
+      first = false;
+      entries.AppendLiteral("{\"parts\":[");
+      parts.AppendElement(name);
+      for (uint32_t i = 0; i < parts.Length(); ++i) {
+        if (i) entries.Append(',');
+        MOZ_TRY(RestoreQuote(cx, parts[i], quoted));
+        entries.Append(quoted);
+      }
+      entries.AppendLiteral("],\"permissions\":");
+      entries.AppendInt(mode & 0777);
+      entries.AppendLiteral(",\"lastModified\":");
+      entries.AppendInt(modified);
+      entries.AppendLiteral(",\"type\":");
+      if (directoryChild) {
+        entries.AppendLiteral("\"directory\"}");
+        MOZ_TRY(RestoreListing(cx, child, parts, entries, first, profile));
+      } else {
+        nsCString bytes, hash;
+        MOZ_TRY(JSONCacheReadFile(child, bytes));
+        MOZ_TRY(StartupHashControl(bytes, hash));
+        MOZ_TRY(RestoreQuote(cx, hash, quoted));
+        entries.AppendLiteral("\"regular\",\"size\":");
+        entries.AppendInt(bytes.Length());
+        entries.AppendLiteral(",\"sha256\":");
+        entries.Append(quoted);
+        entries.Append('}');
+      }
+      parts.RemoveLastElement();
+    }
+    return NS_OK;
+  }
+  nsresult RestoreRootRecord(JSContext* cx, nsIFile* directory,
+                             nsACString& record, bool profile) {
+    uint32_t permissions;
+    int64_t modified;
+    MOZ_TRY(directory->GetPermissions(&permissions));
+    MOZ_TRY(directory->GetLastModifiedTime(&modified));
+    record.AssignLiteral("{\"permissions\":");
+    record.AppendInt(permissions & 0777);
+    record.AppendLiteral(",\"lastModified\":");
+    record.AppendInt(modified);
+    record.AppendLiteral(",\"entries\":[");
+    nsTArray<nsCString> parts;
+    bool first = true;
+    MOZ_TRY(RestoreListing(cx, directory, parts, record, first, profile));
+    record.AppendLiteral("]}");
+    return NS_OK;
+  }
+  nsresult PrepareRestore(uint32_t bodySize = 131073,
+                          bool includeWork = false) {
+    nsCOMPtr<nsIFile> parent;
+    MOZ_TRY(mProfile->GetParent(getter_AddRefs(parent)));
+    MOZ_TRY(RestoreChildFile(parent, "s527-native-restore"_ns,
+                             getter_AddRefs(mRestoreControl)));
+    MOZ_TRY(mRestoreControl->CreateUnique(nsIFile::DIRECTORY_TYPE, 0700));
+    for (auto entry : {std::pair{"archive", &mRestoreArchive},
+                       std::pair{"stage", &mRestoreStage},
+                       std::pair{"external", &mRestoreExternal}}) {
+      MOZ_TRY(RestoreChildFile(mRestoreControl, nsDependentCString(entry.first),
+                               getter_AddRefs(*entry.second)));
+      MOZ_TRY((*entry.second)->Create(nsIFile::DIRECTORY_TYPE, 0700));
+    }
+    nsCString leaf;
+    nsCOMPtr<nsIFile> ownedWork = mStartupFixtureWork;
+    MOZ_TRY(mProfile->GetNativeLeafName(leaf));
+    MOZ_TRY(RestoreChildFile(parent, "panorama-migration-"_ns + leaf,
+                             getter_AddRefs(mStartupFixtureWork)));
+    if (ownedWork) {
+      bool same;
+      MOZ_TRY(ownedWork->Equals(mStartupFixtureWork, &same));
+      NS_ENSURE_TRUE(same, NS_ERROR_UNEXPECTED);
+    } else
+      MOZ_TRY(mStartupFixtureWork->Create(nsIFile::DIRECTORY_TYPE, 0700));
+    MOZ_TRY(RestoreChildFile(mStartupFixtureWork, "restore.json"_ns,
+                             getter_AddRefs(mRestoreRequest)));
+    MOZ_TRY(
+        WriteStartupFile("restore-message.txt", "archived profile bytes"_ns));
+    nsCOMPtr<nsIFile> payload, nested, empty, journal;
+    MOZ_TRY(RestoreChildFile(mRestoreExternal, "body.bin"_ns,
+                             getter_AddRefs(payload)));
+    nsCString body;
+    body.SetLength(bodySize);
+    for (uint32_t i = 0; i < bodySize; ++i)
+      body.BeginWriting()[i] = char((i * 17) % 251);
+    mArchivedBody = body;
+    MOZ_TRY(StartupWriteControl(payload, body));
+    MOZ_TRY(RestoreChildFile(mRestoreExternal, "maildir"_ns,
+                             getter_AddRefs(nested)));
+    MOZ_TRY(nested->Create(nsIFile::DIRECTORY_TYPE, 0700));
+    MOZ_TRY(RestoreChildFile(nested, "empty"_ns, getter_AddRefs(empty)));
+    MOZ_TRY(StartupWriteControl(empty, ""_ns));
+    MOZ_TRY(mProfile->CopyToNative(mRestoreArchive, "root-0"_ns));
+    MOZ_TRY(mRestoreExternal->CopyToNative(mRestoreArchive, "root-1"_ns));
+    if (includeWork) {
+      MOZ_TRY(RestoreChildFile(mStartupFixtureWork, "journal.json"_ns,
+                               getter_AddRefs(journal)));
+      MOZ_TRY(
+          StartupWriteControl(journal, "archived dependency journal bytes"_ns));
+      MOZ_TRY(mStartupFixtureWork->CopyToNative(mRestoreArchive, "root-2"_ns));
+    }
+    dom::AutoJSAPI jsapi;
+    NS_ENSURE_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()), NS_ERROR_FAILURE);
+    JSContext* cx = jsapi.cx();
+    nsCString manifest("{\"version\":1,\"complete\":true,\"roots\":[");
+    nsCString approval("["), profilePath, stagePath;
+    MOZ_TRY(mProfile->GetNativePath(profilePath));
+    MOZ_TRY(mRestoreStage->GetNativePath(stagePath));
+    for (uint32_t i = 0; i < (includeWork ? 3U : 2U); ++i) {
+      nsIFile* original = !i       ? mProfile.get()
+                          : i == 1 ? mRestoreExternal.get()
+                                   : mStartupFixtureWork.get();
+      nsCOMPtr<nsIFile> copy;
+      nsCString name("root-"_ns), path, quoted, record;
+      name.AppendInt(i);
+      MOZ_TRY(RestoreChildFile(mRestoreArchive, name, getter_AddRefs(copy)));
+      MOZ_TRY(original->GetNativePath(path));
+      MOZ_TRY(RestoreQuote(cx, path, quoted));
+      MOZ_TRY(RestoreRootRecord(cx, copy, record, i == 0));
+      record.Truncate(record.Length() - 1);
+      if (i) manifest.Append(',');
+      manifest.Append(record);
+      manifest.AppendLiteral(",\"source\":");
+      manifest.Append(quoted);
+      manifest.AppendLiteral(",\"directory\":\"root-");
+      manifest.AppendInt(i);
+      manifest.AppendLiteral("\"}");
+      if (!i)
+        MOZ_TRY(WriteStartupFile("restore-message.txt",
+                                 "newer retained profile bytes"_ns));
+      else if (i == 1)
+        MOZ_TRY(
+            StartupWriteControl(payload, "newer retained external bytes"_ns));
+      else
+        MOZ_TRY(StartupWriteControl(
+            journal, "newer retained dependency journal bytes"_ns));
+      if (i) approval.Append(',');
+      approval.AppendLiteral("{\"original\":");
+      approval.Append(quoted);
+      approval.Append('}');
+    }
+    manifest.AppendLiteral("]}");
+    approval.Append(']');
+    nsCOMPtr<nsIFile> manifestFile;
+    MOZ_TRY(RestoreChildFile(mRestoreArchive, "manifest.json"_ns,
+                             getter_AddRefs(manifestFile)));
+    MOZ_TRY(StartupWriteControl(manifestFile, manifest));
+    nsCString hash, manifestPath, quoted;
+    MOZ_TRY(StartupHashControl(manifest, hash));
+    MOZ_TRY(manifestFile->GetNativePath(manifestPath));
+    mRestoreOriginal.AssignLiteral(
+        "{\"formatVersion\":1,\"operationId\":\"native-case\",\"action\":"
+        "\"restore\",\"profilePath\":");
+    MOZ_TRY(RestoreQuote(cx, profilePath, quoted));
+    mRestoreOriginal.Append(quoted);
+    mRestoreOriginal.AppendLiteral(",\"localProfilePath\":");
+    mRestoreOriginal.Append(quoted);
+    mRestoreOriginal.AppendLiteral(",\"backup\":{\"path\":");
+    MOZ_TRY(RestoreQuote(cx, manifestPath, quoted));
+    mRestoreOriginal.Append(quoted);
+    mRestoreOriginal.AppendLiteral(",\"sha256\":");
+    MOZ_TRY(RestoreQuote(cx, hash, quoted));
+    mRestoreOriginal.Append(quoted);
+    mRestoreOriginal.AppendLiteral("},\"stagingParent\":");
+    MOZ_TRY(RestoreQuote(cx, stagePath, quoted));
+    mRestoreOriginal.Append(quoted);
+    mRestoreOriginal.AppendLiteral(",\"approvedRoots\":");
+    mRestoreOriginal.Append(approval);
+    mRestoreOriginal.Append('}');
+    return StartupWriteControl(mRestoreRequest, mRestoreOriginal);
+  }
+  nsresult RestoreAuditFile(nsIFile** output) {
+    nsCString bytes;
+    bool pending;
+    MOZ_TRY(mRestoreRequest->Exists(&pending));
+    nsCOMPtr<nsIFile> file = mRestoreRequest;
+    if (!pending)
+      MOZ_TRY(RestoreChildFile(mStartupFixtureWork, "restore-current.json"_ns,
+                               getter_AddRefs(file)));
+    MOZ_TRY(JSONCacheReadFile(file, bytes));
+    dom::AutoJSAPI jsapi;
+    NS_ENSURE_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()), NS_ERROR_FAILURE);
+    JS::Rooted<JS::Value> value(jsapi.cx());
+    MOZ_TRY(StartupDocument(jsapi.cx(), bytes, &value));
+    JS::Rooted<JSObject*> request(jsapi.cx(), &value.toObject());
+    NS_ENSURE_TRUE(JS_GetProperty(jsapi.cx(), request, "progress", &value) &&
+                       value.isObject(),
+                   NS_ERROR_UNEXPECTED);
+    JS::Rooted<JSObject*> progress(jsapi.cx(), &value.toObject());
+    NS_ENSURE_TRUE(JS_GetProperty(jsapi.cx(), progress, "generation", &value) &&
+                       value.isNumber() && value.toNumber() >= 1 &&
+                       value.toNumber() <= UINT32_MAX &&
+                       value.toNumber() == double(uint32_t(value.toNumber())),
+                   NS_ERROR_UNEXPECTED);
+    nsCString leaf("restore-native-case-"_ns);
+    leaf.AppendInt(uint32_t(value.toNumber()));
+    leaf.AppendLiteral(".complete.json");
+    return RestoreChildFile(mStartupFixtureWork, leaf, output);
+  }
+  nsresult PrepareRetainedRestore(uint32_t fault = 0) {
+    MOZ_TRY(Start());
+    FolderImportSnapshot input;
+    FolderImportReceipt receipt;
+    nsCOMPtr<nsIFile> source, journal;
+    MOZ_TRY(PrepareNativeImport(input, getter_AddRefs(source)));
+    MOZ_TRY(ImportNativeFile(source, input, receipt));
+    nsCString path, bytes;
+    MOZ_TRY(StartupReceiptControl(input, receipt, source,
+                                  getter_AddRefs(journal), path, bytes));
+    Stop();
+    MOZ_TRY(PrepareRestore());
+    if (fault == 3) bytes.ReplaceSubstring("\"version\":7", "\"version\":8");
+    if (fault == 4)
+      bytes.ReplaceSubstring(input.identity.token.get(), "foreign-token");
+    if (fault == 5)
+      bytes.ReplaceSubstring(input.identity.databaseSourceId.get(),
+                             "foreign-database");
+    MOZ_TRY(StartupWriteControl(journal, bytes));
+    dom::AutoJSAPI jsapi;
+    NS_ENSURE_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()), NS_ERROR_FAILURE);
+    JSContext* cx = jsapi.cx();
+    JS::Rooted<JS::Value> value(cx), backup(cx), requestValue(cx), deps(cx);
+    MOZ_TRY(StartupDocument(cx, bytes, &value));
+    JS::Rooted<JSObject*> document(cx, &value.toObject());
+    NS_ENSURE_TRUE(JS_GetProperty(cx, document, "backup", &backup),
+                   NS_ERROR_FAILURE);
+    nsCString quoted, hash, dependency, encoded;
+    MOZ_TRY(RestoreQuote(cx, path, quoted));
+    MOZ_TRY(StartupHashControl(bytes, hash));
+    if (fault == 2)
+      hash.AssignLiteral(
+          "0000000000000000000000000000000000000000000000000000000000000000");
+    MOZ_TRY(StartupJSONValue(cx, backup, encoded));
+    dependency.AssignLiteral("[{\"kind\":\"file\",\"path\":");
+    dependency.Append(quoted);
+    dependency.AppendLiteral(",\"sourcePath\":");
+    dependency.Append(quoted);
+    dependency.AppendLiteral(",\"size\":");
+    dependency.AppendInt(bytes.Length() + (fault == 1));
+    dependency.AppendLiteral(",\"sha256\":\"");
+    dependency.Append(hash);
+    dependency.AppendLiteral("\"},");
+    encoded.InsertLiteral("\"kind\":\"archive\",", 1);
+    dependency.Append(encoded);
+    dependency.Append(']');
+    MOZ_TRY(StartupDocument(cx, dependency, &deps));
+    MOZ_TRY(StartupDocument(cx, mRestoreOriginal, &requestValue));
+    JS::Rooted<JSObject*> request(cx, &requestValue.toObject());
+    NS_ENSURE_TRUE(JS_SetProperty(cx, request, "dependencies", deps),
+                   NS_ERROR_FAILURE);
+    MOZ_TRY(StartupJSONValue(cx, requestValue, mRestoreOriginal));
+    return StartupWriteControl(mRestoreRequest, mRestoreOriginal);
+  }
+  void CheckRetainedRefusal(uint32_t fault, nsresult expected) {
+    ASSERT_EQ(NS_OK, PrepareRetainedRestore(fault));
+    EXPECT_EQ(expected, RunRestore());
+    ExpectRestoreBytes(false);
+  }
+  nsresult RunRestoreCommand(const char* flag) {
+    NS_ENSURE_FALSE(mSelectedStartup || mCore, NS_ERROR_ALREADY_INITIALIZED);
+    for (auto entry :
+         {std::pair{NS_APP_PROFILE_DIR_STARTUP, &mOldStartupProfile},
+          std::pair{NS_APP_PROFILE_LOCAL_DIR_STARTUP, &mOldStartupLocal}}) {
+      (void)mDirectories->Get(entry.first, NS_GET_IID(nsIFile),
+                              getter_AddRefs(*entry.second));
+      (void)mDirectories->Undefine(entry.first);
+      MOZ_TRY(mDirectories->Set(entry.first, mProfile));
+    }
+    mSelectedStartup = true;
+    MOZ_TRY(NS_LockProfilePath(mProfile, mProfile, nullptr,
+                               getter_AddRefs(mSelectedLock)));
+    mCore = DatabaseCore::GetInstanceForService();
+    nsCOMPtr<nsICommandLineRunner> commandLine = new nsCommandLine();
+    const char* argv[] = {"thunderbird", flag};
+    MOZ_TRY(commandLine->Init(2, argv, mProfile,
+                              nsICommandLine::STATE_INITIAL_LAUNCH));
+    MOZ_TRY(mCore->Observe(commandLine, "app-startup", nullptr));
+    NS_ENSURE_FALSE(mCore->mProfileStartup, NS_ERROR_UNEXPECTED);
+    int32_t index;
+    MOZ_TRY(
+        commandLine->FindFlag(NS_ConvertASCIItoUTF16(flag + 2), false, &index));
+    return index >= 0 ? NS_OK : NS_ERROR_UNEXPECTED;
+  }
+  nsresult RunRestore(bool observe = true) {
+    MOZ_TRY(ArmSelectedStartup(observe));
+    if (observe) return NS_OK;
+    dom::AutoJSAPI jsapi;
+    NS_ENSURE_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()), NS_ERROR_FAILURE);
+    return mCore->RunProfileRestore(jsapi.cx());
+  }
+  nsresult ChangeRestoreAction(const char* action) {
+    nsCString bytes;
+    MOZ_TRY(JSONCacheReadFile(mRestoreRequest, bytes));
+    dom::AutoJSAPI jsapi;
+    NS_ENSURE_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()), NS_ERROR_FAILURE);
+    JS::Rooted<JS::Value> value(jsapi.cx());
+    MOZ_TRY(StartupDocument(jsapi.cx(), bytes, &value));
+    JS::Rooted<JSObject*> object(jsapi.cx(), &value.toObject());
+    JS::Rooted<JSString*> text(jsapi.cx(),
+                               JS_NewStringCopyZ(jsapi.cx(), action));
+    NS_ENSURE_TRUE(text && JS_DefineProperty(jsapi.cx(), object, "action", text,
+                                             JSPROP_ENUMERATE),
+                   NS_ERROR_FAILURE);
+    MOZ_TRY(StartupJSONValue(jsapi.cx(), value, bytes));
+    return StartupWriteControl(mRestoreRequest, bytes);
+  }
+  void RetireRestoreOwner() {
+    nsCOMPtr<nsIFile> keep = mStartupFixtureWork;
+    mStartupFixtureWork = nullptr;
+    FinishSelectedStartup();
+    mStartupFixtureWork = keep;
+  }
+  nsresult ValidateRestore(nsACString& json, nsISupports* foreign = nullptr) {
+    dom::AutoJSAPI jsapi;
+    NS_ENSURE_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()), NS_ERROR_FAILURE);
+    JS::Rooted<JS::Value> result(jsapi.cx(), JS::Int32Value(73));
+    nsresult rv = mCore->ValidateProfileStartup(
+        foreign ? foreign : mCore->ProfileStartupToken(), jsapi.cx(), &result);
+    if (NS_FAILED(rv)) {
+      EXPECT_TRUE(result.isInt32() && result.toInt32() == 73);
+      return rv;
+    }
+    return StartupJSONValue(jsapi.cx(), result, json);
+  }
+  static bool RestoreReentry(JSContext* cx, unsigned argc, JS::Value* vp) {
+    auto& core = *DatabaseCore::sInstance;
+    JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+    JS::Rooted<JS::Value> unchanged(cx, JS::Int32Value(29));
+    sRestoreReentry =
+        core.ValidateProfileStartup(core.ProfileStartupToken(), cx, &unchanged);
+    sRestoreUnchanged = unchanged.isInt32() && unchanged.toInt32() == 29;
+    JS::Rooted<JSString*> text(cx, JS_NewStringCopyZ(cx, "restore"));
+    if (!text) return false;
+    args.rval().setString(text);
+    return true;
+  }
+  nsresult CompleteRestore(const char* outcome = "restored",
+                           bool reenter = false, bool restoredDefault = false) {
+    dom::AutoJSAPI jsapi;
+    NS_ENSURE_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()), NS_ERROR_FAILURE);
+    JSContext* cx = jsapi.cx();
+    nsCString json;
+    if (restoredDefault)
+      json.AssignLiteral(
+          "{\"mode\":\"restored-default\",\"restoreOperationId\":\"native-"
+          "case\"}");
+    else {
+      json.AssignLiteral("{\"mode\":\"restore\",\"restoreOutcome\":\"");
+      json.Append(outcome);
+      json.AppendLiteral("\"}");
+    }
+    JS::Rooted<JS::Value> activation(cx);
+    MOZ_TRY(StartupDocument(cx, json, &activation));
+    if (reenter) {
+      JS::Rooted<JSObject*> object(cx, &activation.toObject());
+      NS_ENSURE_TRUE(JS_DefineProperty(cx, object, "mode", RestoreReentry,
+                                       nullptr, JSPROP_ENUMERATE),
+                     NS_ERROR_FAILURE);
+    }
+    RefPtr<dom::Promise> promise;
+    MOZ_TRY(mCore->CompleteProfileStartup(
+        mCore->ProfileStartupToken(), activation, cx, getter_AddRefs(promise)));
+    bool resolved = promise->State() == dom::Promise::PromiseState::Resolved;
+    if (!resolved) EXPECT_TRUE(promise->SetAnyPromiseIsHandled());
+    return resolved ? NS_OK : NS_ERROR_FAILURE;
+  }
+  nsresult RestoreCancel(bool create) {
+    nsCOMPtr<nsIFile> marker;
+    MOZ_TRY(RestoreChildFile(mStartupFixtureWork, "cancel-native-case"_ns,
+                             getter_AddRefs(marker)));
+    return create ? StartupWriteControl(marker, "cancel"_ns)
+                  : marker->Remove(false);
+  }
+  void ExpectRestoreBytes(bool original, bool saved = false) {
+    nsCOMPtr<nsIFile> profile = mProfile, external = mRestoreExternal;
+    if (saved) {
+      nsCOMPtr<nsIFile> container;
+      ASSERT_EQ(NS_OK, RestoreChildFile(mRestoreStage, "restore-native-case"_ns,
+                                        getter_AddRefs(container)));
+      ASSERT_EQ(NS_OK, RestoreChildFile(container, "saved-0"_ns,
+                                        getter_AddRefs(profile)));
+      ASSERT_EQ(NS_OK, RestoreChildFile(container, "saved-1"_ns,
+                                        getter_AddRefs(external)));
+    }
+    nsCOMPtr<nsIFile> file;
+    nsCString bytes;
+    ASSERT_EQ(NS_OK, RestoreChildFile(profile, "restore-message.txt"_ns,
+                                      getter_AddRefs(file)));
+    ASSERT_EQ(NS_OK, JSONCacheReadFile(file, bytes));
+    EXPECT_EQ(original ? "archived profile bytes"_ns
+                       : "newer retained profile bytes"_ns,
+              bytes);
+    ASSERT_EQ(NS_OK,
+              RestoreChildFile(external, "body.bin"_ns, getter_AddRefs(file)));
+    ASSERT_EQ(NS_OK, JSONCacheReadFile(file, bytes));
+    EXPECT_EQ(original ? mArchivedBody : "newer retained external bytes"_ns,
+              bytes);
+  }
+  void ExpectRestoreWork(bool archived, bool saved = false) {
+    nsCOMPtr<nsIFile> root = mStartupFixtureWork, file;
+    if (saved) {
+      nsCOMPtr<nsIFile> container;
+      ASSERT_EQ(NS_OK, RestoreChildFile(mRestoreStage, "restore-native-case"_ns,
+                                        getter_AddRefs(container)));
+      ASSERT_EQ(NS_OK, RestoreChildFile(container, "saved-2"_ns,
+                                        getter_AddRefs(root)));
+    }
+    ASSERT_EQ(NS_OK,
+              RestoreChildFile(root, "journal.json"_ns, getter_AddRefs(file)));
+    nsCString bytes;
+    ASSERT_EQ(NS_OK, JSONCacheReadFile(file, bytes));
+    EXPECT_EQ(archived ? "archived dependency journal bytes"_ns
+                       : "newer retained dependency journal bytes"_ns,
+              bytes);
+  }
+  nsCOMPtr<nsIFile> mRestoreControl, mRestoreArchive, mRestoreStage,
+      mRestoreExternal, mRestoreRequest;
+  nsCString mArchivedBody, mRestoreOriginal;
+  UniquePtr<AutoRestore<bool>> mRestorePref;
+  static inline nsresult sRestoreReentry = NS_OK;
+  static inline bool sRestoreUnchanged = false;
+};
+
+TEST_F(DeliveryCoreStartupRestore, RestoreCapturesBeforeAtClosedWriterEntry) {
+  ASSERT_EQ(NS_OK, PrepareRestore());
+  EXPECT_EQ(kNotFound, mRestoreOriginal.Find("\"before\""));
+  ASSERT_EQ(NS_OK, WriteStartupFile("later-child.txt", "after request"_ns));
+  ASSERT_EQ(NS_OK, RunRestore());
+  nsCOMPtr<nsIFile> container, saved, file;
+  ASSERT_EQ(NS_OK, RestoreChildFile(mRestoreStage, "restore-native-case"_ns,
+                                    getter_AddRefs(container)));
+  ASSERT_EQ(NS_OK,
+            RestoreChildFile(container, "saved-0"_ns, getter_AddRefs(saved)));
+  ASSERT_EQ(NS_OK, RestoreChildFile(saved, "later-child.txt"_ns,
+                                    getter_AddRefs(file)));
+  nsCString bytes;
+  ASSERT_EQ(NS_OK, JSONCacheReadFile(file, bytes));
+  EXPECT_EQ("after request"_ns, bytes);
+  ASSERT_EQ(NS_OK, ChangeRestoreAction("rollback"));
+  RetireRestoreOwner();
+  ASSERT_EQ(NS_OK, RunRestore());
+  ASSERT_EQ(NS_OK, RestoreChildFile(mProfile, "later-child.txt"_ns,
+                                    getter_AddRefs(file)));
+  ASSERT_EQ(NS_OK, JSONCacheReadFile(file, bytes));
+  EXPECT_EQ("after request"_ns, bytes);
+}
+
+TEST_F(DeliveryCoreStartupRestore, RestoreCommandsDoNotExecutePendingRequest) {
+  ASSERT_EQ(NS_OK, PrepareRestore());
+  for (const char* flag : {"--panorama-restore", "--panorama-restore-retry",
+                           "--panorama-restore-rollback"}) {
+    ASSERT_EQ(NS_OK, RunRestoreCommand(flag));
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, RestoreStartupError());
+    EXPECT_TRUE(RestoreManaged());
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DatabaseCore::CheckAccountStartup());
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DatabaseCore::CheckAccountStartup(true));
+    EXPECT_FALSE(Connection());
+    nsCString bytes;
+    ASSERT_EQ(NS_OK, JSONCacheReadFile(mRestoreRequest, bytes));
+    EXPECT_EQ(mRestoreOriginal, bytes);
+    ExpectRestoreBytes(false);
+    nsCOMPtr<nsIFile> container;
+    ASSERT_EQ(NS_OK, RestoreChildFile(mRestoreStage, "restore-native-case"_ns,
+                                      getter_AddRefs(container)));
+    bool exists;
+    ASSERT_EQ(NS_OK, container->Exists(&exists));
+    EXPECT_FALSE(exists);
+    RetireRestoreOwner();
+  }
+  ASSERT_EQ(NS_OK, RunRestore());
+  ExpectRestoreBytes(true);
+}
+TEST_F(DeliveryCoreStartupRestore,
+       RestoreOnlyObservedAdmissionKeepsOrdinaryClosed) {
+  ASSERT_EQ(NS_OK, PrepareRestore());
+  ASSERT_EQ(NS_OK, RunRestore());
+  nsCString descriptor;
+  ASSERT_EQ(NS_OK, ValidateRestore(descriptor));
+  EXPECT_NE(kNotFound, descriptor.Find("\"mode\":\"restore\""));
+  EXPECT_NE(kNotFound, descriptor.Find("\"phase\":\"restore-finished\""));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DatabaseCore::CheckAccountStartup());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DatabaseCore::CheckAccountStartup(true));
+  EXPECT_FALSE(Connection());
+  ExpectRestoreBytes(true);
+}
+TEST_F(DeliveryCoreStartupRestore,
+       RestoreRequestAndPendingGuardCoverDisabledPreference) {
+  (void)StaticPrefs::mail_panorama_enabled_AtStartup();
+  AutoRestore<bool> restore(
+      StaticPrefs::sMirror_mail_panorama_enabled_AtStartup);
+  StaticPrefs::sMirror_mail_panorama_enabled_AtStartup = false;
+  ASSERT_EQ(NS_OK, PrepareRestore());
+  ASSERT_EQ(NS_OK, RunRestore());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DatabaseCore::CheckAccountStartup(true));
+  ExpectRestoreBytes(true);
+  bool exists;
+  ASSERT_EQ(NS_OK, mRestoreRequest->Exists(&exists));
+  EXPECT_TRUE(exists);
+  ASSERT_EQ(NS_OK, CompleteRestore());
+  RetireRestoreOwner();
+  nsCString workPath, retainedPath;
+  ASSERT_EQ(NS_OK, mStartupFixtureWork->GetNativePath(workPath));
+  ASSERT_EQ(NS_OK,
+            mStartupFixtureWork->MoveToNative(mRestoreControl, "old-work"_ns));
+  ASSERT_EQ(NS_OK, mStartupFixtureWork->GetNativePath(retainedPath));
+  ASSERT_EQ(0, symlink(retainedPath.get(), workPath.get()));
+  auto unlinkAlias =
+      MakeScopeExit([&] { EXPECT_EQ(0, unlink(workPath.get())); });
+  ASSERT_EQ(NS_OK, RunRestore());
+  EXPECT_FALSE(RestoreManaged());
+  EXPECT_EQ(NS_OK, DatabaseCore::CheckAccountStartup());
+}
+TEST_F(DeliveryCoreStartupRestore,
+       RestoreRequiresExactSelectedIdentityAndCompleteRoots) {
+  ASSERT_EQ(NS_OK, PrepareRestore());
+  nsCString changed(mRestoreOriginal);
+  changed.ReplaceSubstring("\"approvedRoots\":[",
+                           "\"approvedRoots\":[],\"unused\":[");
+  ASSERT_EQ(NS_OK, StartupWriteControl(mRestoreRequest, changed));
+  EXPECT_EQ(NS_ERROR_INVALID_ARG, RunRestore());
+  ExpectRestoreBytes(false);
+  bool exists;
+  ASSERT_EQ(NS_OK, mRestoreRequest->Exists(&exists));
+  EXPECT_TRUE(exists);
+  RetireRestoreOwner();
+  changed = mRestoreOriginal;
+  changed.ReplaceSubstring("\"profilePath\":", "\"unselectedPath\":");
+  changed.InsertLiteral("\"profilePath\":\"/not-selected\",", 1);
+  ASSERT_EQ(NS_OK, StartupWriteControl(mRestoreRequest, changed));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, RunRestore());
+  ExpectRestoreBytes(false);
+  RetireRestoreOwner();
+  ASSERT_EQ(NS_OK, StartupWriteControl(mRestoreRequest, mRestoreOriginal));
+  ASSERT_EQ(NS_OK, mStartupFixtureWork->SetPermissions(0777));
+  EXPECT_EQ(NS_ERROR_FILE_ACCESS_DENIED, RunRestore());
+  ExpectRestoreBytes(false);
+  ASSERT_EQ(NS_OK, mStartupFixtureWork->SetPermissions(0700));
+}
+TEST_F(DeliveryCoreStartupRestore,
+       RestoreStagesEveryRootWithExclusiveVerifiedFiles) {
+  ASSERT_EQ(NS_OK, PrepareRestore());
+  ASSERT_EQ(NS_OK, RunRestore());
+  ExpectRestoreBytes(true);
+  ExpectRestoreBytes(false, true);
+  nsCString progress;
+  ASSERT_EQ(NS_OK, JSONCacheReadFile(mRestoreRequest, progress));
+  EXPECT_NE(kNotFound, progress.Find("\"phase\":3"));
+  EXPECT_NE(kNotFound, progress.Find("\"stageIdentity\":\""));
+  ASSERT_EQ(NS_OK, ChangeRestoreAction("rollback"));
+  RetireRestoreOwner();
+  ASSERT_EQ(NS_OK, RunRestore());
+  ASSERT_EQ(NS_OK, CompleteRestore("rolled-back"));
+  RetireRestoreOwner();
+  nsCOMPtr<nsIFile> existing;
+  ASSERT_EQ(NS_OK, RestoreChildFile(mRestoreStage, "restore-native-case"_ns,
+                                    getter_AddRefs(existing)));
+  ASSERT_EQ(NS_OK,
+            existing->CopyToNative(mRestoreStage, "restore-second-case"_ns));
+  nsCString fresh(mRestoreOriginal);
+  fresh.ReplaceSubstring("native-case", "second-case");
+  ASSERT_EQ(NS_OK, StartupWriteControl(mRestoreRequest, fresh));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, RunRestore());
+  ExpectRestoreBytes(false);
+}
+TEST_F(DeliveryCoreStartupRestore, RestoreRefusesChangedLinkedOrReplacedInput) {
+  ASSERT_EQ(NS_OK, PrepareRestore());
+  nsCOMPtr<nsIFile> file, copy;
+  ASSERT_EQ(NS_OK, RestoreChildFile(mRestoreArchive, "root-1"_ns,
+                                    getter_AddRefs(copy)));
+  ASSERT_EQ(NS_OK, RestoreChildFile(copy, "body.bin"_ns, getter_AddRefs(file)));
+  ASSERT_EQ(NS_OK, file->Remove(false));
+  nsCString link, target;
+  ASSERT_EQ(NS_OK, file->GetNativePath(link));
+  ASSERT_EQ(NS_OK, mRestoreExternal->GetNativePath(target));
+  target.AppendLiteral("/body.bin");
+  ASSERT_EQ(0, symlink(target.get(), link.get()));
+  EXPECT_EQ(NS_ERROR_FILE_ACCESS_DENIED, RunRestore());
+  ExpectRestoreBytes(false);
+}
+TEST_F(DeliveryCoreStartupRestore,
+       RestoreNeverReplacesSelectedDirectoryOrProfileLock) {
+  ASSERT_EQ(NS_OK, PrepareRestore());
+  ASSERT_EQ(NS_OK, ArmSelectedStartup());
+  nsCString profile;
+  ASSERT_EQ(NS_OK, mProfile->GetNativePath(profile));
+  struct stat before {
+  }, after{}, lockBefore{}, lockAfter{};
+  ASSERT_EQ(0, lstat(profile.get(), &before));
+  nsCString lock;
+  for (const char* leaf : {"parent.lock", ".parentlock", "lock"}) {
+    lock = profile + "/"_ns + nsDependentCString(leaf);
+    if (!lstat(lock.get(), &lockBefore)) break;
+  }
+  ASSERT_EQ(0, lstat(lock.get(), &lockBefore));
+  dom::AutoJSAPI jsapi;
+  ASSERT_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()));
+  ASSERT_EQ(NS_OK, RunArmedRestore());
+  ASSERT_EQ(0, lstat(profile.get(), &after));
+  ASSERT_EQ(0, lstat(lock.get(), &lockAfter));
+  EXPECT_EQ(before.st_dev, after.st_dev);
+  EXPECT_EQ(before.st_ino, after.st_ino);
+  EXPECT_EQ(lockBefore.st_dev, lockAfter.st_dev);
+  EXPECT_EQ(lockBefore.st_ino, lockAfter.st_ino);
+}
+TEST_F(DeliveryCoreStartupRestore, RestoreRetainsDisplacedNewerData) {
+  ASSERT_EQ(NS_OK, PrepareRestore());
+  ASSERT_EQ(NS_OK, RunRestore());
+  ExpectRestoreBytes(false, true);
+  ExpectRestoreBytes(true);
+  nsCOMPtr<nsIFile> file, container;
+  ASSERT_EQ(NS_OK, RestoreChildFile(mRestoreStage, "restore-native-case"_ns,
+                                    getter_AddRefs(container)));
+  ASSERT_EQ(NS_OK,
+            RestoreChildFile(container, "saved-1"_ns, getter_AddRefs(file)));
+  nsCString held;
+  ASSERT_EQ(NS_OK, file->GetNativePath(held));
+  ASSERT_EQ(NS_OK, mRestoreExternal->MoveToNative(mRestoreControl,
+                                                  "replaced-external"_ns));
+  ASSERT_EQ(NS_OK, RestoreChildFile(mRestoreControl, "external"_ns,
+                                    getter_AddRefs(mRestoreExternal)));
+  ASSERT_EQ(NS_OK, mRestoreExternal->Create(nsIFile::DIRECTORY_TYPE, 0700));
+  nsCString descriptor;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, ValidateRestore(descriptor));
+  struct stat retained {};
+  EXPECT_EQ(0, lstat(held.get(), &retained));
+}
+TEST_F(DeliveryCoreStartupRestore,
+       RestoreStreamingCopyHasBoundedChunksAndExactLength) {
+  ASSERT_EQ(NS_OK, PrepareRestore(4 * 65536 + 37));
+  ASSERT_EQ(NS_OK, RunRestore());
+  ExpectRestoreBytes(true);
+  nsCOMPtr<nsIFile> unicode;
+  nsCString retained;
+  ASSERT_EQ(NS_OK, RestoreChildFile(mProfile, "𐀀"_ns, getter_AddRefs(unicode)));
+  ASSERT_EQ(NS_OK, JSONCacheReadFile(unicode, retained));
+  EXPECT_EQ("retained unicode path"_ns, retained);
+  nsCOMPtr<nsIFile> body;
+  ASSERT_EQ(NS_OK, RestoreChildFile(mRestoreExternal, "body.bin"_ns,
+                                    getter_AddRefs(body)));
+  int64_t length;
+  ASSERT_EQ(NS_OK, body->GetFileSize(&length));
+  EXPECT_EQ(4 * 65536 + 37, length);
+  ASSERT_EQ(NS_OK, body->SetFileSize(length - 1));
+  nsCString descriptor;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, ValidateRestore(descriptor));
+  ExpectRestoreBytes(false, true);
+}
+TEST_F(DeliveryCoreStartupRestore,
+       RestoreInterruptedRootProgressReconcilesWithoutOverwrite) {
+  ASSERT_EQ(NS_OK, PrepareRestore());
+  ASSERT_EQ(NS_OK, RunRestore());
+  RetireRestoreOwner();  // Actual cutover persisted, before complete
+                         // settlement.
+  ASSERT_EQ(NS_OK, RunRestore());
+  ExpectRestoreBytes(true);
+  ExpectRestoreBytes(false, true);
+  ASSERT_EQ(NS_OK, CompleteRestore());
+  bool pending;
+  ASSERT_EQ(NS_OK, mRestoreRequest->Exists(&pending));
+  EXPECT_FALSE(pending);
+  nsCOMPtr<nsIFile> audit, index;
+  ASSERT_EQ(NS_OK, RestoreAuditFile(getter_AddRefs(audit)));
+  ASSERT_EQ(NS_OK,
+            RestoreChildFile(mStartupFixtureWork, "restore-current.json"_ns,
+                             getter_AddRefs(index)));
+  nsCString actual, expected;
+  ASSERT_EQ(NS_OK, JSONCacheReadFile(audit, expected));
+  ASSERT_EQ(NS_OK, JSONCacheReadFile(index, actual));
+  EXPECT_EQ(expected, actual);
+}
+TEST_F(DeliveryCoreStartupRestore, RestoreRollbackRestoresAllDisplacedRoots) {
+  ASSERT_EQ(NS_OK, PrepareRestore(131073, true));
+  ASSERT_EQ(NS_OK, RunRestore());
+  ExpectRestoreWork(true);
+  ASSERT_EQ(NS_OK, ChangeRestoreAction("rollback"));
+  RetireRestoreOwner();
+  ASSERT_EQ(NS_OK, RunRestore());
+  ExpectRestoreBytes(false);
+  ExpectRestoreWork(false);
+  ExpectRestoreWork(false, true);
+  ExpectRestoreBytes(false, true);
+  nsCString descriptor;
+  ASSERT_EQ(NS_OK, ValidateRestore(descriptor));
+  EXPECT_NE(kNotFound, descriptor.Find("\"restoreOutcome\":\"rolled-back\""));
+  ASSERT_EQ(NS_OK, CompleteRestore("rolled-back"));
+}
+TEST_F(DeliveryCoreStartupRestore,
+       RestoreCancellationStopsAtSettledBoundaries) {
+  ASSERT_EQ(NS_OK, PrepareRestore());
+  ASSERT_EQ(NS_OK, RestoreCancel(true));
+  EXPECT_EQ(NS_ERROR_ABORT, RunRestore());
+  ExpectRestoreBytes(false);
+  EXPECT_FALSE(StartupClosePending());
+  ASSERT_EQ(NS_OK, RestoreCancel(false));
+  RetireRestoreOwner();
+  ASSERT_EQ(NS_OK, RunRestore());
+  ExpectRestoreBytes(true);
+}
+TEST_F(DeliveryCoreStartupRestore,
+       RestoreFirstErrorSurvivesLaterCloseAndCancel) {
+  ASSERT_EQ(NS_OK, PrepareRestore());
+  nsCString malformed("{\"formatVersion\":9}");
+  ASSERT_EQ(NS_OK, StartupWriteControl(mRestoreRequest, malformed));
+  nsresult first = RunRestore();
+  ASSERT_TRUE(NS_FAILED(first));
+  ASSERT_EQ(NS_OK, RestoreCancel(true));
+  EXPECT_EQ(NS_OK, StartupClose(NS_ERROR_ABORT));
+  EXPECT_EQ(first, RestoreStartupError());
+  EXPECT_EQ(first, StartupContextCheck());
+  ExpectRestoreBytes(false);
+}
+TEST_F(DeliveryCoreStartupRestore,
+       RestoreSamePathPreservesGenuineUnixReceipts) {
+  ASSERT_EQ(NS_OK, Start());
+  FolderImportSnapshot input;
+  nsCOMPtr<nsIFile> source;
+  ASSERT_EQ(NS_OK, PrepareNativeImport(input, getter_AddRefs(source)));
+  FolderImportReceipt receipt;
+  ASSERT_EQ(NS_OK, ImportNativeFile(source, input, receipt));
+  nsCString descriptor;
+  ASSERT_EQ(NS_OK, source->GetPersistentDescriptor(descriptor));
+  Stop();
+  ASSERT_EQ(NS_OK, PrepareRestore());
+  nsCString databasePath;
+  ASSERT_EQ(NS_OK, mFile->GetNativePath(databasePath));
+  int oldDatabase = open(databasePath.get(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  ASSERT_GE(oldDatabase, 0);
+  auto closeOld = MakeScopeExit([&] { EXPECT_EQ(0, close(oldDatabase)); });
+  struct stat before {
+  }, after{};
+  ASSERT_EQ(0, fstat(oldDatabase, &before));
+  ASSERT_EQ(NS_OK, RunRestore());
+  ASSERT_EQ(0, lstat(databasePath.get(), &after));
+  EXPECT_EQ(before.st_ino, after.st_ino);
+  ASSERT_EQ(NS_OK, CompleteRestore());
+  RetireRestoreOwner();
+  ASSERT_EQ(NS_OK, Start());
+  nsCString same;
+  ASSERT_EQ(NS_OK, source->GetPersistentDescriptor(same));
+  EXPECT_EQ(descriptor, same);
+  Maybe<FolderImportReceipt> retained;
+  ASSERT_EQ(NS_OK, RestoreReadReceipt(input.identity, retained));
+  ASSERT_TRUE(retained);
+  ASSERT_EQ(receipt.keys.Length(), retained->keys.Length());
+  for (uint32_t i = 0; i < receipt.keys.Length(); ++i) {
+    EXPECT_EQ(receipt.keys[i].source, retained->keys[i].source);
+    EXPECT_EQ(receipt.keys[i].destination, retained->keys[i].destination);
+  }
+}
+TEST_F(DeliveryCoreStartupRestore, RestoreSuccessSettlesWithoutOrdinaryReady) {
+  ASSERT_EQ(NS_OK, PrepareRestore());
+  ASSERT_EQ(NS_OK, RunRestore());
+  ASSERT_EQ(NS_OK, CompleteRestore());
+  EXPECT_FALSE(StartupClosePending());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, StartupContextCheck());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DatabaseCore::CheckAccountStartup());
+  bool exists;
+  ASSERT_EQ(NS_OK, mRestoreRequest->Exists(&exists));
+  EXPECT_FALSE(exists);
+  nsCOMPtr<nsIFile> complete;
+  ASSERT_EQ(NS_OK, RestoreAuditFile(getter_AddRefs(complete)));
+  ASSERT_EQ(NS_OK, complete->Exists(&exists));
+  EXPECT_TRUE(exists);
+  ExpectRestoreBytes(false, true);
+}
+TEST_F(DeliveryCoreStartupRestore,
+       RestoreFreshRestartRechecksBackendVersionAndReceipts) {
+  ASSERT_EQ(NS_OK, Start());
+  ASSERT_EQ(NS_OK, WriteStartupSelector("adopted-existing"));
+  Stop();
+  ASSERT_EQ(NS_OK, PrepareRestore());
+  ASSERT_EQ(NS_OK, RunRestore());
+  ASSERT_EQ(NS_OK, CompleteRestore());
+  RetireRestoreOwner();
+  nsCOMPtr<nsIFile> selector;
+  ASSERT_EQ(NS_OK, RestoreChildFile(mProfile, "panorama-profile.json"_ns,
+                                    getter_AddRefs(selector)));
+  nsCString bytes;
+  ASSERT_EQ(NS_OK, JSONCacheReadFile(selector, bytes));
+  bytes.ReplaceSubstring("\"backend\":\"panorama\"", "\"backend\":\"other\"");
+  ASSERT_EQ(NS_OK, StartupWriteControl(selector, bytes));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, ArmSelectedStartup(true));
+  EXPECT_FALSE(Connection());
+  ExpectRestoreBytes(true);
+}
+TEST_F(DeliveryCoreStartupRestore,
+       RestoreForeignTokenAndReentryPreserveOutputs) {
+  ASSERT_EQ(NS_OK, PrepareRestore());
+  ASSERT_EQ(NS_OK, RunRestore());
+  nsCOMPtr<nsISupports> foreign = new RecoveryPlanOwner();
+  nsCString output("unchanged");
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, ValidateRestore(output, foreign));
+  EXPECT_EQ("unchanged"_ns, output);
+  ASSERT_EQ(NS_OK, CompleteRestore("restored", true));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, sRestoreReentry);
+  EXPECT_TRUE(sRestoreUnchanged);
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DatabaseCore::CheckAccountStartup());
+}
+
+TEST_F(DeliveryCoreStartupRestore,
+       RestoreRetainedSiblingClosureMatchesNativeMap) {
+  ASSERT_EQ(NS_OK, PrepareRetainedRestore());
+  ASSERT_EQ(NS_OK, RunRestore());
+  ExpectRestoreBytes(true);
+  ASSERT_EQ(NS_OK, CompleteRestore());
+}
+TEST_F(DeliveryCoreStartupRestore, RestoreRetainedSiblingRefusesWrongSize) {
+  CheckRetainedRefusal(1, NS_ERROR_NOT_AVAILABLE);
+}
+TEST_F(DeliveryCoreStartupRestore, RestoreRetainedSiblingRefusesWrongDigest) {
+  CheckRetainedRefusal(2, NS_ERROR_NOT_AVAILABLE);
+}
+TEST_F(DeliveryCoreStartupRestore, RestoreRetainedSiblingRefusesWrongVersion) {
+  CheckRetainedRefusal(3, NS_ERROR_INVALID_ARG);
+}
+TEST_F(DeliveryCoreStartupRestore, RestoreRetainedSiblingRefusesWrongToken) {
+  CheckRetainedRefusal(4, NS_ERROR_NOT_AVAILABLE);
+}
+TEST_F(DeliveryCoreStartupRestore, RestoreRetainedSiblingRefusesWrongDatabase) {
+  CheckRetainedRefusal(5, NS_ERROR_NOT_AVAILABLE);
+}
+TEST_F(DeliveryCoreStartupRestore,
+       RestoreRollbackUsesRetainedInputAfterArchiveLoss) {
+  ASSERT_EQ(NS_OK, PrepareRestore());
+  ASSERT_EQ(NS_OK, RunRestore());
+  ASSERT_EQ(NS_OK, mRestoreArchive->MoveToNative(mRestoreControl,
+                                                 "unavailable-archive"_ns));
+  ASSERT_EQ(NS_OK, ChangeRestoreAction("rollback"));
+  RetireRestoreOwner();
+  ASSERT_EQ(NS_OK, RunRestore());
+  ExpectRestoreBytes(false);
+  ASSERT_EQ(NS_OK, CompleteRestore("rolled-back"));
+}
+TEST_F(DeliveryCoreStartupRestore,
+       RestoreRollbackRefusesCorruptRetainedManifest) {
+  ASSERT_EQ(NS_OK, PrepareRestore());
+  ASSERT_EQ(NS_OK, RunRestore());
+  nsCOMPtr<nsIFile> container, manifest;
+  ASSERT_EQ(NS_OK, RestoreChildFile(mRestoreStage, "restore-native-case"_ns,
+                                    getter_AddRefs(container)));
+  ASSERT_EQ(NS_OK, RestoreChildFile(container, "input-manifest.json"_ns,
+                                    getter_AddRefs(manifest)));
+  ASSERT_EQ(NS_OK, StartupWriteControl(manifest, "{}"_ns));
+  ASSERT_EQ(NS_OK, ChangeRestoreAction("rollback"));
+  RetireRestoreOwner();
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, RunRestore());
+  ExpectRestoreBytes(true);
+}
+TEST_F(DeliveryCoreStartupRestore,
+       RestoreCompletedDefaultUsesActualSettlement) {
+  ASSERT_EQ(NS_OK, PrepareRestore());
+  ASSERT_EQ(NS_OK, RunRestore());
+  ASSERT_EQ(NS_OK, CompleteRestore());
+  RetireRestoreOwner();
+  StaticPrefs::sMirror_mail_panorama_enabled_AtStartup = false;
+  ASSERT_EQ(NS_OK, ArmSelectedStartup(true));
+  nsCString descriptor;
+  ASSERT_EQ(NS_OK, ValidateRestore(descriptor));
+  EXPECT_NE(kNotFound, descriptor.Find("\"mode\":\"restored-default\""));
+  ASSERT_EQ(NS_OK, CompleteRestore("restored", false, true));
+  RetireRestoreOwner();
+  ASSERT_EQ(NS_OK, ArmSelectedStartup(true));
+  ASSERT_EQ(NS_OK, ValidateRestore(descriptor));
+  ASSERT_EQ(NS_OK, CompleteRestore("restored", false, true));
+  EXPECT_FALSE(RestoreManaged());
+  EXPECT_FALSE(Connection());
+  nsCOMPtr<nsIFile> index;
+  ASSERT_EQ(NS_OK,
+            RestoreChildFile(mStartupFixtureWork, "restore-current.json"_ns,
+                             getter_AddRefs(index)));
+  nsCString bytes;
+  ASSERT_EQ(NS_OK, JSONCacheReadFile(index, bytes));
+  bytes.ReplaceSubstring("\"nativeSettlement\":1", "\"nativeSettlement\":0");
+  RetireRestoreOwner();
+  ASSERT_EQ(NS_OK, StartupWriteControl(index, bytes));
+  EXPECT_EQ(NS_ERROR_INVALID_ARG, ArmSelectedStartup(true));
+  ExpectRestoreBytes(true);
+}
+TEST_F(DeliveryCoreStartupRestore,
+       RestoreForeignCompletionAuditIsNeverOverwritten) {
+  ASSERT_EQ(NS_OK, PrepareRestore());
+  ASSERT_EQ(NS_OK, RunRestore());
+  nsCOMPtr<nsIFile> audit;
+  ASSERT_EQ(NS_OK, RestoreAuditFile(getter_AddRefs(audit)));
+  ASSERT_EQ(NS_OK, StartupWriteControl(audit, "foreign incomplete audit"_ns));
+  EXPECT_EQ(NS_ERROR_FAILURE, CompleteRestore());
+  nsCString unchanged;
+  ASSERT_EQ(NS_OK, JSONCacheReadFile(audit, unchanged));
+  EXPECT_EQ("foreign incomplete audit"_ns, unchanged);
+  ExpectRestoreBytes(true);
 }
 
 #endif

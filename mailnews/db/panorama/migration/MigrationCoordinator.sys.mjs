@@ -2160,6 +2160,76 @@ function startupMigrationDirectory(journal, core, operation) {
 }
 
 /**
+ * Prepares an explicitly approved request and exits before native restoration.
+ * Never stages or copies a live root. The next process owns native execution.
+ *
+ * @param {nsICommandLine} commandLine - Original startup command line.
+ * @returns {Promise<object>|null} Restore-only request result, or null for an
+ *   ordinary command. Rejection leaves all live roots and older requests intact.
+ */
+export function startPanoramaRestoreCommand(commandLine) {
+  const flags = [
+    "panorama-restore",
+    "panorama-restore-retry",
+    "panorama-restore-rollback",
+  ];
+  const selected = flags.filter(flag => commandLine.findFlag(flag, false) >= 0);
+  if (!selected.length) {
+    return null;
+  }
+  return (async () => {
+    if (
+      selected.length !== 1 ||
+      commandLine.findFlag("panorama-backup", false) >= 0
+    ) {
+      throw new Error(
+        "Choose one restore operation without a simultaneous backup"
+      );
+    }
+    if (!AppConstants.NIGHTLY_BUILD) {
+      throw new Error("This application cannot restore a Panorama profile");
+    }
+    const { requestMigrationRestore, requestMigrationRestoreRecovery } =
+      ChromeUtils.importESModule(
+        "resource:///modules/panorama/MigrationRecovery.sys.mjs"
+      );
+    const profilePath = Services.dirsvc.get("ProfDS", Ci.nsIFile).path;
+    const localProfilePath = Services.dirsvc.get("ProfLD", Ci.nsIFile).path;
+    let request;
+    if (selected[0] === "panorama-restore") {
+      const backupPath = commandLine.handleFlagWithParam(selected[0], false);
+      const roots = [];
+      while (commandLine.findFlag("panorama-restore-approve", false) >= 0) {
+        roots.push(
+          commandLine.handleFlagWithParam("panorama-restore-approve", false)
+        );
+      }
+      request = await requestMigrationRestore(
+        profilePath,
+        localProfilePath,
+        backupPath,
+        roots
+      );
+    } else {
+      commandLine.handleFlag(selected[0], false);
+      if (commandLine.findFlag("panorama-restore-approve", false) >= 0) {
+        throw new Error("Recovery must retain the original approved root set");
+      }
+      request = await requestMigrationRestoreRecovery(
+        profilePath,
+        localProfilePath,
+        selected[0] === "panorama-restore-retry" ? "retry" : "rollback"
+      );
+    }
+    return {
+      restoreOnly: true,
+      requestOnly: true,
+      operationId: request.operationId,
+    };
+  })();
+}
+
+/**
  * Starts the ordinary selected-profile operation from MailGlue app-startup.
  * Captures supported persisted input paths and copies legacy data synchronously
  * before the first await and later profile notifications. It does not pump the
@@ -2176,6 +2246,15 @@ export function startPanoramaProfileAtStartup(signal) {
   let captured;
   let captureError;
   try {
+    const profile = Services.dirsvc.get("ProfDS", Ci.nsIFile);
+    const request = profile.parent.clone();
+    request.append("panorama-migration-" + profile.leafName);
+    request.append("restore.json");
+    const pendingRestore = startupEntryExists(request);
+    request.leafName = "restore-current.json";
+    if (pendingRestore || startupEntryExists(request)) {
+      return finishPanoramaRestoreStartup(database, pending, signal);
+    }
     captured = captureStartupMigration(signal);
   } catch (error) {
     captureError = error;
@@ -2190,13 +2269,80 @@ export function startPanoramaProfileAtStartup(signal) {
 }
 
 /**
+ * Settles the actual native token before restore-only exit or ordinary startup.
+ *
+ * @param {nsIDatabaseCore} database - Actual native service.
+ * @param {Promise<nsISupports>} pending - Native startup operation.
+ * @param {AbortSignal} [signal] - Cancellation before settlement.
+ * @returns {Promise<object>} Restore-only exit or native-validated ordinary entry.
+ * @throws {Error} For failed/incomplete native restoration or settlement.
+ */
+async function finishPanoramaRestoreStartup(database, pending, signal) {
+  let operation;
+  try {
+    operation = await pending;
+    const selected = database.validateProfileStartup(operation);
+    if (signal?.aborted) {
+      throw new DOMException("Restore cancelled", "AbortError");
+    }
+    if (selected.mode === "restore") {
+      if (
+        selected.phase !== "restore-finished" ||
+        !["restored", "rolled-back"].includes(selected.restoreOutcome)
+      ) {
+        throw new Error("Native restoration is not fully verified");
+      }
+      await database.completeProfileStartup(operation, {
+        mode: "restore",
+        restoreOutcome: selected.restoreOutcome,
+      });
+      return { ...selected, restoreOnly: true };
+    }
+    if (
+      !/^[a-f0-9]{32}$/.test(selected.restoreOperationId) ||
+      typeof selected.restoreAuditPath !== "string"
+    ) {
+      throw new Error("Native restore audit is not admitted");
+    }
+    if (selected.mode === "restored-default") {
+      await database.completeProfileStartup(operation, {
+        mode: "restored-default",
+        restoreOperationId: selected.restoreOperationId,
+      });
+      return selected;
+    }
+    const captured = captureStartupMigration(signal, selected);
+    return finishPanoramaProfileStartup(
+      database,
+      pending,
+      captured,
+      null,
+      signal
+    );
+  } catch (error) {
+    if (operation) {
+      try {
+        await database.failProfileStartup(
+          operation,
+          error.result ?? Cr.NS_ERROR_FAILURE
+        );
+      } catch (closeError) {
+        console.error("Restore settlement failed", closeError);
+      }
+    }
+    throw error;
+  }
+}
+
+/**
  * Captures actual persisted input paths and a closed-writer startup backup.
  *
  * @param {AbortSignal} [signal] - Cancellation checked during the copy.
+ * @param {object} [nativeAudit] - Descriptor from the actual validated token.
  * @returns {object} Selected root, native-file presence and optional copy inputs.
  * @throws {Error} For unsafe roots, unconfigured data or unsupported protocols.
  */
-function captureStartupMigration(signal) {
+function captureStartupMigration(signal, nativeAudit) {
   if (signal?.aborted) {
     throw new DOMException("Migration cancelled", "AbortError");
   }
@@ -2211,7 +2357,13 @@ function captureStartupMigration(signal) {
   work.append("panorama-migration-" + profile.leafName);
   const targetExists = startupEntryExists(target);
   const selectorExists = startupEntryExists(selector);
-  if (startupEntryExists(work) && !selectorExists) {
+  const audit = work.clone();
+  audit.append("restore-current.json");
+  if (
+    startupEntryExists(work) &&
+    !selectorExists &&
+    nativeAudit?.restoreAuditPath !== audit.path
+  ) {
     throw new Error("Existing migration work requires explicit recovery");
   }
   if (!targetExists) {
@@ -2493,7 +2645,9 @@ function captureStartupMigration(signal) {
   }
   // The stable outside-profile path preserves discoverable failed attempts.
   // Never create another archive to conceal an existing journal/partial copy.
-  work.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+  if (!startupEntryExists(work)) {
+    work.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+  }
   const backupPath = PathUtils.join(work.path, "backup");
   const backup = createMigrationBackupAtStartup(
     profile.path,

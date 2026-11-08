@@ -4,6 +4,7 @@
 
 import hashlib
 import json
+import os
 import shutil
 import tempfile
 import uuid
@@ -1269,3 +1270,253 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
                 shutil.rmtree(work)
         finally:
             super().tearDown()
+
+
+    def restore_exit(self, flags=(), expected=0):
+        """Run a real command-only/restore-only process without a Marionette session."""
+        self.stop_application()
+        self.marionette.instance.app_args = self.original_args + list(flags)
+        self.marionette.instance.start()
+        code = self.marionette.instance.runner.wait(
+            timeout=self.marionette.startup_timeout
+        )
+        self.assertEqual(expected, code, "Restore processes must settle and exit")
+        self.marionette.instance.app_args = self.original_args
+
+    def restore_request_path(self):
+        """Return only this selected disposable profile's fixed request path."""
+        return self.profile.parent / ("panorama-migration-" + self.profile.name) / "restore.json"
+
+    def restore_result(self):
+        """Read only the actual settled native generation after its process exits."""
+        pending = self.restore_request_path()
+        self.assertFalse(pending.exists(), "Settlement removes the pending request")
+        raw = pending.with_name("restore-current.json").read_bytes()
+        result = json.loads(raw)
+        self.assertEqual(1, result["nativeSettlement"])
+        generation = result["progress"]["generation"]
+        self.assertGreater(generation, 0)
+        audit = pending.with_name(f'restore-{result["operationId"]}-{generation}.complete.json')
+        self.assertEqual(raw, audit.read_bytes(), "Current index binds the exact immutable audit")
+        return result
+
+    def cleanup_restore_staging(self, staging):
+        """Remove only the exact staging directory created for this test's request."""
+        self.assertEqual(self.profile.parent.resolve(), staging.parent.resolve())
+        self.assertTrue(staging.name.startswith("panorama-restore-"))
+        self.assertFalse(staging.is_symlink())
+        if staging.exists():
+            shutil.rmtree(staging)
+
+    def approve_restore(self, backup):
+        """Approve every literal manifest root through the implemented user command."""
+        manifest = json.loads((backup / "manifest.json").read_text())
+        flags = ["--panorama-restore", str(backup)]
+        for root in manifest["roots"]:
+            flags += ["--panorama-restore-approve", root["source"]]
+        work = self.restore_request_path().parent
+        self.created_work.add(work)
+        self.restore_exit(flags)
+        request = json.loads(self.restore_request_path().read_text())
+        self.assertEqual("restore", request["mode"])
+        self.assertEqual([root["source"] for root in manifest["roots"]],
+                         [root["original"] for root in request["approvedRoots"]])
+        self.assertNotIn("progress", request, "Consent is not cutover")
+        staging = Path(request["stagingParent"])
+        self.assertEqual(self.profile.parent.resolve(), staging.parent.resolve())
+        self.assertTrue(staging.name.startswith("panorama-restore-"))
+        self.addCleanup(self.cleanup_restore_staging, staging)
+        return request
+
+    def external_restore_point(self):
+        """Back up real legacy stores/book before writers, then retain newer data."""
+        self.clean_profile(False)
+        mbox_source = self.create_legacy_message("mbox")
+        maildir_source = self.create_legacy_message("maildir")
+        self.marionette.execute_script("""
+            const { MailServices } = ChromeUtils.importESModule(
+              'resource:///modules/MailServices.sys.mjs');
+            const book = MailServices.ab.getDirectory('jsaddrbook://abook.sqlite');
+            const card = Cc['@mozilla.org/addressbook/cardproperty;1']
+              .createInstance(Ci.nsIAbCard);
+            card.displayName = 'Original S527 contact';
+            book.addCard(card);
+        """)
+        temporary = tempfile.TemporaryDirectory(prefix="s527-whole-restore-")
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name).resolve()
+        self.stop_application()
+        external = []
+        prefs = {}
+        for name, source in [("mbox", mbox_source), ("maildir", maildir_source)]:
+            destination = root / name
+            shutil.copytree(source["root"], destination)
+            external.append(destination)
+            prefs[f'mail.server.{source["serverKey"]}.directory'] = str(destination)
+            prefs[f'mail.server.{source["serverKey"]}.directory-rel'] = (
+                "[ProfD]" + Path(os.path.relpath(destination, self.profile)).as_posix()
+            )
+        self.marionette.instance.profile.set_preferences(prefs)
+        markers = [self.profile / "s527-original", *(path / "s527-original" for path in external)]
+        for marker in markers:
+            marker.write_bytes(b"original complete restore bytes\n")
+        backup = root / "archive"
+        self.marionette.instance.app_args = self.original_args + ["--panorama-backup", str(backup)]
+        self.start_same_profile(False)
+        self.marionette.execute_script("""
+            const { MailServices } = ChromeUtils.importESModule(
+              'resource:///modules/MailServices.sys.mjs');
+            const card = Cc['@mozilla.org/addressbook/cardproperty;1']
+              .createInstance(Ci.nsIAbCard);
+            card.displayName = 'Newer retained S527 contact';
+            MailServices.ab.getDirectory('jsaddrbook://abook.sqlite').addCard(card);
+        """)
+        self.stop_application()
+        self.marionette.instance.app_args = self.original_args
+        manifest_bytes = (backup / "manifest.json").read_bytes()
+        manifest = json.loads(manifest_bytes)
+        self.assertTrue(manifest["complete"])
+        self.assertEqual({str(self.profile), *(str(path) for path in external)},
+                         {item["source"] for item in manifest["roots"]})
+        for marker in markers:
+            marker.write_bytes(b"newer retained restore bytes\n")
+        return backup, markers, manifest_bytes
+
+    def assert_restored_contacts(self, newer=False):
+        """Read the restored real address book through its ordinary public service."""
+        names = self.marionette.execute_script("""
+            const { MailServices } = ChromeUtils.importESModule(
+              'resource:///modules/MailServices.sys.mjs');
+            return Array.from(MailServices.ab.getDirectory(
+              'jsaddrbook://abook.sqlite').childCards, card => card.displayName);
+        """)
+        self.assertIn("Original S527 contact", names)
+        self.assertEqual(newer, "Newer retained S527 contact" in names)
+
+    def test_approvedRestoreSameProfileWithExternalStores(self):
+        backup, markers, archive = self.external_restore_point()
+        request = self.approve_restore(backup)
+        for marker in markers:
+            self.assertEqual(b"newer retained restore bytes\n", marker.read_bytes())
+        self.restore_exit()
+        result = self.restore_result()
+        self.assertEqual(request["operationId"], result["operationId"])
+        self.assertEqual("restored", result["progress"]["outcome"])
+        self.assertEqual(archive, (backup / "manifest.json").read_bytes())
+        for marker in markers:
+            self.assertEqual(b"original complete restore bytes\n", marker.read_bytes())
+        current = self.restore_request_path().with_name("restore-current.json")
+        audit = current.read_bytes()
+        current.write_bytes(audit + b" ")
+        self.restore_exit(expected=5)
+        self.assertEqual(audit + b" ", current.read_bytes(), "Foreign index is retained")
+        current.write_bytes(audit)
+        self.start_same_profile(False)
+        self.assert_restored_contacts()
+        receipt = current.with_name(
+            f'restore-{result["operationId"]}-{result["progress"]["generation"]}.ordinary.json'
+        )
+        self.assertEqual(audit, receipt.read_bytes(), "Actual ordinary settlement is durable")
+        self.stop_application()
+        self.start_same_profile(False)
+        self.assert_restored_contacts()
+        self.assertFalse((self.profile / "panorama.sqlite").exists())
+        self.assertFalse((self.profile / "panorama-profile.json").exists())
+
+    def test_restoreRollbackRetainsAllNewerRoots(self):
+        backup, markers, archive = self.external_restore_point()
+        request = self.approve_restore(backup)
+        later = [marker.parent / "s527-created-after-consent" for marker in markers]
+        for child in later:
+            child.write_bytes(b"new child after consent, before native entry\n")
+        prefs = self.profile / "prefs.js"
+        newer_prefs = prefs.read_bytes() + b'\nuser_pref("s527.retainedNewer", true);\n'
+        prefs.write_bytes(newer_prefs)
+        self.restore_exit()
+        for child in later:
+            self.assertFalse(child.exists(), "Restored roots exclude later children")
+        self.assertEqual("restored", self.restore_result()["progress"]["outcome"])
+        offline = backup.with_name("archive-offline")
+        backup.rename(offline)
+        try:
+            self.restore_exit(["--panorama-restore-rollback"])
+            pending = json.loads(self.restore_request_path().read_text())
+            self.assertEqual(request["operationId"], pending["operationId"])
+            self.restore_exit()
+            result = self.restore_result()
+        finally:
+            offline.rename(backup)
+        self.assertEqual("rolled-back", result["progress"]["outcome"])
+        for child in later:
+            self.assertEqual(b"new child after consent, before native entry\n", child.read_bytes())
+        self.assertEqual(newer_prefs, prefs.read_bytes(), "Rollback retains native-entry prefs")
+        for marker in markers:
+            self.assertEqual(b"newer retained restore bytes\n", marker.read_bytes())
+        self.assertEqual(archive, (backup / "manifest.json").read_bytes())
+        self.start_same_profile(False)
+        self.assert_restored_contacts(newer=True)
+
+    def test_failedRestoreGuardBlocksDisabledStartupAndRetries(self):
+        backup, markers, archive = self.external_restore_point()
+        request = self.approve_restore(backup)
+        manifest = json.loads(archive)
+        archived = backup / manifest["roots"][0]["directory"] / "s527-original"
+        saved = archived.read_bytes()
+        archived.write_bytes(b"changed after explicit consent\n")
+        self.restore_exit(expected=5)
+        self.assertEqual(request["operationId"], json.loads(self.restore_request_path().read_text())["operationId"])
+        for marker in markers:
+            self.assertEqual(b"newer retained restore bytes\n", marker.read_bytes())
+        archived.write_bytes(saved)
+        self.restore_exit(["--panorama-restore-retry"])
+        self.restore_exit()
+        self.assertEqual("restored", self.restore_result()["progress"]["outcome"])
+        self.assertEqual(archive, (backup / "manifest.json").read_bytes())
+        self.start_same_profile(False)
+        self.assert_restored_contacts()
+
+    def test_samePathRestorePreservesGenuineNativeReceipts(self):
+        self.clean_profile(False)
+        source = self.create_legacy_message("mbox")
+        legacy_temporary = tempfile.TemporaryDirectory(prefix="s527-before-optin-")
+        self.addCleanup(legacy_temporary.cleanup)
+        legacy_backup = Path(legacy_temporary.name).resolve() / "archive"
+        self.stop_application()
+        self.marionette.instance.app_args = self.original_args + [
+            "--panorama-backup", str(legacy_backup)
+        ]
+        self.start_same_profile(False)
+        self.stop_application()
+        self.marionette.instance.app_args = self.original_args
+        legacy_request = self.approve_restore(legacy_backup)
+        self.restore_exit()
+        self.assertEqual(legacy_request["operationId"], self.restore_result()["operationId"])
+        self.start_same_profile(False)
+        self.assertFalse((self.profile / "panorama.sqlite").exists())
+        self.stop_application()
+        # Opt-in may reuse only native-authenticated restore work, retaining its audit.
+        self.start_same_profile(True)
+        before = self.selection()
+        original = self.assert_message_after_activation(source)
+        selector = (self.profile / "panorama-profile.json").read_bytes()
+        journal = Path(before["record"]["identity"]["journalPath"])
+        journal_bytes = journal.read_bytes()
+        temporary = tempfile.TemporaryDirectory(prefix="s527-native-restore-")
+        self.addCleanup(temporary.cleanup)
+        backup = Path(temporary.name).resolve() / "archive"
+        self.stop_application()
+        self.marionette.instance.app_args = self.original_args + ["--panorama-backup", str(backup)]
+        self.start_same_profile(True)
+        self.stop_application()
+        self.marionette.instance.app_args = self.original_args
+        request = self.approve_restore(backup)
+        self.assertTrue(request["dependencies"], "Retained sibling metadata must be bound")
+        self.restore_exit()
+        self.assertEqual("restored", self.restore_result()["progress"]["outcome"])
+        self.assertEqual(selector, (self.profile / "panorama-profile.json").read_bytes())
+        self.assertEqual(journal_bytes, journal.read_bytes())
+        self.start_same_profile(True)
+        self.assertEqual(before, self.selection())
+        self.assertEqual(original, self.assert_message_after_activation(source))
+        self.assertEqual(selector, (self.profile / "panorama-profile.json").read_bytes())
+        self.assertEqual(journal_bytes, journal.read_bytes())

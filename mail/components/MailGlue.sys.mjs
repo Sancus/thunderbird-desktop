@@ -482,8 +482,43 @@ MailGlue.prototype = {
     ) {
       return;
     }
+    let restore = null;
+    if (
+      [
+        "panorama-restore",
+        "panorama-restore-retry",
+        "panorama-restore-rollback",
+      ].some(flag => commandLine.findFlag(flag, false) >= 0)
+    ) {
+      const { startPanoramaRestoreCommand } = ChromeUtils.importESModule(
+        "resource:///modules/panorama/MigrationCoordinator.sys.mjs"
+      );
+      restore = startPanoramaRestoreCommand(commandLine);
+    }
+    if (restore) {
+      Services.startup.enterLastWindowClosingSurvivalArea();
+      this._panoramaStartupSurvival = true;
+      MailGlue.panoramaStartup = restore;
+      restore.then(
+        result => {
+          this._panoramaRestoreOnly = result;
+          this._quitAfterPanoramaStartup();
+        },
+        error => {
+          console.error("Panorama restore request failed", error);
+          this._panoramaStartupFailed = true;
+          this._quitAfterPanoramaStartup();
+        }
+      );
+      return;
+    }
     const selected = Services.dirsvc.get("ProfDS", Ci.nsIFile).clone();
     selected.append("panorama-profile.json");
+    const restoreRequest = selected.parent.parent.clone();
+    restoreRequest.append("panorama-migration-" + selected.parent.leafName);
+    restoreRequest.append("restore.json");
+    const restoreAudit = restoreRequest.clone();
+    restoreAudit.leafName = "restore-current.json";
     try {
       if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
         let linked = false;
@@ -497,7 +532,12 @@ MailGlue.prototype = {
             throw error;
           }
         }
-        if (!linked && !selected.exists()) {
+        if (
+          !linked &&
+          !selected.exists() &&
+          !restoreRequest.exists() &&
+          !restoreAudit.exists()
+        ) {
           return;
         }
       }
@@ -527,7 +567,14 @@ MailGlue.prototype = {
     }
     // Handle the rejection without replacing the promise seen by real callers.
     MailGlue.panoramaStartup.then(
-      () => this._releasePanoramaStartupSurvival(),
+      result => {
+        if (result?.restoreOnly) {
+          this._panoramaRestoreOnly = result;
+          this._quitAfterPanoramaStartup();
+        } else {
+          this._releasePanoramaStartupSurvival();
+        }
+      },
       error => {
         console.error("Panorama startup requires recovery", error);
         Services.obs.notifyObservers(
@@ -536,7 +583,7 @@ MailGlue.prototype = {
           String(error)
         );
         this._panoramaStartupFailed = true;
-        this._quitAfterPanoramaStartupFailure();
+        this._quitAfterPanoramaStartup();
       }
     );
   },
@@ -564,11 +611,11 @@ MailGlue.prototype = {
   },
 
   /**
-   * Requests the failure exit after XRE has finished its startup notification.
-   * Initializes FOG before shutdown without running successful mail startup.
+   * Requests the recovery or restore-only exit after XRE startup notification.
+   * Initializes FOG before shutdown without running ordinary mail startup.
    * The original rejected promise and native admission gate remain unchanged.
    */
-  _quitAfterPanoramaStartupFailure() {
+  _quitAfterPanoramaStartup() {
     if (!this._finalUIStartupObserved || this._panoramaFailureQuitScheduled) {
       return;
     }
@@ -584,7 +631,12 @@ MailGlue.prototype = {
       } finally {
         try {
           // nsIAppStartup accepts a process exit code in the range 0-255.
-          Services.startup.quit(Ci.nsIAppStartup.eForceQuit, 5);
+          Services.startup.quit(
+            this._panoramaRestoreOnly
+              ? Ci.nsIAppStartup.eAttemptQuit
+              : Ci.nsIAppStartup.eForceQuit,
+            this._panoramaRestoreOnly ? 0 : 5
+          );
         } finally {
           this._releasePanoramaStartupSurvival();
         }
@@ -603,7 +655,16 @@ MailGlue.prototype = {
       action();
       return;
     }
-    MailGlue.panoramaStartup.then(action, () => {}).catch(console.error);
+    MailGlue.panoramaStartup
+      .then(
+        result => {
+          if (!result?.restoreOnly) {
+            action();
+          }
+        },
+        () => {}
+      )
+      .catch(console.error);
   },
 
   // init (called at app startup)
@@ -687,7 +748,12 @@ MailGlue.prototype = {
         );
         if (
           aSubject instanceof Ci.nsICommandLine &&
-          aSubject.findFlag("panorama-backup", false) >= 0
+          aSubject.findFlag("panorama-backup", false) >= 0 &&
+          ![
+            "panorama-restore",
+            "panorama-restore-retry",
+            "panorama-restore-rollback",
+          ].some(flag => aSubject.findFlag(flag, false) >= 0)
         ) {
           try {
             const destination = aSubject.handleFlagWithParam(
@@ -738,8 +804,8 @@ MailGlue.prototype = {
       }
       case "final-ui-startup":
         this._finalUIStartupObserved = true;
-        if (this._panoramaStartupFailed) {
-          this._quitAfterPanoramaStartupFailure();
+        if (this._panoramaStartupFailed || this._panoramaRestoreOnly) {
+          this._quitAfterPanoramaStartup();
           break;
         }
         this._afterPanoramaStartup(() => {

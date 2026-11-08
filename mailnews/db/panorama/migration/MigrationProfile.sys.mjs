@@ -158,10 +158,13 @@ export async function getMigrationProfileState(profilePath) {
  * @returns {Promise<void>} Resolves when the durable recovery state matches.
  * @throws {Error} For missing, corrupt, cancelled or changed recovery state.
  */
-async function validateStartupRecoveryRecord(record) {
+async function validateStartupRecoveryRecord(
+  record,
+  journalPath = record.identity.journalPath
+) {
   const identity = record.identity;
-  startupProfileDirectory(PathUtils.parent(identity.journalPath));
-  const file = canonicalFile(identity.journalPath);
+  startupProfileDirectory(PathUtils.parent(journalPath));
+  const file = canonicalFile(journalPath);
   if ((await IOUtils.stat(file.path)).type !== "regular") {
     throw new Error("Startup recovery journal is not a regular file");
   }
@@ -251,7 +254,7 @@ export async function stageMigrationProfileRestore(profilePath, parentPath) {
  * @returns {Promise<MigrationProfileRecord|null>} Record, or null before conversion.
  * @throws {Error} For unsupported, incomplete or misdirected records.
  */
-async function readProfileRecord(profilePath) {
+async function readProfileRecord(profilePath, identityPath = profilePath) {
   const path = PathUtils.join(profilePath, PROFILE_FILE);
   canonicalFile(path);
   if (!(await IOUtils.exists(path))) {
@@ -262,7 +265,7 @@ async function readProfileRecord(profilePath) {
   }
   const record = await IOUtils.readJSON(path);
   if (record?.formatVersion === 2) {
-    return validateStartupProfileRecord(record, profilePath);
+    return validateStartupProfileRecord(record, identityPath);
   }
   const identity = record?.identity;
   if (
@@ -274,7 +277,7 @@ async function readProfileRecord(profilePath) {
     typeof identity.profilePath != "string" ||
     !PathUtils.isAbsolute(identity.profilePath) ||
     !new FileUtils.File(identity.profilePath).equals(
-      new FileUtils.File(profilePath)
+      new FileUtils.File(identityPath)
     ) ||
     !PathUtils.isAbsolute(identity.journalPath) ||
     !identity.backup ||
@@ -774,4 +777,98 @@ function startupProfileDirectory(path) {
     throw new Error("Startup profile is not a directory");
   }
   return file;
+}
+
+/**
+ * Validates an archived selector at its original path and pins its dependencies.
+ * Copies no data and never changes selectors, receipts or migration journals.
+ *
+ * @param {string} profilePath - Original selected profile directory.
+ * @param {string} archivedProfilePath - Verified archive's profile root.
+ * @param {{source: string, archived: string}[]} roots - Complete restore roots.
+ * @returns {Promise<{record: object|null, dependencies: object[]}>} Original
+ *   selector and retained journal/archive identities required before cutover.
+ * @throws {Error} For unsupported selectors or missing/conflicting dependencies.
+ */
+export async function getMigrationRestoreDependencies(
+  profilePath,
+  archivedProfilePath,
+  roots
+) {
+  const record = await readProfileRecord(archivedProfilePath, profilePath);
+  if (!record) {
+    return { record: null, dependencies: [] };
+  }
+  checkApplicationVersion(record);
+  if (record.formatVersion === 2 && record.origin !== "migrated") {
+    return { record, dependencies: [] };
+  }
+  const identity = record.identity;
+  const original = canonicalFile(identity.journalPath);
+  let journalPath = original.path;
+  for (const root of roots) {
+    const directory = new FileUtils.File(root.source);
+    if (directory.contains(original)) {
+      const archived = new FileUtils.File(root.archived);
+      archived.setRelativePath(
+        archived.clone(),
+        original.getRelativePath(directory)
+      );
+      journalPath = archived.path;
+    }
+  }
+  // Independently retained sibling journals must describe the archived selector,
+  // not a later database incarnation. No import is resumed during this check.
+  startupProfileDirectory(PathUtils.parent(journalPath));
+  const file = canonicalFile(journalPath);
+  if ((await IOUtils.stat(file.path)).type !== "regular") {
+    throw new Error("Restore journal is not a regular file");
+  }
+  const journalSha256 = await IOUtils.computeHexDigest(file.path, "sha256");
+  const state = await IOUtils.readJSON(file.path);
+  if (
+    state.profilePath !== profilePath ||
+    !["activate", "complete"].includes(state.stage) ||
+    JSON.stringify(state.backup) !== JSON.stringify(identity.backup) ||
+    !Array.isArray(state.sources) ||
+    state.sources.length !== identity.imports.length ||
+    identity.imports.some(
+      unit =>
+        !state.sources.some(
+          source =>
+            source.id === unit.id &&
+            source.token === unit.token &&
+            source.sha256 === unit.sha256 &&
+            source.destinationFolderId === unit.folderId &&
+            source.state === "imported"
+        )
+    )
+  ) {
+    throw new Error("Restore selector and journal identities conflict");
+  }
+  if (record.formatVersion === 2) {
+    await validateStartupRecoveryRecord(record, file.path);
+  }
+  const backup = await verifyMigrationBackup(
+    PathUtils.parent(identity.backup.path)
+  );
+  if (JSON.stringify(backup) !== JSON.stringify(identity.backup)) {
+    throw new Error("Restore selector backup identity changed");
+  }
+  if (journalSha256 !== (await IOUtils.computeHexDigest(file.path, "sha256"))) {
+    throw new Error("Restore journal changed during validation");
+  }
+  return {
+    record,
+    dependencies: [
+      {
+        kind: "file",
+        path: original.path,
+        sourcePath: file.path,
+        size: (await IOUtils.stat(file.path)).size,
+        sha256: journalSha256,
+      },
+      { kind: "archive", ...backup },
+    ],
+  };
 }

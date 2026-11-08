@@ -77,7 +77,13 @@ function handleIndexerResult(aFile) {
 
 async function getOrOpen3PaneWindow() {
   if (lazy.MailGlue.panoramaStartup) {
-    await lazy.MailGlue.panoramaStartup;
+    const result = await lazy.MailGlue.panoramaStartup;
+    if (result?.restoreOnly) {
+      throw Components.Exception(
+        "Restore-only process has no mail window",
+        Cr.NS_ERROR_NOT_AVAILABLE
+      );
+    }
   }
   let win = Services.wm.getMostRecentWindow("mail:3pane");
 
@@ -225,7 +231,13 @@ export class MessengerContentHandler {
     // Keep the ordinary command and window route alive until selection settles.
     Services.startup.enterLastWindowClosingSurvivalArea();
     ready
-      .then(() => this.#handleReady(cmdLine))
+      .then(result => {
+        if (result?.restoreOnly) {
+          cmdLine.preventDefault = true;
+        } else {
+          this.#handleReady(cmdLine);
+        }
+      })
       .catch(console.error)
       .finally(() => {
         Services.startup.exitLastWindowClosingSurvivalArea();

@@ -1000,3 +1000,221 @@ add_task(
     );
   }
 );
+
+const {
+  inspectMigrationRestorePlan,
+  requestMigrationRestore,
+  requestMigrationRestoreRecovery,
+  migrationRestoreRequestPath,
+} = ChromeUtils.importESModule(
+  "resource:///modules/panorama/MigrationRecovery.sys.mjs"
+);
+
+/**
+ * Creates a real locked profile and independent external roots for request tests.
+ * The native process tests separately exercise destructive execution and custody.
+ *
+ * @returns {Promise<object>} Exact root paths, retained bytes and verified archive.
+ */
+async function restoreRequestInput() {
+  const input = await lockedProfile();
+  const profilePath = input.lock.directory.path;
+  const external = PathUtils.join(input.root, "external");
+  await IOUtils.makeDirectory(external);
+  const original = PathUtils.join(profilePath, "original");
+  const mail = PathUtils.join(external, "Inbox");
+  await IOUtils.writeUTF8(original, "archived profile bytes");
+  await IOUtils.writeUTF8(mail, "archived external mail bytes");
+  const backupPath = PathUtils.join(input.root, "archive");
+  const backup = await createMigrationBackup(
+    profilePath,
+    [external],
+    backupPath
+  );
+  await IOUtils.writeUTF8(original, "newer profile bytes");
+  await IOUtils.writeUTF8(mail, "newer mail bytes");
+  const roots = [profilePath, external];
+  return {
+    ...input,
+    profilePath,
+    external,
+    original,
+    mail,
+    backupPath,
+    backup,
+    roots,
+    manifest: await IOUtils.read(backup.path),
+    request: (approval = roots) =>
+      requestMigrationRestore(profilePath, profilePath, backupPath, approval),
+    recover: action =>
+      requestMigrationRestoreRecovery(profilePath, profilePath, action),
+  };
+}
+
+add_task(async function test_approvedRestoreWritesOnlyRequest() {
+  const input = await restoreRequestInput();
+  const request = await input.request();
+  Assert.equal(request.mode, "restore");
+  Assert.deepEqual(
+    request.approvedRoots.map(root => root.original),
+    input.roots
+  );
+  Assert.deepEqual(request.backup, input.backup);
+  Assert.ok(!request.progress, "A request is not completion");
+  Assert.deepEqual(
+    await IOUtils.readJSON(migrationRestoreRequestPath(input.profilePath)),
+    request
+  );
+  Assert.equal(await IOUtils.readUTF8(input.original), "newer profile bytes");
+  Assert.equal(await IOUtils.readUTF8(input.mail), "newer mail bytes");
+  Assert.deepEqual(await IOUtils.read(input.backup.path), input.manifest);
+  Assert.ok(input.lock.directory.equals(input.profile.rootDir));
+});
+
+add_task(async function test_restoreRejectsIncompleteOrForeignRootApproval() {
+  const input = await restoreRequestInput();
+  for (const approval of [
+    [],
+    [input.profilePath],
+    [...input.roots, input.root],
+    [input.external, input.external],
+  ]) {
+    await Assert.rejects(
+      input.request(approval),
+      /Approve every original restore root/
+    );
+    Assert.ok(
+      !(await IOUtils.exists(migrationRestoreRequestPath(input.profilePath)))
+    );
+    Assert.equal(await IOUtils.readUTF8(input.mail), "newer mail bytes");
+  }
+});
+
+add_task(async function test_restoreRequestNeverReplacesAnOlderTransaction() {
+  const input = await restoreRequestInput();
+  await input.request();
+  const path = migrationRestoreRequestPath(input.profilePath);
+  const before = await IOUtils.read(path);
+  await Assert.rejects(input.request(), /./);
+  Assert.deepEqual(await IOUtils.read(path), before);
+  Assert.equal(await IOUtils.readUTF8(input.original), "newer profile bytes");
+});
+
+add_task(async function test_restoreRejectsAnotherProfileAndChangedArchive() {
+  const input = await restoreRequestInput();
+  const other = await lockedProfile();
+  await Assert.rejects(
+    inspectMigrationRestorePlan(
+      other.lock.directory.path,
+      other.lock.directory.path,
+      input.backupPath
+    ),
+    /another profile/
+  );
+  const manifest = await IOUtils.readJSON(input.backup.path);
+  const root = manifest.roots[1];
+  await IOUtils.writeUTF8(
+    PathUtils.join(input.backupPath, root.directory, "Inbox"),
+    "changed archive"
+  );
+  await Assert.rejects(input.request(), /differs/);
+  Assert.ok(
+    !(await IOUtils.exists(migrationRestoreRequestPath(input.profilePath)))
+  );
+  Assert.equal(await IOUtils.readUTF8(input.mail), "newer mail bytes");
+});
+
+add_task(async function test_restoreRecoveryChangesOnlyTheRequestedAction() {
+  const input = await restoreRequestInput();
+  const request = await input.request();
+  for (const action of ["retry", "rollback"]) {
+    const changed = await input.recover(action);
+    Assert.deepEqual(changed, {
+      ...request,
+      action: action === "retry" ? "restore" : action,
+    });
+    Assert.equal(await IOUtils.readUTF8(input.original), "newer profile bytes");
+    Assert.equal(await IOUtils.readUTF8(input.mail), "newer mail bytes");
+  }
+  await Assert.rejects(
+    input.recover("ready"),
+    /Invalid restore recovery action/
+  );
+  await Assert.rejects(
+    requestMigrationRestoreRecovery(input.profilePath, input.root, "retry"),
+    /another operation/
+  );
+  Assert.deepEqual(await IOUtils.read(input.backup.path), input.manifest);
+});
+
+add_task(async function test_changedArchiveCannotAuthorizeRestoreRetry() {
+  const input = await restoreRequestInput();
+  await input.request();
+  const path = migrationRestoreRequestPath(input.profilePath);
+  const before = await IOUtils.read(path);
+  await IOUtils.writeUTF8(input.backup.path, "corrupt manifest");
+  await Assert.rejects(input.recover("retry"), /./);
+  Assert.deepEqual(await IOUtils.read(path), before);
+  const rollback = await input.recover("rollback");
+  Assert.deepEqual(rollback, {
+    ...JSON.parse(new TextDecoder().decode(before)),
+    action: "rollback",
+  });
+  Assert.equal(await IOUtils.readUTF8(input.mail), "newer mail bytes");
+});
+
+add_task(async function test_settledAuditRecoveryPreservesItsGeneration() {
+  const input = await restoreRequestInput();
+  const request = await input.request();
+  const path = migrationRestoreRequestPath(input.profilePath);
+  const directory = PathUtils.parent(path);
+  // Request-boundary fixture only: real custody and settlement are native tests.
+  const completed = {
+    ...request,
+    nativeSettlement: 1,
+    progress: { generation: 1, outcome: "restored" },
+  };
+  const bytes = JSON.stringify(completed);
+  const current = PathUtils.join(directory, "restore-current.json");
+  const audit = PathUtils.join(
+    directory,
+    `restore-${request.operationId}-1.complete.json`
+  );
+  await IOUtils.writeUTF8(current, bytes);
+  await IOUtils.writeUTF8(audit, bytes);
+  await IOUtils.remove(path);
+  await IOUtils.writeJSON(current, {
+    ...completed,
+    progress: { outcome: "restored" },
+  });
+  await Assert.rejects(input.recover("rollback"), /settled native generation/);
+  Assert.ok(!(await IOUtils.exists(path)));
+  await IOUtils.writeUTF8(current, bytes);
+  await IOUtils.remove(input.backupPath, { recursive: true });
+  await Assert.rejects(input.recover("retry"), /./);
+  Assert.ok(!(await IOUtils.exists(path)));
+  Assert.deepEqual(await input.recover("rollback"), {
+    ...completed,
+    action: "rollback",
+  });
+  Assert.equal(await IOUtils.readUTF8(current), bytes);
+  Assert.equal(await IOUtils.readUTF8(audit), bytes);
+  await IOUtils.remove(path);
+  await IOUtils.writeUTF8(audit, bytes + " ");
+  await Assert.rejects(input.recover("rollback"), /immutable audit/);
+  Assert.ok(!(await IOUtils.exists(path)));
+  completed.progress.outcome = "rolled-back";
+  const rolledBack = JSON.stringify(completed);
+  await IOUtils.writeUTF8(current, rolledBack);
+  await IOUtils.writeUTF8(audit, rolledBack);
+  await Assert.rejects(input.recover("retry"), /rolled-back generation/);
+  await IOUtils.writeUTF8(path + ".tmp", "retained partial request");
+  await Assert.rejects(input.recover("rollback"), /retained partial/);
+  Assert.equal(
+    await IOUtils.readUTF8(path + ".tmp"),
+    "retained partial request"
+  );
+  Assert.ok(!(await IOUtils.exists(path)));
+  Assert.equal(await IOUtils.readUTF8(input.original), "newer profile bytes");
+  Assert.equal(await IOUtils.readUTF8(input.mail), "newer mail bytes");
+});

@@ -22,6 +22,14 @@ interface nsIDatabaseCore : nsISupports {
    * Resolves to a native operation after XRE's app-startup notification. The
    * opaque object is not a profile lock and must never be used as one.
    */
+  // A pending restore.json is admitted before ordinary selector/pref handling.
+  // The original native startup owner verifies/stages all approved roots and
+  // retains newer data before restore or rollback. Its opaque token is not a
+  // profile lock. A restore descriptor has mode "restore", phase
+  // "restore-finished", and restoreOutcome "restored" or "rolled-back".
+  // completeProfileStartup accepts that exact mode/outcome, joins actual native
+  // settlement and exclusively archives the request. It never admits ordinary
+  // work in the restore process: quit, then restart the same profile separately.
   [implicit_jscontext] Promise beginProfileStartup();
 
   /**

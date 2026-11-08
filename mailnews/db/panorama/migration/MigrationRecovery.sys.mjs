@@ -2,10 +2,17 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+import { FileUtils } from "resource://gre/modules/FileUtils.sys.mjs";
+import { verifyMigrationBackup } from "resource:///modules/panorama/MigrationBackup.sys.mjs";
+import {
+  admitWindowsMigrationPath,
+  migrationPhysicalIdentity,
+} from "resource:///modules/panorama/MigrationSource.sys.mjs";
 import { AppConstants } from "resource://gre/modules/AppConstants.sys.mjs";
 import { MigrationJournal } from "resource:///modules/panorama/MigrationJournal.sys.mjs";
 import {
   getMigrationProfileState,
+  getMigrationRestoreDependencies,
   stageMigrationProfileRestore,
 } from "resource:///modules/panorama/MigrationProfile.sys.mjs";
 
@@ -113,4 +120,323 @@ export async function stageInterruptedMigrationRestore(
     throw new Error("Migration recovery changed while staging restore");
   }
   return { ...restored, ...after };
+}
+
+/**
+ * Returns the fixed sibling request path without opening a database or a store.
+ *
+ * @param {string} profilePath - Exact selected profile directory.
+ * @returns {string} Request path used by the native restoration-only observer.
+ */
+export function migrationRestoreRequestPath(profilePath) {
+  const profile = restoreFile(profilePath);
+  return PathUtils.join(
+    profile.parent.path,
+    "panorama-migration-" + profile.leafName,
+    "restore.json"
+  );
+}
+
+/**
+ * Verifies a complete restore archive and its original destination/dependency set.
+ * Does not stage or copy files and does not authorize startup or live writes.
+ *
+ * @param {string} profilePath - Selected original profile directory.
+ * @param {string} localProfilePath - Selected XRE local directory.
+ * @param {string} backupPath - Complete backup directory outside all live roots.
+ * @returns {Promise<object>} Verified manifest, exact root set and dependencies.
+ * @throws {Error} For unsafe paths, mismatched identity or incomplete input.
+ */
+export async function inspectMigrationRestorePlan(
+  profilePath,
+  localProfilePath,
+  backupPath
+) {
+  const profile = restoreFile(profilePath);
+  const local = restoreFile(localProfilePath);
+  if (!profile.isDirectory() || !local.isDirectory()) {
+    throw new Error("Restore requires existing selected directories");
+  }
+  const archive = restoreFile(backupPath);
+  const backup = await verifyMigrationBackup(archive.path);
+  const manifest = await IOUtils.readJSON(backup.path);
+  const sources = manifest.roots.map(root => restoreFile(root.source));
+  if (sources[0].path !== profile.path) {
+    throw new Error("Restore backup selects another profile");
+  }
+  const work = new FileUtils.File(
+    PathUtils.parent(migrationRestoreRequestPath(profile.path))
+  );
+  for (const [index, source] of sources.entries()) {
+    if (
+      source.equals(archive) ||
+      source.contains(archive) ||
+      archive.contains(source) ||
+      source.equals(work) ||
+      source.contains(work) ||
+      work.contains(source) ||
+      sources.some(
+        (other, otherIndex) =>
+          otherIndex !== index &&
+          (source.equals(other) || source.contains(other))
+      ) ||
+      !/^root-\d+$/.test(manifest.roots[index].directory)
+    ) {
+      throw new Error("Restore roots, work and archive must be disjoint");
+    }
+    if (!source.isDirectory()) {
+      throw new Error("Restore destination is not a directory");
+    }
+  }
+  const roots = manifest.roots.map(root => ({
+    source: root.source,
+    archived: PathUtils.join(archive.path, root.directory),
+  }));
+  const { record, dependencies } = await getMigrationRestoreDependencies(
+    profile.path,
+    roots[0].archived,
+    roots
+  );
+  return {
+    profilePath: profile.path,
+    localProfilePath: local.path,
+    backup,
+    approvedRoots: manifest.roots.map(root => ({ original: root.source })),
+    dependencies,
+    application: record?.application ?? {
+      version: Services.appinfo.version,
+      buildId: Services.appinfo.appBuildID,
+    },
+  };
+}
+
+/**
+ * Writes an approved restore request for the next closed-writer native startup.
+ * Consent covers EVERY original root and retention of its current child entries.
+ * The request process must quit normally before the native executor can run.
+ *
+ * @param {string} profilePath - Exact selected profile directory.
+ * @param {string} localProfilePath - Exact selected local directory.
+ * @param {string} backupPath - Complete verified backup directory.
+ * @param {string[]} approvedRoots - Explicit original destinations, no subset.
+ * @returns {Promise<object>} Durable request with no live root changes.
+ * @throws {Error} For incomplete consent, changed inputs or an existing request.
+ */
+export async function requestMigrationRestore(
+  profilePath,
+  localProfilePath,
+  backupPath,
+  approvedRoots
+) {
+  const plan = await inspectMigrationRestorePlan(
+    profilePath,
+    localProfilePath,
+    backupPath
+  );
+  const expected = plan.approvedRoots.map(root => root.original);
+  if (
+    !Array.isArray(approvedRoots) ||
+    approvedRoots.length !== expected.length ||
+    new Set(approvedRoots).size !== expected.length ||
+    expected.some(path => !approvedRoots.includes(path))
+  ) {
+    throw new Error(
+      "Approve every original restore root: " + expected.join(", ")
+    );
+  }
+  const path = migrationRestoreRequestPath(plan.profilePath);
+  if (await IOUtils.exists(path)) {
+    throw new Error(
+      "Keep the existing restore transaction for retry or rollback"
+    );
+  }
+  await IOUtils.makeDirectory(PathUtils.parent(path), { permissions: 0o700 });
+  restoreFile(PathUtils.parent(path));
+  const request = {
+    formatVersion: 1,
+    mode: "restore",
+    operationId: Services.uuid.generateUUID().toString().replace(/[{}-]/g, ""),
+    action: "restore",
+    ...plan,
+    stagingParent: await IOUtils.createUniqueDirectory(
+      PathUtils.parent(plan.profilePath),
+      "panorama-restore-"
+    ),
+  };
+  // Exclusive creation preserves every older failed or completed transaction.
+  await writeRestoreRequest(path, request, { mode: "create", flush: true });
+  return request;
+}
+
+/**
+ * Requests retry or complete rollback of the retained native transaction.
+ * Preserves the operation, root set, progress, first error and retained bytes.
+ * Retry verifies original inputs; rollback delegates retained custody to native
+ * validation even when the original after-input archive is unavailable.
+ *
+ * @param {string} profilePath - Selected original profile directory.
+ * @param {string} localProfilePath - Selected original local directory.
+ * @param {"retry"|"rollback"} action - Explicit recovery operation.
+ * @returns {Promise<object>} Same request with only its requested action changed.
+ * @throws {Error} For absent/foreign progress, unsafe retry or invalid action.
+ */
+export async function requestMigrationRestoreRecovery(
+  profilePath,
+  localProfilePath,
+  action
+) {
+  if (!["retry", "rollback"].includes(action)) {
+    throw new Error("Invalid restore recovery action");
+  }
+  const path = migrationRestoreRequestPath(profilePath);
+  const pending = await IOUtils.exists(path);
+  const source = pending
+    ? path
+    : PathUtils.join(PathUtils.parent(path), "restore-current.json");
+  restoreFile(source);
+  const before = await IOUtils.readUTF8(source);
+  const request = JSON.parse(before);
+  if (
+    request.formatVersion !== 1 ||
+    request.mode !== "restore" ||
+    request.profilePath !== profilePath ||
+    request.localProfilePath !== localProfilePath ||
+    !/^[a-f0-9]{32}$/.test(request.operationId) ||
+    !request.backup
+  ) {
+    throw new Error("Restore recovery selects another operation");
+  }
+  if (!pending) {
+    const generation = request.progress?.generation;
+    if (
+      request.nativeSettlement !== 1 ||
+      !Number.isSafeInteger(generation) ||
+      generation < 1 ||
+      generation > 0xffffffff ||
+      !["restored", "rolled-back"].includes(request.progress?.outcome)
+    ) {
+      throw new Error("Restore recovery requires a settled native generation");
+    }
+    const audit = restoreFile(
+      PathUtils.join(
+        PathUtils.parent(path),
+        `restore-${request.operationId}-${generation}.complete.json`
+      )
+    );
+    if ((await IOUtils.readUTF8(audit.path)) !== before) {
+      throw new Error("Restore current index differs from its immutable audit");
+    }
+  }
+  if (action === "retry" && request.progress?.outcome === "rolled-back") {
+    throw new Error("A rolled-back generation cannot become a new restore");
+  }
+  if (action === "retry") {
+    const plan = await inspectMigrationRestorePlan(
+      profilePath,
+      localProfilePath,
+      PathUtils.parent(request.backup.path)
+    );
+    if (
+      ["backup", "approvedRoots", "dependencies", "application"].some(
+        key => JSON.stringify(plan[key]) !== JSON.stringify(request[key])
+      )
+    ) {
+      throw new Error("Restore archive, roots or dependencies changed");
+    }
+  }
+  // Audit equality is request preflight only; native revalidates real custody.
+  if ((await IOUtils.readUTF8(source)) !== before) {
+    throw new Error("Restore progress changed during recovery request");
+  }
+  request.action = action === "retry" ? "restore" : action;
+  await writeRestoreRequest(path, request, {
+    mode: pending ? "overwrite" : "create",
+    tmpPath: path + ".tmp",
+    flush: true,
+  });
+  return request;
+}
+
+/**
+ * Admits absolute restore paths through native Windows or Unix link guards.
+ *
+ * @param {string} path - Literal existing path or absent leaf.
+ * @returns {nsIFile} Admitted canonical path with existing safe ancestors.
+ * @throws {Error} For relative/aliased/linked paths or missing ancestors.
+ */
+function restoreFile(path) {
+  if (
+    typeof path !== "string" ||
+    path.includes("\0") ||
+    !PathUtils.isAbsolute(path)
+  ) {
+    throw new Error("Restore path must be absolute");
+  }
+  const file = new FileUtils.File(path);
+  if (AppConstants.platform === "win") {
+    const kind =
+      file.exists() && file.isDirectory()
+        ? Ci.nsIPanoramaMigrationFileSystem.KIND_DIRECTORY
+        : Ci.nsIPanoramaMigrationFileSystem.KIND_FILE_OR_MISSING;
+    const lease = admitWindowsMigrationPath(file, kind);
+    try {
+      Cc["@mozilla.org/mailnews/panorama-migration-file-system;1"]
+        .getService(Ci.nsIPanoramaMigrationFileSystem)
+        .validate(lease);
+      return new FileUtils.File(lease.canonicalPath);
+    } finally {
+      lease.close();
+    }
+  }
+  const normalized = file.clone();
+  normalized.normalize();
+  if (normalized.path !== path) {
+    throw new Error("Restore path must be canonical");
+  }
+  for (let part = file; part; part = part.parent) {
+    try {
+      if (part.isSymlink()) {
+        throw new Error("Restore path contains a link");
+      }
+    } catch (error) {
+      if (error.result !== Cr.NS_ERROR_FILE_NOT_FOUND || part.path !== path) {
+        throw error;
+      }
+    }
+  }
+  return file;
+}
+
+/**
+ * Flushes request JSON while retaining its real Windows parent admission.
+ * The native executor separately retains all live/source/output custody.
+ *
+ * @param {string} path - Fixed sibling request path.
+ * @param {object} request - Verified request or same-operation recovery action.
+ * @param {{mode?: string, tmpPath?: string, flush: boolean}} options - IO options.
+ * @returns {Promise<void>} Resolves after publication and parent revalidation.
+ * @throws {Error} For unsafe/changed parents or failed write/flush.
+ */
+async function writeRestoreRequest(path, request, options) {
+  if (options.tmpPath) {
+    restoreFile(options.tmpPath);
+    if (await IOUtils.exists(options.tmpPath)) {
+      throw new Error("Keep the retained partial restore request");
+    }
+  }
+  const lease = admitWindowsMigrationPath(
+    new FileUtils.File(PathUtils.parent(path)),
+    Ci.nsIPanoramaMigrationFileSystem.KIND_DIRECTORY
+  );
+  try {
+    if (lease) {
+      migrationPhysicalIdentity(lease);
+    }
+    await IOUtils.writeJSON(path, request, options);
+    if (lease) {
+      migrationPhysicalIdentity(lease);
+    }
+  } finally {
+    lease?.close();
+  }
 }

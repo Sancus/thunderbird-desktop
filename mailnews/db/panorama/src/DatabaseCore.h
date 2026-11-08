@@ -6,6 +6,14 @@
 #define COMM_MAILNEWS_DB_PANORAMA_SRC_DATABASECORE_H_
 
 #include <functional>
+#include "prio.h"
+#include "nsIPanoramaMigrationFileSystem.h"
+#include "nsIFile.h"
+#include <utility>
+#ifndef XP_WIN
+#  include <sys/stat.h>
+#  include <unistd.h>
+#endif
 
 #include "FolderDatabase.h"
 #include "MessageDatabase.h"
@@ -13,6 +21,7 @@
 #include "mozilla/RefPtr.h"
 #include "mozilla/StaticPtr.h"
 #include "mozilla/WeakPtr.h"
+#include "mozilla/UniquePtr.h"
 #include "nsCOMPtr.h"
 #include "nsIDatabaseCore.h"
 #include "nsIFactory.h"
@@ -20,14 +29,20 @@
 #include "nsIObserver.h"
 #include "nsTHashMap.h"
 
-#define DATABASE_CORE_CID \
-  {0xbb308d0b, 0xbb99, 0x4699, {0x89, 0xde, 0x42, 0x82, 0x65, 0x2d, 0x0e, 0x16}}
+#define DATABASE_CORE_CID                            \
+  {                                                  \
+    0xbb308d0b, 0xbb99, 0x4699, {                    \
+      0x89, 0xde, 0x42, 0x82, 0x65, 0x2d, 0x0e, 0x16 \
+    }                                                \
+  }
 
 class mozIStorageConnection;
 class mozIStorageStatement;
 class nsIFile;
 class nsIAbDirectory;
 class nsIAsyncShutdownBlocker;
+class nsIPanoramaMigrationPath;
+struct PRFileDesc;
 class nsMsgDBFolder;
 namespace mozilla::dom {
 class Promise;
@@ -35,12 +50,79 @@ class Promise;
 
 namespace mozilla::mailnews {
 
+struct StartupRestoreStamp {
+  nsCString id;
+  int64_t size = 0, modified = 0;
+  uint32_t permissions = 0;
+  bool directory = false;
+};
+struct StartupRestoreFD {
+  ~StartupRestoreFD() { (void)Close(); }
+  nsCOMPtr<nsIFile> file;
+  nsCOMPtr<nsIPanoramaMigrationPath> lease;
+  nsCString path;
+  StartupRestoreStamp identity;
+  PRFileDesc* io = nullptr;
+  int fd = -1;
+  bool writable = false;
+  nsresult SetPermissions(uint32_t mode) {
+#ifdef XP_WIN
+    return file->SetPermissions(mode);
+#else
+    return fchmod(fd, mode) ? NS_ERROR_FILE_ACCESS_DENIED : NS_OK;
+#endif
+  }
+  nsresult Close() {
+    nsresult result = NS_OK;
+    if (io && PR_Close(std::exchange(io, nullptr)) != PR_SUCCESS)
+      result = NS_ERROR_FAILURE;
+#ifndef XP_WIN
+    if (fd >= 0 && close(std::exchange(fd, -1))) result = NS_ERROR_FAILURE;
+#endif
+    if (lease) {
+      nsresult rv = lease->Close();
+      if (NS_SUCCEEDED(result)) result = rv;
+      lease = nullptr;
+    }
+    return result;
+  }
+};
+struct StartupRestoreEntry {
+  nsCString path, hash, nativeId;
+  int64_t size = 0, modified = 0;
+  uint32_t permissions = 0;
+  bool directory = false, metadata = true;
+};
+struct StartupRestoreRoot {
+  ~StartupRestoreRoot();
+  UniquePtr<StartupRestoreFD> live, archive, stage, saved, retired;
+  nsTArray<StartupRestoreEntry> before, after;
+  nsCString archiveIdentity, stageIdentity, savedIdentity, retiredIdentity;
+  uint32_t phase = 0, beforeMode = 0, afterMode = 0;
+  int64_t beforeModified = 0, afterModified = 0;
+};
+struct ProfileRestoreState {
+  ~ProfileRestoreState();
+  UniquePtr<StartupRestoreFD> work, container, parent;
+  nsTArray<UniquePtr<StartupRestoreRoot>> roots;
+  nsTArray<UniquePtr<StartupRestoreFD>> dependencies;
+  nsTHashMap<nsCString, nsCString> dependencyHashes, physicalPins;
+  nsCString id, requestPath, requestBytes, plan, outcome, prefix, action;
+  nsCString writingPath, writingId, dependencyPlan;
+  JSContext* context = nullptr;
+  uint32_t generation = 0, failure = 0;
+  bool complete = false;
+  nsresult Check();
+  nsresult Close();
+};
+
 class ProfileStartupOperation;
 struct StartupMailSource;
 class PerFolderDatabase;
 struct CacheImport;
 class DeliveryCoreMessageExistence;
 class DeliveryCoreReferences;
+class DeliveryCoreStartupRestore;
 class DeliveryCoreProperties;
 class DeliveryFolderInfoProperties;
 class DeliveryMessageReferences;
@@ -258,6 +340,7 @@ class DatabaseCore : public nsIDatabaseCore,
   friend class ::nsMsgDBFolder;
   friend class DeliveryCoreMessageExistence;
   friend class DeliveryCoreReferences;
+  friend class DeliveryCoreStartupRestore;
   friend class DeliveryCoreProperties;
   friend class DeliveryFolderInfoProperties;
   friend class DeliveryMessageReferences;
@@ -339,6 +422,9 @@ class DatabaseCore : public nsIDatabaseCore,
 
   nsresult ArmProfileStartup(nsIFile* profile, nsIFile* localProfile);
   nsresult CheckProfileStartup(nsISupports* operation, bool metadata = false);
+  nsresult RunProfileRestore(JSContext* cx);
+  nsresult CheckProfileRestore(
+      JSContext* cx, const JS::Handle<JS::Value>* activation = nullptr);
   nsresult DescribeProfileStartup(JSContext* cx,
                                   JS::MutableHandle<JS::Value> output);
   nsresult OpenProfileStartup(JSContext* cx, JS::Handle<JS::Value> plan);

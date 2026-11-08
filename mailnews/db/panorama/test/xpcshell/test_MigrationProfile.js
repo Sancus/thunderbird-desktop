@@ -1115,3 +1115,140 @@ add_task(
     await checkStartupTargetFailure("partial");
   }
 );
+
+const { getMigrationRestoreDependencies } = ChromeUtils.importESModule(
+  "resource:///modules/panorama/MigrationProfile.sys.mjs"
+);
+
+/**
+ * Archives an actual selector with its retained unit-boundary journal/archive.
+ * Does not model native receipt validation, which runs in ordinary process tests.
+ *
+ * @param {boolean} [nested=false] - Archive the journal inside an external root.
+ * @returns {Promise<object>} Original selector and complete verified root copies.
+ */
+async function archivedSelectorInput(nested = false) {
+  const input = await lifecycleProfile();
+  await input.journal.finishStage("validate");
+  input.journal.close();
+  if (nested) {
+    const original = input.journalPath;
+    input.journalPath = PathUtils.join(
+      input.root,
+      "external",
+      "metadata",
+      "journal.json"
+    );
+    await IOUtils.makeDirectory(PathUtils.parent(input.journalPath));
+    await IOUtils.move(original, input.journalPath, { noOverwrite: true });
+  }
+  const record = await activateMigrationProfile(
+    input.journalPath,
+    input.profilePath
+  );
+  const archive = PathUtils.join(input.root, "restore-point");
+  const backup = await createMigrationBackup(
+    input.profilePath,
+    [PathUtils.join(input.root, "external")],
+    archive
+  );
+  const manifest = await IOUtils.readJSON(backup.path);
+  const roots = manifest.roots.map(root => ({
+    source: root.source,
+    archived: PathUtils.join(archive, root.directory),
+  }));
+  const archived = roots[0].archived;
+  return {
+    ...input,
+    record,
+    roots,
+    archived,
+    dependencies: () =>
+      getMigrationRestoreDependencies(input.profilePath, archived, roots),
+  };
+}
+
+add_task(
+  async function test_restoreIntentBindsOriginalSelectorAndDependencies() {
+    for (const nested of [false, true]) {
+      const input = await archivedSelectorInput(nested);
+      const before = await IOUtils.read(
+        PathUtils.join(input.profilePath, "panorama-profile.json")
+      );
+      const result = await input.dependencies();
+      Assert.deepEqual(
+        result.record,
+        input.record,
+        "No selector receipt is reminted"
+      );
+      Assert.equal(result.dependencies.length, 2);
+      Assert.equal(result.dependencies[0].path, input.journalPath);
+      Assert.equal(
+        result.dependencies[0].sourcePath,
+        nested
+          ? PathUtils.join(input.roots[1].archived, "metadata", "journal.json")
+          : input.journalPath,
+        "Read the genuine archived or retained journal"
+      );
+      Assert.equal(
+        result.dependencies[0].sha256,
+        await IOUtils.computeHexDigest(input.journalPath, "sha256")
+      );
+      Assert.deepEqual(result.dependencies[1], {
+        kind: "archive",
+        ...input.record.identity.backup,
+      });
+      Assert.deepEqual(
+        await IOUtils.read(
+          PathUtils.join(input.profilePath, "panorama-profile.json")
+        ),
+        before
+      );
+    }
+  }
+);
+
+add_task(
+  async function test_restoreRefusesMissingOrConflictingRetainedJournal() {
+    const input = await archivedSelectorInput();
+    const saved = await IOUtils.read(input.journalPath);
+    const moved = input.journalPath + ".retained";
+    await IOUtils.move(input.journalPath, moved, { noOverwrite: true });
+    await Assert.rejects(input.dependencies(), /./);
+    Assert.ok(
+      !(await IOUtils.exists(input.journalPath)),
+      "Missing dependency stays missing"
+    );
+    await IOUtils.move(moved, input.journalPath, { noOverwrite: true });
+    const state = await IOUtils.readJSON(input.journalPath);
+    state.sources[0].token += "-foreign";
+    await IOUtils.writeJSON(input.journalPath, state);
+    const corrupt = await IOUtils.read(input.journalPath);
+    await Assert.rejects(input.dependencies(), /identities conflict/);
+    Assert.deepEqual(await IOUtils.read(input.journalPath), corrupt);
+    await IOUtils.write(input.journalPath, saved);
+  }
+);
+
+add_task(
+  async function test_archivedRestoreRetainsOriginalPathAndVersionGuards() {
+    const input = await archivedSelectorInput();
+    await Assert.rejects(
+      getMigrationRestoreDependencies(input.root, input.archived, input.roots),
+      /unsupported.*profile format/
+    );
+    const path = PathUtils.join(input.archived, "panorama-profile.json");
+    const newer = await IOUtils.readJSON(path);
+    newer.application.version = "999.0";
+    await IOUtils.writeJSON(path, newer);
+    await Assert.rejects(
+      input.dependencies(),
+      /compatible application version/
+    );
+    Assert.deepEqual(
+      await IOUtils.readJSON(path),
+      newer,
+      "Refusal does not rewrite the archived selector to admit it"
+    );
+  }
+);

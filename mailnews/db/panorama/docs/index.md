@@ -32,6 +32,144 @@ $ ./mach mochitest --setpref mail.panorama.enabled=true ....
 $ ./mach xpcshell-test --setpref mail.panorama.enabled=true ....
 ```
 
+## Restore a complete migration backup
+
+The same procedure applies on Linux, macOS and Windows. It restores the selected
+profile and every external store in its verified migration backup to their
+approved original locations. The archive remains intact. Current data displaced
+by restoration is retained separately, including messages written after backup.
+
+Use the same Thunderbird trial build for every invocation below. Unix examples
+use `thunderbird`; on macOS use the executable inside your installed app, such as
+`/Applications/Thunderbird.app/Contents/MacOS/thunderbird`. Quote executable and
+absolute paths that contain spaces. On Windows, use PowerShell's `&` with your
+installed `thunderbird.exe` and native absolute paths; for example, replace these
+paths to list the required roots without approving replacement:
+
+```powershell
+& 'C:\Program Files\Mozilla Thunderbird\thunderbird.exe' --new-instance --profile 'C:\Profiles\Trial' --panorama-restore 'D:\Backups\Trial'
+```
+
+Use that platform's executable and paths for approval, recovery and both ordinary
+invocations too. The restore flags and process sequence are identical.
+
+### Select and approve the complete operation
+
+Close Thunderbird and other writers to the selected profile and its external
+stores. Keep the same profile and local-profile directories. Retain the complete
+archive and any matching saved journal or archive required by its selector.
+A missing or conflicting dependency is an error to resolve before replacement;
+saved backend/version, database UUID, import-token and source-map identities are
+preserved. Use the application-generated request; do not write or edit its JSON.
+
+First request the backup without approval flags to list the complete required
+root set. This refuses replacement:
+
+```sh
+thunderbird --new-instance --profile /absolute/profile --panorama-restore /absolute/backup
+```
+
+Review the listed destinations before approving their replacement. Repeat with
+one `--panorama-restore-approve` for **every** exact root, including the selected
+profile. Approval covers replacing
+those roots' contents while retaining their current data. An omitted, extra,
+changed, linked or overlapping root causes refusal.
+
+For example, replace these absolute paths with the exact listed roots; repeat
+the approval option for any additional root:
+
+```sh
+thunderbird --new-instance --profile /absolute/profile \
+  --panorama-restore /absolute/backup \
+  --panorama-restore-approve /absolute/profile \
+  --panorama-restore-approve /absolute/mail-mbox \
+  --panorama-restore-approve /absolute/mail-maildir
+```
+
+This **request process** verifies the archive and complete root/dependency
+approval, saves the fixed profile-specific sibling request, and quits. It does
+not restore live data. Keep the archive digest and all reported retained paths.
+Keep enough writable space for staged copies and displaced current data. Staged
+restore copies stay outside archive/live roots. On Windows, native-owned retained
+originals may use an exclusive same-volume retirement directory inside an
+approved live root. Never create, move or change these custody paths yourself.
+
+### Restore, quit and restart
+
+After the request process has exited, run the same profile without restore
+options:
+
+```sh
+thunderbird --new-instance --profile /absolute/profile
+```
+
+This **restoration-only process** retains the normal selected-profile lock and
+keeps account/database writers closed. Its synchronous native operation verifies
+and stages every archive root, holding source/output custody through copy, flush
+and verification. It captures current contents at this closed-writer boundary,
+including newer children created since request preparation, and retains them
+before installation. Selected directories and live lock files remain in place.
+Every installed root is checked against its saved bytes and metadata.
+
+Treat restoration as incomplete until all roots have a verified terminal result.
+One restored root does not make a partially restored profile usable. The process
+settles its file operations and quits without normal mail windows. Preserve its
+outcome and the recorded archive, progress, stage and displaced-data locations,
+including the sibling `panorama-migration-<profile-leaf>` work directory.
+Settlement removes pending `restore.json`, retaining fixed `restore-current.json`
+and immutable `restore-<id>-<generation>.complete.json`. Preserve these audits;
+never select one by newest timestamp, overwrite, repair or remove it.
+
+After verified full restoration and exit, run the same ordinary command **again**
+in a fresh process. Before writers start, it revalidates the real native audit
+and completes native settlement; restored preferences are read afresh. Check the
+backend, accounts, folders and messages, including external stores. Normal
+version, selector, journal and native-receipt checks still apply. Keep the archive
+and retained newer-data trees until their contents have been checked and their
+disposal is explicitly chosen. Do not repeat the new-request flags on every
+startup or automatically combine these three process lifetimes.
+
+### Retry, interruption and full rollback
+
+On error, cancellation or process interruption, retain the first error and every
+reported file/directory. Keep archive, progress, stages and partially displaced
+contents at their recorded paths. An unfinished operation blocks ordinary startup
+even with Panorama disabled. Never edit IDs, progress, generations or receipts,
+or delete guards, selectors, journals or audits, to force startup.
+
+Stop all writers. To recover the exact retained operation, choose **one** action:
+
+```sh
+thunderbird --new-instance --profile /absolute/profile --panorama-restore-retry
+# Or return all displaced current roots to their approved original paths:
+thunderbird --new-instance --profile /absolute/profile --panorama-restore-rollback
+```
+
+These actions are mutually exclusive with a new restore request. This process
+rechecks identity, records only the supported action, and quits. Retry requires
+the original verified archive and dependencies. Explicit rollback after cutover
+can use the native-retained verified manifest, stage, saved-before data, ledger
+and physical custody when the original after-input is unavailable. Missing or
+conflicting retained proof refuses; JSON, timestamps or partial bytes alone
+grant no authority. After the request exits, run the ordinary command above for
+native recovery; it settles and quits. Only complete verified settlement allows
+a further fresh ordinary process. Changed, unknown or mixed-root states block.
+
+Successful full rollback returns every displaced root, rather than mixing roots
+from different attempts. Failed rollback retains the guard, first error and all
+remaining data: preserve its diagnostic and resolve that exact failure. The
+original archive and retained evidence are never discarded to make retry succeed.
+
+### Validation
+
+From the Firefox source root after a normal Debug build, the registered full-file
+startup test exercises real profile selection, external stores, restoration-only
+exit, fresh restart and recovery outcomes:
+
+```text
+python3 ./mach --no-interactive marionette-test --headless --log-raw=- --gecko-log=- comm/mail/test/marionette/test_panorama_startup_backup.py
+```
+
 ## Logging
 
 The `panorama` log emits a bunch of relevant stuff.

@@ -3,6 +3,12 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 #include "DatabaseCore.h"
+#include "prio.h"
+#include "nsIPanoramaMigrationFileSystem.h"
+#include "private/pprio.h"
+#ifdef XP_WIN
+#  include <windows.h>
+#endif
 #include "mozIStorageCompletionCallback.h"
 #include "mozilla/AutoRestore.h"
 #include "mozilla/ClearOnShutdown.h"
@@ -32,6 +38,7 @@
 #include "nsEscape.h"
 #include "mozilla/dom/ScriptSettings.h"
 #ifndef XP_WIN
+#  include <dirent.h>
 #  include <fcntl.h>
 #  include <sys/stat.h>
 #  include <unistd.h>
@@ -199,9 +206,15 @@ class ProfileStartupOperation final : public nsIAsyncShutdownBlocker {
   bool closing = false, settled = false;
   nsTArray<RefPtr<Promise>> settlements;
   std::function<nsresult()> onShutdown;
+  UniquePtr<ProfileRestoreState> restore;
+  UniquePtr<StartupRestoreFD> profileLease, localLease;
+  nsCString completedAudit, completedAuditPath, completedId, completedName;
+  nsTHashMap<nsCString, nsCString> retiredPaths;
+  bool auditCandidate = false;
 #ifndef XP_WIN
   int profileFD = -1, localFD = -1, databaseFD = -1;
-  struct stat profileIdentity{}, localIdentity{}, databaseIdentity{};
+  struct stat profileIdentity {
+  }, localIdentity{}, databaseIdentity{};
 #endif
 
  private:
@@ -218,13 +231,22 @@ NS_IMPL_ISUPPORTS(ProfileStartupOperation, nsIAsyncShutdownBlocker)
 DatabaseCore::~DatabaseCore() = default;
 
 namespace {
+nsresult RestoreOpen(nsIFile*, StartupRestoreFD&, bool writable = false);
+nsresult RestorePin(StartupRestoreFD&);
+nsresult RestoreCompleted(JSContext*, ProfileStartupOperation&, bool&);
 nsresult StartupDirectory(nsIFile* file, nsACString& path) {
   NS_ENSURE_TRUE(file, NS_ERROR_INVALID_ARG);
   bool directory, linked;
   MOZ_TRY(file->IsDirectory(&directory));
   MOZ_TRY(file->IsSymlink(&linked));
   NS_ENSURE_TRUE(directory && !linked, NS_ERROR_FILE_ACCESS_DENIED);
+#ifdef XP_WIN
+  nsString unicode;
+  MOZ_TRY(file->GetPath(unicode));
+  CopyUTF16toUTF8(unicode, path);
+#else
   MOZ_TRY(file->GetNativePath(path));
+#endif
   // Every ancestor must retain its literal spelling; a link at any depth is
   // not a selected physical directory admission.
   nsCOMPtr<nsIFile> current = file;
@@ -239,7 +261,12 @@ nsresult StartupDirectory(nsIFile* file, nsACString& path) {
   MOZ_TRY(file->Clone(getter_AddRefs(normalized)));
   MOZ_TRY(normalized->Normalize());
   nsAutoCString actual;
+#ifdef XP_WIN
+  MOZ_TRY(normalized->GetPath(unicode));
+  CopyUTF16toUTF8(unicode, actual);
+#else
   MOZ_TRY(normalized->GetNativePath(actual));
+#endif
   NS_ENSURE_TRUE(actual == path, NS_ERROR_FILE_INVALID_PATH);
   return NS_OK;
 }
@@ -293,6 +320,50 @@ nsresult StartupHash(nsIFile* file, nsACString& hex) {
   }
   return NS_OK;
 }
+nsresult RestoreWork(nsIFile* profile, nsIFile** output, bool validate = true) {
+  nsCOMPtr<nsIFile> work;
+  nsString leaf;
+  nsCString literal;
+  MOZ_TRY(profile->GetParent(getter_AddRefs(work)));
+  MOZ_TRY(profile->GetLeafName(leaf));
+  MOZ_TRY(work->Append(u"panorama-migration-"_ns + leaf));
+  bool exists;
+  MOZ_TRY(work->Exists(&exists));
+  if (!exists) {
+    *output = nullptr;
+    return NS_OK;
+  }
+  if (validate) MOZ_TRY(StartupDirectory(work, literal));
+  work.forget(output);
+  return NS_OK;
+}
+nsresult RestorePending(nsIFile* profile, bool& pending,
+                        const char* leaf = "restore.json") {
+  pending = false;
+  nsCOMPtr<nsIFile> work;
+  MOZ_TRY(RestoreWork(profile, getter_AddRefs(work), false));
+  if (!work) return NS_OK;
+  nsCString path;
+  MOZ_TRY(work->GetNativePath(path));
+#ifdef XP_WIN
+  nsCOMPtr<nsIFile> request;
+  MOZ_TRY(StartupChild(work, leaf, getter_AddRefs(request)));
+  bool link = false;
+  nsresult rv = request->IsSymlink(&link);
+  if (NS_FAILED(rv) && rv != NS_ERROR_FILE_NOT_FOUND) return rv;
+  MOZ_TRY(request->Exists(&pending));
+  pending |= link;
+#else
+  struct stat st {};
+  nsCString requestPath(path + "/"_ns + nsDependentCString(leaf));
+  if (!lstat(requestPath.get(), &st))
+    pending = true;
+  else
+    NS_ENSURE_TRUE(errno == ENOENT || errno == ENOTDIR,
+                   NS_ERROR_FILE_ACCESS_DENIED);
+#endif
+  return NS_OK;
+}
 }  // namespace
 
 nsresult DatabaseCore::ArmProfileStartup(nsIFile* profile, nsIFile* local) {
@@ -303,12 +374,14 @@ nsresult DatabaseCore::ArmProfileStartup(nsIFile* profile, nsIFile* local) {
   RefPtr<ProfileStartupOperation> operation = new ProfileStartupOperation();
   MOZ_TRY(StartupDirectory(profile, operation->profilePath));
   MOZ_TRY(StartupDirectory(local, operation->localPath));
-#ifdef XP_WIN
-  // No implicit weakening of the existing Windows physical-admission ABI.
-  return NS_ERROR_NOT_IMPLEMENTED;
-#else
   operation->profile = profile;
   operation->localProfile = local;
+#ifdef XP_WIN
+  operation->profileLease = MakeUnique<StartupRestoreFD>();
+  operation->localLease = MakeUnique<StartupRestoreFD>();
+  MOZ_TRY(RestoreOpen(profile, *operation->profileLease));
+  MOZ_TRY(RestoreOpen(local, *operation->localLease));
+#else
   operation->profileFD = open(operation->profilePath.get(),
                               O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   operation->localFD = open(operation->localPath.get(),
@@ -318,6 +391,7 @@ nsresult DatabaseCore::ArmProfileStartup(nsIFile* profile, nsIFile* local) {
           !fstat(operation->profileFD, &operation->profileIdentity) &&
           !fstat(operation->localFD, &operation->localIdentity),
       NS_ERROR_FILE_ACCESS_DENIED);
+#endif
   nsCOMPtr<nsIAsyncShutdownService> shutdown =
       do_GetService("@mozilla.org/async-shutdown-service;1");
   NS_ENSURE_TRUE(shutdown, NS_ERROR_NOT_AVAILABLE);
@@ -336,7 +410,6 @@ nsresult DatabaseCore::ArmProfileStartup(nsIFile* profile, nsIFile* local) {
   NS_ENSURE_TRUE(observers, NS_ERROR_NOT_AVAILABLE);
   MOZ_TRY(observers->AddObserver(this, "profile-before-change", false));
   return NS_OK;
-#endif
 }
 
 nsISupports* DatabaseCore::ProfileStartupToken() {
@@ -351,8 +424,12 @@ nsresult DatabaseCore::CheckProfileStartup(nsISupports* token, bool metadata) {
   NS_ENSURE_FALSE(mShuttingDown || operation.closing || operation.settled,
                   NS_ERROR_NOT_AVAILABLE);
   NS_ENSURE_FALSE(operation.busy && !metadata, NS_ERROR_IN_PROGRESS);
+  if (operation.restore) MOZ_TRY(operation.restore->Check());
+  if (operation.profileLease) MOZ_TRY(RestorePin(*operation.profileLease));
+  if (operation.localLease) MOZ_TRY(RestorePin(*operation.localLease));
 #ifndef XP_WIN
-  struct stat profile{}, local{};
+  struct stat profile {
+  }, local{};
   NS_ENSURE_TRUE(!lstat(operation.profilePath.get(), &profile) &&
                      !lstat(operation.localPath.get(), &local) &&
                      profile.st_dev == operation.profileIdentity.st_dev &&
@@ -364,7 +441,7 @@ nsresult DatabaseCore::CheckProfileStartup(nsISupports* token, bool metadata) {
 #endif
 #ifndef XP_WIN
   if (operation.databaseFD >= 0) {
-    struct stat database{};
+    struct stat database {};
     nsAutoCString path(operation.profilePath + "/panorama.sqlite"_ns);
     NS_ENSURE_TRUE(!lstat(path.get(), &database) && S_ISREG(database.st_mode) &&
                        database.st_dev == operation.databaseIdentity.st_dev &&
@@ -396,6 +473,9 @@ nsresult DatabaseCore::CheckProfileStartup(nsISupports* token, bool metadata) {
     bool metadata, const nsACString* serverKey) {
   if (sInstance && sInstance->mStartupManaged) {
     auto& core = *sInstance;
+    NS_ENSURE_TRUE(
+        core.mProfileStartup && core.mProfileStartup->mode != "restore"_ns,
+        NS_ERROR_NOT_AVAILABLE);
     bool admittedMetadata = metadata && core.mStartupMetadataDepth;
     if (metadata && serverKey && core.mProfileStartup &&
         core.mProfileStartup->opened) {
@@ -481,16 +561,33 @@ DatabaseCore::Observe(nsISupports* aSubject, const char* aTopic,
     nsCOMPtr<nsICommandLine> commandLine = do_QueryInterface(aSubject);
     NS_ENSURE_TRUE(commandLine, NS_ERROR_INVALID_ARG);
     mStartupObserved = true;
+    for (const char* flag : {"panorama-restore", "panorama-restore-retry",
+                             "panorama-restore-rollback"}) {
+      int32_t index;
+      MOZ_TRY(
+          commandLine->FindFlag(NS_ConvertASCIItoUTF16(flag), false, &index));
+      if (index >= 0) {
+        mStartupManaged = true;
+        mStartupFailure = NS_ERROR_NOT_AVAILABLE;
+        for (const auto& promise : mStartupBegins)
+          promise->MaybeReject(mStartupFailure);
+        mStartupBegins.Clear();
+        return NS_OK;
+      }
+    }
     nsCOMPtr<nsIFile> profile, local, selector;
     nsresult rv = NS_GetSpecialDirectory(NS_APP_PROFILE_DIR_STARTUP,
                                          getter_AddRefs(profile));
-    bool hasSelector = false;
+    bool hasSelector = false, hasRestore = false, hasAudit = false;
+    if (NS_SUCCEEDED(rv)) rv = RestorePending(profile, hasRestore);
+    if (NS_SUCCEEDED(rv))
+      rv = RestorePending(profile, hasAudit, "restore-current.json");
     if (NS_SUCCEEDED(rv))
       rv = StartupChild(profile, "panorama-profile.json",
                         getter_AddRefs(selector));
     if (NS_SUCCEEDED(rv)) rv = selector->Exists(&hasSelector);
     if (NS_SUCCEEDED(rv) && !StaticPrefs::mail_panorama_enabled_AtStartup() &&
-        !hasSelector) {
+        !hasSelector && !hasRestore && !hasAudit) {
       mStartupManaged = false;
       for (const auto& promise : mStartupBegins)
         promise->MaybeReject(NS_ERROR_NOT_AVAILABLE);
@@ -501,16 +598,19 @@ DatabaseCore::Observe(nsISupports* aSubject, const char* aTopic,
     if (NS_SUCCEEDED(rv))
       rv = NS_GetSpecialDirectory(NS_APP_PROFILE_LOCAL_DIR_STARTUP,
                                   getter_AddRefs(local));
-    if (NS_SUCCEEDED(rv) && !StaticPrefs::mail_panorama_enabled_AtStartup())
+    if (NS_SUCCEEDED(rv) && !hasRestore &&
+        !StaticPrefs::mail_panorama_enabled_AtStartup())
       rv = NS_ERROR_NOT_AVAILABLE;
     if (NS_SUCCEEDED(rv)) rv = ArmProfileStartup(profile, local);
+    if (NS_SUCCEEDED(rv)) mProfileStartup->auditCandidate = hasAudit;
     if (NS_SUCCEEDED(rv)) {
       dom::AutoJSAPI jsapi;
       if (!jsapi.Init(xpc::PrivilegedJunkScope()))
         rv = NS_ERROR_FAILURE;
       else {
         JS::Rooted<JS::Value> descriptor(jsapi.cx());
-        rv = DescribeProfileStartup(jsapi.cx(), &descriptor);
+        rv = hasRestore ? RunProfileRestore(jsapi.cx())
+                        : DescribeProfileStartup(jsapi.cx(), &descriptor);
         if (jsapi.HasException()) jsapi.ReportException();
       }
     }
@@ -1833,6 +1933,17 @@ class FolderImportAdmission final {
     }
 #endif
     return NS_OK;
+  }
+  nsresult Close() {
+    nsresult first = NS_OK;
+#ifdef XP_WIN
+    for (const auto& lease : mLeases) {
+      nsresult rv = lease->Close();
+      if (NS_SUCCEEDED(first)) first = rv;
+    }
+    mLeases.Clear();
+#endif
+    return first;
   }
   const FolderImportIdentity& Identity() const { return mIdentity; }
   nsIFile* Summary() const { return mSummary; }
@@ -9002,8 +9113,10 @@ nsresult StartupJSONCache(nsIFile* file, bool& empty) {
 #endif
 }
 
-nsresult StartupInventory(nsIFile* directory, nsTArray<nsCString>& sources,
-                          bool mailTree = false, bool selectedRoot = true) {
+nsresult StartupInventory(
+    nsIFile* directory, nsTArray<nsCString>& sources, bool mailTree = false,
+    bool selectedRoot = true,
+    const nsTHashMap<nsCString, nsCString>* retired = nullptr) {
   nsAutoCString ignored;
   MOZ_TRY(StartupDirectory(directory, ignored));
   bool jsonCache = false, emptyJSON = false;
@@ -9038,10 +9151,23 @@ nsresult StartupInventory(nsIFile* directory, nsTArray<nsCString>& sources,
       continue;
     }
     if (isDirectory) {
+      nsString literal;
+      MOZ_TRY(file->GetPath(literal));
+      if (retired) {
+        auto held = retired->Lookup(NS_ConvertUTF16toUTF8(literal));
+        if (held) {
+          StartupRestoreFD pin;
+          MOZ_TRY(RestoreOpen(file, pin));
+          NS_ENSURE_TRUE(pin.identity.id == held.Data(),
+                         NS_ERROR_NOT_AVAILABLE);
+          MOZ_TRY(pin.Close());
+          continue;
+        }
+      }
       MOZ_TRY(StartupInventory(file, sources,
                                mailTree || name == "Mail"_ns ||
                                    name == "ImapMail"_ns || name == "News"_ns,
-                               false));
+                               false, retired));
     } else if (StringEndsWith(name, ".msf"_ns) ||
                StringEndsWith(name, ".mab"_ns) ||
                name == "folderCache.json"_ns || name == "panacea.dat"_ns) {
@@ -9083,9 +9209,10 @@ nsresult StartupConfiguredPath(nsIPrefBranch* prefs, const nsACString& branch,
   return NS_OK;
 }
 
-nsresult StartupConfiguredRoots(nsIFile* profile,
-                                nsTArray<nsCString>& inventory,
-                                nsTArray<StartupServerRoot>* output = nullptr) {
+nsresult StartupConfiguredRoots(
+    nsIFile* profile, nsTArray<nsCString>& inventory,
+    nsTArray<StartupServerRoot>* output = nullptr,
+    const nsTHashMap<nsCString, nsCString>* retired = nullptr) {
   nsCOMPtr<nsIPrefBranch> prefs =
       do_GetService("@mozilla.org/preferences-service;1");
   NS_ENSURE_TRUE(prefs, NS_ERROR_NOT_AVAILABLE);
@@ -9107,7 +9234,7 @@ nsresult StartupConfiguredRoots(nsIFile* profile,
     MOZ_TRY(profile->Contains(root, &inside));
     NS_ENSURE_TRUE(inside, NS_ERROR_FILE_ACCESS_DENIED);
     nsTArray<nsCString> files;
-    MOZ_TRY(StartupInventory(root, files, true, false));
+    MOZ_TRY(StartupInventory(root, files, true, false, retired));
     inventory.AppendElements(files);
     if (output) {
       StartupServerRoot binding;
@@ -9299,8 +9426,1341 @@ nsresult StartupBackup(JSContext* cx, ProfileStartupOperation& operation,
 }
 }  // namespace
 
+StartupRestoreRoot::~StartupRestoreRoot() = default;
+ProfileRestoreState::~ProfileRestoreState() = default;
 namespace {
+constexpr int64_t kRestoreInteger = 9007199254740991LL;
+nsresult RestoreProgress(JSContext*, ProfileRestoreState&);
+#ifdef XP_WIN
+nsresult RestoreWinId(HANDLE handle, nsCString& id) {
+  FILE_ID_INFO info{};
+  NS_ENSURE_TRUE(
+      GetFileInformationByHandleEx(handle, FileIdInfo, &info, sizeof(info)),
+      NS_ERROR_FAILURE);
+  id.Truncate();
+  for (int shift = 60; shift >= 0; shift -= 4)
+    id.Append("0123456789abcdef"[(info.VolumeSerialNumber >> shift) & 15]);
+  id.Append(':');
+  for (uint8_t c : info.FileId.Identifier) id.AppendPrintf("%02x", c);
+  return NS_OK;
+}
+HANDLE RestoreHandle(PRFileDesc* io) {
+  return reinterpret_cast<HANDLE>(PR_FileDesc2NativeHandle(io));
+}
+#endif
+nsresult RestorePath(nsIFile* file, nsCString& path) {
+  nsString literal;
+  MOZ_TRY(file->GetPath(literal));
+  CopyUTF16toUTF8(literal, path);
+  return NS_OK;
+}
+nsresult RestoreFile(const nsACString& path, nsIFile** file) {
+  return NS_NewLocalFile(NS_ConvertUTF8toUTF16(path), file);
+}
+nsresult RestoreAt(nsIFile* root, const nsACString& relative,
+                   nsIFile** output) {
+  nsCOMPtr<nsIFile> file;
+  MOZ_TRY(root->Clone(getter_AddRefs(file)));
+  for (const auto& part : nsCCharSeparatedTokenizer(relative, '/').ToRange()) {
+    NS_ENSURE_TRUE(!part.IsEmpty() && part != "."_ns && part != ".."_ns &&
+                       part.FindChar('\\') < 0 && part.FindChar(0) < 0,
+                   NS_ERROR_FILE_INVALID_PATH);
+    MOZ_TRY(file->Append(NS_ConvertUTF8toUTF16(part)));
+  }
+  file.forget(output);
+  return NS_OK;
+}
+bool RestoreInside(const nsACString& path, const nsACString& root) {
+  nsCOMPtr<nsIFile> file, directory;
+  bool contains = false;
+  if (NS_FAILED(RestoreFile(path, getter_AddRefs(file))) ||
+      NS_FAILED(RestoreFile(root, getter_AddRefs(directory))))
+    return false;
+  return path == root ||
+         (NS_SUCCEEDED(directory->Contains(file, &contains)) && contains);
+}
+nsresult RestoreMeasure(StartupRestoreFD& node, StartupRestoreStamp& stamp) {
+  nsCOMPtr<nsIFile> fresh;
+  MOZ_TRY(node.file->Clone(getter_AddRefs(fresh)));
+  bool linked, file;
+  MOZ_TRY(fresh->IsSymlink(&linked));
+  MOZ_TRY(fresh->IsDirectory(&stamp.directory));
+  MOZ_TRY(fresh->IsFile(&file));
+  NS_ENSURE_TRUE(!linked && (file || stamp.directory),
+                 NS_ERROR_FILE_ACCESS_DENIED);
+  MOZ_TRY(fresh->GetPermissions(&stamp.permissions));
+  stamp.permissions &= 0777;
+  MOZ_TRY(fresh->GetLastModifiedTime(&stamp.modified));
+  if (file) MOZ_TRY(fresh->GetFileSize(&stamp.size));
+  if (node.io) {
+    PRFileInfo64 info;
+    NS_ENSURE_TRUE(PR_GetOpenFileInfo64(node.io, &info) == PR_SUCCESS,
+                   NS_ERROR_FAILURE);
+    stamp.size = info.size;
+    stamp.modified = info.modifyTime / 1000;
+  }
+#ifdef XP_WIN
+  RefPtr<MigrationFileSystem> fs = new MigrationFileSystem();
+  NS_ENSURE_TRUE(node.lease, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(fs->Validate(node.lease));
+  if (node.io && node.writable)
+    MOZ_TRY(RestoreWinId(RestoreHandle(node.io), stamp.id));
+  else
+    MOZ_TRY(node.lease->GetIdentity(stamp.id));
+#else
+  struct stat held {
+  }, current{};
+  NS_ENSURE_TRUE(node.fd >= 0 && !fstat(node.fd, &held) &&
+                     !lstat(node.path.get(), &current) &&
+                     held.st_dev == current.st_dev &&
+                     held.st_ino == current.st_ino && !S_ISLNK(current.st_mode),
+                 NS_ERROR_NOT_AVAILABLE);
+  stamp.id.Truncate();
+  stamp.id.AppendInt(uint64_t(held.st_dev));
+  stamp.id.Append(':');
+  stamp.id.AppendInt(uint64_t(held.st_ino));
+  if (node.io) {
+    struct stat opened {};
+    NS_ENSURE_TRUE(!fstat(PR_FileDesc2NativeHandle(node.io), &opened) &&
+                       held.st_dev == opened.st_dev &&
+                       held.st_ino == opened.st_ino,
+                   NS_ERROR_NOT_AVAILABLE);
+  }
+#endif
+  return NS_OK;
+}
+nsresult RestorePin(StartupRestoreFD& node) {
+  StartupRestoreStamp actual;
+  MOZ_TRY(RestoreMeasure(node, actual));
+  return actual.id == node.identity.id ? NS_OK : NS_ERROR_NOT_AVAILABLE;
+}
+nsresult RestoreOpen(nsIFile* file, StartupRestoreFD& node, bool writable) {
+  node.file = file;
+  MOZ_TRY(RestorePath(file, node.path));
+  bool directory;
+  MOZ_TRY(file->IsDirectory(&directory));
+  nsCOMPtr<nsIFile> parent;
+  MOZ_TRY(file->GetParent(getter_AddRefs(parent)));
+  nsCString checked;
+  MOZ_TRY(StartupDirectory(directory ? file : parent.get(), checked));
+#ifdef XP_WIN
+  RefPtr<MigrationFileSystem> fs = new MigrationFileSystem();
+  MOZ_TRY(fs->Admit(file, directory ? file : parent.get(),
+                    directory ? nsIPanoramaMigrationFileSystem::KIND_DIRECTORY
+                    : writable
+                        ? nsIPanoramaMigrationFileSystem::KIND_FILE_OR_MISSING
+                        : nsIPanoramaMigrationFileSystem::KIND_FILE,
+                    getter_AddRefs(node.lease)));
+#else
+  node.fd = open(node.path.get(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC |
+                                      (directory ? O_DIRECTORY : 0));
+  NS_ENSURE_TRUE(node.fd >= 0, NS_ERROR_FILE_ACCESS_DENIED);
+#endif
+  MOZ_TRY(RestoreMeasure(node, node.identity));
+#ifdef XP_WIN
+  if (writable && !directory) {
+    nsCString expected(node.identity.id);
+    MOZ_TRY(node.lease->Close());
+    node.lease = nullptr;
+    MOZ_TRY(fs->Admit(parent, parent,
+                      nsIPanoramaMigrationFileSystem::KIND_DIRECTORY,
+                      getter_AddRefs(node.lease)));
+    nsString native;
+    MOZ_TRY(file->GetPath(native));
+    HANDLE handle = CreateFileW(
+        reinterpret_cast<const wchar_t*>(native.get()),
+        GENERIC_READ | GENERIC_WRITE | DELETE, FILE_SHARE_READ, nullptr,
+        OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH,
+        nullptr);
+    NS_ENSURE_TRUE(handle != INVALID_HANDLE_VALUE, NS_ERROR_FILE_ACCESS_DENIED);
+    node.io = PR_ImportFile(reinterpret_cast<PROsfd>(handle));
+    if (!node.io) {
+      CloseHandle(handle);
+      return NS_ERROR_FAILURE;
+    }
+    node.writable = true;
+    StartupRestoreStamp actual;
+    MOZ_TRY(RestoreMeasure(node, actual));
+    NS_ENSURE_TRUE(actual.id == expected, NS_ERROR_NOT_AVAILABLE);
+  }
+#endif
+  return NS_OK;
+}
+nsresult RestoreDirectory(const nsACString& path,
+                          UniquePtr<StartupRestoreFD>& output) {
+  nsCOMPtr<nsIFile> file;
+  MOZ_TRY(RestoreFile(path, getter_AddRefs(file)));
+  auto node = MakeUnique<StartupRestoreFD>();
+  MOZ_TRY(RestoreOpen(file, *node));
+  NS_ENSURE_TRUE(node->identity.directory, NS_ERROR_FILE_NOT_DIRECTORY);
+  output = std::move(node);
+  return NS_OK;
+}
+nsresult RestoreIO(StartupRestoreFD& node, bool write = false) {
+  MOZ_TRY(RestorePin(node));
+  if (!node.io)
+    MOZ_TRY(node.file->OpenNSPRFileDesc(write ? PR_RDWR : PR_RDONLY, 0600,
+                                        &node.io));
+  return RestorePin(node);
+}
+nsresult RestoreSync(StartupRestoreFD& node) {
+  MOZ_TRY(RestorePin(node));
+  if (node.io) NS_ENSURE_TRUE(PR_Sync(node.io) == PR_SUCCESS, NS_ERROR_FAILURE);
+#ifndef XP_WIN
+  else
+    NS_ENSURE_TRUE(!fsync(node.fd), NS_ERROR_FAILURE);
+#endif
+  return RestorePin(node);
+}
+nsresult RestorePrivate(StartupRestoreFD& node, bool stage) {
+#ifdef XP_WIN
+  // Admission rejects reparse/offline/shared roots before any IO.
+  return RestorePin(node);
+#else
+  struct stat st {};
+  NS_ENSURE_TRUE(
+      !fstat(node.fd, &st) && st.st_uid == geteuid() &&
+          (stage ? !(st.st_mode & 077) : (st.st_mode & 0722) == 0700),
+      NS_ERROR_FILE_ACCESS_DENIED);
+  return NS_OK;
+#endif
+}
+nsresult RestoreBoundary(ProfileRestoreState& state) {
+  MOZ_TRY(state.Check());
+  nsCOMPtr<nsIFile> cancel;
+  MOZ_TRY(RestoreAt(state.work->file, "cancel-"_ns + state.id,
+                    getter_AddRefs(cancel)));
+  bool exists, linked = false;
+  nsresult rv = cancel->IsSymlink(&linked);
+  if (NS_FAILED(rv) && rv != NS_ERROR_FILE_NOT_FOUND) return rv;
+  MOZ_TRY(cancel->Exists(&exists));
+  NS_ENSURE_FALSE(linked, NS_ERROR_FILE_ACCESS_DENIED);
+  if (exists) MOZ_TRY(StartupRegular(cancel));
+  return exists ? NS_ERROR_ABORT : NS_OK;
+}
+nsresult RestoreHash(StartupRestoreFD& input, nsCString& output,
+                     ProfileRestoreState* state = nullptr,
+                     StartupRestoreFD* target = nullptr) {
+  MOZ_TRY(RestoreIO(input));
+  StartupRestoreStamp before, after;
+  MOZ_TRY(RestoreMeasure(input, before));
+  NS_ENSURE_TRUE(!before.directory && before.size >= 0 &&
+                     before.size <= kRestoreInteger &&
+                     PR_Seek64(input.io, 0, PR_SEEK_SET) == 0,
+                 NS_ERROR_FILE_ACCESS_DENIED);
+  if (target) {
+    MOZ_TRY(RestoreIO(*target, true));
+    NS_ENSURE_TRUE(PR_Seek64(target->io, 0, PR_SEEK_SET) == 0,
+                   NS_ERROR_FAILURE);
+#ifdef XP_WIN
+    NS_ENSURE_TRUE(SetEndOfFile(RestoreHandle(target->io)), NS_ERROR_FAILURE);
+#else
+    NS_ENSURE_TRUE(!ftruncate(PR_FileDesc2NativeHandle(target->io), 0),
+                   NS_ERROR_FAILURE);
+#endif
+  }
+  nsCOMPtr<nsICryptoHash> hash;
+  MOZ_TRY(NS_NewCryptoHash(nsICryptoHash::SHA256, getter_AddRefs(hash)));
+  uint8_t buffer[65536];
+  int64_t total = 0;
+  for (;;) {
+    if (state) MOZ_TRY(RestoreBoundary(*state));
+    int32_t count = PR_Read(input.io, buffer, sizeof(buffer));
+    NS_ENSURE_TRUE(count >= 0 && count <= before.size - total,
+                   NS_ERROR_NOT_AVAILABLE);
+    if (!count) break;
+    MOZ_TRY(hash->Update(buffer, count));
+    if (target)
+      for (int32_t offset = 0; offset < count;) {
+        int32_t written = PR_Write(target->io, buffer + offset, count - offset);
+        NS_ENSURE_TRUE(written > 0, NS_ERROR_FAILURE);
+        offset += written;
+      }
+    total += count;
+  }
+  if (target) MOZ_TRY(RestoreSync(*target));
+  MOZ_TRY(RestoreMeasure(input, after));
+  NS_ENSURE_TRUE(before.id == after.id && before.size == after.size &&
+                     before.modified == after.modified &&
+                     before.permissions == after.permissions &&
+                     total == before.size,
+                 NS_ERROR_NOT_AVAILABLE);
+  nsCString digest;
+  MOZ_TRY(hash->Finish(false, digest));
+  output.Truncate();
+  for (unsigned char c : digest.View()) output.AppendPrintf("%02x", c);
+  return NS_OK;
+}
+nsresult RestoreRead(StartupRestoreFD& parent, const nsACString& leaf,
+                     nsCString& bytes) {
+  MOZ_TRY(RestorePin(parent));
+  nsCOMPtr<nsIFile> file;
+  StartupRestoreFD input;
+  MOZ_TRY(RestoreAt(parent.file, leaf, getter_AddRefs(file)));
+  MOZ_TRY(RestoreOpen(file, input));
+  MOZ_TRY(StartupRead(file, bytes));
+  MOZ_TRY(RestorePin(input));
+  return input.Close();
+}
+nsresult RestoreNames(StartupRestoreFD& root, nsTArray<nsCString>& names,
+                      ProfileRestoreState* state = nullptr) {
+  MOZ_TRY(RestorePin(root));
+  nsCOMPtr<nsIDirectoryEnumerator> iterator;
+  MOZ_TRY(root.file->GetDirectoryEntries(getter_AddRefs(iterator)));
+  auto close = MakeScopeExit([&] { iterator->Close(); });
+  for (;;) {
+    if (state) MOZ_TRY(RestoreBoundary(*state));
+    nsCOMPtr<nsIFile> child;
+    MOZ_TRY(iterator->GetNextFile(getter_AddRefs(child)));
+    if (!child) break;
+    nsString name;
+    MOZ_TRY(child->GetLeafName(name));
+    names.AppendElement(NS_ConvertUTF16toUTF8(name));
+  }
+  MOZ_TRY(iterator->Close());
+  close.release();
+  names.Sort([](const nsCString& a, const nsCString& b) {
+    return Compare(NS_ConvertUTF8toUTF16(a), NS_ConvertUTF8toUTF16(b));
+  });
+  return RestorePin(root);
+}
+bool RestoreLock(const nsACString& path) {
+  return path == "parent.lock"_ns || path == ".parentlock"_ns ||
+         path == "lock"_ns;
+}
+nsresult RestoreMetadata(StartupRestoreFD& node, uint32_t mode,
+                         int64_t modified) {
+  MOZ_TRY(RestorePin(node));
+  MOZ_TRY(node.SetPermissions(mode));
+#ifdef XP_WIN
+  if (node.identity.directory)
+    MOZ_TRY(node.file->SetLastModifiedTime(modified));
+  else {
+    MOZ_TRY(RestoreIO(node, true));
+    NS_ENSURE_TRUE(modified >= -11644473600000LL &&
+                       modified <= INT64_MAX / 10000 - 11644473600000LL,
+                   NS_ERROR_INVALID_ARG);
+    uint64_t ticks = uint64_t(modified + 11644473600000LL) * 10000;
+    FILETIME time{DWORD(ticks), DWORD(ticks >> 32)};
+    NS_ENSURE_TRUE(SetFileTime(RestoreHandle(node.io), nullptr, nullptr, &time),
+                   NS_ERROR_FAILURE);
+  }
+#else
+  MOZ_TRY(node.file->SetLastModifiedTime(modified));
+#endif
+  return RestoreSync(node);
+}
+nsresult RestoreFileMatches(StartupRestoreFD& node,
+                            const StartupRestoreEntry& entry,
+                            ProfileRestoreState& state) {
+  StartupRestoreStamp st;
+  MOZ_TRY(RestoreMeasure(node, st));
+  NS_ENSURE_TRUE(!st.directory && st.size == entry.size &&
+                     st.permissions == entry.permissions &&
+                     st.modified == entry.modified,
+                 NS_ERROR_NOT_AVAILABLE);
+  nsCString hash;
+  MOZ_TRY(RestoreHash(node, hash, &state));
+  return hash == entry.hash ? NS_OK : NS_ERROR_NOT_AVAILABLE;
+}
+nsresult RestoreInventory(StartupRestoreFD& root, const nsACString& base,
+                          nsTArray<StartupRestoreEntry>& entries, bool profile,
+                          uint32_t depth = 0,
+                          ProfileRestoreState* state = nullptr) {
+  NS_ENSURE_TRUE(depth < 128, NS_ERROR_FILE_INVALID_PATH);
+  nsTArray<nsCString> names;
+  MOZ_TRY(RestoreNames(root, names, state));
+  for (const auto& name : names) {
+    nsCString path(base);
+    if (!path.IsEmpty()) path.Append('/');
+    path.Append(name);
+    if (profile && RestoreLock(path)) continue;
+    if (state && base.IsEmpty())
+      for (const auto& owner : state->roots)
+        if (owner->live.get() == &root && owner->retired &&
+            path == state->prefix + "-retired"_ns) {
+          MOZ_TRY(RestorePin(*owner->retired));
+          path.Truncate();
+          break;
+        }
+    if (path.IsEmpty()) continue;
+    if (state && base.IsEmpty() &&
+        root.identity.id == state->work->identity.id &&
+        (path == "restore.json"_ns || path == "restore-current.json"_ns ||
+         path == "cancel-"_ns + state->id ||
+         (StringBeginsWith(path, "restore-"_ns + state->id + "-"_ns) &&
+          (StringEndsWith(path, ".ordinary.json"_ns) ||
+           StringEndsWith(path, ".complete.json"_ns))) ||
+         StringBeginsWith(path, "restore-"_ns + state->id + ".json.tmp-"_ns)))
+      continue;
+    nsCOMPtr<nsIFile> file;
+    StartupRestoreFD child;
+    MOZ_TRY(RestoreAt(root.file, name, getter_AddRefs(file)));
+    MOZ_TRY(RestoreOpen(file, child));
+    auto& entry = *entries.AppendElement();
+    entry.path = path;
+    entry.nativeId = child.identity.id;
+    entry.directory = child.identity.directory;
+    entry.permissions = child.identity.permissions;
+    entry.modified = child.identity.modified;
+    entry.size = child.identity.size;
+    if (entry.directory)
+      MOZ_TRY(RestoreInventory(child, path, entries, false, depth + 1, state));
+    else
+      MOZ_TRY(RestoreHash(child, entry.hash, state));
+    MOZ_TRY(child.Close());
+  }
+  return RestorePin(root);
+}
+nsresult RestoreTree(ProfileRestoreState& state, StartupRestoreFD& root,
+                     const nsTArray<StartupRestoreEntry>& expected,
+                     bool profile, bool subset = false,
+                     bool directoryTimes = true) {
+  MOZ_TRY(RestoreBoundary(state));
+  nsTArray<StartupRestoreEntry> actual;
+  MOZ_TRY(RestoreInventory(root, ""_ns, actual, profile, 0, &state));
+  NS_ENSURE_TRUE(subset || actual.Length() == expected.Length(),
+                 NS_ERROR_NOT_AVAILABLE);
+  bool physical = false;
+  for (const auto& owner : state.roots)
+    physical |= owner->live.get() == &root && &owner->before == &expected &&
+                !owner->phase;
+  for (uint32_t i = 0; i < actual.Length(); ++i) {
+    const auto& item = actual[i];
+    auto found =
+        std::find_if(expected.begin(), expected.end(),
+                     [&](const auto& e) { return e.path == item.path; });
+    NS_ENSURE_TRUE(
+        !physical || (found != expected.end() && !found->nativeId.IsEmpty() &&
+                      found->nativeId == item.nativeId),
+        NS_ERROR_NOT_AVAILABLE);
+    NS_ENSURE_TRUE(
+        found != expected.end() && (subset || expected[i].path == item.path) &&
+            found->directory == item.directory &&
+            (item.directory ||
+             (found->size == item.size && found->hash == item.hash)) &&
+            (!found->metadata || (item.directory && !directoryTimes) ||
+             (found->modified == item.modified &&
+              found->permissions == item.permissions)),
+        NS_ERROR_NOT_AVAILABLE);
+  }
+  return RestoreBoundary(state);
+}
 
+nsresult RestoreParent(StartupRestoreFD& root, const nsCString& relative,
+                       StartupRestoreFD& parent, nsCString& leaf) {
+  int32_t slash = relative.RFindChar('/');
+  nsCOMPtr<nsIFile> directory;
+  if (slash < 0)
+    MOZ_TRY(root.file->Clone(getter_AddRefs(directory)));
+  else
+    MOZ_TRY(RestoreAt(root.file, Substring(relative, 0, slash),
+                      getter_AddRefs(directory)));
+  leaf = Substring(relative, slash < 0 ? 0 : slash + 1);
+  MOZ_TRY(RestorePin(root));
+  return RestoreOpen(directory, parent);
+}
+nsresult RestoreCreate(StartupRestoreFD& parent, const nsACString& leaf,
+                       StartupRestoreFD& output) {
+  MOZ_TRY(RestorePin(parent));
+  MOZ_TRY(RestoreAt(parent.file, leaf, getter_AddRefs(output.file)));
+  MOZ_TRY(RestorePath(output.file, output.path));
+#ifdef XP_WIN
+  RefPtr<MigrationFileSystem> fs = new MigrationFileSystem();
+  nsCOMPtr<nsIPanoramaMigrationPath> absent;
+  MOZ_TRY(fs->Admit(output.file, parent.file,
+                    nsIPanoramaMigrationFileSystem::KIND_FILE_OR_MISSING,
+                    getter_AddRefs(absent)));
+  bool exists;
+  MOZ_TRY(absent->GetExists(&exists));
+  NS_ENSURE_FALSE(exists, NS_ERROR_FILE_ALREADY_EXISTS);
+  MOZ_TRY(absent->Close());
+  MOZ_TRY(fs->Admit(parent.file, parent.file,
+                    nsIPanoramaMigrationFileSystem::KIND_DIRECTORY,
+                    getter_AddRefs(output.lease)));
+  nsString path;
+  MOZ_TRY(output.file->GetPath(path));
+  HANDLE handle = CreateFileW(
+      reinterpret_cast<const wchar_t*>(path.get()),
+      GENERIC_READ | GENERIC_WRITE | DELETE, FILE_SHARE_READ, nullptr,
+      CREATE_NEW, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH,
+      nullptr);
+  NS_ENSURE_TRUE(handle != INVALID_HANDLE_VALUE, NS_ERROR_FILE_ACCESS_DENIED);
+  output.io = PR_ImportFile(reinterpret_cast<PROsfd>(handle));
+  if (!output.io) {
+    CloseHandle(handle);
+    return NS_ERROR_FAILURE;
+  }
+  output.writable = true;
+#else
+  nsCString flat(leaf);
+  int fd = openat(parent.fd, flat.get(),
+                  O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+  NS_ENSURE_TRUE(fd >= 0, errno == EEXIST ? NS_ERROR_FILE_ALREADY_EXISTS
+                                          : NS_ERROR_FILE_ACCESS_DENIED);
+  output.fd = dup(fd);
+  output.io = PR_ImportFile(fd);
+  if (!output.io) {
+    close(fd);
+    return NS_ERROR_FAILURE;
+  }
+#endif
+  MOZ_TRY(RestoreMeasure(output, output.identity));
+  MOZ_TRY(RestoreSync(output));
+  return RestoreSync(parent);
+}
+#ifdef XP_WIN
+nsresult RestoreWinRename(HANDLE handle, nsIFile* destination, bool replace) {
+  nsString path;
+  MOZ_TRY(destination->GetPath(path));
+  nsTArray<uint8_t> storage;
+  storage.SetLength(sizeof(FILE_RENAME_INFO) + path.Length() * sizeof(wchar_t));
+  auto* rename = reinterpret_cast<FILE_RENAME_INFO*>(storage.Elements());
+  memset(rename, 0, storage.Length());
+  rename->ReplaceIfExists = replace;
+  rename->FileNameLength = path.Length() * sizeof(wchar_t);
+  memcpy(rename->FileName, path.get(), rename->FileNameLength);
+  NS_ENSURE_TRUE(SetFileInformationByHandle(handle, FileRenameInfo, rename,
+                                            storage.Length()),
+                 NS_ERROR_FILE_ACCESS_DENIED);
+  return NS_OK;
+}
+nsresult RestoreMove(StartupRestoreFD& from, const nsACString& name,
+                     StartupRestoreFD& to, const nsACString& leaf,
+                     const nsACString& expectedId) {
+  MOZ_TRY(RestorePin(from));
+  MOZ_TRY(RestorePin(to));
+  nsCOMPtr<nsIFile> file, destination;
+  MOZ_TRY(RestoreAt(from.file, name, getter_AddRefs(file)));
+  MOZ_TRY(RestoreAt(to.file, leaf, getter_AddRefs(destination)));
+  nsString path;
+  MOZ_TRY(file->GetPath(path));
+  HANDLE handle = CreateFileW(
+      reinterpret_cast<const wchar_t*>(path.get()),
+      DELETE | FILE_READ_ATTRIBUTES, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+      FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  NS_ENSURE_TRUE(handle != INVALID_HANDLE_VALUE, NS_ERROR_FILE_ACCESS_DENIED);
+  auto close = MakeScopeExit([&] { CloseHandle(handle); });
+  nsCString id;
+  FILE_ATTRIBUTE_TAG_INFO attributes{};
+  MOZ_TRY(RestoreWinId(handle, id));
+  NS_ENSURE_TRUE(
+      id == expectedId &&
+          GetFileInformationByHandleEx(handle, FileAttributeTagInfo,
+                                       &attributes, sizeof(attributes)) &&
+          !(attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT),
+      NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(RestoreWinRename(handle, destination, false));
+  close.release();
+  NS_ENSURE_TRUE(CloseHandle(handle), NS_ERROR_FAILURE);
+  StartupRestoreFD check;
+  MOZ_TRY(RestoreOpen(destination, check));
+  NS_ENSURE_TRUE(check.identity.id == expectedId, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(check.Close());
+  MOZ_TRY(RestoreSync(from));
+  return RestoreSync(to);
+}
+#endif
+nsresult RestoreRename(StartupRestoreFD& output, StartupRestoreFD& parent,
+                       const nsACString& leaf, bool replace) {
+  MOZ_TRY(RestoreSync(output));
+  MOZ_TRY(RestorePin(parent));
+  nsCOMPtr<nsIFile> destination;
+  MOZ_TRY(RestoreAt(parent.file, leaf, getter_AddRefs(destination)));
+#ifdef XP_WIN
+  MOZ_TRY(RestoreWinRename(RestoreHandle(output.io), destination, replace));
+#else
+  nsCString oldLeaf, flat(leaf);
+  MOZ_TRY(output.file->GetNativeLeafName(oldLeaf));
+  if (!replace) {
+    struct stat exists {};
+    NS_ENSURE_TRUE(
+        fstatat(parent.fd, flat.get(), &exists, AT_SYMLINK_NOFOLLOW) &&
+            errno == ENOENT,
+        NS_ERROR_FILE_ALREADY_EXISTS);
+  }
+  NS_ENSURE_TRUE(!renameat(parent.fd, oldLeaf.get(), parent.fd, flat.get()),
+                 NS_ERROR_FAILURE);
+#endif
+  output.file = destination;
+  MOZ_TRY(RestorePath(destination, output.path));
+  MOZ_TRY(RestoreSync(output));
+  return RestoreSync(parent);
+}
+nsresult RestoreDrop(StartupRestoreFD& parent, const nsACString& leaf,
+                     const nsACString& expectedId, bool directory) {
+  MOZ_TRY(RestorePin(parent));
+  nsCOMPtr<nsIFile> file;
+  MOZ_TRY(RestoreAt(parent.file, leaf, getter_AddRefs(file)));
+#ifdef XP_WIN
+  nsString path;
+  MOZ_TRY(file->GetPath(path));
+  HANDLE handle = CreateFileW(
+      reinterpret_cast<const wchar_t*>(path.get()),
+      DELETE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ,
+      nullptr, OPEN_EXISTING,
+      FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  NS_ENSURE_TRUE(handle != INVALID_HANDLE_VALUE, NS_ERROR_FILE_ACCESS_DENIED);
+  auto close = MakeScopeExit([&] { CloseHandle(handle); });
+  nsCString identity;
+  MOZ_TRY(RestoreWinId(handle, identity));
+  FILE_ATTRIBUTE_TAG_INFO attributes{};
+  NS_ENSURE_TRUE(
+      identity == expectedId &&
+          GetFileInformationByHandleEx(handle, FileAttributeTagInfo,
+                                       &attributes, sizeof(attributes)) &&
+          !(attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+          bool(attributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) ==
+              directory,
+      NS_ERROR_NOT_AVAILABLE);
+  if (attributes.FileAttributes & FILE_ATTRIBUTE_READONLY) {
+    FILE_BASIC_INFO writable{};
+    writable.FileAttributes =
+        attributes.FileAttributes & ~FILE_ATTRIBUTE_READONLY;
+    if (!writable.FileAttributes)
+      writable.FileAttributes = FILE_ATTRIBUTE_NORMAL;
+    NS_ENSURE_TRUE(SetFileInformationByHandle(handle, FileBasicInfo, &writable,
+                                              sizeof(writable)),
+                   NS_ERROR_FAILURE);
+  }
+  FILE_DISPOSITION_INFO removed{TRUE};
+  NS_ENSURE_TRUE(SetFileInformationByHandle(handle, FileDispositionInfo,
+                                            &removed, sizeof(removed)),
+                 NS_ERROR_FAILURE);
+  close.release();
+  NS_ENSURE_TRUE(CloseHandle(handle), NS_ERROR_FAILURE);
+#else
+  nsCString name(leaf);
+  struct stat st {};
+  NS_ENSURE_TRUE(!fstatat(parent.fd, name.get(), &st, AT_SYMLINK_NOFOLLOW),
+                 NS_ERROR_NOT_AVAILABLE);
+  nsCString id;
+  id.AppendInt(uint64_t(st.st_dev));
+  id.Append(':');
+  id.AppendInt(uint64_t(st.st_ino));
+  NS_ENSURE_TRUE(
+      id == expectedId && bool(S_ISDIR(st.st_mode)) == directory &&
+          !unlinkat(parent.fd, name.get(), directory ? AT_REMOVEDIR : 0),
+      NS_ERROR_NOT_AVAILABLE);
+#endif
+  return RestoreSync(parent);
+}
+nsresult RestoreCopyFD(ProfileRestoreState& state, StartupRestoreFD& source,
+                       StartupRestoreFD& target) {
+  nsCString original, copied;
+  MOZ_TRY(RestoreHash(source, original, &state, &target));
+  MOZ_TRY(RestoreHash(target, copied, &state));
+  return original == copied ? NS_OK : NS_ERROR_NOT_AVAILABLE;
+}
+nsresult RestoreRetainPartial(ProfileRestoreState& state,
+                              StartupRestoreFD& input) {
+  StartupRestoreFD retained;
+  for (uint32_t n = 0; n < UINT32_MAX; ++n) {
+    nsCString name("partial-"_ns);
+    name.AppendInt(n);
+    nsresult rv = RestoreCreate(*state.container, name, retained);
+    if (rv == NS_ERROR_FILE_ALREADY_EXISTS) continue;
+    MOZ_TRY(rv);
+    MOZ_TRY(RestoreCopyFD(state, input, retained));
+    MOZ_TRY(retained.Close());
+    return RestoreSync(*state.container);
+  }
+  return NS_ERROR_FAILURE;
+}
+nsresult RestoreCopyTree(ProfileRestoreState& state, StartupRestoreFD& source,
+                         StartupRestoreFD& target,
+                         const nsTArray<StartupRestoreEntry>& entries,
+                         uint32_t mode, int64_t modified, bool profile) {
+  MOZ_TRY(RestoreBoundary(state));
+  nsTArray<StartupRestoreEntry> actual;
+  MOZ_TRY(RestoreInventory(target, ""_ns, actual, profile, 0, &state));
+  for (const auto& item : actual) {
+    auto wanted =
+        std::find_if(entries.begin(), entries.end(),
+                     [&](const auto& e) { return e.path == item.path; });
+    NS_ENSURE_TRUE(
+        wanted != entries.end() && wanted->directory == item.directory,
+        NS_ERROR_NOT_AVAILABLE);
+    if (item.directory) continue;
+    bool known = wanted->hash == item.hash && wanted->size == item.size &&
+                 wanted->modified == item.modified &&
+                 wanted->permissions == item.permissions;
+    for (const auto& owner : state.roots)
+      if (owner->live.get() == &target)
+        for (const auto& e :
+             (state.action == "restore"_ns ? owner->before : owner->after))
+          known |= e.path == item.path && e.hash == item.hash &&
+                   e.size == item.size && e.modified == item.modified &&
+                   e.permissions == item.permissions;
+    nsCOMPtr<nsIFile> file;
+    nsCString path;
+    MOZ_TRY(RestoreAt(target.file, item.path, getter_AddRefs(file)));
+    MOZ_TRY(RestorePath(file, path));
+    known |= state.writingPath == path &&
+             (state.writingId == item.nativeId ||
+              (state.writingId == "absent"_ns && !item.size));
+    NS_ENSURE_TRUE(known, NS_ERROR_NOT_AVAILABLE);
+  }
+  MOZ_TRY(target.SetPermissions(0700));
+  for (const auto& entry : entries) {
+    StartupRestoreFD parent;
+    nsCString leaf;
+    MOZ_TRY(RestoreParent(target, entry.path, parent, leaf));
+    nsCOMPtr<nsIFile> file;
+    MOZ_TRY(RestoreAt(parent.file, leaf, getter_AddRefs(file)));
+    bool exists;
+    MOZ_TRY(file->Exists(&exists));
+    if (entry.directory) {
+      if (!exists) {
+        MOZ_TRY(file->Create(nsIFile::DIRECTORY_TYPE, 0700));
+        MOZ_TRY(RestoreSync(parent));
+      }
+      StartupRestoreFD directory;
+      MOZ_TRY(RestoreOpen(file, directory));
+      NS_ENSURE_TRUE(directory.identity.directory, NS_ERROR_NOT_AVAILABLE);
+      MOZ_TRY(directory.SetPermissions(0700));
+      MOZ_TRY(directory.Close());
+    } else {
+      StartupRestoreFD output;
+      if (exists) {
+        MOZ_TRY(RestoreOpen(file, output));
+        nsresult matched = RestoreFileMatches(output, entry, state);
+        if (NS_SUCCEEDED(matched)) {
+          MOZ_TRY(output.Close());
+          continue;
+        }
+        NS_ENSURE_TRUE(matched == NS_ERROR_NOT_AVAILABLE, matched);
+        bool own = state.writingPath == output.path &&
+                   (state.writingId == output.identity.id ||
+                    (state.writingId == "absent"_ns && !output.identity.size));
+        for (const auto& root : state.roots)
+          if (root->live.get() == &target)
+            for (const auto& old :
+                 (state.action == "restore"_ns ? root->before : root->after))
+              if (old.path == entry.path && !old.directory) {
+                nsresult prior = RestoreFileMatches(output, old, state);
+                if (NS_SUCCEEDED(prior))
+                  own = true;
+                else
+                  NS_ENSURE_TRUE(prior == NS_ERROR_NOT_AVAILABLE, prior);
+              }
+        NS_ENSURE_TRUE(own, NS_ERROR_NOT_AVAILABLE);
+        state.writingPath = output.path;
+        state.writingId = output.identity.id;
+        MOZ_TRY(RestoreProgress(state.context, state));
+        MOZ_TRY(output.SetPermissions(output.identity.permissions | 0600));
+        MOZ_TRY(output.Close());
+        MOZ_TRY(RestoreOpen(file, output, true));
+        NS_ENSURE_TRUE(output.identity.id == state.writingId,
+                       NS_ERROR_NOT_AVAILABLE);
+        MOZ_TRY(RestoreRetainPartial(state, output));
+      } else {
+        MOZ_TRY(RestorePath(file, state.writingPath));
+        state.writingId = "absent"_ns;
+        MOZ_TRY(RestoreProgress(state.context, state));
+        MOZ_TRY(RestoreCreate(parent, leaf, output));
+      }
+      state.writingPath = output.path;
+      state.writingId = output.identity.id;
+      MOZ_TRY(RestoreProgress(state.context, state));
+      StartupRestoreFD input;
+      nsCOMPtr<nsIFile> original;
+      MOZ_TRY(RestoreAt(source.file, entry.path, getter_AddRefs(original)));
+      MOZ_TRY(RestoreOpen(original, input));
+      MOZ_TRY(RestoreFileMatches(input, entry, state));
+      MOZ_TRY(RestoreCopyFD(state, input, output));
+      MOZ_TRY(RestoreMetadata(output, entry.permissions, entry.modified));
+      MOZ_TRY(RestoreFileMatches(output, entry, state));
+      MOZ_TRY(output.Close());
+      MOZ_TRY(input.Close());
+      state.writingPath.Truncate();
+      state.writingId.Truncate();
+      MOZ_TRY(RestoreProgress(state.context, state));
+    }
+    MOZ_TRY(parent.Close());
+  }
+  for (uint32_t i = entries.Length(); i; --i)
+    if (entries[i - 1].directory) {
+      nsCOMPtr<nsIFile> file;
+      StartupRestoreFD directory;
+      MOZ_TRY(
+          RestoreAt(target.file, entries[i - 1].path, getter_AddRefs(file)));
+      MOZ_TRY(RestoreOpen(file, directory));
+      MOZ_TRY(RestoreMetadata(directory, entries[i - 1].permissions,
+                              entries[i - 1].modified));
+      MOZ_TRY(directory.Close());
+    }
+  MOZ_TRY(RestoreMetadata(target, mode, modified));
+  return RestoreTree(state, target, entries, profile);
+}
+nsresult RestoreRetired(ProfileRestoreState& state, StartupRestoreRoot& root,
+                        bool returning = false) {
+#ifdef XP_WIN
+  if (!root.retired) return root.phase ? NS_ERROR_NOT_AVAILABLE : NS_OK;
+  nsTArray<nsCString> names;
+  MOZ_TRY(RestoreNames(*root.retired, names));
+  uint32_t retained = 0;
+  for (uint32_t i = 0; i < root.before.Length(); ++i) {
+    const auto& before = root.before[i];
+    bool common = false;
+    for (const auto& after : root.after)
+      common |=
+          before.path == after.path && before.directory == after.directory;
+    if (common) continue;
+    nsCString leaf("entry-"_ns);
+    leaf.AppendInt(i);
+    nsCOMPtr<nsIFile> saved, live;
+    MOZ_TRY(RestoreAt(root.retired->file, leaf, getter_AddRefs(saved)));
+    MOZ_TRY(RestoreAt(root.live->file, before.path, getter_AddRefs(live)));
+    bool exists;
+    MOZ_TRY(saved->Exists(&exists));
+    if (exists) {
+      ++retained;
+      StartupRestoreFD pin;
+      MOZ_TRY(RestoreOpen(saved, pin));
+      NS_ENSURE_TRUE(pin.identity.id == before.nativeId &&
+                         pin.identity.directory == before.directory,
+                     NS_ERROR_NOT_AVAILABLE);
+      if (before.directory) {
+        nsTArray<nsCString> empty;
+        MOZ_TRY(RestoreNames(pin, empty));
+        NS_ENSURE_TRUE(empty.IsEmpty(), NS_ERROR_NOT_AVAILABLE);
+      } else
+        MOZ_TRY(RestoreFileMatches(pin, before, state));
+      MOZ_TRY(pin.Close());
+      if (returning) {
+        MOZ_TRY(live->Exists(&exists));
+        NS_ENSURE_FALSE(exists, NS_ERROR_NOT_AVAILABLE);
+        StartupRestoreFD parent;
+        nsCString name;
+        MOZ_TRY(RestoreParent(*root.live, before.path, parent, name));
+        MOZ_TRY(
+            RestoreMove(*root.retired, leaf, parent, name, before.nativeId));
+        MOZ_TRY(parent.Close());
+      }
+    } else {
+      StartupRestoreFD pin;
+      MOZ_TRY(RestoreOpen(live, pin));
+      NS_ENSURE_TRUE(pin.identity.id == before.nativeId &&
+                         pin.identity.directory == before.directory,
+                     NS_ERROR_NOT_AVAILABLE);
+      if (!before.directory) MOZ_TRY(RestoreFileMatches(pin, before, state));
+      MOZ_TRY(pin.Close());
+    }
+  }
+  NS_ENSURE_TRUE(names.Length() == retained, NS_ERROR_NOT_AVAILABLE);
+#endif
+  return NS_OK;
+}
+nsresult RestoreRemoveTree(ProfileRestoreState& state, StartupRestoreFD& root,
+                           const nsTArray<StartupRestoreEntry>& entries,
+                           bool profile) {
+  MOZ_TRY(RestoreBoundary(state));
+  MOZ_TRY(root.SetPermissions(0700));
+  const nsTArray<StartupRestoreEntry>* next = nullptr;
+  for (const auto& owner : state.roots)
+    if (owner->live.get() == &root)
+      next = state.action == "restore"_ns ? &owner->after : &owner->before;
+  nsTArray<StartupRestoreEntry> actual;
+  MOZ_TRY(RestoreInventory(root, ""_ns, actual, profile, 0, &state));
+  for (const auto& item : actual) {
+    bool known = false;
+    for (const auto* list : {&entries, next})
+      if (list)
+        for (const auto& e : *list)
+          known |=
+              e.path == item.path && e.directory == item.directory &&
+              (item.directory || (e.hash == item.hash && e.size == item.size &&
+                                  e.modified == item.modified &&
+                                  e.permissions == item.permissions));
+    nsCOMPtr<nsIFile> file;
+    nsCString path;
+    MOZ_TRY(RestoreAt(root.file, item.path, getter_AddRefs(file)));
+    MOZ_TRY(RestorePath(file, path));
+    known |= !item.directory && state.writingPath == path &&
+             (state.writingId == item.nativeId ||
+              (state.writingId == "absent"_ns && !item.size));
+    NS_ENSURE_TRUE(known, NS_ERROR_NOT_AVAILABLE);
+  }
+  for (uint32_t i = actual.Length(); i; --i) {
+    const auto& item = actual[i - 1];
+    bool keep = false;
+    if (next)
+      for (const auto& e : *next)
+        if (e.path == item.path && e.directory == item.directory) keep = true;
+    if (keep) continue;
+    StartupRestoreFD parent;
+    nsCString leaf;
+    MOZ_TRY(RestoreParent(root, item.path, parent, leaf));
+    MOZ_TRY(parent.SetPermissions(0700));
+    if (!item.directory) {
+      nsCOMPtr<nsIFile> file;
+      StartupRestoreFD input;
+      MOZ_TRY(RestoreAt(root.file, item.path, getter_AddRefs(file)));
+      MOZ_TRY(RestoreOpen(file, input));
+      if (input.path == state.writingPath)
+        MOZ_TRY(RestoreRetainPartial(state, input));
+      state.writingPath = input.path;
+      state.writingId = input.identity.id;
+      MOZ_TRY(RestoreProgress(state.context, state));
+      MOZ_TRY(input.Close());
+    }
+#ifdef XP_WIN
+    StartupRestoreRoot* owner = nullptr;
+    for (const auto& candidate : state.roots)
+      if (candidate->live.get() == &root) owner = candidate.get();
+    if (owner && state.action == "restore"_ns) {
+      uint32_t index = 0;
+      while (index < owner->before.Length() &&
+             owner->before[index].path != item.path)
+        ++index;
+      NS_ENSURE_TRUE(index < owner->before.Length() && owner->retired &&
+                         owner->before[index].nativeId == item.nativeId,
+                     NS_ERROR_NOT_AVAILABLE);
+      nsCString saved("entry-"_ns);
+      saved.AppendInt(index);
+      MOZ_TRY(RestoreMove(parent, leaf, *owner->retired, saved, item.nativeId));
+    } else
+#endif
+      MOZ_TRY(RestoreDrop(parent, leaf, item.nativeId, item.directory));
+    MOZ_TRY(parent.Close());
+  }
+  state.writingPath.Truncate();
+  state.writingId.Truncate();
+  return RestoreProgress(state.context, state);
+}
+nsresult RestoreFinish(ProfileRestoreState&);
+nsresult RestoreText(JSContext* cx, JS::Handle<JSObject*> object,
+                     const char* name, const nsACString& value) {
+  JS::Rooted<JSString*> text(
+      cx, JS_NewStringCopyUTF8N(
+              cx, JS::UTF8Chars(value.BeginReading(), value.Length())));
+  NS_ENSURE_TRUE(
+      text && JS_DefineProperty(cx, object, name, text, JSPROP_ENUMERATE),
+      NS_ERROR_OUT_OF_MEMORY);
+  return NS_OK;
+}
+nsresult RestoreEntries(JSContext* cx, JS::Handle<JSObject*> root,
+                        nsTArray<StartupRestoreEntry>& output,
+                        uint32_t& permissions, int64_t& modified,
+                        const nsACString& prefix, bool profile,
+                        bool metadata = true) {
+  int64_t mode;
+  if (metadata) {
+    MOZ_TRY(StartupNumber(cx, root, "permissions", 0, 0777, mode));
+    permissions = mode;
+    MOZ_TRY(StartupNumber(cx, root, "lastModified", -kRestoreInteger,
+                          kRestoreInteger, modified));
+  }
+  JS::Rooted<JSObject*> entries(cx);
+  uint32_t length;
+  MOZ_TRY(StartupArray(cx, root, "entries", &entries, length));
+  nsTArray<nsCString> directories;
+  directories.AppendElement(""_ns);
+  for (uint32_t i = 0; i < length; ++i) {
+    JS::Rooted<JSObject*> item(cx), parts(cx);
+    MOZ_TRY(StartupItem(cx, entries, i, &item));
+    uint32_t count;
+    MOZ_TRY(StartupArray(cx, item, "parts", &parts, count));
+    NS_ENSURE_TRUE(count && count < 128, NS_ERROR_FILE_INVALID_PATH);
+    auto& entry = *output.AppendElement();
+    for (uint32_t part = 0; part < count; ++part) {
+      JS::Rooted<JS::Value> value(cx);
+      NS_ENSURE_TRUE(JS_GetElement(cx, parts, part, &value), NS_ERROR_FAILURE);
+      nsCString text;
+      MOZ_TRY(ImportText(cx, value, text));
+      NS_ENSURE_TRUE(!text.IsEmpty() && text != "."_ns && text != ".."_ns &&
+                         text.FindChar('/') < 0 && text.FindChar('\\') < 0 &&
+                         text.FindChar(0) < 0 &&
+                         !StringBeginsWith(text, prefix),
+                     NS_ERROR_FILE_INVALID_PATH);
+      if (part) entry.path.Append('/');
+      entry.path.Append(text);
+    }
+    int32_t slash = entry.path.RFindChar('/');
+    nsCString parent(slash < 0 ? ""_ns
+                               : nsCString(Substring(entry.path, 0, slash)));
+    NS_ENSURE_TRUE(
+        directories.Contains(parent) && !(profile && RestoreLock(entry.path)),
+        NS_ERROR_FILE_CORRUPTED);
+    nsCString type;
+    JS::Rooted<JS::Value> nativeId(cx);
+    MOZ_TRY(ImportMember(cx, item, "nativeId", &nativeId, true));
+    if (!nativeId.isUndefined())
+      MOZ_TRY(ImportText(cx, nativeId, entry.nativeId));
+    MOZ_TRY(StartupText(cx, item, "type", type));
+    NS_ENSURE_TRUE(type == "regular"_ns || type == "directory"_ns,
+                   NS_ERROR_FILE_CORRUPTED);
+    entry.directory = type == "directory"_ns;
+    JS::Rooted<JS::Value> permission(cx), modifiedValue(cx);
+    MOZ_TRY(ImportMember(cx, item, "permissions", &permission, !metadata));
+    MOZ_TRY(ImportMember(cx, item, "lastModified", &modifiedValue, !metadata));
+    NS_ENSURE_TRUE(permission.isUndefined() == modifiedValue.isUndefined(),
+                   NS_ERROR_FILE_CORRUPTED);
+    entry.metadata = !permission.isUndefined();
+    if (entry.metadata) {
+      MOZ_TRY(ImportNumber(permission, 0, 0777, mode));
+      entry.permissions = mode;
+      MOZ_TRY(ImportNumber(modifiedValue, -kRestoreInteger, kRestoreInteger,
+                           entry.modified));
+    }
+    if (entry.directory)
+      directories.AppendElement(entry.path);
+    else {
+      MOZ_TRY(StartupNumber(cx, item, "size", 0, kRestoreInteger, entry.size));
+      MOZ_TRY(StartupText(cx, item, "sha256", entry.hash));
+      NS_ENSURE_TRUE(
+          entry.hash.Length() == 64 &&
+              std::all_of(entry.hash.BeginReading(), entry.hash.EndReading(),
+                          [](char c) {
+                            return (c >= '0' && c <= '9') ||
+                                   (c >= 'a' && c <= 'f');
+                          }),
+          NS_ERROR_FILE_CORRUPTED);
+    }
+  }
+  return NS_OK;
+}
+}  // namespace
+
+namespace {
+nsresult RestoreExpect(JSContext* cx, JS::Handle<JSObject*> object,
+                       const char* field, const nsACString& expected) {
+  nsCString actual;
+  MOZ_TRY(StartupText(cx, object, field, actual));
+  return actual == expected ? NS_OK : NS_ERROR_NOT_AVAILABLE;
+}
+nsresult RestoreSnapshot(JSContext* cx,
+                         const nsTArray<StartupRestoreEntry>& entries,
+                         uint32_t permissions, int64_t modified,
+                         JS::MutableHandle<JSObject*> result) {
+  result.set(JS_NewPlainObject(cx));
+  JS::Rooted<JSObject*> array(cx, JS::NewArrayObject(cx, entries.Length()));
+  NS_ENSURE_TRUE(result && array, NS_ERROR_OUT_OF_MEMORY);
+  NS_ENSURE_TRUE(JS_DefineProperty(cx, result, "permissions",
+                                   double(permissions), JSPROP_ENUMERATE) &&
+                     JS_DefineProperty(cx, result, "lastModified",
+                                       double(modified), JSPROP_ENUMERATE),
+                 NS_ERROR_FAILURE);
+  for (uint32_t i = 0; i < entries.Length(); ++i) {
+    const auto& e = entries[i];
+    JS::Rooted<JSObject*> row(cx, JS_NewPlainObject(cx));
+    JS::Rooted<JSObject*> parts(cx, JS::NewArrayObject(cx, 0));
+    NS_ENSURE_TRUE(row && parts, NS_ERROR_OUT_OF_MEMORY);
+    uint32_t n = 0;
+    for (const auto& part : nsCCharSeparatedTokenizer(e.path, '/').ToRange()) {
+      JS::Rooted<JSString*> text(
+          cx, JS_NewStringCopyUTF8N(
+                  cx, JS::UTF8Chars(part.BeginReading(), part.Length())));
+      NS_ENSURE_TRUE(text && JS_SetElement(cx, parts, n++, text),
+                     NS_ERROR_FAILURE);
+    }
+    MOZ_TRY(RestoreText(cx, row, "type",
+                        e.directory ? "directory"_ns : "regular"_ns));
+    MOZ_TRY(RestoreText(cx, row, "sha256", e.hash));
+    MOZ_TRY(RestoreText(cx, row, "nativeId", e.nativeId));
+    NS_ENSURE_TRUE(
+        JS_DefineProperty(cx, row, "parts", parts, JSPROP_ENUMERATE) &&
+            JS_DefineProperty(cx, row, "permissions", double(e.permissions),
+                              JSPROP_ENUMERATE) &&
+            JS_DefineProperty(cx, row, "lastModified", double(e.modified),
+                              JSPROP_ENUMERATE) &&
+            JS_DefineProperty(cx, row, "size", double(e.size),
+                              JSPROP_ENUMERATE) &&
+            JS_SetElement(cx, array, i, row),
+        NS_ERROR_FAILURE);
+  }
+  NS_ENSURE_TRUE(
+      JS_DefineProperty(cx, result, "entries", array, JSPROP_ENUMERATE),
+      NS_ERROR_FAILURE);
+  return NS_OK;
+}
+nsresult RestoreWrite(StartupRestoreFD& parent, const nsACString& leaf,
+                      const nsCString& bytes, bool replace,
+                      const nsCString& id) {
+  UniquePtr<StartupRestoreFD> output;
+  for (uint32_t n = 0; n < UINT32_MAX; ++n) {
+    auto candidate = MakeUnique<StartupRestoreFD>();
+    nsCString name("restore-"_ns + id + ".json.tmp-"_ns);
+    name.AppendInt(n);
+    nsresult rv = RestoreCreate(parent, name, *candidate);
+    if (rv == NS_ERROR_FILE_ALREADY_EXISTS) continue;
+    MOZ_TRY(rv);
+    output = std::move(candidate);
+    break;
+  }
+  NS_ENSURE_TRUE(output, NS_ERROR_FAILURE);
+  for (uint32_t offset = 0; offset < bytes.Length();) {
+    int32_t n =
+        PR_Write(output->io, bytes.get() + offset, bytes.Length() - offset);
+    NS_ENSURE_TRUE(n > 0, NS_ERROR_FAILURE);
+    offset += n;
+  }
+  MOZ_TRY(RestoreSync(*output));
+  NS_ENSURE_TRUE(PR_Seek64(output->io, 0, PR_SEEK_SET) == 0, NS_ERROR_FAILURE);
+  nsCString actual;
+  actual.SetLength(bytes.Length());
+  uint32_t offset = 0;
+  while (offset < actual.Length()) {
+    int32_t n = PR_Read(output->io, actual.BeginWriting() + offset,
+                        actual.Length() - offset);
+    NS_ENSURE_TRUE(n > 0, NS_ERROR_FAILURE);
+    offset += n;
+  }
+  NS_ENSURE_TRUE(actual == bytes, NS_ERROR_FILE_CORRUPTED);
+  MOZ_TRY(RestoreRename(*output, parent, leaf, replace));
+  return output->Close();
+}
+nsresult RestoreFinish(ProfileRestoreState& state) {
+  nsCString current;
+  MOZ_TRY(RestoreRead(*state.work, "restore.json"_ns, current));
+  NS_ENSURE_TRUE(current == state.requestBytes && !state.outcome.IsEmpty(),
+                 NS_ERROR_NOT_AVAILABLE);
+  nsCString audit(current);
+  NS_ENSURE_TRUE(audit.Last() == '}', NS_ERROR_FILE_CORRUPTED);
+  audit.Truncate(audit.Length() - 1);
+  audit.AppendLiteral(",\"nativeSettlement\":1}");
+  nsCString leaf("restore-"_ns + state.id + "-"_ns);
+  leaf.AppendInt(state.generation);
+  leaf.AppendLiteral(".complete.json");
+  nsCOMPtr<nsIFile> file;
+  MOZ_TRY(RestoreAt(state.work->file, leaf, getter_AddRefs(file)));
+  bool exists;
+  MOZ_TRY(file->Exists(&exists));
+  if (exists) {
+    nsCString saved;
+    MOZ_TRY(RestoreRead(*state.work, leaf, saved));
+    NS_ENSURE_TRUE(saved == audit, NS_ERROR_FILE_ALREADY_EXISTS);
+  } else
+    MOZ_TRY(RestoreWrite(*state.work, leaf, audit, false, state.id));
+  MOZ_TRY(RestoreWrite(*state.work, "restore-current.json"_ns, audit, true,
+                       state.id));
+  StartupRestoreFD pending;
+  MOZ_TRY(RestoreAt(state.work->file, "restore.json"_ns, getter_AddRefs(file)));
+  MOZ_TRY(RestoreOpen(file, pending));
+  nsCString identity(pending.identity.id);
+  MOZ_TRY(pending.Close());
+  return RestoreDrop(*state.work, "restore.json"_ns, identity, false);
+}
+nsresult RestoreCompleted(JSContext* cx, ProfileStartupOperation& operation,
+                          bool& present) {
+  present = false;
+  nsCOMPtr<nsIFile> work, file;
+  MOZ_TRY(RestoreWork(operation.profile, getter_AddRefs(work)));
+  if (!work) return NS_OK;
+  MOZ_TRY(RestoreAt(work, "restore-current.json"_ns, getter_AddRefs(file)));
+  bool exists, linked = false;
+  nsresult link = file->IsSymlink(&linked);
+  if (NS_FAILED(link) && link != NS_ERROR_FILE_NOT_FOUND) return link;
+  MOZ_TRY(file->Exists(&exists));
+  NS_ENSURE_FALSE(linked, NS_ERROR_FILE_ACCESS_DENIED);
+  if (!exists) return NS_OK;
+  StartupRestoreFD directory;
+  MOZ_TRY(RestoreOpen(work, directory));
+  MOZ_TRY(RestorePrivate(directory, false));
+  nsCString bytes;
+  MOZ_TRY(RestoreRead(directory, "restore-current.json"_ns, bytes));
+  JS::Rooted<JS::Value> value(cx);
+  MOZ_TRY(StartupParse(cx, bytes, &value));
+  NS_ENSURE_TRUE(value.isObject(), NS_ERROR_FILE_CORRUPTED);
+  JS::Rooted<JSObject*> audit(cx, &value.toObject()), progress(cx), roots(cx);
+  int64_t n;
+  MOZ_TRY(StartupNumber(cx, audit, "nativeSettlement", 1, 1, n));
+  nsCString id, text;
+  MOZ_TRY(StartupText(cx, audit, "operationId", id));
+  NS_ENSURE_TRUE(!id.IsEmpty() && id.Length() <= 64 &&
+                     std::all_of(id.begin(), id.end(),
+                                 [](char c) {
+                                   return (c >= 'a' && c <= 'z') ||
+                                          (c >= 'A' && c <= 'Z') ||
+                                          (c >= '0' && c <= '9') || c == '-' ||
+                                          c == '_';
+                                 }),
+                 NS_ERROR_FILE_CORRUPTED);
+  MOZ_TRY(RestoreExpect(cx, audit, "profilePath", operation.profilePath));
+  MOZ_TRY(RestoreExpect(cx, audit, "localProfilePath", operation.localPath));
+  MOZ_TRY(StartupObject(cx, audit, "progress", &progress));
+  MOZ_TRY(RestoreExpect(cx, progress, "workIdentity", directory.identity.id));
+  MOZ_TRY(StartupText(cx, progress, "outcome", text));
+  NS_ENSURE_TRUE(text == "restored"_ns || text == "rolled-back"_ns,
+                 NS_ERROR_FILE_CORRUPTED);
+  uint32_t phase = text == "restored"_ns ? 3 : 6, count;
+  MOZ_TRY(StartupArray(cx, progress, "roots", &roots, count));
+  NS_ENSURE_TRUE(count, NS_ERROR_FILE_CORRUPTED);
+  JS::Rooted<JSObject*> plan(cx), approvals(cx);
+  JS::Rooted<JS::Value> planned(cx);
+  MOZ_TRY(StartupText(cx, progress, "plan", text));
+  MOZ_TRY(StartupParse(cx, text, &planned));
+  NS_ENSURE_TRUE(planned.isObject(), NS_ERROR_FILE_CORRUPTED);
+  plan = &planned.toObject();
+  uint32_t approved;
+  MOZ_TRY(StartupArray(cx, plan, "approvedRoots", &approvals, approved));
+  NS_ENSURE_TRUE(count == approved, NS_ERROR_FILE_CORRUPTED);
+  int64_t generation;
+  MOZ_TRY(StartupNumber(cx, progress, "generation", 1, UINT32_MAX, generation));
+  nsCString prefix("restore-"_ns + id + "-"_ns);
+  prefix.AppendInt(generation);
+  nsCOMPtr<nsIFile> released;
+  MOZ_TRY(
+      RestoreAt(work, prefix + ".ordinary.json"_ns, getter_AddRefs(released)));
+  bool ordinary;
+  MOZ_TRY(released->Exists(&ordinary));
+  if (ordinary) {
+    nsCString proof;
+    MOZ_TRY(RestoreRead(directory, prefix + ".ordinary.json"_ns, proof));
+    NS_ENSURE_TRUE(proof == bytes, NS_ERROR_NOT_AVAILABLE);
+  }
+  if (!ordinary) {
+    nsCString path, retained;
+    MOZ_TRY(StartupText(cx, plan, "stagingParent", path));
+    UniquePtr<StartupRestoreFD> parent, container;
+    MOZ_TRY(RestoreDirectory(path, parent));
+    MOZ_TRY(RestoreExpect(cx, progress, "parentIdentity", parent->identity.id));
+    nsCOMPtr<nsIFile> child;
+    MOZ_TRY(RestoreAt(parent->file, "restore-"_ns + id, getter_AddRefs(child)));
+    MOZ_TRY(RestorePath(child, path));
+    MOZ_TRY(RestoreDirectory(path, container));
+    MOZ_TRY(RestoreExpect(cx, progress, "containerIdentity",
+                          container->identity.id));
+    JS::Rooted<JSObject*> backup(cx);
+    MOZ_TRY(StartupObject(cx, plan, "backup", &backup));
+    MOZ_TRY(StartupText(cx, backup, "sha256", retained));
+    MOZ_TRY(RestoreAt(container->file, "input-manifest.json"_ns,
+                      getter_AddRefs(child)));
+    StartupRestoreFD manifest;
+    MOZ_TRY(RestoreOpen(child, manifest));
+    MOZ_TRY(RestoreHash(manifest, path));
+    NS_ENSURE_TRUE(path == retained, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(manifest.Close());
+    MOZ_TRY(container->Close());
+    MOZ_TRY(parent->Close());
+  }
+  bool localCovered = false;
+  for (uint32_t i = 0; i < count; ++i) {
+    JS::Rooted<JSObject*> root(cx), approval(cx);
+    MOZ_TRY(StartupItem(cx, roots, i, &root));
+    MOZ_TRY(StartupItem(cx, approvals, i, &approval));
+    MOZ_TRY(StartupNumber(cx, root, "phase", phase, phase, n));
+    nsCString path;
+    MOZ_TRY(StartupText(cx, approval, "original", path));
+    NS_ENSURE_TRUE(i || path == operation.profilePath, NS_ERROR_NOT_AVAILABLE);
+    localCovered |= RestoreInside(operation.localPath, path);
+    nsCOMPtr<nsIFile> literal;
+    MOZ_TRY(RestoreFile(path, getter_AddRefs(literal)));
+    bool exists;
+    MOZ_TRY(literal->Exists(&exists));
+    if (ordinary && i && !exists) continue;
+    UniquePtr<StartupRestoreFD> live;
+    MOZ_TRY(RestoreDirectory(path, live));
+    nsCString expectedId;
+    MOZ_TRY(StartupText(cx, root, "identity", expectedId));
+    if (ordinary && i && expectedId != live->identity.id) {
+      MOZ_TRY(live->Close());
+      continue;
+    }
+    NS_ENSURE_TRUE(expectedId == live->identity.id, NS_ERROR_NOT_AVAILABLE);
+    nsCString retiredId;
+    MOZ_TRY(StartupText(cx, root, "retiredIdentity", retiredId));
+    if (!retiredId.IsEmpty()) {
+      nsCOMPtr<nsIFile> control;
+      MOZ_TRY(RestoreAt(live->file,
+                        ".panorama-restore-"_ns + id + "-retired"_ns,
+                        getter_AddRefs(control)));
+      MOZ_TRY(control->Exists(&exists));
+      if (ordinary && !exists) {
+        MOZ_TRY(live->Close());
+        continue;
+      }
+      StartupRestoreFD pin;
+      MOZ_TRY(RestoreOpen(control, pin));
+      NS_ENSURE_TRUE(pin.identity.id == retiredId && pin.identity.directory,
+                     NS_ERROR_NOT_AVAILABLE);
+      operation.retiredPaths.InsertOrUpdate(pin.path, retiredId);
+      MOZ_TRY(pin.Close());
+    }
+    MOZ_TRY(live->Close());
+  }
+  NS_ENSURE_TRUE(localCovered, NS_ERROR_NOT_AVAILABLE);
+  nsCString leaf(prefix + ".complete.json"_ns);
+  nsCString saved;
+  MOZ_TRY(RestoreRead(directory, leaf, saved));
+  NS_ENSURE_TRUE(saved == bytes, NS_ERROR_NOT_AVAILABLE);
+  operation.completedId = id;
+  operation.completedName = leaf;
+  operation.completedAudit = bytes;
+  MOZ_TRY(RestorePath(file, operation.completedAuditPath));
+  present = true;
+  return directory.Close();
+}
+nsresult RestoreRelease(ProfileStartupOperation& operation) {
+  if (operation.completedAudit.IsEmpty()) return NS_OK;
+  nsCOMPtr<nsIFile> work, file;
+  MOZ_TRY(RestoreWork(operation.profile, getter_AddRefs(work)));
+  StartupRestoreFD directory;
+  MOZ_TRY(RestoreOpen(work, directory));
+  nsCString bytes;
+  MOZ_TRY(RestoreRead(directory, "restore-current.json"_ns, bytes));
+  NS_ENSURE_TRUE(bytes == operation.completedAudit, NS_ERROR_NOT_AVAILABLE);
+  nsCString leaf(operation.completedName);
+  leaf.ReplaceSubstring(".complete.json", ".ordinary.json");
+  MOZ_TRY(RestoreAt(work, leaf, getter_AddRefs(file)));
+  bool exists;
+  MOZ_TRY(file->Exists(&exists));
+  if (exists) {
+    MOZ_TRY(RestoreRead(directory, leaf, bytes));
+    NS_ENSURE_TRUE(bytes == operation.completedAudit, NS_ERROR_NOT_AVAILABLE);
+  } else
+    MOZ_TRY(RestoreWrite(directory, leaf, operation.completedAudit, false,
+                         operation.completedId));
+  return directory.Close();
+}
+}  // namespace
+nsresult ProfileRestoreState::Check() {
+  for (auto* file : {work.get(), container.get(), parent.get()})
+    if (file) MOZ_TRY(RestorePin(*file));
+  for (const auto& root : roots)
+    for (auto* file : {root->live.get(), root->archive.get(), root->stage.get(),
+                       root->saved.get(), root->retired.get()})
+      if (file) MOZ_TRY(RestorePin(*file));
+  for (const auto& file : dependencies) MOZ_TRY(RestorePin(*file));
+#ifdef XP_WIN
+  for (auto entry = physicalPins.Iter(); !entry.Done(); entry.Next()) {
+    nsString path = NS_ConvertUTF8toUTF16(entry.Key());
+    HANDLE handle = CreateFileW(
+        reinterpret_cast<const wchar_t*>(path.get()), FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    NS_ENSURE_TRUE(handle != INVALID_HANDLE_VALUE, NS_ERROR_FILE_ACCESS_DENIED);
+    auto close = MakeScopeExit([&] { CloseHandle(handle); });
+    nsCString id;
+    MOZ_TRY(RestoreWinId(handle, id));
+    NS_ENSURE_TRUE(id == entry.Data(), NS_ERROR_NOT_AVAILABLE);
+    close.release();
+    NS_ENSURE_TRUE(CloseHandle(handle), NS_ERROR_FAILURE);
+  }
+#endif
+  return NS_OK;
+}
+nsresult ProfileRestoreState::Close() {
+  nsresult first = NS_OK;
+  auto close = [&](StartupRestoreFD* file) {
+    nsresult rv = file ? file->Close() : NS_OK;
+    if (NS_SUCCEEDED(first)) first = rv;
+  };
+  for (const auto& root : roots)
+    for (auto* file : {root->live.get(), root->archive.get(), root->stage.get(),
+                       root->saved.get(), root->retired.get()})
+      close(file);
+  for (const auto& file : dependencies) close(file.get());
+  close(container.get());
+  close(parent.get());
+  if (NS_SUCCEEDED(first) && complete) first = RestoreFinish(*this);
+  close(work.get());
+  return first;
+}
+
+namespace {
 nsresult StartupModuleCall(JSContext* cx, const nsAString& uri,
                            const char* method, JS::HandleValueArray arguments,
                            JS::MutableHandle<JS::Value> result) {
@@ -10178,10 +11638,1003 @@ nsresult DatabaseCore::BindStartupLocalNames(JSContext* cx,
   return CheckProfileStartup(ProfileStartupToken(), true);
 }
 
+namespace {
+
+nsresult RestoreProgress(JSContext* cx, ProfileRestoreState& state) {
+  NS_ENSURE_TRUE(cx && state.generation < UINT32_MAX, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(state.Check());
+  nsCString current;
+  MOZ_TRY(RestoreRead(*state.work, "restore.json"_ns, current));
+  NS_ENSURE_TRUE(current == state.requestBytes, NS_ERROR_NOT_AVAILABLE);
+  JS::Rooted<JS::Value> value(cx);
+  MOZ_TRY(StartupParse(cx, state.plan, &value));
+  JS::Rooted<JSObject*> request(cx, &value.toObject()),
+      progress(cx, JS_NewPlainObject(cx));
+  JS::Rooted<JSObject*> records(cx,
+                                JS::NewArrayObject(cx, state.roots.Length()));
+  NS_ENSURE_TRUE(progress && records, NS_ERROR_OUT_OF_MEMORY);
+  for (auto [key, n] : {std::pair{"formatVersion", 1.0},
+                        std::pair{"generation", double(state.generation + 1)},
+                        std::pair{"firstError", double(state.failure)}})
+    NS_ENSURE_TRUE(JS_DefineProperty(cx, progress, key, n, JSPROP_ENUMERATE),
+                   NS_ERROR_FAILURE);
+  MOZ_TRY(RestoreText(cx, request, "action", state.action));
+  for (auto pair :
+       {std::pair{"plan", &state.plan}, std::pair{"outcome", &state.outcome},
+        std::pair{"writingPath", &state.writingPath},
+        std::pair{"writingId", &state.writingId},
+        std::pair{"workIdentity", &state.work->identity.id},
+        std::pair{"parentIdentity", &state.parent->identity.id},
+        std::pair{"containerIdentity", &state.container->identity.id}})
+    MOZ_TRY(RestoreText(cx, progress, pair.first, *pair.second));
+  for (uint32_t i = 0; i < state.roots.Length(); ++i) {
+    auto& root = *state.roots[i];
+    JS::Rooted<JSObject*> record(cx, JS_NewPlainObject(cx)), before(cx);
+    NS_ENSURE_TRUE(record, NS_ERROR_OUT_OF_MEMORY);
+    for (auto pair : {std::pair{"identity", &root.live->identity.id},
+                      std::pair{"archiveIdentity", &root.archiveIdentity},
+                      std::pair{"stageIdentity", &root.stageIdentity},
+                      std::pair{"savedIdentity", &root.savedIdentity},
+                      std::pair{"retiredIdentity", &root.retiredIdentity}})
+      MOZ_TRY(RestoreText(cx, record, pair.first, *pair.second));
+    MOZ_TRY(RestoreSnapshot(cx, root.before, root.beforeMode,
+                            root.beforeModified, &before));
+    NS_ENSURE_TRUE(
+        JS_DefineProperty(cx, record, "before", before, JSPROP_ENUMERATE) &&
+            JS_DefineProperty(cx, record, "phase", double(root.phase),
+                              JSPROP_ENUMERATE) &&
+            JS_SetElement(cx, records, i, record),
+        NS_ERROR_FAILURE);
+  }
+  NS_ENSURE_TRUE(
+      JS_DefineProperty(cx, progress, "roots", records, JSPROP_ENUMERATE) &&
+          JS_DefineProperty(cx, request, "progress", progress,
+                            JSPROP_ENUMERATE),
+      NS_ERROR_FAILURE);
+  nsCString bytes;
+  MOZ_TRY(StartupJSON(cx, value, bytes));
+  MOZ_TRY(RestoreWrite(*state.work, "restore.json"_ns, bytes, true, state.id));
+  state.requestBytes = bytes;
+  ++state.generation;
+  return NS_OK;
+}
+nsresult RestoreChild(ProfileRestoreState& state, const nsCString& leaf,
+                      nsCString& identity, UniquePtr<StartupRestoreFD>& output,
+                      JSContext* cx, StartupRestoreFD* parent = nullptr) {
+  if (!parent) parent = state.container.get();
+  nsCOMPtr<nsIFile> file;
+  MOZ_TRY(RestoreAt(parent->file, leaf, getter_AddRefs(file)));
+  bool exists;
+  MOZ_TRY(file->Exists(&exists));
+  if (!exists) {
+    NS_ENSURE_TRUE(identity.IsEmpty(), NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(file->Create(nsIFile::DIRECTORY_TYPE, 0700));
+    MOZ_TRY(RestoreSync(*parent));
+  }
+  nsCString path;
+  MOZ_TRY(RestorePath(file, path));
+  MOZ_TRY(RestoreDirectory(path, output));
+  if (identity.IsEmpty()) {
+    nsTArray<nsCString> names;
+    MOZ_TRY(RestoreNames(*output, names));
+    NS_ENSURE_TRUE(names.IsEmpty(), NS_ERROR_NOT_AVAILABLE);
+    identity = output->identity.id;
+    MOZ_TRY(RestoreProgress(cx, state));
+  } else
+    NS_ENSURE_TRUE(identity == output->identity.id, NS_ERROR_NOT_AVAILABLE);
+  return NS_OK;
+}
+nsresult RestoreDependencies(JSContext* cx, ProfileRestoreState& state,
+                             JS::Handle<JSObject*> request,
+                             JS::Handle<JSObject*> selector) {
+  JS::Rooted<JSObject*> entries(cx), identity(cx), journal(cx), archive(cx);
+  uint32_t count;
+  MOZ_TRY(StartupArray(cx, request, "dependencies", &entries, count, true));
+  nsCString origin;
+  if (selector) {
+    MOZ_TRY(StartupText(cx, selector, "origin", origin));
+    MOZ_TRY(StartupObject(cx, selector, "identity", &identity));
+  }
+  if (origin != "migrated"_ns) {
+    NS_ENSURE_TRUE(!count, NS_ERROR_NOT_AVAILABLE);
+    return NS_OK;
+  }
+  NS_ENSURE_TRUE(count == 2, NS_ERROR_NOT_AVAILABLE);
+  nsCString journalPath;
+  MOZ_TRY(StartupText(cx, identity, "journalPath", journalPath));
+  bool foundJournal = false, foundArchive = false;
+  for (uint32_t i = 0; i < count; ++i) {
+    JS::Rooted<JSObject*> entry(cx);
+    MOZ_TRY(StartupItem(cx, entries, i, &entry));
+    nsCString kind, path, source, hash, actual;
+    MOZ_TRY(StartupText(cx, entry, "kind", kind));
+    MOZ_TRY(StartupText(cx, entry, "path", path));
+    MOZ_TRY(StartupText(cx, entry, "sha256", hash));
+    source = path;
+    for (const auto& root : state.roots)
+      if (RestoreInside(path, root->live->path)) {
+        nsCOMPtr<nsIFile> original, archived;
+        nsCString relative;
+        MOZ_TRY(RestoreFile(path, getter_AddRefs(original)));
+        MOZ_TRY(original->GetRelativePath(root->live->file, relative));
+        MOZ_TRY(
+            RestoreAt(root->archive->file, relative, getter_AddRefs(archived)));
+        MOZ_TRY(RestorePath(archived, source));
+      }
+    if (kind == "file"_ns) {
+      NS_ENSURE_TRUE(!foundJournal && path == journalPath,
+                     NS_ERROR_NOT_AVAILABLE);
+      nsCString supplied;
+      MOZ_TRY(StartupText(cx, entry, "sourcePath", supplied));
+      NS_ENSURE_TRUE(source == supplied, NS_ERROR_NOT_AVAILABLE);
+    } else
+      NS_ENSURE_TRUE(kind == "archive"_ns && !foundArchive,
+                     NS_ERROR_INVALID_ARG);
+    nsCOMPtr<nsIFile> file;
+    MOZ_TRY(RestoreFile(source, getter_AddRefs(file)));
+    auto pin = MakeUnique<StartupRestoreFD>();
+    MOZ_TRY(RestoreOpen(file, *pin));
+    MOZ_TRY(RestoreHash(*pin, actual, &state));
+    NS_ENSURE_TRUE(actual == hash, NS_ERROR_NOT_AVAILABLE);
+    if (kind == "file"_ns) {
+      int64_t size;
+      MOZ_TRY(StartupNumber(cx, entry, "size", 1, kRestoreInteger, size));
+      NS_ENSURE_TRUE(size == pin->identity.size, NS_ERROR_NOT_AVAILABLE);
+      MOZ_TRY(StartupReadJSON(cx, file, &journal));
+      foundJournal = true;
+    } else {
+      JS::Rooted<JS::Value> expected(cx);
+      MOZ_TRY(ImportMember(cx, identity, "backup", &expected));
+      NS_ENSURE_TRUE(expected.isObject(), NS_ERROR_NOT_AVAILABLE);
+      archive = &expected.toObject();
+      MOZ_TRY(StartupFieldsEqual(cx, archive, entry, {"path", "sha256"}));
+      nsCOMPtr<nsIFile> directory;
+      MOZ_TRY(file->GetParent(getter_AddRefs(directory)));
+      JS::Rooted<JSObject*> manifest(cx), roots(cx);
+      MOZ_TRY(StartupReadJSON(cx, file, &manifest));
+      JS::Rooted<JS::Value> complete(cx);
+      MOZ_TRY(ImportMember(cx, manifest, "complete", &complete));
+      NS_ENSURE_TRUE(complete.isBoolean() && complete.toBoolean(),
+                     NS_ERROR_NOT_AVAILABLE);
+      int64_t version;
+      MOZ_TRY(StartupNumber(cx, manifest, "version", 1, 3, version));
+      uint32_t rootsCount;
+      MOZ_TRY(StartupArray(cx, manifest, "roots", &roots, rootsCount));
+      NS_ENSURE_TRUE(rootsCount, NS_ERROR_FILE_CORRUPTED);
+      for (uint32_t r = 0; r < rootsCount; ++r) {
+        JS::Rooted<JSObject*> root(cx);
+        MOZ_TRY(StartupItem(cx, roots, r, &root));
+        nsCString label, original, expectedLabel("root-"_ns);
+        expectedLabel.AppendInt(r);
+        MOZ_TRY(StartupText(cx, root, "directory", label));
+        MOZ_TRY(StartupText(cx, root, "source", original));
+        NS_ENSURE_TRUE(label == expectedLabel &&
+                           (r || original == state.roots[0]->live->path),
+                       NS_ERROR_NOT_AVAILABLE);
+        nsCOMPtr<nsIFile> copy;
+        MOZ_TRY(RestoreAt(directory, label, getter_AddRefs(copy)));
+        auto held = MakeUnique<StartupRestoreFD>();
+        MOZ_TRY(RestoreOpen(copy, *held));
+        nsTArray<StartupRestoreEntry> rows;
+        uint32_t mode;
+        int64_t modified;
+        MOZ_TRY(RestoreEntries(cx, root, rows, mode, modified, state.prefix,
+                               r == 0, version != 1));
+        MOZ_TRY(RestoreTree(state, *held, rows, false));
+        for (const auto& row : rows)
+          if (!row.directory) {
+            nsCOMPtr<nsIFile> sourceFile;
+            MOZ_TRY(RestoreAt(copy, row.path, getter_AddRefs(sourceFile)));
+            auto input = MakeUnique<StartupRestoreFD>();
+            MOZ_TRY(RestoreOpen(sourceFile, *input));
+            MOZ_TRY(RestoreHash(*input, actual, &state));
+            NS_ENSURE_TRUE(actual == row.hash, NS_ERROR_NOT_AVAILABLE);
+            state.dependencyHashes.InsertOrUpdate(input->path, row.hash);
+            state.dependencies.AppendElement(std::move(input));
+          }
+        state.dependencies.AppendElement(std::move(held));
+      }
+      foundArchive = true;
+    }
+    state.dependencyHashes.InsertOrUpdate(pin->path, hash);
+    state.dependencies.AppendElement(std::move(pin));
+  }
+  NS_ENSURE_TRUE(foundJournal && foundArchive, NS_ERROR_NOT_AVAILABLE);
+  int64_t version;
+  MOZ_TRY(StartupNumber(cx, journal, "version", 7, 7, version));
+  nsCString profile, stage, database, selected;
+  MOZ_TRY(StartupText(cx, journal, "profilePath", profile));
+  MOZ_TRY(StartupText(cx, journal, "stage", stage));
+  JS::Rooted<JSObject*> startup(cx), backup(cx);
+  MOZ_TRY(StartupObject(cx, journal, "startup", &startup));
+  MOZ_TRY(StartupText(cx, startup, "databaseSourceId", database));
+  MOZ_TRY(StartupText(cx, identity, "databaseSourceId", selected));
+  JS::Rooted<JS::Value> cancelled(cx), bound(cx), expected(cx), actual(cx);
+  MOZ_TRY(ImportMember(cx, journal, "cancelled", &cancelled));
+  MOZ_TRY(ImportMember(cx, startup, "bound", &bound));
+  NS_ENSURE_TRUE(profile == state.roots[0]->live->path &&
+                     database == selected &&
+                     (stage == "complete"_ns || stage == "activate"_ns) &&
+                     cancelled.isBoolean() && !cancelled.toBoolean() &&
+                     bound.isBoolean() && bound.toBoolean(),
+                 NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(ImportMember(cx, journal, "backup", &actual));
+  MOZ_TRY(ImportMember(cx, identity, "backup", &expected));
+  MOZ_TRY(StartupEqual(cx, expected, actual));
+  JS::Rooted<JSObject*> imports(cx), sources(cx);
+  uint32_t units, sourceCount;
+  MOZ_TRY(StartupArray(cx, identity, "imports", &imports, units));
+  MOZ_TRY(StartupArray(cx, journal, "sources", &sources, sourceCount));
+  NS_ENSURE_TRUE(units == sourceCount, NS_ERROR_NOT_AVAILABLE);
+  nsTHashSet<nsCString> ids;
+  for (uint32_t i = 0; i < units; ++i) {
+    JS::Rooted<JSObject*> unit(cx);
+    MOZ_TRY(StartupItem(cx, imports, i, &unit));
+    nsCString id;
+    MOZ_TRY(StartupText(cx, unit, "id", id));
+    NS_ENSURE_FALSE(ids.Contains(id), NS_ERROR_FILE_CORRUPTED);
+    ids.Insert(id);
+    bool found = false;
+    for (uint32_t j = 0; j < sourceCount; ++j) {
+      JS::Rooted<JSObject*> source(cx);
+      MOZ_TRY(StartupItem(cx, sources, j, &source));
+      nsCString sourceId;
+      MOZ_TRY(StartupText(cx, source, "id", sourceId));
+      if (sourceId != id) continue;
+      NS_ENSURE_FALSE(found, NS_ERROR_FILE_CORRUPTED);
+      found = true;
+      MOZ_TRY(StartupFieldsEqual(cx, unit, source,
+                                 {"id", "token", "sha256", "receipt"}));
+      int64_t folder, destination;
+      MOZ_TRY(StartupNumber(cx, unit, "folderId", 1, kRestoreInteger, folder));
+      MOZ_TRY(StartupNumber(cx, source, "destinationFolderId", 1,
+                            kRestoreInteger, destination));
+      MOZ_TRY(StartupText(cx, source, "state", stage));
+      NS_ENSURE_TRUE(folder == destination && stage == "imported"_ns,
+                     NS_ERROR_NOT_AVAILABLE);
+    }
+    NS_ENSURE_TRUE(found, NS_ERROR_NOT_AVAILABLE);
+  }
+  for (const char* name : {"books", "caches"}) {
+    JS::Rooted<JSObject*> selectedUnits(cx), retainedUnits(cx);
+    uint32_t selectedCount, retainedCount;
+    MOZ_TRY(
+        StartupArray(cx, identity, name, &selectedUnits, selectedCount, true));
+    MOZ_TRY(
+        StartupArray(cx, journal, name, &retainedUnits, retainedCount, true));
+    NS_ENSURE_TRUE(selectedCount == retainedCount, NS_ERROR_NOT_AVAILABLE);
+    for (uint32_t i = 0; i < selectedCount; ++i) {
+      JS::Rooted<JSObject*> selectedUnit(cx), retainedUnit(cx);
+      MOZ_TRY(StartupItem(cx, selectedUnits, i, &selectedUnit));
+      MOZ_TRY(StartupItem(cx, retainedUnits, i, &retainedUnit));
+      MOZ_TRY(StartupFieldsEqual(cx, selectedUnit, retainedUnit,
+                                 {"id", "token", "sha256", "receipt"}));
+      MOZ_TRY(StartupText(cx, retainedUnit, "state", stage));
+      NS_ENSURE_TRUE(stage == "imported"_ns, NS_ERROR_NOT_AVAILABLE);
+      if (!strcmp(name, "books")) {
+        JS::Rooted<JSObject*> publication(cx);
+        MOZ_TRY(StartupObject(cx, retainedUnit, "publication", &publication));
+        MOZ_TRY(StartupText(cx, publication, "state", stage));
+        NS_ENSURE_TRUE(stage == "published"_ns, NS_ERROR_NOT_AVAILABLE);
+        MOZ_TRY(ImportMember(cx, publication, "receipt", &actual));
+        MOZ_TRY(ImportMember(cx, selectedUnit, "publication", &expected));
+        MOZ_TRY(StartupEqual(cx, expected, actual));
+      }
+    }
+  }
+  JS::Rooted<JSObject*> selectedSummaries(cx), journalSummaries(cx);
+  uint32_t selectedCount, retainedCount;
+  MOZ_TRY(StartupArray(cx, identity, "serverSummaries", &selectedSummaries,
+                       selectedCount, true));
+  MOZ_TRY(StartupArray(cx, startup, "serverSummaries", &journalSummaries,
+                       retainedCount, true));
+  NS_ENSURE_TRUE(selectedCount == retainedCount, NS_ERROR_NOT_AVAILABLE);
+  expected.setObject(*selectedSummaries);
+  actual.setObject(*journalSummaries);
+  MOZ_TRY(StartupEqual(cx, expected, actual));
+  JS::Rooted<JS::Value> journalValue(cx, JS::ObjectValue(*journal));
+  MOZ_TRY(StartupJSON(cx, journalValue, state.dependencyPlan));
+  return state.Check();
+}
+nsresult RestorePhysicalReceipts(JSContext* cx, nsIFile* database,
+                                 ProfileRestoreState& state,
+                                 JS::Handle<JSObject*> selector) {
+  nsCOMPtr<nsIURI> uri;
+  MOZ_TRY(NS_NewFileURI(getter_AddRefs(uri), database));
+  nsCString spec;
+  MOZ_TRY(uri->GetSpec(spec));
+  spec.AppendLiteral("?mode=ro");
+  MOZ_TRY(NS_NewURI(getter_AddRefs(uri), spec));
+  nsCOMPtr<nsIFileURL> url = do_QueryInterface(uri);
+  nsCOMPtr<mozIStorageService> storage =
+      do_GetService("@mozilla.org/storage/service;1");
+  NS_ENSURE_TRUE(storage && url, NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<mozIStorageConnection> reader;
+  MOZ_TRY(storage->OpenDatabaseWithFileURL(
+      url, "panorama.sqlite"_ns, mozIStorageService::CONNECTION_DEFAULT,
+      getter_AddRefs(reader)));
+  auto close = MakeScopeExit([&] { reader->Close(); });
+  auto read = [&]() -> nsresult {
+    JS::Rooted<JSObject*> identity(cx), imports(cx), journal(cx), sources(cx);
+    uint32_t count = 0, sourceCount = 0;
+    if (!state.dependencyPlan.IsEmpty()) {
+      JS::Rooted<JS::Value> value(cx);
+      MOZ_TRY(StartupParse(cx, state.dependencyPlan, &value));
+      journal = &value.toObject();
+      MOZ_TRY(StartupArray(cx, journal, "sources", &sources, sourceCount));
+    }
+    if (selector) {
+      MOZ_TRY(StartupObject(cx, selector, "identity", &identity));
+      MOZ_TRY(StartupArray(cx, identity, "imports", &imports, count, true));
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+      JS::Rooted<JSObject*> unit(cx);
+      MOZ_TRY(StartupItem(cx, imports, i, &unit));
+      nsCString token, source;
+      int64_t folder, length;
+      MOZ_TRY(StartupText(cx, unit, "token", token));
+      MOZ_TRY(StartupText(cx, unit, "id", source));
+      MOZ_TRY(StartupNumber(cx, unit, "folderId", 1, kRestoreInteger, folder));
+      nsCOMPtr<mozIStorageStatement> row;
+      MOZ_TRY(reader->CreateStatement(
+          "SELECT token,sourceId,databaseSourceId,sourceSha256,folderId,messageCount,sourcePath FROM folder_import_receipts WHERE token=:token OR sourceId=:source OR folderId=:folder"_ns,
+          getter_AddRefs(row)));
+      MOZ_TRY(row->BindUTF8StringByName("token"_ns, token));
+      MOZ_TRY(row->BindUTF8StringByName("source"_ns, source));
+      MOZ_TRY(row->BindInt64ByName("folder"_ns, folder));
+      bool more;
+      MOZ_TRY(row->ExecuteStep(&more));
+      NS_ENSURE_TRUE(more, NS_ERROR_NOT_AVAILABLE);
+      FolderImportReceipt receipt;
+      auto& found = receipt.identity;
+      MOZ_TRY(row->GetUTF8String(0, found.token));
+      MOZ_TRY(row->GetUTF8String(1, found.sourceId));
+      MOZ_TRY(row->GetUTF8String(2, found.databaseSourceId));
+      MOZ_TRY(row->GetUTF8String(3, found.sourceSha256));
+      int64_t id;
+      MOZ_TRY(row->GetInt64(4, &id));
+      MOZ_TRY(row->GetInt64(5, &length));
+      NS_ENSURE_TRUE(id == folder && length >= 0 && length <= UINT32_MAX &&
+                         found.token == token && found.sourceId == source,
+                     NS_ERROR_NOT_AVAILABLE);
+      found.folderId = id;
+      nsString originalPath;
+      nsCString database, sha;
+      MOZ_TRY(row->GetString(6, originalPath));
+      MOZ_TRY(StartupText(cx, identity, "databaseSourceId", database));
+      MOZ_TRY(StartupText(cx, unit, "sha256", sha));
+      NS_ENSURE_TRUE(
+          found.databaseSourceId == database && found.sourceSha256 == sha,
+          NS_ERROR_NOT_AVAILABLE);
+      for (uint32_t n = 0; n < sourceCount; ++n) {
+        JS::Rooted<JSObject*> sourceRow(cx);
+        MOZ_TRY(StartupItem(cx, sources, n, &sourceRow));
+        nsCString id, path;
+        MOZ_TRY(StartupText(cx, sourceRow, "id", id));
+        MOZ_TRY(StartupText(cx, sourceRow, "path", path));
+        if (id == source)
+          NS_ENSURE_TRUE(path == NS_ConvertUTF16toUTF8(originalPath),
+                         NS_ERROR_NOT_AVAILABLE);
+      }
+      MOZ_TRY(row->ExecuteStep(&more));
+      NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
+      MOZ_TRY(row->Finalize());
+      JS::Rooted<JS::Value> expected(cx), actual(cx);
+      MOZ_TRY(ImportMember(cx, unit, "receipt", &expected));
+#ifdef XP_WIN
+      NS_ENSURE_TRUE(expected.isObject(), NS_ERROR_FILE_CORRUPTED);
+      JS::Rooted<JSObject*> object(cx, &expected.toObject());
+      MOZ_TRY(ImportWindowsAdmission(cx, object, found));
+      MOZ_TRY(ReadWindowsImportReceipt(reader, found, found));
+#endif
+      MOZ_TRY(reader->CreateStatement(
+          "SELECT sourceKey,destinationKey FROM folder_import_keys WHERE token=:token ORDER BY sourceKey"_ns,
+          getter_AddRefs(row)));
+      MOZ_TRY(row->BindUTF8StringByName("token"_ns, token));
+      for (;;) {
+        MOZ_TRY(row->ExecuteStep(&more));
+        if (!more) break;
+        int64_t from, to;
+        MOZ_TRY(row->GetInt64(0, &from));
+        MOZ_TRY(row->GetInt64(1, &to));
+        NS_ENSURE_TRUE(
+            from >= 0 && from < nsMsgKey_None && to > 0 && to < nsMsgKey_None,
+            NS_ERROR_FILE_CORRUPTED);
+        receipt.keys.AppendElement(
+            FolderImportKey{nsMsgKey(from), nsMsgKey(to)});
+      }
+      MOZ_TRY(row->Finalize());
+      NS_ENSURE_TRUE(receipt.keys.Length() == uint64_t(length) &&
+                         ImportReceiptValue(cx, receipt, &actual),
+                     NS_ERROR_FILE_CORRUPTED);
+      NS_ENSURE_TRUE(expected.isObject() && actual.isObject(),
+                     NS_ERROR_FILE_CORRUPTED);
+      JS::Rooted<JSObject*> declared(cx, &expected.toObject()),
+          measured(cx, &actual.toObject());
+      MOZ_TRY(
+          StartupFieldsEqual(cx, declared, measured,
+                             {"token", "sourceSha256", "folderId", "keys"}));
+#ifdef XP_WIN
+      MOZ_TRY(StartupFieldsEqual(
+          cx, declared, measured,
+          {"version", "windowsAdmission", "sourcePhysicalIdentity"}));
+#endif
+    }
+    if (identity) {
+      MOZ_TRY(StartupArray(cx, identity, "caches", &imports, count, true));
+      for (uint32_t i = 0; i < count; ++i) {
+        JS::Rooted<JSObject*> unit(cx);
+        MOZ_TRY(StartupItem(cx, imports, i, &unit));
+        nsCString token, source, bytes;
+        MOZ_TRY(StartupText(cx, unit, "token", token));
+        MOZ_TRY(StartupText(cx, unit, "id", source));
+        nsCOMPtr<mozIStorageStatement> row;
+        MOZ_TRY(reader->CreateStatement(
+            "SELECT receipt FROM folder_cache_imports WHERE token=:token OR sourceId=:source"_ns,
+            getter_AddRefs(row)));
+        MOZ_TRY(row->BindUTF8StringByName("token"_ns, token));
+        MOZ_TRY(row->BindUTF8StringByName("source"_ns, source));
+        bool more;
+        MOZ_TRY(row->ExecuteStep(&more));
+        NS_ENSURE_TRUE(more, NS_ERROR_NOT_AVAILABLE);
+        MOZ_TRY(row->GetUTF8String(0, bytes));
+        MOZ_TRY(row->ExecuteStep(&more));
+        NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
+        MOZ_TRY(row->Finalize());
+        JS::Rooted<JS::Value> actual(cx), expected(cx);
+        MOZ_TRY(StartupParse(cx, bytes, &actual));
+        MOZ_TRY(ImportMember(cx, unit, "receipt", &expected));
+        MOZ_TRY(StartupEqual(cx, expected, actual));
+      }
+    }
+#ifdef XP_WIN
+    bool exists;
+    MOZ_TRY(reader->TableExists("folder_import_windows"_ns, &exists));
+    if (exists) {
+      nsCOMPtr<mozIStorageStatement> rows;
+      MOZ_TRY(reader->CreateStatement(
+          "SELECT sOriginal,sRootOriginal,sCanonical,sCanonicalRoot,sId,sParentId,sRootId,tOriginal,tRootOriginal,tCanonical,tCanonicalRoot,tId,tParentId,tRootId FROM folder_import_windows w JOIN folder_import_receipts r ON r.token=w.token JOIN folders f ON f.id=r.folderId"_ns,
+          getter_AddRefs(rows)));
+      bool more;
+      for (;;) {
+        MOZ_TRY(rows->ExecuteStep(&more));
+        if (!more) break;
+        FolderImportIdentity receipt;
+        receipt.windows = Some(FolderImportWindowsIdentity{});
+        MOZ_TRY(ReadImportPath(rows, 0, receipt.windows->summary));
+        MOZ_TRY(ReadImportPath(rows, 7, receipt.windows->store));
+        FolderImportAdmission admission;
+        MOZ_TRY(admission.Acquire(receipt));
+        for (uint32_t first : {0U, 7U}) {
+          const auto& expected =
+              first ? receipt.windows->store : receipt.windows->summary;
+          nsCOMPtr<nsIFile> file;
+          MOZ_TRY(NS_NewLocalFile(expected.originalPath, getter_AddRefs(file)));
+          bool directory = false;
+          if (!expected.id.IsEmpty()) MOZ_TRY(file->IsDirectory(&directory));
+          nsCString id(expected.id), literal;
+          MOZ_TRY(RestorePath(file, literal));
+          if (!id.IsEmpty()) {
+            for (const auto& approved : state.roots)
+              if (RestoreInside(literal, approved->live->path) &&
+                  literal != approved->live->path) {
+                bool included = false;
+                nsCString relative;
+                MOZ_TRY(file->GetRelativePath(approved->live->file, relative));
+                for (const auto& entry : approved->after)
+                  included |=
+                      entry.path == relative && entry.directory == directory;
+                NS_ENSURE_TRUE(included, NS_ERROR_NOT_AVAILABLE);
+              }
+            state.physicalPins.InsertOrUpdate(literal, id);
+            nsCOMPtr<nsIFile> parent;
+            MOZ_TRY(file->GetParent(getter_AddRefs(parent)));
+            auto held = MakeUnique<StartupRestoreFD>();
+            MOZ_TRY(RestoreOpen(parent, *held));
+            state.dependencies.AppendElement(std::move(held));
+          }
+        }
+        MOZ_TRY(admission.Close());
+      }
+      MOZ_TRY(rows->Finalize());
+    }
+#endif
+    return NS_OK;
+  };
+  nsresult result = read();
+  nsresult closed = reader->Close();
+  close.release();
+  return NS_FAILED(result) ? result : closed;
+}
+nsresult RestoreExecute(JSContext* cx, ProfileStartupOperation& operation) {
+  auto& state = *operation.restore;
+  AutoRestore<JSContext*> context(state.context);
+  state.context = cx;
+  nsCOMPtr<nsIFile> work;
+  MOZ_TRY(RestoreWork(operation.profile, getter_AddRefs(work)));
+  NS_ENSURE_TRUE(work, NS_ERROR_NOT_AVAILABLE);
+  nsCString workPath;
+  MOZ_TRY(RestorePath(work, workPath));
+  MOZ_TRY(RestoreDirectory(workPath, state.work));
+  MOZ_TRY(RestorePrivate(*state.work, false));
+  nsCOMPtr<nsIFile> requestFile;
+  MOZ_TRY(RestoreAt(work, "restore.json"_ns, getter_AddRefs(requestFile)));
+  MOZ_TRY(RestorePath(requestFile, state.requestPath));
+  MOZ_TRY(RestoreRead(*state.work, "restore.json"_ns, state.requestBytes));
+  JS::Rooted<JS::Value> value(cx);
+  MOZ_TRY(StartupParse(cx, state.requestBytes, &value));
+  NS_ENSURE_TRUE(value.isObject(), NS_ERROR_FILE_CORRUPTED);
+  JS::Rooted<JSObject*> request(cx, &value.toObject()), backup(cx),
+      manifest(cx), roots(cx), approved(cx), progress(cx);
+  int64_t number;
+  MOZ_TRY(StartupNumber(cx, request, "formatVersion", 1, 1, number));
+  MOZ_TRY(StartupText(cx, request, "operationId", state.id));
+  NS_ENSURE_TRUE(!state.id.IsEmpty() && state.id.Length() <= 64 &&
+                     std::all_of(state.id.begin(), state.id.end(),
+                                 [](char c) {
+                                   return (c >= 'a' && c <= 'z') ||
+                                          (c >= 'A' && c <= 'Z') ||
+                                          (c >= '0' && c <= '9') || c == '-' ||
+                                          c == '_';
+                                 }),
+                 NS_ERROR_INVALID_ARG);
+  state.prefix = ".panorama-restore-"_ns + state.id;
+  nsCString text;
+  MOZ_TRY(RestoreExpect(cx, request, "profilePath", operation.profilePath));
+  MOZ_TRY(RestoreExpect(cx, request, "localProfilePath", operation.localPath));
+  MOZ_TRY(StartupText(cx, request, "action", state.action));
+  NS_ENSURE_TRUE(state.action == "restore"_ns || state.action == "rollback"_ns,
+                 NS_ERROR_INVALID_ARG);
+  JS::Rooted<JSObject*> plan(cx, JS_NewPlainObject(cx));
+  NS_ENSURE_TRUE(plan, NS_ERROR_OUT_OF_MEMORY);
+  for (const char* name : {"formatVersion", "operationId", "profilePath",
+                           "localProfilePath", "backup", "stagingParent",
+                           "approvedRoots", "dependencies", "application"}) {
+    JS::Rooted<JS::Value> field(cx);
+    MOZ_TRY(ImportMember(cx, request, name, &field, true));
+    if (!field.isUndefined())
+      NS_ENSURE_TRUE(JS_DefineProperty(cx, plan, name, field, JSPROP_ENUMERATE),
+                     NS_ERROR_FAILURE);
+  }
+  JS::Rooted<JS::Value> original(cx, JS::ObjectValue(*plan)), prior(cx);
+  MOZ_TRY(StartupJSON(cx, original, state.plan));
+  MOZ_TRY(ImportMember(cx, request, "progress", &prior, true));
+  bool resumed = !prior.isUndefined();
+  JS::Rooted<JSObject*> savedRecords(cx);
+  if (resumed) {
+    NS_ENSURE_TRUE(prior.isObject(), NS_ERROR_FILE_CORRUPTED);
+    progress = &prior.toObject();
+    MOZ_TRY(StartupNumber(cx, progress, "formatVersion", 1, 1, number));
+    MOZ_TRY(StartupText(cx, progress, "plan", text));
+    MOZ_TRY(StartupParse(cx, text, &prior));
+    MOZ_TRY(StartupEqual(cx, original, prior));
+    state.plan = text;
+    MOZ_TRY(
+        StartupNumber(cx, progress, "generation", 1, UINT32_MAX - 1, number));
+    state.generation = number;
+    MOZ_TRY(StartupNumber(cx, progress, "firstError", 0, UINT32_MAX, number));
+    state.failure = number;
+    MOZ_TRY(StartupText(cx, progress, "writingPath", state.writingPath));
+    MOZ_TRY(StartupText(cx, progress, "writingId", state.writingId));
+    MOZ_TRY(
+        RestoreExpect(cx, progress, "workIdentity", state.work->identity.id));
+  } else
+    NS_ENSURE_TRUE(state.action == "restore"_ns, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(StartupText(cx, request, "stagingParent", text));
+  MOZ_TRY(RestoreDirectory(text, state.parent));
+  MOZ_TRY(RestorePrivate(*state.parent, true));
+  if (resumed) {
+    MOZ_TRY(RestoreExpect(cx, progress, "parentIdentity",
+                          state.parent->identity.id));
+  }
+  nsCOMPtr<nsIFile> container;
+  MOZ_TRY(RestoreAt(state.parent->file, "restore-"_ns + state.id,
+                    getter_AddRefs(container)));
+  bool exists;
+  MOZ_TRY(container->Exists(&exists));
+  if (!exists) {
+    NS_ENSURE_FALSE(resumed, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(container->Create(nsIFile::DIRECTORY_TYPE, 0700));
+    MOZ_TRY(RestoreSync(*state.parent));
+  }
+  nsCString containerPath;
+  MOZ_TRY(RestorePath(container, containerPath));
+  MOZ_TRY(RestoreDirectory(containerPath, state.container));
+  if (resumed) {
+    MOZ_TRY(RestoreExpect(cx, progress, "containerIdentity",
+                          state.container->identity.id));
+  } else {
+    nsTArray<nsCString> names;
+    MOZ_TRY(RestoreNames(*state.container, names));
+    NS_ENSURE_TRUE(names.IsEmpty(), NS_ERROR_NOT_AVAILABLE);
+  }
+  MOZ_TRY(StartupObject(cx, request, "backup", &backup));
+  MOZ_TRY(StartupText(cx, backup, "path", operation.backupPath));
+  MOZ_TRY(StartupText(cx, backup, "sha256", operation.backupHash));
+  nsCOMPtr<nsIFile> manifestFile, archive;
+  MOZ_TRY(RestoreFile(operation.backupPath, getter_AddRefs(manifestFile)));
+  MOZ_TRY(manifestFile->GetParent(getter_AddRefs(archive)));
+  nsCString archivePath;
+  MOZ_TRY(RestorePath(archive, archivePath));
+  bool rollback = state.action == "rollback"_ns;
+  nsCString manifestBytes, actual;
+  if (!rollback) {
+    auto archivePin = MakeUnique<StartupRestoreFD>();
+    MOZ_TRY(RestoreOpen(archive, *archivePin));
+    nsString leaf;
+    MOZ_TRY(manifestFile->GetLeafName(leaf));
+    MOZ_TRY(
+        RestoreRead(*archivePin, NS_ConvertUTF16toUTF8(leaf), manifestBytes));
+    state.dependencies.AppendElement(std::move(archivePin));
+    auto originalPin = MakeUnique<StartupRestoreFD>();
+    MOZ_TRY(RestoreOpen(manifestFile, *originalPin));
+    MOZ_TRY(RestoreHash(*originalPin, actual, &state));
+    NS_ENSURE_TRUE(actual == operation.backupHash, NS_ERROR_NOT_AVAILABLE);
+    state.dependencyHashes.InsertOrUpdate(originalPin->path,
+                                          operation.backupHash);
+    state.dependencies.AppendElement(std::move(originalPin));
+    if (!resumed)
+      MOZ_TRY(RestoreWrite(*state.container, "input-manifest.json"_ns,
+                           manifestBytes, false, state.id));
+  }
+  nsCString retained;
+  MOZ_TRY(RestoreRead(*state.container, "input-manifest.json"_ns, retained));
+  if (!rollback)
+    NS_ENSURE_TRUE(retained == manifestBytes, NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<nsIFile> retainedFile;
+  MOZ_TRY(RestoreAt(state.container->file, "input-manifest.json"_ns,
+                    getter_AddRefs(retainedFile)));
+  auto manifestPin = MakeUnique<StartupRestoreFD>();
+  MOZ_TRY(RestoreOpen(retainedFile, *manifestPin));
+  MOZ_TRY(RestoreHash(*manifestPin, actual, &state));
+  NS_ENSURE_TRUE(actual == operation.backupHash, NS_ERROR_NOT_AVAILABLE);
+  state.dependencyHashes.InsertOrUpdate(manifestPin->path,
+                                        operation.backupHash);
+  state.dependencies.AppendElement(std::move(manifestPin));
+  MOZ_TRY(StartupParse(cx, retained, &value));
+  NS_ENSURE_TRUE(value.isObject(), NS_ERROR_FILE_CORRUPTED);
+  manifest = &value.toObject();
+  MOZ_TRY(ImportMember(cx, manifest, "complete", &value));
+  NS_ENSURE_TRUE(value.isBoolean() && value.toBoolean(),
+                 NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(StartupNumber(cx, manifest, "version", 1, 3, number));
+  uint32_t count, approvals;
+  MOZ_TRY(StartupArray(cx, manifest, "roots", &roots, count));
+  MOZ_TRY(StartupArray(cx, request, "approvedRoots", &approved, approvals));
+  NS_ENSURE_TRUE(count && count == approvals, NS_ERROR_INVALID_ARG);
+  if (resumed) {
+    MOZ_TRY(StartupArray(cx, progress, "roots", &savedRecords, approvals));
+    NS_ENSURE_TRUE(count == approvals, NS_ERROR_NOT_AVAILABLE);
+  }
+  bool localCovered = false;
+  for (uint32_t i = 0; i < count; ++i) {
+    auto root = MakeUnique<StartupRestoreRoot>();
+    JS::Rooted<JSObject*> record(cx), approval(cx), saved(cx), before(cx);
+    MOZ_TRY(StartupItem(cx, roots, i, &record));
+    MOZ_TRY(StartupItem(cx, approved, i, &approval));
+    nsCString path, declared, copy("root-"_ns);
+    copy.AppendInt(i);
+    MOZ_TRY(StartupText(cx, record, "directory", declared));
+    NS_ENSURE_TRUE(declared == copy, NS_ERROR_FILE_CORRUPTED);
+    MOZ_TRY(StartupText(cx, record, "source", path));
+    MOZ_TRY(StartupText(cx, approval, "original", declared));
+    NS_ENSURE_TRUE(path == declared && (i || path == operation.profilePath),
+                   NS_ERROR_NOT_AVAILABLE);
+    for (const auto& previous : state.roots)
+      NS_ENSURE_TRUE(!RestoreInside(path, previous->live->path) &&
+                         !RestoreInside(previous->live->path, path),
+                     NS_ERROR_FILE_INVALID_PATH);
+    for (const auto& other : {archivePath, state.parent->path})
+      NS_ENSURE_TRUE(!RestoreInside(path, other) && !RestoreInside(other, path),
+                     NS_ERROR_FILE_INVALID_PATH);
+    NS_ENSURE_TRUE(path == workPath || (!RestoreInside(path, workPath) &&
+                                        !RestoreInside(workPath, path)),
+                   NS_ERROR_FILE_INVALID_PATH);
+    localCovered |= RestoreInside(operation.localPath, path);
+    MOZ_TRY(RestoreDirectory(path, root->live));
+    nsCOMPtr<nsIFile> archived;
+    MOZ_TRY(RestoreAt(archive, copy, getter_AddRefs(archived)));
+    nsCString archivedPath;
+    MOZ_TRY(RestorePath(archived, archivedPath));
+    if (!rollback) {
+      MOZ_TRY(RestoreDirectory(archivedPath, root->archive));
+      root->archiveIdentity = root->archive->identity.id;
+    }
+    MOZ_TRY(RestoreEntries(cx, record, root->after, root->afterMode,
+                           root->afterModified, state.prefix, i == 0));
+    if (resumed) {
+      MOZ_TRY(StartupItem(cx, savedRecords, i, &saved));
+      MOZ_TRY(RestoreExpect(cx, saved, "identity", root->live->identity.id));
+      MOZ_TRY(StartupText(cx, saved, "archiveIdentity", text));
+      NS_ENSURE_TRUE(
+          !text.IsEmpty() && (rollback || text == root->archiveIdentity),
+          NS_ERROR_NOT_AVAILABLE);
+      root->archiveIdentity = text;
+      MOZ_TRY(StartupObject(cx, saved, "before", &before));
+      MOZ_TRY(RestoreEntries(cx, before, root->before, root->beforeMode,
+                             root->beforeModified, state.prefix, i == 0));
+      MOZ_TRY(StartupText(cx, saved, "stageIdentity", root->stageIdentity));
+      MOZ_TRY(StartupText(cx, saved, "savedIdentity", root->savedIdentity));
+      MOZ_TRY(StartupText(cx, saved, "retiredIdentity", root->retiredIdentity));
+      MOZ_TRY(StartupNumber(cx, saved, "phase", 0, 6, number));
+      root->phase = number;
+    } else {
+      root->beforeMode = root->live->identity.permissions;
+      root->beforeModified = root->live->identity.modified;
+      MOZ_TRY(RestoreInventory(*root->live, ""_ns, root->before, i == 0, 0,
+                               &state));
+      for (const auto& entry : root->before)
+        NS_ENSURE_TRUE(!StringBeginsWith(entry.path, state.prefix) &&
+                           entry.path.Find("/"_ns + state.prefix) < 0,
+                       NS_ERROR_FILE_ACCESS_DENIED);
+    }
+#ifndef XP_WIN
+    NS_ENSURE_TRUE(path != workPath || (root->afterMode & 0722) == 0700,
+                   NS_ERROR_FILE_ACCESS_DENIED);
+#endif
+    state.roots.AppendElement(std::move(root));
+  }
+  NS_ENSURE_TRUE(localCovered && !RestoreInside(state.parent->path, workPath) &&
+                     !RestoreInside(workPath, state.parent->path) &&
+                     !RestoreInside(state.parent->path, archivePath) &&
+                     !RestoreInside(archivePath, state.parent->path),
+                 NS_ERROR_FILE_INVALID_PATH);
+  if (!resumed) MOZ_TRY(RestoreProgress(cx, state));
+  for (uint32_t i = 0; i < count; ++i) {
+    auto& root = *state.roots[i];
+    if (root.archive)
+      MOZ_TRY(RestoreTree(state, *root.archive, root.after, false));
+    nsCString stage("root-"_ns), saved("saved-"_ns);
+    stage.AppendInt(i);
+    saved.AppendInt(i);
+    MOZ_TRY(RestoreChild(state, stage, root.stageIdentity, root.stage, cx));
+    MOZ_TRY(RestoreChild(state, saved, root.savedIdentity, root.saved, cx));
+#ifdef XP_WIN
+    MOZ_TRY(RestoreChild(state, state.prefix + "-retired"_ns,
+                         root.retiredIdentity, root.retired, cx,
+                         root.live.get()));
+    MOZ_TRY(RestoreRetired(state, root));
+#endif
+    if (state.action == "restore"_ns) {
+      NS_ENSURE_TRUE(root.phase <= 3, NS_ERROR_NOT_AVAILABLE);
+      if (!root.phase) {
+        MOZ_TRY(RestoreTree(state, *root.live, root.before, i == 0));
+        MOZ_TRY(RestoreCopyTree(state, *root.archive, *root.stage, root.after,
+                                root.afterMode, root.afterModified, false));
+        MOZ_TRY(RestoreCopyTree(state, *root.live, *root.saved, root.before,
+                                root.beforeMode, root.beforeModified, false));
+      }
+      MOZ_TRY(RestoreTree(state, *root.stage, root.after, false));
+      MOZ_TRY(RestoreTree(state, *root.saved, root.before, false));
+    } else if (root.phase && root.phase != 6) {
+      MOZ_TRY(RestoreTree(state, *root.saved, root.before, false));
+      MOZ_TRY(RestoreTree(state, *root.stage, root.after, false));
+    }
+  }
+  nsTHashSet<nsCString> destinations;
+  for (const auto& root : state.roots) {
+    NS_ENSURE_FALSE(destinations.Contains(root->live->identity.id),
+                    NS_ERROR_FILE_ACCESS_DENIED);
+    destinations.Insert(root->live->identity.id);
+    for (const auto& entry : root->before) {
+      NS_ENSURE_FALSE(destinations.Contains(entry.nativeId),
+                      NS_ERROR_FILE_ACCESS_DENIED);
+      destinations.Insert(entry.nativeId);
+    }
+  }
+  for (const auto& root : state.roots) {
+    if (!root->archive) continue;
+    NS_ENSURE_FALSE(destinations.Contains(root->archive->identity.id),
+                    NS_ERROR_FILE_ACCESS_DENIED);
+    nsTArray<StartupRestoreEntry> input;
+    MOZ_TRY(RestoreInventory(*root->archive, ""_ns, input, false, 0, &state));
+    for (const auto& entry : input)
+      NS_ENSURE_FALSE(destinations.Contains(entry.nativeId),
+                      NS_ERROR_FILE_ACCESS_DENIED);
+  }
+  RefPtr<ProfileStartupOperation> staged = new ProfileStartupOperation();
+  staged->profile = state.roots[0]->stage->file;
+  staged->profilePath = operation.profilePath;
+  JS::Rooted<JSObject*> selector(cx), identity(cx);
+  if (!rollback) {
+    MOZ_TRY(StartupSelector(cx, *staged, &selector));
+    MOZ_TRY(RestoreDependencies(cx, state, request, selector));
+  }
+  for (const auto& input : state.dependencies)
+    NS_ENSURE_FALSE(destinations.Contains(input->identity.id),
+                    NS_ERROR_FILE_ACCESS_DENIED);
+  if (state.action == "restore"_ns) {
+    nsCOMPtr<nsIFile> scratch;
+    MOZ_TRY(
+        RestoreAt(state.container->file, "probe"_ns, getter_AddRefs(scratch)));
+    MOZ_TRY(scratch->CreateUnique(nsIFile::DIRECTORY_TYPE, 0700));
+    nsCString path;
+    MOZ_TRY(RestorePath(scratch, path));
+    UniquePtr<StartupRestoreFD> probe;
+    MOZ_TRY(RestoreDirectory(path, probe));
+    nsTArray<StartupRestoreEntry> files;
+    for (const char* leaf : {"panorama.sqlite", "panorama.sqlite-wal",
+                             "panorama.sqlite-shm", "panorama.sqlite-journal"})
+      for (const auto& entry : state.roots[0]->after)
+        if (entry.path.Equals(leaf)) files.AppendElement(entry);
+    files.Sort(
+        [](const auto& a, const auto& b) { return Compare(a.path, b.path); });
+    MOZ_TRY(RestoreCopyTree(state, *state.roots[0]->stage, *probe, files, 0700,
+                            0, false));
+    nsCOMPtr<nsIFile> database;
+    MOZ_TRY(StartupChild(scratch, "panorama.sqlite", getter_AddRefs(database)));
+    MOZ_TRY(StartupProbe(database, staged->existing, staged->schema,
+                         staged->sourceId));
+    if (staged->existing)
+      MOZ_TRY(RestorePhysicalReceipts(cx, database, state, selector));
+    if (selector) {
+      MOZ_TRY(StartupObject(cx, selector, "identity", &identity));
+      MOZ_TRY(StartupText(cx, identity, "databaseSourceId", text));
+      NS_ENSURE_TRUE(staged->existing && text == staged->sourceId,
+                     NS_ERROR_NOT_AVAILABLE);
+      MOZ_TRY(StartupNumber(cx, identity, "schemaVersion", 0, 21, number));
+      NS_ENSURE_TRUE(number == staged->schema, NS_ERROR_NOT_AVAILABLE);
+    }
+    MOZ_TRY(probe->Close());
+  }
+  for (uint32_t i = 0; i < count; ++i) {
+    auto& root = *state.roots[i];
+    if (state.action == "restore"_ns) {
+      if (!root.phase) {
+        root.phase = 1;
+        MOZ_TRY(RestoreProgress(cx, state));
+      }
+      if (root.phase == 1) {
+        MOZ_TRY(RestoreRemoveTree(state, *root.live, root.before, i == 0));
+        root.phase = 2;
+        MOZ_TRY(RestoreProgress(cx, state));
+      }
+      if (root.phase == 2) {
+        MOZ_TRY(RestoreCopyTree(state, *root.stage, *root.live, root.after,
+                                root.afterMode, root.afterModified, i == 0));
+        root.phase = 3;
+        MOZ_TRY(RestoreProgress(cx, state));
+      }
+      MOZ_TRY(RestoreTree(state, *root.live, root.after, i == 0));
+      MOZ_TRY(RestoreRetired(state, root));
+    } else {
+      if (!root.phase)
+        MOZ_TRY(RestoreTree(state, *root.live, root.before, i == 0));
+      else if (root.phase != 6) {
+        if (root.phase == 2 || root.phase == 3) {
+          root.phase = 4;
+          MOZ_TRY(RestoreProgress(cx, state));
+        }
+        if (root.phase == 4)
+          MOZ_TRY(RestoreRemoveTree(state, *root.live, root.after, i == 0));
+        root.phase = 5;
+        MOZ_TRY(RestoreProgress(cx, state));
+        MOZ_TRY(RestoreRetired(state, root, true));
+        MOZ_TRY(RestoreCopyTree(state, *root.saved, *root.live, root.before,
+                                root.beforeMode, root.beforeModified, i == 0));
+      }
+      root.phase = 6;
+      MOZ_TRY(RestoreProgress(cx, state));
+      MOZ_TRY(RestoreTree(state, *root.live, root.before, i == 0));
+    }
+  }
+  state.outcome =
+      state.action == "restore"_ns ? "restored"_ns : "rolled-back"_ns;
+  return RestoreProgress(cx, state);
+}
+}  // namespace
+nsresult DatabaseCore::RunProfileRestore(JSContext* cx) {
+  MOZ_TRY(CheckProfileStartup(ProfileStartupToken()));
+  auto& operation = *mProfileStartup;
+  operation.mode = "restore"_ns;
+  operation.selected = true;
+  operation.restore = MakeUnique<ProfileRestoreState>();
+  AutoRestore<bool> busy(operation.busy);
+  operation.busy = true;
+  nsresult rv = RestoreExecute(cx, operation);
+  auto& state = *operation.restore;
+  if (NS_FAILED(rv) && state.generation && state.container) {
+    if (!state.failure) state.failure = uint32_t(rv);
+    (void)RestoreProgress(cx, state);
+  }
+  return rv;
+}
+nsresult DatabaseCore::CheckProfileRestore(
+    JSContext* cx, const JS::Handle<JS::Value>* activation) {
+  auto& state = *mProfileStartup->restore;
+  AutoRestore<bool> busy(mProfileStartup->busy);
+  mProfileStartup->busy = true;
+  if (activation) {
+    NS_ENSURE_TRUE(activation->isObject(), NS_ERROR_INVALID_ARG);
+    JS::Rooted<JSObject*> record(cx, &activation->toObject());
+    nsCString mode, outcome;
+    MOZ_TRY(StartupText(cx, record, "mode", mode));
+    MOZ_TRY(StartupText(cx, record, "restoreOutcome", outcome));
+    NS_ENSURE_TRUE(mode == "restore"_ns && outcome == state.outcome,
+                   NS_ERROR_NOT_AVAILABLE);
+  }
+  MOZ_TRY(CheckProfileStartup(ProfileStartupToken(), true));
+  MOZ_TRY(RestoreBoundary(state));
+  for (const auto& file : state.dependencies) {
+    auto digest = state.dependencyHashes.Lookup(file->path);
+    if (digest) {
+      nsCString actual;
+      MOZ_TRY(RestoreHash(*file, actual, &state));
+      NS_ENSURE_TRUE(actual == digest.Data(), NS_ERROR_NOT_AVAILABLE);
+    }
+  }
+  nsCString current;
+  MOZ_TRY(RestoreRead(*state.work, "restore.json"_ns, current));
+  NS_ENSURE_TRUE(current == state.requestBytes && !state.outcome.IsEmpty(),
+                 NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<nsIFile> manifest;
+  if (state.action == "rollback"_ns)
+    MOZ_TRY(RestoreAt(state.container->file, "input-manifest.json"_ns,
+                      getter_AddRefs(manifest)));
+  else
+    MOZ_TRY(RestoreFile(mProfileStartup->backupPath, getter_AddRefs(manifest)));
+  MOZ_TRY(StartupHash(manifest, current));
+  NS_ENSURE_TRUE(current == mProfileStartup->backupHash,
+                 NS_ERROR_NOT_AVAILABLE);
+  for (uint32_t i = 0; i < state.roots.Length(); ++i) {
+    auto& root = *state.roots[i];
+    if (root.archive)
+      MOZ_TRY(RestoreTree(state, *root.archive, root.after, false));
+    MOZ_TRY(RestoreRetired(state, root));
+    bool restored = state.outcome == "restored"_ns;
+    NS_ENSURE_TRUE(root.phase == (restored ? 3U : 6U), NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(RestoreTree(state, *root.live, restored ? root.after : root.before,
+                        i == 0));
+    if (restored) {
+      MOZ_TRY(RestoreTree(state, *root.saved, root.before, false));
+      MOZ_TRY(RestoreTree(state, *root.stage, root.after, false));
+    }
+  }
+  return NS_OK;
+}
 nsresult DatabaseCore::DescribeProfileStartup(
     JSContext* cx, JS::MutableHandle<JS::Value> output) {
   MOZ_TRY(CheckProfileStartup(ProfileStartupToken()));
   auto& operation = *mProfileStartup;
+  if (operation.auditCandidate && !operation.restore) {
+    bool present;
+    MOZ_TRY(RestoreCompleted(cx, operation, present));
+    NS_ENSURE_TRUE(present, NS_ERROR_NOT_AVAILABLE);
+    nsCOMPtr<nsIFile> selector;
+    MOZ_TRY(StartupChild(operation.profile, "panorama-profile.json",
+                         getter_AddRefs(selector)));
+    bool exists;
+    MOZ_TRY(selector->Exists(&exists));
+    if (!exists && !StaticPrefs::mail_panorama_enabled_AtStartup()) {
+      operation.mode = "restored-default"_ns;
+      operation.selected = true;
+      JS::Rooted<JSObject*> result(cx, JS_NewPlainObject(cx));
+      NS_ENSURE_TRUE(result, NS_ERROR_OUT_OF_MEMORY);
+      for (auto pair :
+           {std::pair{"mode", &operation.mode},
+            std::pair{"profilePath", &operation.profilePath},
+            std::pair{"localProfilePath", &operation.localPath},
+            std::pair{"restoreAuditPath", &operation.completedAuditPath},
+            std::pair{"restoreOperationId", &operation.completedId}})
+        MOZ_TRY(RestoreText(cx, result, pair.first, *pair.second));
+      output.setObject(*result);
+      return NS_OK;
+    }
+  }
+  if (auto* restore = operation.restore.get()) {
+    MOZ_TRY(CheckProfileRestore(cx));
+    JS::Rooted<JSObject*> result(cx, JS_NewPlainObject(cx));
+    NS_ENSURE_TRUE(result, NS_ERROR_OUT_OF_MEMORY);
+    MOZ_TRY(RestoreText(cx, result, "mode", "restore"_ns));
+    MOZ_TRY(RestoreText(cx, result, "phase", "restore-finished"_ns));
+    MOZ_TRY(RestoreText(cx, result, "restoreOutcome", restore->outcome));
+    MOZ_TRY(
+        RestoreText(cx, result, "restoreRequestPath", restore->requestPath));
+    MOZ_TRY(RestoreText(cx, result, "profilePath", operation.profilePath));
+    MOZ_TRY(RestoreText(cx, result, "localProfilePath", operation.localPath));
+    output.setObject(*result);
+    return NS_OK;
+  }
   if (!operation.selected) {
     AutoRestore<bool> busy(operation.busy);
     operation.busy = true;
@@ -10234,8 +12687,10 @@ nsresult DatabaseCore::DescribeProfileStartup(
       operation.mode = "reuse"_ns;
     } else {
       nsTArray<nsCString> inventory;
-      MOZ_TRY(StartupInventory(operation.profile, inventory));
-      MOZ_TRY(StartupConfiguredRoots(operation.profile, inventory));
+      MOZ_TRY(StartupInventory(operation.profile, inventory, false, true,
+                               &operation.retiredPaths));
+      MOZ_TRY(StartupConfiguredRoots(operation.profile, inventory, nullptr,
+                                     &operation.retiredPaths));
       operation.mode = inventory.IsEmpty() ? "initialize"_ns : "migrate"_ns;
     }
     operation.selected = true;
@@ -10310,6 +12765,12 @@ nsresult DatabaseCore::DescribeProfileStartup(
   NS_ENSURE_TRUE(JS_DefineProperty(cx, result, "serverSummaries",
                                    serverSummaries, JSPROP_ENUMERATE),
                  NS_ERROR_OUT_OF_MEMORY);
+  if (!operation.completedAudit.IsEmpty()) {
+    MOZ_TRY(RestoreText(cx, result, "restoreAuditPath",
+                        operation.completedAuditPath));
+    MOZ_TRY(
+        RestoreText(cx, result, "restoreOperationId", operation.completedId));
+  }
   output.setObject(*result);
   return NS_OK;
 }
@@ -10422,14 +12883,17 @@ nsresult DatabaseCore::OpenProfileStartup(JSContext* cx,
   } else {
     NS_ENSURE_TRUE(mode == "migrate"_ns || (!exists && !selector),
                    NS_ERROR_NOT_AVAILABLE);
-    MOZ_TRY(StartupInventory(operation.profile, inventory));
+    MOZ_TRY(StartupInventory(operation.profile, inventory, false, true,
+                             &operation.retiredPaths));
     operation.servers.Clear();
     MOZ_TRY(StartupConfiguredRoots(
         operation.profile, inventory,
-        mode == "migrate"_ns ? &operation.servers : nullptr));
+        mode == "migrate"_ns ? &operation.servers : nullptr,
+        &operation.retiredPaths));
     if (mode == "initialize"_ns) {
       NS_ENSURE_TRUE(inventory.IsEmpty() && !count, NS_ERROR_NOT_AVAILABLE);
-      MOZ_TRY(StartupConfiguredRoots(operation.profile, inventory));
+      MOZ_TRY(StartupConfiguredRoots(operation.profile, inventory, nullptr,
+                                     &operation.retiredPaths));
       NS_ENSURE_TRUE(inventory.IsEmpty(), NS_ERROR_NOT_AVAILABLE);
     } else {
       NS_ENSURE_TRUE(selector, NS_ERROR_NOT_AVAILABLE);
@@ -10657,7 +13121,8 @@ nsresult DatabaseCore::BuildStartupFolders() {
     nsCOMPtr<nsIFile> retainedRoot;
     MOZ_TRY(NS_NewNativeLocalFile(source.path, getter_AddRefs(retainedRoot)));
     nsTArray<nsCString> beforeConstruction;
-    MOZ_TRY(StartupInventory(retainedRoot, beforeConstruction, true, false));
+    MOZ_TRY(StartupInventory(retainedRoot, beforeConstruction, true, false,
+                             &operation.retiredPaths));
     for (const auto& path : beforeConstruction)
       NS_ENSURE_TRUE(operation.backupFiles.Contains(path),
                      NS_ERROR_NOT_AVAILABLE);
@@ -11037,7 +13502,8 @@ nsresult DatabaseCore::BuildStartupFolders() {
     nsCOMPtr<nsIFile> root;
     MOZ_TRY(NS_NewNativeLocalFile(server.path, getter_AddRefs(root)));
     nsTArray<nsCString> files;
-    MOZ_TRY(StartupInventory(root, files, true, false));
+    MOZ_TRY(
+        StartupInventory(root, files, true, false, &operation.retiredPaths));
     for (const auto& path : files) {
       if (operation.backupFiles.Contains(path)) continue;
       nsCOMPtr<nsIFile> file;
@@ -11097,6 +13563,9 @@ NS_IMETHODIMP DatabaseCore::OpenProfileStartupTarget(
     nsISupports* token, JS::Handle<JS::Value> plan, JSContext* cx,
     JS::MutableHandle<JS::Value> output) {
   MOZ_TRY(CheckProfileStartup(token));
+  NS_ENSURE_TRUE(mProfileStartup->mode != "restore"_ns &&
+                     mProfileStartup->mode != "restored-default"_ns,
+                 NS_ERROR_NOT_AVAILABLE);
   JS::Rooted<JS::Value> ignored(cx);
   MOZ_TRY(DescribeProfileStartup(cx, &ignored));
   nsresult rv = OpenProfileStartup(cx, plan);
@@ -11184,7 +13653,25 @@ nsresult DatabaseCore::SettleProfileStartup(nsresult failure) {
       }
     }
 #endif
+    for (auto* lease :
+         {operation->profileLease.get(), operation->localLease.get()}) {
+      nsresult rv = lease ? lease->Close() : NS_OK;
+      if (NS_SUCCEEDED(operation->closeError)) operation->closeError = rv;
+    }
+    if (operation->restore) {
+      operation->restore->complete &= NS_SUCCEEDED(operation->firstError) &&
+                                      NS_SUCCEEDED(operation->closeError);
+      nsresult restoredClose = operation->restore->Close();
+      if (NS_SUCCEEDED(operation->closeError))
+        operation->closeError = restoredClose;
+    }
+    if (NS_SUCCEEDED(operation->firstError) &&
+        NS_SUCCEEDED(operation->closeError))
+      operation->closeError = RestoreRelease(*operation);
     operation->Remember(operation->closeError);
+    if (operation->mode == "restored-default"_ns &&
+        NS_SUCCEEDED(operation->firstError))
+      self->mStartupManaged = false;
     operation->settled = true;
     operation->onShutdown = {};
     if (operation->barrier) {
@@ -11192,7 +13679,8 @@ nsresult DatabaseCore::SettleProfileStartup(nsresult failure) {
       operation->barrier = nullptr;
     }
     for (const auto& promise : operation->settlements) {
-      if (NS_FAILED(operation->closeError))
+      if (NS_FAILED(operation->closeError) ||
+          (operation->mode == "restore"_ns && NS_FAILED(operation->firstError)))
         promise->MaybeReject(operation->firstError);
       else
         promise->MaybeResolveWithUndefined();
@@ -11492,8 +13980,30 @@ nsresult DatabaseCore::ReadStartupReusedBookDirectory(nsIFile* target,
 
 nsresult DatabaseCore::CheckProfileActivation(
     JSContext* cx, JS::Handle<JS::Value> activation) {
+  if (mProfileStartup && mProfileStartup->restore)
+    return CheckProfileRestore(cx, &activation);
   MOZ_TRY(CheckProfileStartup(ProfileStartupToken()));
   auto& operation = *mProfileStartup;
+  if (operation.mode == "restored-default"_ns) {
+    AutoRestore<bool> busy(operation.busy);
+    operation.busy = true;
+    NS_ENSURE_TRUE(activation.isObject(), NS_ERROR_INVALID_ARG);
+    nsCString snapshot;
+    MOZ_TRY(StartupJSON(cx, activation, snapshot));
+    JS::Rooted<JS::Value> frozen(cx);
+    MOZ_TRY(StartupParse(cx, snapshot, &frozen));
+    JS::Rooted<JSObject*> record(cx, &frozen.toObject());
+    nsCString mode, id, prior(operation.completedAudit);
+    MOZ_TRY(StartupText(cx, record, "mode", mode));
+    MOZ_TRY(StartupText(cx, record, "restoreOperationId", id));
+    NS_ENSURE_TRUE(mode == operation.mode && id == operation.completedId,
+                   NS_ERROR_NOT_AVAILABLE);
+    bool present;
+    MOZ_TRY(RestoreCompleted(cx, operation, present));
+    NS_ENSURE_TRUE(present && prior == operation.completedAudit,
+                   NS_ERROR_NOT_AVAILABLE);
+    return CheckProfileStartup(ProfileStartupToken(), true);
+  }
   NS_ENSURE_TRUE(operation.opened && !operation.ready, NS_ERROR_NOT_AVAILABLE);
   if (operation.mode == "legacy"_ns) {
     NS_ENSURE_TRUE(activation.isNull() && !sConnection, NS_ERROR_INVALID_ARG);
@@ -12388,8 +14898,10 @@ nsresult DatabaseCore::CheckProfileActivation(
     return NS_OK;
   }
   nsTArray<nsCString> finalInventory;
-  MOZ_TRY(StartupInventory(operation.profile, finalInventory));
-  MOZ_TRY(StartupConfiguredRoots(operation.profile, finalInventory));
+  MOZ_TRY(StartupInventory(operation.profile, finalInventory, false, true,
+                           &operation.retiredPaths));
+  MOZ_TRY(StartupConfiguredRoots(operation.profile, finalInventory, nullptr,
+                                 &operation.retiredPaths));
   for (const auto& path : finalInventory) {
     if (StringEndsWith(path, ".msf"_ns) || StringEndsWith(path, ".mab"_ns) ||
         StringEndsWith(path, "/panacea.dat"_ns) ||
@@ -12419,6 +14931,18 @@ NS_IMETHODIMP DatabaseCore::CompleteProfileStartup(
       promise->MaybeReject(rv);
     }
   } else {
+    if (mProfileStartup->restore ||
+        mProfileStartup->mode == "restored-default"_ns) {
+      if (mProfileStartup->restore) mProfileStartup->restore->complete = true;
+      mProfileStartup->settlements.AppendElement(promise);
+      rv = SettleProfileStartup(NS_OK);
+      if (NS_FAILED(rv)) {
+        mProfileStartup->settlements.RemoveElement(promise);
+        promise->MaybeReject(mProfileStartup->firstError);
+      }
+      promise.forget(output);
+      return NS_OK;
+    }
     // The final native check runs without a caller getter between it and ready.
     rv = CheckProfileStartup(token);
     if (NS_FAILED(rv)) {

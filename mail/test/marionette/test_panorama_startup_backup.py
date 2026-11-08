@@ -5,8 +5,13 @@
 import hashlib
 import json
 import os
+import select
 import shutil
+import signal
+import sqlite3
+import sys
 import tempfile
+import unittest
 import uuid
 from pathlib import Path
 
@@ -1533,3 +1538,329 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.assertEqual(original, self.assert_message_after_activation(source))
         self.assertEqual(selector, (self.profile / "panorama-profile.json").read_bytes())
         self.assertEqual(journal_bytes, journal.read_bytes())
+
+    # S7-15 trial: interrupt the real pref-driven process at its existing
+    # durable boundaries, then restart it. POSIX kernel limits/FIFOs/signals only;
+    # no product hook, polling loop or custom harness.
+
+    def largest_file_limit(self, roots):
+        """Exceed every existing regular file the process may copy before the cut."""
+        largest = 0
+        for root in roots:
+            for path in Path(root).rglob("*"):
+                if path.is_file() and not path.is_symlink():
+                    largest = max(largest, path.stat().st_size)
+        return largest + 1024 * 1024
+
+    def write_large_file(self, path, size):
+        """Write deterministic bytes larger than the limit; return their digest."""
+        block = hashlib.sha256(path.name.encode()).digest() * 2048
+        digest = hashlib.sha256()
+        with open(path, "wb") as output:
+            written = 0
+            while written < size:
+                chunk = block[: min(len(block), size - written)]
+                output.write(chunk)
+                digest.update(chunk)
+                written += len(chunk)
+        return digest.hexdigest()
+
+    def file_digests(self, root):
+        """Independently hash every regular file in a physical tree."""
+        return {
+            path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted(Path(root).rglob("*"))
+            if path.is_file() and not path.is_symlink()
+        }
+
+    def start_with_file_size_limit(self, limit):
+        """Start the stopped process so the kernel stops its first write past limit."""
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+        self.assertTrue(hard == resource.RLIM_INFINITY or hard > limit)
+        # The child inherits the limit; mozprocess restores default SIGXFSZ.
+        resource.setrlimit(resource.RLIMIT_FSIZE, (limit, hard))
+        try:
+            self.marionette.instance.start()
+        finally:
+            resource.setrlimit(resource.RLIMIT_FSIZE, (soft, hard))
+        code = self.marionette.instance.runner.wait(
+            timeout=self.marionette.startup_timeout
+        )
+        self.assertEqual(-signal.SIGXFSZ, code,
+                         "The kernel must stop the real copy at its file-size limit")
+
+    def restart_or_refusal(self):
+        """Start the same unchanged profile; return None after exit 5, else selection."""
+        try:
+            self.marionette.start_session()
+        except Exception:
+            code = self.marionette.instance.runner.wait(
+                timeout=self.marionette.startup_timeout
+            )
+            self.assertEqual(5, code, "Recovery must exit with NS_ERROR_FAILURE")
+            return None
+        self.marionette.set_context(self.marionette.CONTEXT_CHROME)
+        self.assertEqual(self.profile, Path(self.marionette.execute_script(
+            "return Services.dirsvc.get('ProfD', Ci.nsIFile).path;"
+        )).resolve())
+        return self.selection()
+
+    def create_legacy_folders(self, count):
+        """Write genuine Mork folders, one message each, through the legacy API."""
+        result = self.marionette.execute_script(r"""
+            const { MailServices } = ChromeUtils.importESModule(
+              'resource:///modules/MailServices.sys.mjs');
+            const { FileUtils } = ChromeUtils.importESModule(
+              'resource://gre/modules/FileUtils.sys.mjs');
+            const root = PathUtils.join(PathUtils.profileDir, 'Mail',
+              's715-' + Services.uuid.generateUUID().toString());
+            const file = new FileUtils.File(root);
+            if (!file.parent.exists()) {
+              file.parent.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+            }
+            file.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+            const server = MailServices.accounts.createIncomingServer(
+              's715', 'localhost', 'none');
+            server.setStringValue('storeContractID',
+              '@mozilla.org/msgstore/berkeleystore;1');
+            server.localPath = file;
+            const account = MailServices.accounts.createAccount();
+            account.incomingServer = server;
+            const folders = [];
+            for (let i = 0; i < arguments[0]; i++) {
+              const name = 'S715 committed unit ' + i;
+              server.rootFolder.createSubfolder(name, null);
+              const folder = server.rootFolder.getChildNamed(name)
+                .QueryInterface(Ci.nsIMsgLocalMailFolder);
+              const header = folder.addMessage(
+                'From - Thu Nov 05 00:00:00 2026\r\n' +
+                'Message-ID: <s715-unit-' + i + '@invalid>\r\n' +
+                'From: source@example.invalid\r\n' +
+                'Subject: Committed unit ' + i + '\r\n' +
+                'Date: Thu, 5 Nov 2026 00:00:00 +0000\r\n\r\n' +
+                'Preserved unit body.\r\n');
+              folder.msgDatabase.commit(Ci.nsMsgDBCommitType.kLargeCommit);
+              folders.push({name, summary: folder.summaryFile.path,
+                key: header.messageKey});
+            }
+            Services.prefs.savePrefFile(null);
+            return {serverKey: server.key, root, folders};
+        """, script_args=[count])
+        self.assertEqual(count, len(result["folders"]))
+        return result
+
+    def kill_inside_selector_publication(self):
+        """Hold the real final selector write in a full FIFO, then SIGKILL it."""
+        import fcntl
+
+        fifo = self.profile / "panorama-profile.json.tmp"
+        os.mkfifo(fifo, 0o600)
+        holder = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
+        held = b""
+        try:
+            capacity = fcntl.fcntl(holder, getattr(fcntl, "F_SETPIPE_SZ", 1031), 4096)
+            self.marionette.instance.profile.set_preferences({"mail.panorama.enabled": True})
+            self.marionette.instance.start()
+            # Readable only once the process writes its publication; a record
+            # larger than the pipe keeps that real write blocked until the kill.
+            ready, _, _ = select.select([holder], [], [], self.marionette.startup_timeout)
+            self.assertTrue(ready, "The process must reach its final selector publication")
+            self.marionette.instance.runner.process_handler.kill(sig=signal.SIGKILL)
+            code = self.marionette.instance.runner.wait(
+                timeout=self.marionette.startup_timeout
+            )
+            self.assertEqual(-signal.SIGKILL, code)
+            while True:
+                try:
+                    chunk = os.read(holder, 65536)
+                except BlockingIOError:
+                    break
+                if not chunk:
+                    break
+                held += chunk
+        finally:
+            os.close(holder)
+            fifo.unlink(missing_ok=True)
+        self.assertEqual(capacity, len(held), "The publication write was still blocked")
+        self.assertTrue(held.startswith(b"{"))
+
+    def native_unit_mappings(self):
+        """Read committed native receipts from a copy, never the retained files."""
+        copy = tempfile.TemporaryDirectory(prefix="s715-native-read-")
+        self.addCleanup(copy.cleanup)
+        for suffix in ("", "-wal", "-shm"):
+            path = self.profile / ("panorama.sqlite" + suffix)
+            if path.exists():
+                shutil.copyfile(path, Path(copy.name) / path.name)
+        connection = sqlite3.connect(Path(copy.name) / "panorama.sqlite")
+        try:
+            receipts = connection.execute(
+                "SELECT token, sourceId, folderId, messageCount "
+                "FROM folder_import_receipts"
+            ).fetchall()
+            mappings = {}
+            for token, source_id, folder_id, count in receipts:
+                keys = connection.execute(
+                    "SELECT sourceKey, destinationKey FROM folder_import_keys "
+                    "WHERE token=? ORDER BY sourceKey", (token,)
+                ).fetchall()
+                messages = connection.execute(
+                    "SELECT COUNT(*) FROM messages WHERE folderId=?", (folder_id,)
+                ).fetchone()[0]
+                mappings[source_id] = (folder_id, count, keys, messages)
+        finally:
+            connection.close()
+        self.assertEqual(len(receipts), len(mappings), "One receipt per source")
+        return mappings
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "POSIX file-size limit")
+    def test_interruptedStartupBackupIsNeverAccepted(self):
+        """S7-15.1: cut the real opt-in startup copy; restart never accepts it."""
+        self.clean_profile(False)
+        source = self.create_legacy_message("mbox")
+        self.stop_application()
+        limit = self.largest_file_limit([self.profile])
+        large = self.profile / "s715-large-backup-input"
+        digest = self.write_large_file(large, 4 * limit)
+        originals = {path: path.read_bytes()
+                     for path in Path(source["root"]).rglob("*") if path.is_file()}
+        work = self.profile.parent / ("panorama-migration-" + self.profile.name)
+        self.assertFalse(work.exists())
+        self.created_work.add(work)
+        self.marionette.instance.profile.set_preferences({"mail.panorama.enabled": True})
+        self.start_with_file_size_limit(limit)
+
+        backup = work / "backup"
+        manifest_bytes = (backup / "manifest.json").read_bytes()
+        manifest = json.loads(manifest_bytes)
+        self.assertIs(False, manifest["complete"], "An interrupted copy is never complete")
+        profile_root = next(root for root in manifest["roots"]
+                            if Path(root["source"]).resolve() == self.profile)
+        self.assertFalse((backup / profile_root["directory"] / large.name).exists(),
+                         "The cut file is never installed in the archive")
+        partial = [path.stat().st_size for path in (backup / "scratch").iterdir()]
+        self.assertTrue(partial and max(partial) <= limit, partial)
+        for absent in (work / "journal.json", self.profile / "panorama-profile.json",
+                       self.profile / "panorama.sqlite"):
+            self.assertFalse(absent.exists(), "No migration state follows a partial copy")
+        self.assertEqual(digest, hashlib.sha256(large.read_bytes()).hexdigest())
+        for path, contents in originals.items():
+            self.assertEqual(contents, path.read_bytes())
+
+        selected = self.restart_or_refusal()
+        if selected is None:
+            self.assertEqual(manifest_bytes, (backup / "manifest.json").read_bytes())
+            for absent in (work / "journal.json", self.profile / "panorama-profile.json",
+                           self.profile / "panorama.sqlite"):
+                self.assertFalse(absent.exists())
+        else:
+            record = selected["record"]
+            self.assertEqual("migrated", record["origin"])
+            completed = json.loads(Path(record["identity"]["backup"]["path"]).read_bytes())
+            self.assertIs(True, completed["complete"])
+            self.assertEqual(manifest["roots"], completed["roots"],
+                             "Resumption keeps the original inventory")
+            for root in completed["roots"]:
+                for entry in root["entries"]:
+                    if entry["type"] == "regular":
+                        copied = backup / root["directory"] / Path(*entry["parts"])
+                        self.assertEqual(entry["sha256"],
+                                         hashlib.sha256(copied.read_bytes()).hexdigest())
+            archived = backup / profile_root["directory"] / large.name
+            self.assertEqual(digest, hashlib.sha256(archived.read_bytes()).hexdigest())
+            self.assert_message_after_activation(source)
+        self.assertEqual(digest, hashlib.sha256(large.read_bytes()).hexdigest())
+        for path, contents in originals.items():
+            self.assertEqual(contents, path.read_bytes())
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "POSIX FIFO and signals")
+    def test_interruptedActivationCutoverNeverExposesActiveState(self):
+        """S7-15.2/S7-15.3: kill after committed units inside the final publication."""
+        self.clean_profile(False)
+        source = self.create_legacy_folders(40)
+        self.stop_application()
+        summaries = [Path(folder["summary"]) for folder in source["folders"]]
+        originals = {path: path.read_bytes()
+                     for path in Path(source["root"]).rglob("*") if path.is_file()}
+        work = self.profile.parent / ("panorama-migration-" + self.profile.name)
+        self.created_work.add(work)
+        self.kill_inside_selector_publication()
+
+        selector = self.profile / "panorama-profile.json"
+        database = self.profile / "panorama.sqlite"
+        record = json.loads(selector.read_bytes())
+        self.assertEqual("prepared", record["state"], "Cutover never published active")
+        journal = Path(record["identity"]["journalPath"])
+        self.assertEqual("complete", json.loads(journal.read_bytes())["stage"])
+        mappings = self.native_unit_mappings()
+        self.assertEqual(len(summaries), len(mappings))
+        for folder_id, count, keys, messages in mappings.values():
+            self.assertEqual((1, 1, 1), (count, len(keys), messages),
+                             "Each committed unit keeps exactly one physical mapping")
+        self.assertEqual(len(mappings), len({value[0] for value in mappings.values()}))
+        for path, contents in originals.items():
+            self.assertEqual(contents, path.read_bytes())
+
+        retained = [selector, journal, database, *summaries]
+        self.assert_startup_refuses(retained)
+        before = {path: path.read_bytes() for path in retained}
+        self.marionette.instance.profile.set_preferences({"mail.panorama.enabled": False})
+        self.marionette.instance.start()
+        code = self.marionette.instance.runner.wait(timeout=self.marionette.startup_timeout)
+        self.assertEqual(5, code, "Legacy default never ignores an unvalidated selection")
+        for path, contents in before.items():
+            self.assertEqual(contents, path.read_bytes())
+        self.assertEqual(mappings, self.native_unit_mappings())
+        self.assertEqual("prepared", json.loads(selector.read_bytes())["state"])
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "POSIX file-size limit")
+    def test_interruptedRestoreCopyClaimsNoCompletion(self):
+        """S7-15.4: cut the real native restore copy; never claim completion."""
+        backup, markers, archive = self.external_restore_point()
+        external = [marker.parent for marker in markers[1:]]
+        limit = self.largest_file_limit([self.profile, backup, *external])
+        newer = self.profile / "s715-newer-before-restore"
+        digest = self.write_large_file(newer, 4 * limit)
+        archived = self.file_digests(backup)
+        request = self.approve_restore(backup)
+        self.marionette.instance.app_args = self.original_args
+        self.start_with_file_size_limit(limit)
+
+        pending = self.restore_request_path()
+        self.assertEqual(request["operationId"], json.loads(pending.read_text())["operationId"])
+        self.assertFalse(pending.with_name("restore-current.json").exists())
+        self.assertFalse(list(pending.parent.glob("restore-*.complete.json")))
+        self.assertEqual(archive, (backup / "manifest.json").read_bytes())
+        self.assertEqual(archived, self.file_digests(backup))
+        for marker in markers:
+            self.assertEqual(b"newer retained restore bytes\n", marker.read_bytes())
+        self.assertEqual(digest, hashlib.sha256(newer.read_bytes()).hexdigest())
+
+        self.stop_application()
+        self.marionette.instance.start()
+        code = self.marionette.instance.runner.wait(timeout=self.marionette.startup_timeout)
+        if code == 5:
+            # Interrupted work blocks; the documented exact-operation retry follows.
+            self.assertEqual(request["operationId"],
+                             json.loads(pending.read_text())["operationId"])
+            self.assertFalse(pending.with_name("restore-current.json").exists())
+            for marker in markers:
+                self.assertEqual(b"newer retained restore bytes\n", marker.read_bytes())
+            self.restore_exit(["--panorama-restore-retry"])
+            self.assertTrue(list(pending.parent.glob(
+                f'restore-{request["operationId"]}-*.failed.json')))
+            self.restore_exit()
+        else:
+            self.assertEqual(0, code, "Restart either refuses or settles the restore")
+        result = self.restore_result()
+        self.assertEqual(request["operationId"], result["operationId"])
+        self.assertEqual("restored", result["progress"]["outcome"])
+        for marker in markers:
+            self.assertEqual(b"original complete restore bytes\n", marker.read_bytes())
+        self.assertFalse(newer.exists(), "Restored roots exclude data newer than the archive")
+        self.assertEqual(archive, (backup / "manifest.json").read_bytes())
+        self.assertEqual(archived, self.file_digests(backup))
+        self.start_same_profile(False)
+        self.assert_restored_contacts()

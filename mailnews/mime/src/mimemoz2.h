@@ -87,6 +87,7 @@ class mime_stream_data { /* This object is the state we pass around
   MimeObject* obj;             /* The root parser object */
   MimeDisplayOptions* options; /* Data for communicating with libmime.a */
   MimeHeaders* headers;        /* Copy of outer most mime header */
+  bool channel_headers_set;    /* Channel has the outer most headers */
 
   nsIMimeEmitter* output_emitter; /* Output emitter engine for libmime */
 };

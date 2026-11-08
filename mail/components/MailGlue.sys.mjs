@@ -558,6 +558,19 @@ MailGlue.prototype = {
       MailGlue.panoramaStartup = startPanoramaProfileAtStartup(
         this._panoramaStartupController.signal
       );
+      if (restoreRequest.exists()) {
+        // Native restored at app-startup; settle and verify it before
+        // profile-after-change services (such as cookie storage) write.
+        let settled = false;
+        MailGlue.panoramaStartup.then(
+          () => (settled = true),
+          () => (settled = true)
+        );
+        Services.tm.spinEventLoopUntil(
+          "MailGlue: Panorama restore settlement",
+          () => settled || Services.startup.shuttingDown
+        );
+      }
     } catch (error) {
       if (!this._panoramaStartupSurvival) {
         Services.startup.enterLastWindowClosingSurvivalArea();

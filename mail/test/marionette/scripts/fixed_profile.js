@@ -202,7 +202,9 @@ async function createImapAccount(offline) {
   await urlOperation(listener =>
     MailServices.imap.discoverAllFolders(incoming.rootFolder, listener, null)
   );
-  const inbox = incoming.rootFolder.getChildNamed("INBOX");
+  const inbox = incoming.rootFolder
+    .getChildNamed("INBOX")
+    .QueryInterface(Ci.nsIMsgImapMailFolder);
   await urlOperation(listener => inbox.updateFolderWithListener(null, listener));
   if (offline) {
     await urlOperation(listener =>
@@ -312,13 +314,18 @@ async function selectMessage(uri, messageId) {
     "resource://testing-common/TestUtils.sys.mjs"
   );
   const pane = about3Pane();
-  pane.displayFolder(uri);
+  // A new folder's pane row can appear after creation; retry until shown.
   await TestUtils.waitForCondition(
-    () =>
-      pane.gFolder?.URI == uri &&
-      pane.gDBView &&
-      pane.dbViewWrapperListener.allMessagesLoaded,
-    "The folder view loads " + uri
+    () => {
+      if (pane.gFolder?.URI != uri) {
+        pane.displayFolder(uri);
+        return false;
+      }
+      return pane.gDBView && pane.dbViewWrapperListener.allMessagesLoaded;
+    },
+    "The folder view loads " + uri,
+    100,
+    600
   );
   const folder = MailServices.folderLookup.getFolderForURL(uri);
   const header = [...folder.messages].find(h => h.messageId == messageId);
@@ -328,7 +335,9 @@ async function selectMessage(uri, messageId) {
   pane.threadTree.selectedIndex = pane.gDBView.findIndexOfMsgHdr(header, true);
   await TestUtils.waitForCondition(
     () => pane.gDBView.hdrForFirstSelectedMessage?.messageId == messageId,
-    "The message is selected"
+    "The message is selected",
+    100,
+    600
   );
   return pane;
 }
@@ -351,7 +360,7 @@ async function display(uri, messageId, body) {
     const text =
       aboutMessage.getMessagePaneBrowser?.()?.contentDocument?.body?.textContent;
     return aboutMessage.gMessage?.messageId == messageId && text?.includes(body);
-  }, `The message pane displays ${messageId}`);
+  }, `The message pane displays ${messageId}`, 100, 600);
   const shown = aboutMessage.gMessage;
   return {
     folderURI: shown.folder.URI,
@@ -409,7 +418,12 @@ async function search(a) {
   const tabmail = win.document.getElementById("tabmail");
   const tab = tabmail.openTab("glodaFacet", { mailSearch: { text: a.term } });
   try {
-    await TestUtils.waitForCondition(() => tab.searchPromise, "Facet query starts");
+    await TestUtils.waitForCondition(
+      () => tab.searchPromise,
+      "Facet query starts",
+      100,
+      600
+    );
     await tab.searchPromise;
     const context = tab.browser.contentWindow.FacetContext;
     const byId = new Map(
@@ -444,7 +458,7 @@ async function search(a) {
         view?.gViewWrapper?.isSynthetic &&
         view.dbViewWrapperListener.allMessagesLoaded
       );
-    }, "The conversation list completes");
+    }, "The conversation list completes", 100, 600);
     const view = list.chromeBrowser.contentWindow;
     const conversation = Array.from({ length: view.gDBView.rowCount }, (_, i) =>
       identity(view.gDBView.getMsgHdrAt(i))

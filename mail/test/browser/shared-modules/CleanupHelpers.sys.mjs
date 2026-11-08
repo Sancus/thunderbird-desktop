@@ -68,12 +68,17 @@ export async function clearStatusBar(window) {
     0,
     "status bar should not have any start requests"
   );
+  // Paused and waiting processes stay tracked so they can resume; only running
+  // processes keep the status bar busy.
+  const running = status._activeProcesses.filter(
+    process => process.state == Ci.nsIActivityProcess.STATE_INPROGRESS
+  );
   Assert.equal(
-    status._activeProcesses.length,
+    running.length,
     0,
     "status bar should not have any active processes"
   );
-  for (const process of status._activeProcesses) {
+  for (const process of running) {
     dump(
       `Leftover status bar process: id=${process.id}, ` +
         `displayText="${process.displayText}", state=${process.state}, ` +

@@ -530,6 +530,9 @@ MailGlue.prototype = {
       () => this._releasePanoramaStartupSurvival(),
       error => {
         console.error("Panorama startup requires recovery", error);
+        dump(`CI052-DIAG startup failed: ${error}
+${error?.stack}
+`);
         Services.obs.notifyObservers(
           null,
           "panorama-startup-failed",

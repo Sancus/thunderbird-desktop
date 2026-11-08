@@ -203,6 +203,16 @@ export class AttachmentInfo {
           currentMessageId: current?.messageId,
           messageId: selected.messageId,
           selectedMessageKey: selected.message.messageKey,
+          selectedMessageIdNow: selected.message.messageId,
+          sameHeaderObject: current === selected.message,
+          currentSubject: current?.subject,
+          selectedSubject: selected.message.subject,
+          count: selected.database.dBFolderInfo.numMessages,
+          keys: [...selected.database.enumerateMessages()].map(h => [
+            h.messageKey,
+            h.messageId,
+            h.subject,
+          ]),
           selectedMessageFolder: selected.message.folder?.URI,
         }) +
         String.fromCharCode(10)

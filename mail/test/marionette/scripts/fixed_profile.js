@@ -116,7 +116,9 @@ function registerModules() {
       }
     }
   }
-  throw new Error("The ordinary installed test modules/mailnews payload is missing");
+  throw new Error(
+    "The ordinary installed test modules/mailnews payload is missing"
+  );
 }
 
 /** Stops this process's IMAP server and restores the resource mapping. */
@@ -191,7 +193,8 @@ async function createImapAccount(offline) {
   incoming.password = "password";
   incoming.setBoolValue("login_at_startup", false);
   incoming.setBoolValue("download_on_biff", false);
-  incoming.QueryInterface(Ci.nsIImapIncomingServer).maximumConnectionsNumber = 1;
+  incoming.QueryInterface(Ci.nsIImapIncomingServer).maximumConnectionsNumber =
+    1;
   incoming.useIdle = false;
   incoming.setBoolValue("autosync_offline_stores", false);
   const account = MailServices.accounts.createAccount();
@@ -205,11 +208,11 @@ async function createImapAccount(offline) {
   const inbox = incoming.rootFolder
     .getChildNamed("INBOX")
     .QueryInterface(Ci.nsIMsgImapMailFolder);
-  await urlOperation(listener => inbox.updateFolderWithListener(null, listener));
+  await urlOperation(listener =>
+    inbox.updateFolderWithListener(null, listener)
+  );
   if (offline) {
-    await urlOperation(listener =>
-      inbox.downloadAllForOffline(listener, null)
-    );
+    await urlOperation(listener => inbox.downloadAllForOffline(listener, null));
   }
   return inbox;
 }
@@ -368,11 +371,19 @@ async function selectMessage(uri, messageId) {
 async function display(uri, messageId, body) {
   const pane = await selectMessage(uri, messageId);
   const aboutMessage = pane.messageBrowser.contentWindow;
-  await waitFor(() => {
-    const text =
-      aboutMessage.getMessagePaneBrowser?.()?.contentDocument?.body?.textContent;
-    return aboutMessage.gMessage?.messageId == messageId && text?.includes(body);
-  }, `The message pane displays ${messageId}`, 100, 600);
+  await waitFor(
+    () => {
+      const text =
+        aboutMessage.getMessagePaneBrowser?.()?.contentDocument?.body
+          ?.textContent;
+      return (
+        aboutMessage.gMessage?.messageId == messageId && text?.includes(body)
+      );
+    },
+    `The message pane displays ${messageId}`,
+    100,
+    600
+  );
   const shown = aboutMessage.gMessage;
   return {
     folderURI: shown.folder.URI,
@@ -427,12 +438,7 @@ async function search(a) {
   const tabmail = win.document.getElementById("tabmail");
   const tab = tabmail.openTab("glodaFacet", { mailSearch: { text: a.term } });
   try {
-    await waitFor(
-      () => tab.searchPromise,
-      "Facet query starts",
-      100,
-      600
-    );
+    await waitFor(() => tab.searchPromise, "Facet query starts", 100, 600);
     await tab.searchPromise;
     const context = tab.browser.contentWindow.FacetContext;
     const byId = new Map(
@@ -461,13 +467,18 @@ async function search(a) {
     if (!list) {
       throw new Error("The conversation list did not open");
     }
-    await waitFor(() => {
-      const view = list.chromeBrowser?.contentWindow;
-      return (
-        view?.gViewWrapper?.isSynthetic &&
-        view.dbViewWrapperListener.allMessagesLoaded
-      );
-    }, "The conversation list completes", 100, 600);
+    await waitFor(
+      () => {
+        const view = list.chromeBrowser?.contentWindow;
+        return (
+          view?.gViewWrapper?.isSynthetic &&
+          view.dbViewWrapperListener.allMessagesLoaded
+        );
+      },
+      "The conversation list completes",
+      100,
+      600
+    );
     const view = list.chromeBrowser.contentWindow;
     const conversation = Array.from({ length: view.gDBView.rowCount }, (_, i) =>
       identity(view.gDBView.getMsgHdrAt(i))
@@ -523,7 +534,9 @@ function extensionReport(prefix) {
         .createLocalSubfolder("S711Migrated")
         .QueryInterface(Ci.nsIMsgLocalMailFolder);
       for (const m of LOCAL_THREAD) {
-        local.addMessage("From - Sun Nov 08 12:00:00 2026\r\n" + messageText(m));
+        local.addMessage(
+          "From - Sun Nov 08 12:00:00 2026\r\n" + messageText(m)
+        );
       }
       local.msgDatabase.commit(Ci.nsMsgDBCommitType.kLargeCommit);
       inbox.msgDatabase.commit(Ci.nsMsgDBCommitType.kLargeCommit);

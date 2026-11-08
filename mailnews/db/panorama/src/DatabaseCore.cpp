@@ -211,7 +211,10 @@ class ProfileStartupOperation final : public nsIAsyncShutdownBlocker {
   nsCString completedAudit, completedAuditPath, completedId, completedName;
   nsTHashMap<nsCString, nsCString> retiredPaths;
   bool auditCandidate = false;
-#ifndef XP_WIN
+#ifdef XP_WIN
+  // The selected panorama.sqlite; see StartupDatabasePin.
+  UniquePtr<StartupRestoreFD> databaseLease;
+#else
   int profileFD = -1, localFD = -1, databaseFD = -1;
   struct stat profileIdentity{}, localIdentity{}, databaseIdentity{};
 #endif
@@ -256,6 +259,9 @@ namespace {
 nsresult RestoreOpen(nsIFile*, StartupRestoreFD&, bool writable = false);
 nsresult RestorePin(StartupRestoreFD&);
 nsresult RestoreCompleted(JSContext*, ProfileStartupOperation&, bool&);
+#ifdef XP_WIN
+nsresult StartupDatabasePin(nsIFile*, nsIFile*, UniquePtr<StartupRestoreFD>&);
+#endif
 // A link above a selected startup profile whose canonical target contains
 // that profile is the operating system's alias of its location (macOS /var
 // to /private/var). A link at or inside the profile is never such an alias.
@@ -494,7 +500,11 @@ nsresult DatabaseCore::CheckProfileStartup(nsISupports* token, bool metadata) {
   if (operation.restore) MOZ_TRY(operation.restore->Check());
   if (operation.profileLease) MOZ_TRY(RestorePin(*operation.profileLease));
   if (operation.localLease) MOZ_TRY(RestorePin(*operation.localLease));
-#ifndef XP_WIN
+#ifdef XP_WIN
+  // As the POSIX st_dev/st_ino check below: a replaced, linked or removed
+  // database is refused once its physical identity has been pinned.
+  if (operation.databaseLease) MOZ_TRY(RestorePin(*operation.databaseLease));
+#else
   struct stat profile{}, local{};
   NS_ENSURE_TRUE(!lstat(operation.profilePath.get(), &profile) &&
                      !lstat(operation.localPath.get(), &local) &&
@@ -9682,6 +9692,36 @@ nsresult RestoreOpen(nsIFile* file, StartupRestoreFD& node, bool writable) {
 #endif
   return NS_OK;
 }
+#ifdef XP_WIN
+// The selected-startup database pin on Windows. RestoreOpen's file admission
+// denies writers and its writable form shares only reading, either of which
+// would exclude SQLite. Admit the existing database FILE_OR_MISSING instead:
+// the same no-reparse/offline walk and retained volume serial and 128-bit
+// file ID of every component, with handles that deny deletion or renaming
+// but share reading and writing with SQLite. Only a present regular file
+// inside the selected profile is admitted; RestorePin re-walks and compares.
+nsresult StartupDatabasePin(nsIFile* file, nsIFile* profile,
+                            UniquePtr<StartupRestoreFD>& output) {
+  auto node = MakeUnique<StartupRestoreFD>();
+  node->file = file;
+  MOZ_TRY(RestorePath(file, node->path));
+  RefPtr<MigrationFileSystem> fs = new MigrationFileSystem();
+  nsresult rv = fs->Admit(file, profile,
+                          nsIPanoramaMigrationFileSystem::KIND_FILE_OR_MISSING,
+                          getter_AddRefs(node->lease));
+  bool exists = false;
+  if (NS_SUCCEEDED(rv)) rv = node->lease->GetExists(&exists);
+  if (NS_SUCCEEDED(rv) && exists) rv = RestoreMeasure(*node, node->identity);
+  if (NS_FAILED(rv) || !exists || node->identity.directory) {
+    MOZ_LOG(
+        gPanoramaLog, LogLevel::Error,
+        ("Startup database physical admission refused: 0x%08x", unsigned(rv)));
+    return NS_ERROR_FILE_ACCESS_DENIED;
+  }
+  output = std::move(node);
+  return NS_OK;
+}
+#endif
 nsresult RestoreDirectory(const nsACString& path,
                           UniquePtr<StartupRestoreFD>& output) {
   nsCOMPtr<nsIFile> file;
@@ -12767,8 +12807,11 @@ nsresult DatabaseCore::DescribeProfileStartup(
                          getter_AddRefs(file)));
     MOZ_TRY(StartupProbe(file, operation.existing, operation.schema,
                          operation.sourceId));
-#ifndef XP_WIN
     if (operation.existing) {
+#ifdef XP_WIN
+      MOZ_TRY(
+          StartupDatabasePin(file, operation.profile, operation.databaseLease));
+#else
       nsAutoCString path;
       MOZ_TRY(GetComparablePath(file, path));
       operation.databaseFD =
@@ -12777,6 +12820,7 @@ nsresult DatabaseCore::DescribeProfileStartup(
           operation.databaseFD >= 0 &&
               !fstat(operation.databaseFD, &operation.databaseIdentity),
           NS_ERROR_FILE_ACCESS_DENIED);
+#endif
       bool exists;
       int32_t version;
       nsCString source;
@@ -12786,7 +12830,6 @@ nsresult DatabaseCore::DescribeProfileStartup(
           NS_ERROR_NOT_AVAILABLE);
       MOZ_TRY(CheckProfileStartup(ProfileStartupToken(), true));
     }
-#endif
     if (selector) {
       nsCString state;
       MOZ_TRY(StartupText(cx, selector, "state", state));
@@ -13224,8 +13267,14 @@ nsresult DatabaseCore::OpenProfileStartup(JSContext* cx,
             !fstat(operation.databaseFD, &operation.databaseIdentity),
         NS_ERROR_FILE_ACCESS_DENIED);
   }
-  MOZ_TRY(CheckProfileStartup(ProfileStartupToken(), true));
+#else
+  // Pin the exact database file after SQLite open, not just its pathname.
+  if (!operation.databaseLease) {
+    MOZ_TRY(
+        StartupDatabasePin(file, operation.profile, operation.databaseLease));
+  }
 #endif
+  MOZ_TRY(CheckProfileStartup(ProfileStartupToken(), true));
   if (mode == "migrate"_ns) MOZ_TRY(BuildStartupFolders());
   operation.opened = true;
   return NS_OK;
@@ -13780,6 +13829,11 @@ nsresult DatabaseCore::SettleProfileStartup(nsresult failure) {
         *fd = -1;
       }
     }
+#else
+    if (operation->databaseLease) {
+      nsresult rv = operation->databaseLease->Close();
+      if (NS_SUCCEEDED(operation->closeError)) operation->closeError = rv;
+    }
 #endif
     for (auto* lease :
          {operation->profileLease.get(), operation->localLease.get()}) {
@@ -14164,8 +14218,14 @@ nsresult DatabaseCore::CheckProfileActivation(
   nsCString profile, selectorPath;
   MOZ_TRY(StartupText(cx, caller, "profilePath", profile));
   MOZ_TRY(StartupText(cx, caller, "selectorPath", selectorPath));
+  // The caller joins with the platform separator (PathUtils.join).
+#ifdef XP_WIN
+  constexpr auto selectorLeaf = "\\panorama-profile.json"_ns;
+#else
+  constexpr auto selectorLeaf = "/panorama-profile.json"_ns;
+#endif
   NS_ENSURE_TRUE(profile == operation.profilePath &&
-                     selectorPath.Equals(profile + "/panorama-profile.json"_ns),
+                     selectorPath.Equals(profile + selectorLeaf),
                  NS_ERROR_NOT_AVAILABLE);
   JS::Rooted<JS::Value> declaredJournal(cx);
   MOZ_TRY(ImportMember(cx, identity, "journalPath", &declaredJournal));

@@ -69,7 +69,8 @@ add_task(async function test_accounts_MV3_event_pages() {
     {
       type: "imap",
       identity: "user@invalidImap",
-      expectedUpdate: true,
+      // The IMAP test account keeps its creation login, so it is not renamed.
+      expectedUpdate: false,
       expectedName: accountKey => `Mail for ${accountKey}user@localhost`,
       expectedType: "imap",
       updatedName: "Test1",

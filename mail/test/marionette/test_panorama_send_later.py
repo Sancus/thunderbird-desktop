@@ -25,6 +25,8 @@ class TestPanoramaSendLater(MarionetteTestCase):
             )
             prefs = {
                 "mail.panorama.enabled": True,
+                # Startup refusals quit before any window; log their recovery reason.
+                "devtools.console.stdout.chrome": True,
                 "mailnews.database.global.indexer.enabled": False,
                 "mailnews.sendInBackground": False,
                 # Keep queued messages until the explicit post-restart send.

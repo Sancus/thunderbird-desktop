@@ -660,8 +660,10 @@ nsMsgAccountManager::RemoveIncomingServer(nsIMsgIncomingServer* aServer,
                                  mozilla::GetStaticErrorName(rv))
                      .get());
     }
-    nsCOMPtr<nsIDatabaseCore> core =
-        mozilla::components::DatabaseCore::Service();
+    // The live core, as constructed for the service; a cached service
+    // reference can outlive a core that was replaced (tests recreate it).
+    RefPtr<mozilla::mailnews::DatabaseCore> core =
+        mozilla::mailnews::DatabaseCore::GetInstanceForService();
     nsresult identityRv =
         core ? core->GetSourceId(rootDatabaseSourceId) : NS_ERROR_NOT_AVAILABLE;
     if (NS_FAILED(identityRv)) {

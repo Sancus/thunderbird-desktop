@@ -26529,10 +26529,6 @@ class DeliveryCoreStartupRestore : public DeliveryCoreReferences {
                               Maybe<FolderImportReceipt>& result) {
     return mCore->ReadFolderImportReceipt(identity, result);
   }
-  void TearDown() override {
-    DeliveryCoreReferences::TearDown();
-    if (mRestoreControl) EXPECT_EQ(NS_OK, mRestoreControl->Remove(true));
-  }
   nsresult RestoreChildFile(nsIFile* directory, const nsACString& name,
                             nsIFile** result) {
     MOZ_TRY(directory->Clone(result));

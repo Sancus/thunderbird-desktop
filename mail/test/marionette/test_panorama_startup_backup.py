@@ -1463,12 +1463,15 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         manifest = json.loads(archive)
         archived = backup / manifest["roots"][0]["directory"] / "s527-original"
         saved = archived.read_bytes()
+        saved_stat = archived.stat()
         archived.write_bytes(b"changed after explicit consent\n")
         self.restore_exit(expected=5)
         self.assertEqual(request["operationId"], json.loads(self.restore_request_path().read_text())["operationId"])
         for marker in markers:
             self.assertEqual(b"newer retained restore bytes\n", marker.read_bytes())
         archived.write_bytes(saved)
+        # A genuinely restored archive input also has its original times.
+        os.utime(archived, ns=(saved_stat.st_atime_ns, saved_stat.st_mtime_ns))
         self.restore_exit(["--panorama-restore-retry"])
         self.restore_exit()
         self.assertEqual("restored", self.restore_result()["progress"]["outcome"])

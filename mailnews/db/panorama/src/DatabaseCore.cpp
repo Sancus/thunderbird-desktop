@@ -9587,13 +9587,7 @@ nsresult RestoreOpen(nsIFile* file, StartupRestoreFD& node, bool writable) {
   }
 #else
   if (writable && !directory) {
-    int fd = open(node.path.get(), O_RDWR | O_NOFOLLOW | O_CLOEXEC);
-    NS_ENSURE_TRUE(fd >= 0, NS_ERROR_FILE_ACCESS_DENIED);
-    node.io = PR_ImportFile(fd);
-    if (!node.io) {
-      close(fd);
-      return NS_ERROR_FAILURE;
-    }
+    MOZ_TRY(file->OpenNSPRFileDesc(PR_RDWR, 0600, &node.io));
     node.writable = true;
     StartupRestoreStamp actual;
     MOZ_TRY(RestoreMeasure(node, actual));
@@ -9741,8 +9735,9 @@ nsresult RestoreNames(StartupRestoreFD& root, nsTArray<nsCString>& names,
   return RestorePin(root);
 }
 bool RestoreLock(const nsACString& path) {
+  // XRE's startup canary belongs to the running process, like its locks.
   return path == "parent.lock"_ns || path == ".parentlock"_ns ||
-         path == "lock"_ns;
+         path == "lock"_ns || path == ".startup-incomplete"_ns;
 }
 nsresult RestoreMetadata(StartupRestoreFD& node, uint32_t mode,
                          int64_t modified) {
@@ -10396,6 +10391,10 @@ nsresult RestoreEntries(JSContext* cx, JS::Handle<JSObject*> root,
                      NS_ERROR_FILE_INVALID_PATH);
       if (part) entry.path.Append('/');
       entry.path.Append(text);
+    }
+    if (profile && entry.path == ".startup-incomplete"_ns) {
+      output.RemoveLastElement();
+      continue;
     }
     int32_t slash = entry.path.RFindChar('/');
     nsCString parent(slash < 0 ? ""_ns
@@ -11841,7 +11840,7 @@ nsresult RestoreDependencies(JSContext* cx, ProfileRestoreState& state,
         int64_t modified;
         MOZ_TRY(RestoreEntries(cx, root, rows, mode, modified, state.prefix,
                                r == 0, version != 1));
-        MOZ_TRY(RestoreTree(state, *held, rows, false, false, false));
+        MOZ_TRY(RestoreTree(state, *held, rows, r == 0, false, false));
         for (const auto& row : rows)
           if (!row.directory) {
             nsCOMPtr<nsIFile> sourceFile;
@@ -12406,7 +12405,7 @@ nsresult RestoreExecute(JSContext* cx, ProfileStartupOperation& operation) {
     auto& root = *state.roots[i];
     if (root.archive)
       MOZ_TRY(
-          RestoreTree(state, *root.archive, root.after, false, false, false));
+          RestoreTree(state, *root.archive, root.after, i == 0, false, false));
     nsCString stage("root-"_ns), saved("saved-"_ns);
     stage.AppendInt(i);
     saved.AppendInt(i);
@@ -12603,7 +12602,7 @@ nsresult DatabaseCore::CheckProfileRestore(
     auto& root = *state.roots[i];
     if (root.archive)
       MOZ_TRY(
-          RestoreTree(state, *root.archive, root.after, false, false, false));
+          RestoreTree(state, *root.archive, root.after, i == 0, false, false));
     MOZ_TRY(RestoreRetired(state, root));
     bool restored = state.outcome == "restored"_ns;
     NS_ENSURE_TRUE(root.phase == (restored ? 3U : 6U), NS_ERROR_NOT_AVAILABLE);

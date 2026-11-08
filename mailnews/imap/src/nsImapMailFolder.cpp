@@ -3548,6 +3548,11 @@ nsImapMailFolder::UpdateImapMailboxInfo(nsIImapProtocol* aProtocol,
     existingUids.Sort();
     nsTArray<ImapUid> uidsToDelete;
     FindUidsToDelete(existingUids, uidsToDelete, flagState, boxFlags);
+#ifdef MOZ_PANORAMA
+    if (mail_panorama_enabled_AtStartup())
+      uidsToDelete.RemoveElementsBy(
+          [&](ImapUid uid) { return !existingUids.ContainsSorted(uid); });
+#endif
     keysToDelete = MOZ_TRY(MsgKeysFromUids(mDatabase, uidsToDelete));
 
     // Suppress retired queued sources only after deciding which LIVE rows

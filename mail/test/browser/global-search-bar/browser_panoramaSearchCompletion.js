@@ -159,8 +159,16 @@ add_task(async function test_openCompletionCardChangesRefreshCurrentLabels() {
     });
     Assert.equal(input.controller.searchString, "completionperson");
     Assert.equal(tabmail.tabInfo.length, tabs);
+    const deletedNames = TestUtils.topicObserved(
+      "panorama-mail-search-names-changed",
+      (subject, sourceId) => sourceId == fixture.sourceId
+    );
     book.deleteCards([currentCard]);
     currentCard = null;
+    // The opened search binds current name revisions; let the deletion's
+    // revision settle before taking the fallback that it opens.
+    await deletedNames;
+    await TestUtils.waitForTick();
     await TestUtils.waitForCondition(
       () =>
         provider.curResult != changed &&

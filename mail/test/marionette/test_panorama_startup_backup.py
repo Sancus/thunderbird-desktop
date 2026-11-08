@@ -1600,22 +1600,6 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.assertEqual(-signal.SIGXFSZ, code,
                          "The kernel must stop the real copy at its file-size limit")
 
-    def restart_or_refusal(self):
-        """Start the same unchanged profile; return None after exit 5, else selection."""
-        try:
-            self.marionette.start_session()
-        except Exception:
-            code = self.marionette.instance.runner.wait(
-                timeout=self.marionette.startup_timeout
-            )
-            self.assertEqual(5, code, "Recovery must exit with NS_ERROR_FAILURE")
-            return None
-        self.marionette.set_context(self.marionette.CONTEXT_CHROME)
-        self.assertEqual(self.profile, Path(self.marionette.execute_script(
-            "return Services.dirsvc.get('ProfD', Ci.nsIFile).path;"
-        )).resolve())
-        return self.selection()
-
     def create_legacy_folders(self, count):
         """Write genuine Mork folders, one message each, through the legacy API."""
         result = self.marionette.execute_script(r"""
@@ -1738,31 +1722,15 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         for path, contents in originals.items():
             self.assertEqual(contents, path.read_bytes())
 
-        selected = self.restart_or_refusal()
-        if selected is None:
-            self.assertEqual(manifest_bytes, (backup / "manifest.json").read_bytes())
-            for absent in (work / "journal.json", self.profile / "panorama-profile.json",
-                           self.profile / "panorama.sqlite"):
-                self.assertFalse(absent.exists())
-        else:
-            record = selected["record"]
-            self.assertEqual("migrated", record["origin"])
-            completed = json.loads(Path(record["identity"]["backup"]["path"]).read_bytes())
-            self.assertIs(True, completed["complete"])
-            self.assertEqual(manifest["roots"], completed["roots"],
-                             "Resumption keeps the original inventory")
-            for root in completed["roots"]:
-                for entry in root["entries"]:
-                    if entry["type"] == "regular":
-                        copied = backup / root["directory"] / Path(*entry["parts"])
-                        self.assertEqual(entry["sha256"],
-                                         hashlib.sha256(copied.read_bytes()).hexdigest())
-            archived = backup / profile_root["directory"] / large.name
-            self.assertEqual(digest, hashlib.sha256(archived.read_bytes()).hexdigest())
-            self.assert_message_after_activation(source)
-        self.assertEqual(digest, hashlib.sha256(large.read_bytes()).hexdigest())
-        for path, contents in originals.items():
-            self.assertEqual(contents, path.read_bytes())
+        # Partial work without a selector is explicit recovery: restart never
+        # accepts, resumes or replaces the incomplete archive.
+        self.assert_startup_refuses(
+            [backup / "manifest.json", large, *originals],
+            absent=[work / "journal.json", self.profile / "panorama-profile.json",
+                    self.profile / "panorama.sqlite"],
+        )
+        self.assertIs(False, json.loads((backup / "manifest.json").read_bytes())["complete"])
+        self.assertFalse((backup / profile_root["directory"] / large.name).exists())
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux process lifecycle")
     def test_interruptedActivationCutoverNeverExposesActiveState(self):

@@ -229,7 +229,7 @@ add_task(async function test_pausedActivitiesResumeWithoutLeakingStatus() {
         "Paused or waiting work releases only its running request"
       );
       Assert.ok(
-        !status._activeProcesses.includes(process),
+        !status._busyProcesses.has(process),
         "Paused or waiting work is not a running process"
       );
       Assert.equal(
@@ -237,10 +237,9 @@ add_task(async function test_pausedActivitiesResumeWithoutLeakingStatus() {
         process,
         "The same unfinished work remains in the Activity Manager"
       );
-      Assert.equal(
-        status._observedProcesses.get(process.id),
-        process,
-        "Paused or waiting work remains observed for resume"
+      Assert.ok(
+        status._activeProcesses.includes(process),
+        "Paused or waiting work remains tracked for resume"
       );
       await TestUtils.waitForCondition(
         () =>
@@ -268,8 +267,8 @@ add_task(async function test_pausedActivitiesResumeWithoutLeakingStatus() {
       "Completion releases the resumed request once"
     );
     Assert.ok(
-      !status._observedProcesses.has(process.id),
-      "A completed process is no longer observed"
+      !status._activeProcesses.includes(process),
+      "A completed process is no longer tracked"
     );
     manager.removeActivity(process.id);
     registered = false;

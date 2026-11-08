@@ -154,6 +154,28 @@ export class AttachmentInfo {
       return null;
     }
     const unavailable = () => {
+      dump(
+        "CI052-DIAG checkSelection " +
+          JSON.stringify({
+            sameMessage: this.message === selected.inputMessage,
+            sameURI: this.uri === selected.inputURI,
+            uri: this.uri,
+            inputURI: selected.inputURI,
+            sameURL: this.url === selected.url,
+            url: this.url,
+            selectedURL: selected.url,
+            samePart: this.partID === selected.part,
+            part: selected.part,
+            sameDatabase: selected.folder.msgDatabase === selected.database,
+            containsKey: selected.database.containsKey(selected.key),
+            live: selected.message.isLive,
+          }) +
+          "
+" +
+          new Error().stack +
+          "
+"
+      );
       throw new Components.Exception(
         "The selected attachment is no longer available",
         Cr.NS_ERROR_NOT_AVAILABLE

@@ -861,6 +861,10 @@ DBViewWrapper.prototype = {
     this._savedSearchDissociating = true;
     try {
       this.search.dissociateView(this._searchViewListener || this.dbView);
+      // The closed view's own search-done callback is now stale and ignored,
+      // so end its searching state here; the listener must not keep showing
+      // a search that can no longer finish.
+      this.searching = false;
     } finally {
       this._savedSearchDissociating = false;
     }

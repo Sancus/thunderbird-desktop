@@ -10285,7 +10285,7 @@ nsresult RestoreRemoveTree(ProfileRestoreState& state, StartupRestoreFD& root,
     MOZ_TRY(RestoreInventory(*newer, ""_ns, retained, false, 0, &state));
   for (const auto& item : actual) {
     bool known = false;
-    for (const auto* list : {&entries, next, &retained})
+    for (const auto* list : {&entries, next, &std::as_const(retained)})
       if (list)
         for (const auto& e : *list)
           known |=

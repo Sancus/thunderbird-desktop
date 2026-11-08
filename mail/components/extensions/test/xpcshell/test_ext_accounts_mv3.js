@@ -113,6 +113,14 @@ add_task(async function test_accounts() {
                   path: "/INBOX",
                   specialUse: ["inbox"],
                 },
+                {
+                  // Account setup completes folder discovery, which creates
+                  // the missing Trash folder.
+                  accountId: account2Id,
+                  name: "Trash",
+                  path: "/Trash",
+                  specialUse: ["trash"],
+                },
               ],
             },
           },
@@ -243,8 +251,6 @@ add_task(async function test_accounts() {
             specialUse: ["inbox"],
           },
           {
-            // The trash folder magically appears at this point.
-            // It wasn't here before.
             accountId: "account2",
             name: "Trash",
             path: "/Trash",

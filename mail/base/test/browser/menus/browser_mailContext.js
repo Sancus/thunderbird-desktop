@@ -271,12 +271,16 @@ add_setup(async function () {
     "chrome://messenger/content/messageWindow.xhtml"
   );
 
-  registerCleanupFunction(() => {
+  registerCleanupFunction(async () => {
+    // CI051 diagnostic only: report what account removal leaves animating.
+    await ci051ReportAnimations("cleanup-start");
     for (const folder of MailServices.accounts.allFolders) {
       Gloda.setFolderIndexingPriority(folder, -1);
     }
     MailServices.accounts.removeAccount(account, false);
+    await ci051ReportAnimations("after-remove-account");
     cal.manager.getCalendars()[0].setProperty("disabled", true);
+    await ci051ReportAnimations("after-calendar-disabled");
   });
 });
 
@@ -1119,4 +1123,82 @@ add_task(async function testExternalMessageWindow() {
   await helper.checkMenuitems("singleMessage", externalOverride);
 
   await BrowserTestUtils.closeWindow(win);
+});
+
+// CI051 diagnostic only (never a candidate).
+async function ci051ReportAnimations(step) {
+  await new Promise(resolve => setTimeout(resolve, 2000));
+  const describe = node =>
+    node
+      ? `${node.localName}#${node.id || ""}.${[...(node.classList || [])].join(".")}`
+      : "null";
+  const documents = [];
+  const collect = doc => {
+    if (!doc || documents.includes(doc)) {
+      return;
+    }
+    documents.push(doc);
+    for (const frame of doc.querySelectorAll("browser, iframe")) {
+      try {
+        collect(frame.contentDocument);
+      } catch (e) {}
+    }
+  };
+  for (const win of Services.wm.getEnumerator(null)) {
+    collect(win.document);
+  }
+  const about3Pane = document.getElementById("tabmail").currentAbout3Pane;
+  const report = {
+    step,
+    vsync: ChromeUtils.vsyncEnabled(),
+    meteors: window.MsgStatusFeedback?._meteorsSpinning,
+    displayed: about3Pane?.gFolder?.URI ?? null,
+    bodyClasses: about3Pane ? [...about3Pane.document.body.classList] : null,
+    busyRows: about3Pane
+      ? [...about3Pane.document.querySelectorAll("[data-is-busy], [busy], .busy")].map(describe)
+      : null,
+    documents: [],
+  };
+  for (const doc of documents) {
+    const entry = { url: doc.documentURI, animations: [], loading: [], animatedImages: [] };
+    for (const animation of doc.getAnimations()) {
+      entry.animations.push({
+        target: describe(animation.effect?.target),
+        name: animation.animationName || animation.transitionProperty,
+        state: animation.playState,
+      });
+    }
+    for (const element of doc.querySelectorAll("*")) {
+      for (const pseudo of [null, "::before", "::after"]) {
+        const style = doc.defaultView.getComputedStyle(element, pseudo);
+        const images = [style.content, style.backgroundImage, style.listStyleImage].join(" ");
+        if (images.includes("loading.svg")) {
+          const rect = element.getBoundingClientRect();
+          entry.loading.push({
+            element: describe(element),
+            pseudo,
+            parents: [element.parentElement, element.parentElement?.parentElement].map(describe),
+            visibility: style.visibility,
+            display: style.display,
+            rect: [rect.width, rect.height],
+          });
+        }
+      }
+      try {
+        const image = element.getRequest?.(Ci.nsIImageLoadingContent.CURRENT_REQUEST)?.image;
+        if (image?.animated) {
+          entry.animatedImages.push({ element: describe(element), src: element.currentSrc || element.src });
+        }
+      } catch (e) {}
+    }
+    if (entry.animations.length || entry.loading.length || entry.animatedImages.length) {
+      report.documents.push(entry);
+    }
+  }
+  dump("CI051_DIAG_STEP=" + JSON.stringify(report) + "\n");
+}
+
+add_task(async function diagnoseRemainingAnimations() {
+  await ci051ReportAnimations("after-last-subtest");
+  Assert.ok(true, "diagnostic recorded");
 });

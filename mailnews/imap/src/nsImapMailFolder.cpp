@@ -88,6 +88,7 @@
 #ifdef MOZ_PANORAMA
 #  include "../../local/src/nsLocalUtils.h"
 #  include "DatabaseCore.h"
+#  include "DetachedMsgHdr.h"
 #  include "nsDirectoryServiceDefs.h"
 #  include "Message.h"
 #  include "PerFolderDatabase.h"
@@ -3547,6 +3548,11 @@ nsImapMailFolder::UpdateImapMailboxInfo(nsIImapProtocol* aProtocol,
     existingUids.Sort();
     nsTArray<ImapUid> uidsToDelete;
     FindUidsToDelete(existingUids, uidsToDelete, flagState, boxFlags);
+#ifdef MOZ_PANORAMA
+    if (mail_panorama_enabled_AtStartup())
+      uidsToDelete.RemoveElementsBy(
+          [&](ImapUid uid) { return !existingUids.ContainsSorted(uid); });
+#endif
     keysToDelete = MOZ_TRY(MsgKeysFromUids(mDatabase, uidsToDelete));
 
     // Suppress retired queued sources only after deciding which LIVE rows
@@ -6537,8 +6543,18 @@ nsresult nsImapMailFolder::HandleCustomFlags(nsMsgKey msgKey,
     MOZ_TRY(
         mDatabase->SetStringPropertyByHdr(dbHdr, "junkscore", msgJunkScore));
   } else if (CaseInsensitiveFindInReadable("Junk"_ns, keywords)) {
-    uint32_t newFlags;
-    MOZ_TRY(dbHdr->AndFlags(~nsMsgMessageFlags::New, &newFlags));
+    bool clearNew = true;
+#ifdef MOZ_PANORAMA
+    if (mail_panorama_enabled_AtStartup()) {
+      RefPtr<mozilla::mailnews::DetachedMsgHdr> parsed = do_QueryObject(dbHdr);
+      // A keyword refresh of a published member does not reclassify New.
+      clearNew = bool(parsed);
+    }
+#endif
+    if (clearNew) {
+      uint32_t newFlags;
+      MOZ_TRY(dbHdr->AndFlags(~nsMsgMessageFlags::New, &newFlags));
+    }
     nsAutoCString msgJunkScore;
     msgJunkScore.AppendInt(nsIJunkMailPlugin::IS_SPAM_SCORE);
     MOZ_TRY(
@@ -7136,12 +7152,36 @@ nsImapMailFolder::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
       nsCOMPtr<nsIMsgFolderNotificationService> notifier =
           mozilla::components::FolderNotification::Service();
       if (m_copyState) {
-        if (imapAction == nsIImapUrl::nsImapOnlineMove) {
+        nsTArray<RefPtr<nsIMsgDBHdr>> destinationHeaders;
+        bool notifyCopy = true;
+#ifdef MOZ_PANORAMA
+        if (static_cast<nsImapUrl*>(imapUrl.get())
+                ->HasNativeOnlineCopyTargets()) {
+          notifyCopy = NS_SUCCEEDED(aExitCode);
+          if (notifyCopy) {
+            for (const auto& entry : m_copyState->m_nativeOnlineCopies) {
+              if (!entry->settled || !entry->live) {
+                aExitCode = NS_ERROR_NOT_AVAILABLE;
+                notifyCopy = false;
+                break;
+              }
+              RefPtr<nsIMsgDBHdr> header = entry->live.get();
+              destinationHeaders.AppendElement(std::move(header));
+            }
+            if (destinationHeaders.Length() !=
+                m_copyState->m_messages.Length()) {
+              aExitCode = NS_ERROR_NOT_AVAILABLE;
+              notifyCopy = false;
+            }
+          }
+        }
+#endif
+        if (notifyCopy && imapAction == nsIImapUrl::nsImapOnlineMove) {
           notifier->NotifyMsgsMoveCopyCompleted(true, m_copyState->m_messages,
-                                                this, {});
-        } else if (imapAction == nsIImapUrl::nsImapOnlineCopy) {
+                                                this, destinationHeaders);
+        } else if (notifyCopy && imapAction == nsIImapUrl::nsImapOnlineCopy) {
           notifier->NotifyMsgsMoveCopyCompleted(false, m_copyState->m_messages,
-                                                this, {});
+                                                this, destinationHeaders);
         } else if (imapAction == nsIImapUrl::nsImapDeleteMsg) {
           notifier->NotifyMsgsDeleted(m_copyState->m_messages);
         }
@@ -8943,7 +8983,27 @@ nsresult nsImapMailFolder::ValidateStreamSource(nsImapMailCopyState* state,
 
 nsresult nsImapMailFolder::ContinueStreamCopy(nsImapMailCopyState* state,
                                               nsresult status) {
+  RefPtr<nsImapMailCopyState> heldState = state;
   if (m_copyState != state) return NS_ERROR_NOT_AVAILABLE;
+#ifdef MOZ_PANORAMA
+  if (mail_panorama_enabled_AtStartup()) {
+    // A consumed source slot cannot reenter or complete the stream twice.
+    if (state->m_nativeOnlineCopies.Length() == state->m_curIndex)
+      return NS_FAILED(status) ? status : NS_ERROR_NOT_AVAILABLE;
+    auto& entry = state->m_nativeOnlineAppend;
+    if (NS_SUCCEEDED(status)) {
+      if (!entry || !entry->settled || !entry->live ||
+          state->m_curIndex > state->m_messages.Length() ||
+          state->m_nativeOnlineCopies.Length() + 1 != state->m_curIndex) {
+        status = NS_ERROR_NOT_AVAILABLE;
+      } else {
+        // Retain checked destinations in source order through terminal
+        // callbacks.
+        state->m_nativeOnlineCopies.AppendElement(std::move(entry));
+      }
+    }
+  }
+#endif
   if (NS_SUCCEEDED(status) && state->m_curIndex < state->m_messages.Length()) {
     RefPtr<nsIMsgDBHdr> message = state->m_messages[state->m_curIndex];
     bool isRead;
@@ -8955,13 +9015,51 @@ nsresult nsImapMailFolder::ContinueStreamCopy(nsImapMailCopyState* state,
     }
     if (NS_SUCCEEDED(status)) return status;
   } else if (NS_SUCCEEDED(status)) {
+    nsTArray<RefPtr<nsIMsgDBHdr>> destinationHeaders;
+#ifdef MOZ_PANORAMA
+    if (mail_panorama_enabled_AtStartup()) {
+      status = [&]() -> nsresult {
+        NS_ENSURE_TRUE(
+            state->m_nativeOnlineCopies.Length() == state->m_messages.Length(),
+            NS_ERROR_NOT_AVAILABLE);
+        nsCOMPtr<nsIMsgDatabase> database;
+        MOZ_TRY(GetMsgDatabase(getter_AddRefs(database)));
+        NS_ENSURE_STATE(database);
+        nsCOMPtr<nsIDBFolderInfo> info;
+        MOZ_TRY(database->GetDBFolderInfo(getter_AddRefs(info)));
+        NS_ENSURE_STATE(info);
+        uint32_t epoch;
+        MOZ_TRY(info->GetImapUidValidity(&epoch));
+        nsTHashSet<nsMsgKey> keys;
+        for (const auto& entry : state->m_nativeOnlineCopies) {
+          NS_ENSURE_TRUE(entry && entry->settled && entry->live &&
+                             entry->expected.databaseSourceId.Equals(
+                                 mFolderDatabaseSourceId) &&
+                             entry->mapping.folderId == mFolderId &&
+                             entry->mapping.epoch == epoch,
+                         NS_ERROR_NOT_AVAILABLE);
+          nsMsgKey key;
+          MOZ_TRY(entry->live->GetMessageKey(&key));
+          nsMsgKey current =
+              MOZ_TRY(MsgKeyFromUid(database, entry->mapping.uid));
+          NS_ENSURE_TRUE(key == entry->mapping.key && key == current &&
+                             keys.EnsureInserted(key),
+                         NS_ERROR_NOT_AVAILABLE);
+          RefPtr<nsIMsgDBHdr> header = entry->live.get();
+          destinationHeaders.AppendElement(std::move(header));
+        }
+        NS_ENSURE_TRUE(m_copyState == state, NS_ERROR_NOT_AVAILABLE);
+        return NS_OK;
+      }();
+    }
+#endif
     nsCOMPtr<nsIMsgFolderNotificationService> notifier =
         mozilla::components::FolderNotification::Service();
-    if (!state->m_messages.IsEmpty()) {
+    if (NS_SUCCEEDED(status) && !state->m_messages.IsEmpty()) {
       notifier->NotifyMsgsMoveCopyCompleted(state->m_isMove, state->m_messages,
-                                            this, {});
+                                            this, destinationHeaders);
     }
-    if (state->m_isMove) {
+    if (NS_SUCCEEDED(status) && state->m_isMove) {
       nsCOMPtr<nsIMsgFolder> source = do_QueryInterface(state->m_srcSupport);
       nsCOMPtr<nsIMsgLocalMailFolder> localSource = do_QueryInterface(source);
       if (localSource) source->NotifyFolderEvent(kDeleteOrMoveMsgCompleted);

@@ -18,7 +18,8 @@ add_task(
     skip_if: () => IS_NNTP,
   },
   async function setup() {
-    const account = await createAccount();
+    // Returning a copy beside its original requires an actual COPYUID mapping.
+    const account = await createAccount(undefined, { extensions: ["RFC4315"] });
     const rootFolder = account.incomingServer.rootFolder;
     gSubFolders = {
       test1: await createSubfolder(rootFolder, "test1"),
@@ -305,5 +306,180 @@ add_task(
     await extension.startup();
     await extension.awaitFinish("finished");
     await extension.unload();
+  }
+);
+
+add_task(
+  { skip_if: () => IS_NNTP },
+  async function test_rejectsReusedPhysicalSource() {
+    const { MessageTracker } = ChromeUtils.importESModule(
+      "resource:///modules/ExtensionMessages.sys.mjs"
+    );
+    const account = await createAccount();
+    const folder = await createSubfolder(
+      account.incomingServer.rootFolder,
+      "physicalIdentity"
+    );
+    await createMessages(folder, 2);
+    const headers = [...folder.messages];
+    Assert.equal(
+      headers.length,
+      2,
+      "The actual folder publishes two physical headers"
+    );
+    const native = Services.prefs.getBoolPref("mail.panorama.enabled");
+    const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+      Ci.nsIMsgDBService
+    );
+    Assert.equal(
+      service instanceof Ci.nsIDatabaseCore,
+      native,
+      "The actual database service matches the selected backend"
+    );
+    const tracker = new MessageTracker(null);
+    try {
+      const first = tracker.getId(headers[0]);
+      const second = tracker.getId(headers[1]);
+      Assert.notEqual(
+        first,
+        second,
+        "Different physical headers have distinct IDs"
+      );
+      Assert.equal(tracker.getMessage(first).messageId, headers[0].messageId);
+      const retained = tracker.getIdentifier(headers[0]);
+      if (IS_IMAP) {
+        const info = folder.msgDatabase.dBFolderInfo;
+        const epoch = info.imapUidValidity;
+        Assert.greater(epoch, 0, "The real IMAP folder has an accepted epoch");
+        try {
+          info.imapUidValidity = epoch + 1;
+          Assert.equal(
+            tracker.getMessage(first),
+            null,
+            "An old ID cannot resolve a reused key in another epoch"
+          );
+          const replacement = tracker.getId(headers[0]);
+          Assert.notEqual(replacement, first);
+          tracker._remove(retained);
+          Assert.equal(
+            tracker.getMessage(replacement).messageId,
+            headers[0].messageId,
+            "A late old removal preserves the new mapping"
+          );
+        } finally {
+          info.imapUidValidity = epoch;
+        }
+      } else {
+        const root = account.incomingServer.rootFolder;
+        root.propagateDelete(folder, true);
+        const replacementFolder = await createSubfolder(
+          root,
+          "physicalIdentity"
+        );
+        await createMessages(replacementFolder, 2);
+        Assert.equal(
+          tracker.getMessage(first),
+          null,
+          "An old ID cannot resolve through a replacement database facade"
+        );
+        const current = [...replacementFolder.messages][0];
+        const replacement = tracker.getId(current);
+        Assert.notEqual(replacement, first);
+        tracker._remove(retained);
+        Assert.equal(
+          tracker.getMessage(replacement).messageId,
+          current.messageId
+        );
+      }
+    } finally {
+      tracker.cleanup();
+      cleanUpAccount(account);
+    }
+  }
+);
+
+add_task(
+  {
+    skip_if: () =>
+      IS_IMAP || IS_NNTP || Services.prefs.getBoolPref("mail.panorama.enabled"),
+  },
+  async function test_identifiersSurviveCompaction() {
+    const account = await createAccount();
+    const folder = await createSubfolder(
+      account.incomingServer.rootFolder,
+      "compactIdentity"
+    );
+    await createMessages(folder, 3);
+    const extension = ExtensionTestUtils.loadExtension({
+      manifest: {
+        permissions: ["accountsRead", "messagesRead", "messagesDelete"],
+      },
+      async background() {
+        const accounts = await browser.accounts.list();
+        const selected = accounts
+          .flatMap(account => account.folders)
+          .find(folder => folder.name == "compactIdentity");
+        const original = (await browser.messages.list(selected.id)).messages;
+        browser.test.assertEq(3, original.length);
+        await browser.messages.delete([original[0].id], {
+          deletePermanently: true,
+        });
+        const before = (await browser.messages.list(selected.id)).messages;
+        browser.test.assertEq(2, before.length);
+        const compacted = new Promise(resolve => {
+          const listener = () => {
+            browser.test.onMessage.removeListener(listener);
+            resolve();
+          };
+          browser.test.onMessage.addListener(listener);
+        });
+        browser.test.sendMessage("compact");
+        await compacted;
+        const lookedUp = await Promise.allSettled(
+          before.map(message => browser.messages.get(message.id))
+        );
+        browser.test.assertDeepEq(
+          ["fulfilled", "fulfilled"],
+          lookedUp.map(result => result.status),
+          "Compaction keeps both existing public IDs resolvable"
+        );
+        browser.test.assertDeepEq(
+          before.map(message => message.id),
+          lookedUp.map(result => result.value?.id),
+          "Compaction preserves each existing public ID"
+        );
+        browser.test.assertDeepEq(
+          before.map(message => message.headerMessageId),
+          lookedUp.map(result => result.value?.headerMessageId),
+          "Compaction resolves the same physical messages"
+        );
+        browser.test.assertDeepEq(
+          before.map(message => message.id),
+          (await browser.messages.list(selected.id)).messages.map(
+            message => message.id
+          ),
+          "Compaction preserves the existing public message IDs"
+        );
+        browser.test.notifyPass("compaction");
+      },
+    });
+    try {
+      await extension.startup();
+      await extension.awaitMessage("compact");
+      const previousDatabase = folder.msgDatabase;
+      const listener = new MailPromiseTestUtils.PromiseUrlListener();
+      folder.compact(listener, null);
+      await listener.promise;
+      Assert.notEqual(
+        folder.msgDatabase,
+        previousDatabase,
+        "Ordinary compaction replaces the database facade"
+      );
+      extension.sendMessage("compacted");
+      await extension.awaitFinish("compaction");
+    } finally {
+      await extension.unload();
+      cleanUpAccount(account);
+    }
   }
 );

@@ -811,9 +811,15 @@ void PerFolderDatabase::OnMessageFlagsChangedCaptured(
     mNewList.RemoveElement(after.id);
   }
   uint32_t newStatus = StatusFlags(after.id, after.flags);
+  // Preserve the existing facade's retained header identity for ordinary UI
+  // listeners. The native writer's batch header is a separate view of the row.
+  nsCOMPtr<nsIMsgDBHdr> observed = mCachedHeaders.Get(after.id);
+  if (!observed) {
+    observed = message;
+  }
   // Freeze both outgoing words before ordinary listeners can remove/re-add the
   // key, change flags again, or close this facade.
-  NotifyHdrChangeAll(message, oldStatus, newStatus, nullptr);
+  NotifyHdrChangeAll(observed, oldStatus, newStatus, nullptr);
   if (mIsNewsFolder &&
       ((before.flags ^ after.flags) & nsMsgMessageFlags::Read)) {
     // The native writer already committed the checkpoint and installed/swapped
@@ -833,9 +839,13 @@ void PerFolderDatabase::OnMessageTagsChangedCaptured(
     return;
   }
   RefPtr<PerFolderDatabase> self(this);
+  nsCOMPtr<nsIMsgDBHdr> observed = mCachedHeaders.Get(after.id);
+  if (!observed) {
+    observed = message;
+  }
   for (RefPtr<nsIDBChangeListener> listener : mListeners.EndLimitedRange()) {
     uint32_t status = 0;
-    listener->OnHdrPropertyChanged(message, "keywords"_ns, false, &status,
+    listener->OnHdrPropertyChanged(observed, "keywords"_ns, false, &status,
                                    nullptr);
   }
 }
@@ -2946,10 +2956,21 @@ NS_IMETHODIMP PerFolderDatabase::MarkMDNSent(nsMsgKey aKey, bool aSent,
 }
 NS_IMETHODIMP PerFolderDatabase::MarkRead(nsMsgKey aKey, bool aRead,
                                           nsIDBChangeListener* aInstigator) {
+  RefPtr<PerFolderDatabase> self(this);
   nsCOMPtr<nsIMsgDBHdr> member;
   MOZ_TRY(GetMsgHdrForKey(aKey, getter_AddRefs(member)));
-  return MessageDB().SetMessageFlag(aKey, nsMsgMessageFlags::Read, aRead);
+  uint32_t flags;
+  MOZ_TRY(MessageDB().GetMessageFlags(aKey, flags));
+  uint32_t nextFlags = aRead ? flags | nsMsgMessageFlags::Read
+                             : flags & ~nsMsgMessageFlags::Read;
+  if ((flags ^ nextFlags) & nsMsgMessageFlags::Read) {
+    // The folder operation removes both stored and facade New on a read-state
+    // transition. Captured fanout clears the facade before notifying listeners.
+    nextFlags &= ~nsMsgMessageFlags::New;
+  }
+  return MessageDB().SetMessageFlags(aKey, nextFlags);
 }
+
 NS_IMETHODIMP PerFolderDatabase::MarkMarked(nsMsgKey aKey, bool aMarked,
                                             nsIDBChangeListener* instigator) {
   nsCOMPtr<nsIMsgDBHdr> member;
@@ -4070,8 +4091,14 @@ NS_IMETHODIMP MessageEnumerator::GetNext(nsIMsgDBHdr** item) {
   MOZ_TRY(mStatus);
   NS_ENSURE_TRUE(current && mHasNext, NS_ERROR_FAILURE);
   nsMsgKey key = static_cast<nsMsgKey>(mStmt->AsInt64(0));
-  RefPtr<Message> message = new Message(key);
-  MOZ_TRY(mOwner->CacheHeader(key, message));
+  // Re-enumeration must not replace a header retained by its UI. Cached
+  // search hits can belong to another physical folder, so retain the cursor's
+  // original lazy-header behavior instead of a folder-restricted lookup.
+  nsCOMPtr<nsIMsgDBHdr> message = mOwner->mCachedHeaders.Get(key);
+  if (!message) {
+    message = new Message(key);
+    MOZ_TRY(mOwner->CacheHeader(key, message));
+  }
   message.forget(item);
   Advance();
   return NS_OK;

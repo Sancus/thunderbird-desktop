@@ -1240,3 +1240,125 @@ add_task(async function test_content_language_suppressed() {
 
   Services.prefs.clearUserPref("mail.suppress_content_language");
 });
+
+add_task(async function test_additionalFccReportsNewPhysicalCopy() {
+  clearTestFolders();
+  const root = gLocalAccount.incomingServer.rootFolder;
+  const nativeSent = root.getChildNamed("Sent");
+  const nativeDrafts = root.getChildNamed("Drafts");
+  let injected = false;
+  let oldKey;
+  const observer = {
+    msgsClassified(messages) {
+      const primary = messages.find(
+        message =>
+          message.folder.URI == nativeSent.URI &&
+          message.mime2DecodedSubject == "S378 physical FCC"
+      );
+      if (!primary || injected) {
+        return;
+      }
+      injected = true;
+      nativeDrafts
+        .QueryInterface(Ci.nsIMsgLocalMailFolder)
+        .addMessage(
+          [
+            "From: previous@example.invalid",
+            "To: recipient@example.invalid",
+            "Subject: Older physical FCC copy",
+            `Message-ID: <${primary.messageId}>`,
+            "",
+            "Preexisting collision bytes",
+            "",
+          ].join("\r\n")
+        );
+      oldKey = [...nativeDrafts.messages].find(
+        message => message.mime2DecodedSubject == "Older physical FCC copy"
+      ).messageKey;
+    },
+  };
+  MailServices.mfn.addListener(observer, MailServices.mfn.msgsClassified);
+  const extension = ExtensionTestUtils.loadExtension({
+    manifest: {
+      manifest_version: 2,
+      permissions: ["accountsRead", "messagesRead"],
+      optional_permissions: ["messages.send"],
+    },
+    background: async () => {
+      const granted = await new Promise(resolve => {
+        browser.test.withHandlingUserInput(() =>
+          resolve(
+            browser.permissions.request({ permissions: ["messages.send"] })
+          )
+        );
+      });
+      browser.test.assertTrue(granted);
+      const [sent] = await browser.folders.query({ name: "Sent" });
+      const [drafts] = await browser.folders.query({ name: "Drafts" });
+      const result = await browser.messages.sendMessage({
+        to: "recipient@example.invalid",
+        subject: "S378 physical FCC",
+        plainTextBody: "Current FCC bytes # percent %",
+        additionalFccFolder: { accountId: drafts.accountId, path: drafts.path },
+      });
+      browser.test.assertEq(
+        2,
+        result.messages.length,
+        "One primary and one distinct FCC2 result are returned"
+      );
+      browser.test.assertEq(sent.id, result.messages[0].folder.id);
+      browser.test.assertEq(drafts.id, result.messages[1].folder.id);
+      browser.test.assertTrue(result.messages[0].id != result.messages[1].id);
+      for (const message of result.messages) {
+        browser.test.assertEq(result.headerMessageId, message.headerMessageId);
+        browser.test.assertTrue(
+          (await browser.messages.getRaw(message.id)).includes(
+            "Current FCC bytes # percent %"
+          ),
+          "Returned FCC header resolves the actual new copied bytes"
+        );
+      }
+      const stored = (await browser.messages.list(drafts.id)).messages;
+      browser.test.assertEq(
+        2,
+        stored.length,
+        "The older physical collision is retained"
+      );
+      const previous = stored.find(
+        message => message.id != result.messages[1].id
+      );
+      browser.test.assertTrue(
+        (await browser.messages.getRaw(previous.id)).includes(
+          "Preexisting collision bytes"
+        )
+      );
+      browser.test.notifyPass("physical-fcc");
+    },
+  });
+  try {
+    await extension.startup();
+    await extension.awaitFinish("physical-fcc");
+    Assert.ok(
+      injected,
+      "The real primary classification created the older same-ID destination copy"
+    );
+    Assert.ok(
+      nativeDrafts.msgDatabase.containsKey(oldKey),
+      "The preexisting physical row remains"
+    );
+    Assert.equal(
+      nativeSent.getTotalMessages(false),
+      1,
+      "Sending publishes the primary once"
+    );
+    Assert.equal(
+      nativeDrafts.getTotalMessages(false),
+      2,
+      "FCC2 adds only one physical row"
+    );
+  } finally {
+    MailServices.mfn.removeListener(observer);
+    await extension.unload();
+    clearTestFolders();
+  }
+});

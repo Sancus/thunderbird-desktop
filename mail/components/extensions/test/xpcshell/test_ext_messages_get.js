@@ -1503,3 +1503,319 @@ add_task(async function test_get_deleted_messages() {
 
   cleanUpAccount(_account);
 });
+
+add_task(async function test_readsSelectedPhysicalContent() {
+  const account = await createAccount();
+  const root = account.incomingServer.rootFolder;
+  const first = await createSubfolder(root, "selectedContentA");
+  const second = await createSubfolder(root, "selectedContentB");
+  for (const [folder, label] of [
+    [first, "A"],
+    [second, "B"],
+  ]) {
+    await createMessageFromString(
+      folder,
+      [
+        "From: sender@example.invalid",
+        "To: recipient@example.invalid",
+        `Subject: Selected content ${label}`,
+        "Message-ID: <same-selected-content@example.invalid>",
+        "MIME-Version: 1.0",
+        "Content-Type: multipart/mixed; boundary=s378-content",
+        "",
+        "--s378-content",
+        "Content-Type: text/plain; charset=utf-8",
+        "",
+        `Selected body ${label}#%`,
+        "--s378-content",
+        'Content-Type: text/plain; name="owned.txt"',
+        'Content-Disposition: attachment; filename="owned.txt"',
+        "Content-Transfer-Encoding: base64",
+        "",
+        btoa(`Attachment ${label}#%`),
+        "--s378-content--",
+        "",
+      ].join("\r\n")
+    );
+  }
+  const extension = ExtensionTestUtils.loadExtension({
+    manifest: {
+      manifest_version: 2,
+      permissions: ["accountsRead", "messagesRead"],
+    },
+    background: async () => {
+      const ids = [];
+      for (const label of ["A", "B"]) {
+        const [folder] = await browser.folders.query({
+          name: `selectedContent${label}`,
+        });
+        const { messages } = await browser.messages.list(folder.id);
+        browser.test.assertEq(1, messages.length);
+        const selected = messages[0];
+        ids.push(selected.id);
+        browser.test.assertEq(
+          folder.id,
+          (await browser.messages.get(selected.id)).folder.id
+        );
+        const raw = await browser.messages.getRaw(selected.id);
+        browser.test.assertTrue(
+          raw.includes(`Selected body ${label}#%`),
+          "Raw bytes belong to the selected physical message"
+        );
+        const full = await browser.messages.getFull(selected.id);
+        browser.test.assertTrue(
+          JSON.stringify(full).includes(`Selected body ${label}#%`)
+        );
+        const headers = await browser.messages.getHeaders(selected.id);
+        browser.test.assertEq(`Selected content ${label}`, headers.subject[0]);
+        if (
+          folder.accountId &&
+          (await browser.accounts.get(folder.accountId)).type == "none"
+        ) {
+          const attachments = await browser.messages.listAttachments(
+            selected.id
+          );
+          browser.test.assertEq(1, attachments.length);
+          const file = await browser.messages.getAttachmentFile(
+            selected.id,
+            attachments[0].partName
+          );
+          browser.test.assertEq(`Attachment ${label}#%`, await file.text());
+          const parts = await browser.messages.listInlineTextParts(selected.id);
+          browser.test.assertTrue(
+            parts.some(part =>
+              part.content.includes(`Selected body ${label}#%`)
+            )
+          );
+        }
+      }
+      browser.test.assertTrue(
+        ids[0] != ids[1],
+        "Equal Message-IDs in different folders remain distinct"
+      );
+      browser.test.notifyPass("selected-content");
+    },
+  });
+  try {
+    await extension.startup();
+    await extension.awaitFinish("selected-content");
+  } finally {
+    await extension.unload();
+    cleanUpAccount(account);
+  }
+});
+
+add_task(async function test_preservesEncodedMailboxStructure() {
+  // Mail address headers require a real mail account. An NNTP overview does not
+  // publish To/Cc/Bcc; the original news tests above keep their protocol setup.
+  const account = await createAccount("none");
+  const folder = await createSubfolder(
+    account.incomingServer.rootFolder,
+    "encodedMailboxStructure"
+  );
+  const raw = [
+    "From: =?UTF-8?Q?H=C3=B6rst=2C_Kenny?= <from@example.invalid>",
+    "To: =?ISO-8859-1?Q?R=F6mer=2C_To?= <to@example.invalid>",
+    "To: Plain To <to2@example.invalid>",
+    "Cc: =?UTF-8?Q?G=C3=B6mez=2C_Cc?= <cc@example.invalid>",
+    "Cc: Plain Cc <cc2@example.invalid>",
+    // The shared legacy control stores one Bcc field; both mailboxes stay required.
+    "Bcc: =?UTF-8?Q?K=C3=B6nig=2C_Bcc?= <bcc@example.invalid>, Plain Bcc <bcc2@example.invalid>",
+    "Subject: =?UTF-8?Q?S378_=E2=98=83?=",
+    "Message-ID: <encoded-mailbox-structure@example.invalid>",
+    "MIME-Version: 1.0",
+    "Content-Type: text/plain; charset=utf-8",
+    "",
+    "Selected encoded mailbox bytes #%",
+    "",
+  ].join("\r\n");
+  await createMessageFromString(folder, raw);
+  Assert.equal(
+    [...folder.messages].length,
+    1,
+    "One physical message is published"
+  );
+  const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIMsgDBService
+  );
+  Assert.equal(
+    service instanceof Ci.nsIDatabaseCore,
+    Services.prefs.getBoolPref("mail.panorama.enabled"),
+    "The real database service matches the selected backend"
+  );
+  const extension = ExtensionTestUtils.loadExtension({
+    manifest: {
+      manifest_version: 2,
+      permissions: ["accountsRead", "messagesRead"],
+    },
+    background: async () => {
+      const [target] = await browser.folders.query({
+        name: "encodedMailboxStructure",
+      });
+      const listed = (await browser.messages.list(target.id)).messages;
+      browser.test.assertEq(1, listed.length);
+      const expected = {
+        author: '"Hörst, Kenny" <from@example.invalid>',
+        recipients: [
+          '"Römer, To" <to@example.invalid>',
+          "Plain To <to2@example.invalid>",
+        ],
+        ccList: [
+          '"Gömez, Cc" <cc@example.invalid>',
+          "Plain Cc <cc2@example.invalid>",
+        ],
+        bccList: [
+          '"König, Bcc" <bcc@example.invalid>',
+          "Plain Bcc <bcc2@example.invalid>",
+        ],
+        subject: "S378 ☃",
+      };
+      for (const message of [
+        listed[0],
+        await browser.messages.get(listed[0].id),
+      ]) {
+        browser.test.assertEq(target.id, message.folder.id);
+        for (const [field, value] of Object.entries(expected)) {
+          browser.test.assertEq(
+            JSON.stringify(value),
+            JSON.stringify(message[field]),
+            `${field} keeps decoded names, mailbox boundaries and order`
+          );
+        }
+        for (const field of ["recipients", "ccList", "bccList"]) {
+          browser.test.assertEq(
+            2,
+            message[field].length,
+            `${field} has two mailboxes`
+          );
+        }
+      }
+      const headers = await browser.messages.getHeaders(listed[0].id);
+      const full = await browser.messages.getFull(listed[0].id);
+      for (const actual of [headers, full.headers]) {
+        for (const [field, value] of Object.entries({
+          from: [expected.author],
+          to: expected.recipients,
+          cc: expected.ccList,
+          bcc: [expected.bccList.join(", ")],
+          subject: [expected.subject],
+        })) {
+          browser.test.assertEq(
+            JSON.stringify(value),
+            JSON.stringify(actual[field]),
+            `${field} raw-derived and stored header results agree`
+          );
+        }
+      }
+      const stored = await browser.messages.getRaw(listed[0].id);
+      for (const fragment of [
+        "From: =?UTF-8?Q?H=C3=B6rst=2C_Kenny?= <from@example.invalid>",
+        "To: =?ISO-8859-1?Q?R=F6mer=2C_To?= <to@example.invalid>",
+        "To: Plain To <to2@example.invalid>",
+        "Cc: =?UTF-8?Q?G=C3=B6mez=2C_Cc?= <cc@example.invalid>",
+        "Cc: Plain Cc <cc2@example.invalid>",
+        "Bcc: =?UTF-8?Q?K=C3=B6nig=2C_Bcc?= <bcc@example.invalid>",
+        "Plain Bcc <bcc2@example.invalid>",
+        "Selected encoded mailbox bytes #%",
+      ]) {
+        browser.test.assertTrue(
+          stored.includes(fragment),
+          "Original bytes are retained"
+        );
+      }
+      browser.test.notifyPass("encoded-mailbox-structure");
+    },
+  });
+  try {
+    await extension.startup();
+    await extension.awaitFinish("encoded-mailbox-structure");
+  } finally {
+    await extension.unload();
+    cleanUpAccount(account);
+  }
+});
+
+// Repeated Bcc aggregation is an additional native producer contract. The shared
+// case above still checks both Bcc mailboxes on every supported backend.
+add_task(
+  { skip_if: () => !Services.prefs.getBoolPref("mail.panorama.enabled") },
+  async function test_preservesRepeatedBccMailboxStructure() {
+    const account = await createAccount("none");
+    const folder = await createSubfolder(
+      account.incomingServer.rootFolder,
+      "repeatedBccMailboxStructure"
+    );
+    const raw = [
+      "From: Sender <from@example.invalid>",
+      "Bcc: =?UTF-8?Q?K=C3=B6nig=2C_Bcc?= <bcc@example.invalid>",
+      "Bcc: Plain Bcc <bcc2@example.invalid>",
+      "Subject: Repeated Bcc physical message",
+      "Message-ID: <repeated-bcc-structure@example.invalid>",
+      "",
+      "Repeated Bcc bytes #%",
+      "",
+    ].join("\r\n");
+    await createMessageFromString(folder, raw);
+    Assert.equal([...folder.messages].length, 1, "One physical message exists");
+    Assert.ok(
+      Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+        Ci.nsIMsgDBService
+      ) instanceof Ci.nsIDatabaseCore,
+      "Repeated-field coverage uses the real native database service"
+    );
+    const extension = ExtensionTestUtils.loadExtension({
+      manifest: {
+        manifest_version: 2,
+        permissions: ["accountsRead", "messagesRead"],
+      },
+      background: async () => {
+        const [target] = await browser.folders.query({
+          name: "repeatedBccMailboxStructure",
+        });
+        const listed = (await browser.messages.list(target.id)).messages;
+        browser.test.assertEq(1, listed.length);
+        const expected = [
+          '"König, Bcc" <bcc@example.invalid>',
+          "Plain Bcc <bcc2@example.invalid>",
+        ];
+        for (const message of [
+          listed[0],
+          await browser.messages.get(listed[0].id),
+        ]) {
+          browser.test.assertEq(target.id, message.folder.id);
+          browser.test.assertEq(2, message.bccList.length);
+          browser.test.assertEq(
+            JSON.stringify(expected),
+            JSON.stringify(message.bccList),
+            "Repeated native Bcc fields preserve both mailbox boundaries and names"
+          );
+        }
+        const headers = await browser.messages.getHeaders(listed[0].id);
+        const full = await browser.messages.getFull(listed[0].id);
+        for (const actual of [headers, full.headers]) {
+          browser.test.assertEq(2, actual.bcc.length);
+          browser.test.assertEq(
+            JSON.stringify(expected),
+            JSON.stringify(actual.bcc)
+          );
+        }
+        const stored = await browser.messages.getRaw(listed[0].id);
+        for (const fragment of [
+          "Bcc: =?UTF-8?Q?K=C3=B6nig=2C_Bcc?= <bcc@example.invalid>",
+          "Bcc: Plain Bcc <bcc2@example.invalid>",
+          "Repeated Bcc bytes #%",
+        ]) {
+          browser.test.assertTrue(stored.includes(fragment));
+        }
+        browser.test.notifyPass("repeated-bcc-mailbox-structure");
+      },
+    });
+    try {
+      await extension.startup();
+      await extension.awaitFinish("repeated-bcc-mailbox-structure");
+    } finally {
+      await extension.unload();
+      cleanUpAccount(account);
+    }
+  }
+);

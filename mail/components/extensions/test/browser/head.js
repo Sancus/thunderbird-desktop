@@ -100,7 +100,42 @@ registerCleanupFunction(async () => {
     tabmail.closeTab(tabmail.tabInfo[1]);
   }
 
+  // Release the test's mail before auditing its background activity.
+  MailServices.accounts.accounts.forEach(cleanUpAccount);
+  let searchDrainError;
+  if (
+    "nsIDatabaseCore" in Ci &&
+    Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+      Ci.nsIMsgDBService
+    ) instanceof Ci.nsIDatabaseCore
+  ) {
+    const { TestUtils } = ChromeUtils.importESModule(
+      "resource://testing-common/TestUtils.sys.mjs"
+    );
+    // Test bodies keep indexing disabled. After their accounts are removed,
+    // let the normal writer settle its actual pending work, then restore the
+    // pref before the unchanged ordinary audit. Never discard an activity.
+    await SpecialPowers.pushPrefEnv({
+      set: [["mailnews.database.global.indexer.enabled", true]],
+    });
+    try {
+      await TestUtils.waitForCondition(
+        () =>
+          !window.MsgStatusFeedback._activeProcesses.some(
+            process => process.contextType == "panorama-search"
+          ),
+        "Waiting for removed account search work to settle"
+      );
+    } catch (error) {
+      searchDrainError = error;
+    } finally {
+      await SpecialPowers.popPrefEnv();
+    }
+  }
   await clearStatusBar(window);
+  if (searchDrainError) {
+    throw searchDrainError;
+  }
 
   // Some tests that open new windows don't return focus to the main window
   // in a way that satisfies mochitest, and the test times out.
@@ -112,7 +147,6 @@ registerCleanupFunction(async () => {
   mainWindowElement.focus();
   mainWindowElement.blur();
 
-  MailServices.accounts.accounts.forEach(cleanUpAccount);
   check3PaneState(true, true);
 
   // The unified toolbar must have been cleaned up. If this fails, check if a
@@ -185,9 +219,15 @@ async function check3PaneState(folderPaneOpen = null, messagePaneOpen = null) {
 }
 
 var gIMAPServers = new Map();
+/** Runs a fake IMAP server with selected protocol extensions. */
 class IMAPServer {
+  /**
+   * @param {{extensions?: string[], username?: string}} [options={}] -
+   *   Protocol extensions and login name. The default login name is "user".
+   */
   constructor(options = {}) {
     this.extensions = options?.extensions ?? [];
+    this.username = options?.username ?? "user";
   }
 
   open() {
@@ -203,7 +243,9 @@ class IMAPServer {
     this.ImapMessage = ImapMessage;
     this.daemon = new ImapDaemon();
     this.server = new nsMailServer(daemon => {
-      const handler = new IMAP_RFC3501_handler(daemon);
+      const handler = new IMAP_RFC3501_handler(daemon, {
+        username: this.username,
+      });
       for (const ext of this.extensions) {
         mixinExtension(handler, ImapD[`IMAP_${ext}_extension`]);
       }
@@ -245,6 +287,14 @@ class IMAPServer {
   }
 }
 
+/**
+ * Creates an account and discovers IMAP folders before publishing the account.
+ *
+ * @param {string} [type="none"] - Incoming server type.
+ * @param {{extensions?: string[]}} [options={}] - Fake IMAP extensions.
+ * @returns {nsIMsgAccount|Promise<nsIMsgAccount>} A promise for IMAP accounts;
+ *   other account types return synchronously. IMAP discovery errors reject.
+ */
 function createAccount(type = "none", options = {}) {
   let account;
 
@@ -260,14 +310,29 @@ function createAccount(type = "none", options = {}) {
   }
 
   if (type == "imap") {
-    const server = new IMAPServer(options);
+    const server = new IMAPServer({
+      ...options,
+      username: account.incomingServer.username,
+    });
     server.open();
     account.incomingServer.port = server.port;
-    account.incomingServer.username = "user";
     account.incomingServer.password = "password";
-    const inbox = account.incomingServer.rootFolder.getChildNamed("INBOX");
-    inbox.QueryInterface(Ci.nsIMsgImapMailFolder).hierarchyDelimiter = "/";
-    gIMAPServers.set(account.incomingServer.key, server);
+    const listener = new MailPromiseTestUtils.PromiseUrlListener();
+    MailServices.imap.discoverAllFolders(
+      account.incomingServer.rootFolder,
+      listener,
+      null
+    );
+    return listener.promise.then(() => {
+      const inbox = account.incomingServer.rootFolder.getChildNamed("INBOX");
+      if (!inbox) {
+        throw new Error("IMAP discovery completed without an Inbox");
+      }
+      inbox.QueryInterface(Ci.nsIMsgImapMailFolder).hierarchyDelimiter = "/";
+      gIMAPServers.set(account.incomingServer.key, server);
+      info(`Created account ${account.toString()}`);
+      return account;
+    });
   }
 
   info(`Created account ${account.toString()}`);
@@ -316,7 +381,17 @@ async function createSubfolder(parent, name) {
   const promiseAdded = MailPromiseTestUtils.promiseFolderAdded(name);
   parent.createSubfolder(name, null);
   await promiseAdded;
-  return parent.getChildNamed(name);
+  const folder = parent.getChildNamed(name);
+  if (parent.server.type == "imap") {
+    // Admit the actual server UIDVALIDITY before an operation captures this
+    // cold destination's database. The first SELECT may replace a legacy DB.
+    const listener = new MailPromiseTestUtils.PromiseUrlListener();
+    folder
+      .QueryInterface(Ci.nsIMsgImapMailFolder)
+      .updateFolderWithListener(null, listener);
+    await listener.promise;
+  }
+  return folder;
 }
 
 async function createMessages(folder, makeMessagesArg) {

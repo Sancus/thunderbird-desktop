@@ -4,17 +4,18 @@
 
 #include "MailHeaderParsing.h"
 
-#include "MailNewsTypes.h"
-#include "nsMsgMessageFlags.h"
-#include "nsMsgUtils.h"
-#include "nsCharSeparatedTokenizer.h"
-#include "nsReadableUtils.h"
-#include "nsURLHelper.h"  // For net_ParseContentType().
 #include "HeaderReader.h"
 #include "IHeaderBlock.h"
-#include "nsIMimeConverter.h"
+#include "MailNewsTypes.h"
 #include "mozilla/Components.h"
 #include "mozilla/mailnews/MsgSubjectUtils.h"
+#include "nsCharSeparatedTokenizer.h"
+#include "nsIMimeConverter.h"
+#include "nsIMsgHeaderParser.h"
+#include "nsMsgMessageFlags.h"
+#include "nsMsgUtils.h"
+#include "nsReadableUtils.h"
+#include "nsURLHelper.h"  // For net_ParseContentType().
 
 // Attempt to extract a timestamp from a "Received:" header value, e.g:
 // "from bar.com by foo.com ; Thu, 21 May 1998 05:33:29 -0700".
@@ -164,25 +165,37 @@ RawHdr ParseRawMailHeaders(mozilla::Span<const char> raw) {
   nsCOMPtr<nsIMimeConverter> mimeConverter;
   mimeConverter = mozilla::components::MimeConverter::Service();
   NS_ENSURE_TRUE(mimeConverter, out);
-  mimeConverter->DecodeMimeHeaderToUTF8(out.sender, out.charset.get(), true,
-                                        true, out.sender);
+  nsCOMPtr<nsIMsgHeaderParser> headerParser =
+      mozilla::components::HeaderParser::Service();
+  NS_ENSURE_TRUE(headerParser, out);
+  // Parse address structure before decoding display names. Decoding a comma
+  // inside an encoded word first would turn one mailbox into two addresses.
+  auto decodeAddresses = [&](nsCString& header) -> nsresult {
+    nsTArray<RefPtr<msgIAddressObject>> addresses;
+    nsresult rv = headerParser->ParseEncodedHeader(header, out.charset.get(),
+                                                   true, addresses);
+    NS_ENSURE_SUCCESS(rv, rv);
+    nsAutoString decoded;
+    rv = headerParser->MakeMimeHeader(addresses, decoded);
+    NS_ENSURE_SUCCESS(rv, rv);
+    CopyUTF16toUTF8(decoded, header);
+    return NS_OK;
+  };
+  NS_ENSURE_SUCCESS(decodeAddresses(out.sender), out);
   mimeConverter->DecodeMimeHeaderToUTF8(out.subject, out.charset.get(), true,
                                         true, out.subject);
 
   // Merge multiple "Cc:" values.
   out.ccList = StringJoin(","_ns, ccValues);
-  mimeConverter->DecodeMimeHeaderToUTF8(out.ccList, out.charset.get(), true,
-                                        true, out.ccList);
+  NS_ENSURE_SUCCESS(decodeAddresses(out.ccList), out);
   // Merge multiple "Bcc:" values.
   out.bccList = StringJoin(","_ns, bccValues);
-  mimeConverter->DecodeMimeHeaderToUTF8(out.bccList, out.charset.get(), true,
-                                        true, out.bccList);
+  NS_ENSURE_SUCCESS(decodeAddresses(out.bccList), out);
 
   // Fill in recipients, with fallbacks.
   if (!toValues.IsEmpty()) {
     out.recipients = StringJoin(","_ns, toValues);
-    mimeConverter->DecodeMimeHeaderToUTF8(out.recipients, out.charset.get(),
-                                          true, true, out.recipients);
+    NS_ENSURE_SUCCESS(decodeAddresses(out.recipients), out);
   } else if (!out.ccList.IsEmpty()) {
     out.recipients = out.ccList;
   } else if (!newsgroups.IsEmpty()) {

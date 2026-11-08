@@ -662,12 +662,36 @@ add_task(
           .getChildNamed(foldername)
           .QueryInterface(Ci.nsIMsgImapMailFolder);
 
-        const listener = new PromiseTestUtils.PromiseUrlListener();
+        const makeListener = phase =>
+          new PromiseTestUtils.PromiseUrlListener({
+            OnStopRunningUrl(url, status) {
+              if (Components.isSuccessCode(status)) {
+                return;
+              }
+              const details = { phase, status, folder: folder.URI };
+              try {
+                const imapUrl = url.QueryInterface(Ci.nsIImapUrl);
+                Object.assign(details, {
+                  url: url.spec,
+                  action: imapUrl.imapAction,
+                  uids: imapUrl.listOfMessageIds,
+                  epoch: folder.msgDatabase.dBFolderInfo.imapUidValidity,
+                  keys: [...folder.messages]
+                    .slice(0, 16)
+                    .map(h => h.messageKey),
+                });
+              } catch (ex) {
+                details.captureError = String(ex);
+              }
+              info(`forceServerUpdate failure: ${JSON.stringify(details)}`);
+            },
+          });
+        const listener = makeListener("updateFolderWithListener");
         folder.updateFolderWithListener(null, listener);
         await listener.promise;
 
         // ...and download for offline use.
-        const promiseUrlListener = new PromiseTestUtils.PromiseUrlListener();
+        const promiseUrlListener = makeListener("downloadAllForOffline");
         folder.downloadAllForOffline(promiseUrlListener, null);
         await promiseUrlListener.promise;
       }
@@ -1121,6 +1145,139 @@ add_task(
       Assert.equal(moved.getTotalMessages(false), 0);
       Assert.equal(archived.getTotalMessages(false), 2);
       Assert.equal(outside.getTotalMessages(false), 1);
+    } finally {
+      await extension.unload();
+      cleanUpAccount(account);
+      await AddonTestUtils.promiseShutdownManager();
+    }
+  }
+);
+
+add_task(
+  { skip_if: () => IS_NNTP },
+  async function test_copyKeepsPhysicalDuplicateMembership() {
+    await AddonTestUtils.promiseStartupManager();
+    const account = await createAccount(undefined, {
+      extensions: ["RFC2195", "RFC4315"],
+    });
+    const root = account.incomingServer.rootFolder;
+    const nativeSource = await createSubfolder(root, "physicalCopySource");
+    const nativeDestination = await createSubfolder(
+      root,
+      "physicalCopyDestination"
+    );
+    for (const [folder, body] of [
+      [nativeSource, "Selected A"],
+      [nativeSource, "Selected B"],
+      [nativeDestination, "Existing outside copy"],
+    ]) {
+      await createMessageFromString(
+        folder,
+        [
+          "From: sender@example.invalid",
+          "To: recipient@example.invalid",
+          `Subject: ${body}`,
+          "Message-ID: <physical-copy-duplicate@example.invalid>",
+          "",
+          `${body}#%`,
+          "",
+        ].join("\r\n")
+      );
+    }
+    const extension = ExtensionTestUtils.loadExtension({
+      manifest: {
+        manifest_version: 2,
+        permissions: ["accountsRead", "messagesRead", "messagesMove"],
+      },
+      background: async () => {
+        const [source] = await browser.folders.query({
+          name: "physicalCopySource",
+        });
+        const [destination] = await browser.folders.query({
+          name: "physicalCopyDestination",
+        });
+        const original = (await browser.messages.list(source.id)).messages;
+        const before = (await browser.messages.list(destination.id)).messages;
+        browser.test.assertEq(2, original.length);
+        browser.test.assertEq(1, before.length);
+        const events = [];
+        const received = new Promise(resolve => {
+          const listener = (src, dst) => {
+            events.push([src, dst]);
+            if (
+              events.reduce(
+                (count, event) => count + event[0].messages.length,
+                0
+              ) == 2
+            ) {
+              browser.messages.onCopied.removeListener(listener);
+              resolve();
+            }
+          };
+          browser.messages.onCopied.addListener(listener);
+        });
+        // Do not stream the sources first: the native copy must handle cold bytes.
+        await browser.messages.copy(
+          [original[0].id, original[1].id, original[0].id],
+          destination.id
+        );
+        await received;
+        const sources = events.flatMap(event => event[0].messages);
+        const copies = events.flatMap(event => event[1].messages);
+        browser.test.assertEq(
+          2,
+          sources.length,
+          "Repeated public IDs are deduplicated"
+        );
+        browser.test.assertEq(
+          2,
+          copies.length,
+          "Both physical copies are published"
+        );
+        browser.test.assertEq(
+          2,
+          new Set(copies.map(message => message.id)).size,
+          "One destination header cannot fulfill two physical slots"
+        );
+        browser.test.assertTrue(
+          copies.every(
+            message =>
+              message.folder.id == destination.id && message.id != before[0].id
+          )
+        );
+        const bodies = [];
+        for (const copy of copies) {
+          bodies.push(await browser.messages.getRaw(copy.id));
+        }
+        browser.test.assertTrue(
+          bodies.some(raw => raw.includes("Selected A#%"))
+        );
+        browser.test.assertTrue(
+          bodies.some(raw => raw.includes("Selected B#%"))
+        );
+        browser.test.assertTrue(
+          bodies.every(raw => !raw.includes("Existing outside copy#%"))
+        );
+        browser.test.assertEq(
+          3,
+          (await browser.messages.list(destination.id)).messages.length
+        );
+        browser.test.assertEq(
+          2,
+          (await browser.messages.list(source.id)).messages.length,
+          "Copy retains both original physical sources"
+        );
+        browser.test.assertTrue(
+          (await browser.messages.getRaw(before[0].id)).includes(
+            "Existing outside copy#%"
+          )
+        );
+        browser.test.notifyPass("physical-copy-membership");
+      },
+    });
+    try {
+      await extension.startup();
+      await extension.awaitFinish("physical-copy-membership");
     } finally {
       await extension.unload();
       cleanUpAccount(account);

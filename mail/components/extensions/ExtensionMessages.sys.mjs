@@ -280,9 +280,23 @@ function getParentMsgInfo(msgHdr) {
   for (const param of params) {
     url.searchParams.delete(param);
   }
-  const parentMsgHdr = Services.io
+  const messageUrl = Services.io
     .newURI(url.href)
-    .QueryInterface(Ci.nsIMsgMessageUrl).messageHeader;
+    .QueryInterface(Ci.nsIMsgMessageUrl);
+  if (url.protocol == "imap:") {
+    // A parsed fetch URL has its server UID, but no weak folder reference.
+    // Use only its folder URI here; messageHeader resolves the UID through
+    // the actual folder database instead of treating it as a physical key.
+    const folderURI = messageUrl.uri
+      .split("#")[0]
+      .replace(/^imap-message:/, "imap:");
+    const folder = MailServices.folderLookup.getFolderForURL(folderURI);
+    if (!folder || folder.server.type != "imap") {
+      throw new ExtensionError("Parent IMAP message folder is unavailable");
+    }
+    messageUrl.QueryInterface(Ci.nsIMsgMailNewsUrl).folder = folder;
+  }
+  const parentMsgHdr = messageUrl.messageHeader;
   return { msgHdr: parentMsgHdr, partName };
 }
 
@@ -917,13 +931,11 @@ export function getMessagesInFolder(folder) {
   try {
     return [...folder.messages];
   } catch (e) {
-    // Some folders fail to retrieve messages, instead of returning an empty array.
     console.warn(
       `Failed to retrieve content of folder ${folder.localizedName}: ${e}`
     );
+    throw e;
   }
-
-  return [];
 }
 
 /**
@@ -977,6 +989,8 @@ export class CachedMsgHeader {
     this.accountKey = "";
 
     if (msgHdr) {
+      // Retain the physical source before deletion invalidates the live header.
+      this._identifier = messageTracker.getIdentifier(msgHdr);
       // Cache all elements which are needed by MessageManager.convert().
       this.author = msgHdr.author;
       this.subject = msgHdr.mime2DecodedSubject;
@@ -1074,7 +1088,11 @@ export class CachedMsgHeader {
 /**
  * @typedef {object} MsgIdentifier - An object with information needed to identify
  *    a specific message.
- * @property {boolean} [folderURI] - folder URI of the real message
+ * @property {string} [folderURI] - folder URI of the real message
+ * @property {integer} [folderGeneration] - Captured folder lifetime.
+ * @property {string} [headerMessageId] - Captured Message-ID consistency check.
+ * @property {?integer} [uidValidity] - Captured IMAP folder epoch.
+ * @property {integer} [trackerId] - ID associated with this stored identifier.
  * @property {integer} [messageKey] - messageKey of the real message
  * @property {string}  [dummyMsgUrl] - dummyMsgUrl of the dummy message (mostly
  *    a file:// URL)
@@ -1094,6 +1112,7 @@ export class MessageTracker extends EventEmitter {
     super();
     this._nextId = 1;
     this._messages = new Map();
+    this._folderGenerations = new ExtensionUtils.DefaultMap(() => 0);
     this._messageIds = new Map();
     this._listenerCount = 0;
     this._pendingKeyChanges = new Map();
@@ -1119,7 +1138,9 @@ export class MessageTracker extends EventEmitter {
     // nsIFolderListener
     MailServices.mailSession.AddFolderListener(
       this,
-      Ci.nsIFolderListener.propertyFlagChanged | Ci.nsIFolderListener.removed
+      Ci.nsIFolderListener.propertyFlagChanged |
+        Ci.nsIFolderListener.added |
+        Ci.nsIFolderListener.removed
     );
     // nsIMsgFolderListener
     MailServices.mfn.addListener(
@@ -1128,7 +1149,10 @@ export class MessageTracker extends EventEmitter {
         MailServices.mfn.msgAdded |
         MailServices.mfn.msgsDeleted |
         MailServices.mfn.msgsMoveCopyCompleted |
-        MailServices.mfn.msgKeyChanged
+        MailServices.mfn.msgKeyChanged |
+        MailServices.mfn.folderDeleted |
+        MailServices.mfn.folderRenamed |
+        MailServices.mfn.folderMoveCopyCompleted
     );
   }
 
@@ -1138,10 +1162,12 @@ export class MessageTracker extends EventEmitter {
    * @param {nsIMsgDBHdr} msgHdr
    */
   addPendingNewMessage(msgHdr) {
-    if (this._knownNewMessages.has(msgHdr.messageId)) {
+    const identifier = this.getIdentifier(msgHdr);
+    const physical = `${this.getHash(identifier)}, epoch: ${identifier.uidValidity}, generation: ${identifier.folderGeneration}`;
+    if (this._knownNewMessages.has(physical)) {
       return;
     }
-    this._knownNewMessages.add(msgHdr.messageId);
+    this._knownNewMessages.add(physical);
 
     const folder = msgHdr.folder;
     this._pendingNewMessages.get(folder).push(msgHdr);
@@ -1171,6 +1197,18 @@ export class MessageTracker extends EventEmitter {
     MailServices.mailSession.RemoveFolderListener(this);
     // nsIMsgFolderListener
     MailServices.mfn.removeListener(this);
+    for (const task of this._deferredNewMessagesNotifications.values()) {
+      task.disarm();
+    }
+    this._messages.clear();
+    this._folderGenerations.clear();
+    this._messageIds.clear();
+    this._pendingKeyChanges.clear();
+    this._dummyMessageHeaders.clear();
+    this._msgHdrCache.clear();
+    this._knownNewMessages.clear();
+    this._pendingNewMessages.clear();
+    this._deferredNewMessagesNotifications.clear();
   }
 
   /**
@@ -1198,7 +1236,7 @@ export class MessageTracker extends EventEmitter {
   _set(id, msgIdentifier, msgHdr) {
     const hash = this.getHash(msgIdentifier);
     this._messageIds.set(hash, id);
-    this._messages.set(id, msgIdentifier);
+    this._messages.set(id, { ...msgIdentifier, trackerId: id });
     if (
       msgHdr &&
       !msgHdr.folder &&
@@ -1224,9 +1262,33 @@ export class MessageTracker extends EventEmitter {
   _get(msgIdentifier) {
     const hash = this.getHash(msgIdentifier);
     if (this._messageIds.has(hash)) {
-      return this._messageIds.get(hash);
+      const id = this._messageIds.get(hash);
+      if (
+        msgIdentifier.headerMessageId !== undefined &&
+        !this._samePhysicalIdentifier(this._messages.get(id), msgIdentifier)
+      ) {
+        return null;
+      }
+      return id;
     }
     return null;
+  }
+
+  /**
+   * Compare captured physical rows, folder lifetimes and IMAP epochs.
+   *
+   * @param {MsgIdentifier} left - First captured source.
+   * @param {MsgIdentifier} right - Second captured source.
+   * @returns {boolean} Whether both identifiers describe the same physical row.
+   */
+  _samePhysicalIdentifier(left, right) {
+    return (
+      left?.folderURI === right.folderURI &&
+      left.messageKey === right.messageKey &&
+      left.folderGeneration === right.folderGeneration &&
+      left.uidValidity === right.uidValidity &&
+      left.headerMessageId === right.headerMessageId
+    );
   }
 
   /**
@@ -1236,10 +1298,13 @@ export class MessageTracker extends EventEmitter {
    */
   _remove(msgIdentifier) {
     const hash = this.getHash(msgIdentifier);
-    const id = this._get(msgIdentifier);
+    const id = msgIdentifier.trackerId ?? this._get(msgIdentifier);
     this._messages.delete(id);
-    this._messageIds.delete(hash);
-    this._dummyMessageHeaders.delete(msgIdentifier.dummyMsgUrl);
+    // A late deletion of an old physical message must not erase a new mapping.
+    if (this._messageIds.get(hash) == id) {
+      this._messageIds.delete(hash);
+      this._dummyMessageHeaders.delete(msgIdentifier.dummyMsgUrl);
+    }
   }
 
   /**
@@ -1261,14 +1326,26 @@ export class MessageTracker extends EventEmitter {
    * @returns {object} The msgIdentifier of the message.
    */
   getIdentifier(msgHdr) {
-    if (msgHdr instanceof CachedMsgHeader && msgHdr.hasId) {
-      return this._messages.get(msgHdr.id);
+    if (msgHdr instanceof CachedMsgHeader) {
+      if (msgHdr.hasId && this._messages.has(msgHdr.id)) {
+        return this._messages.get(msgHdr.id);
+      }
+      if (msgHdr._identifier) {
+        return msgHdr._identifier;
+      }
     }
 
     if (msgHdr.folder) {
+      const database = msgHdr.folder.msgDatabase;
       return {
         folderURI: msgHdr.folder.URI,
         messageKey: msgHdr.messageKey,
+        folderGeneration: this._folderGenerations.get(msgHdr.folder.URI),
+        headerMessageId: msgHdr.messageId,
+        uidValidity:
+          msgHdr.folder.server.type == "imap"
+            ? database.dBFolderInfo.imapUidValidity
+            : null,
       };
     }
     // Normalize the dummyMsgUrl by sorting its parameters and striping them
@@ -1303,11 +1380,44 @@ export class MessageTracker extends EventEmitter {
 
     const msgIdentifier = this.getIdentifier(msgHdr);
     let id = this._get(msgIdentifier);
+    if (id && msgIdentifier.folderURI) {
+      const previous = this._messages.get(id);
+      if (
+        previous.folderGeneration !== msgIdentifier.folderGeneration ||
+        previous.uidValidity !== msgIdentifier.uidValidity ||
+        previous.headerMessageId !== msgIdentifier.headerMessageId
+      ) {
+        this._messageIds.delete(this.getHash(msgIdentifier));
+        id = null;
+      }
+    }
     if (id) {
       return id;
     }
     id = this._nextId++;
 
+    if (msgIdentifier.folderURI && msgHdr instanceof CachedMsgHeader) {
+      let current;
+      try {
+        const folder = MailServices.folderLookup.getFolderForURL(
+          msgIdentifier.folderURI
+        );
+        const header = folder?.msgDatabase.getMsgHdrForKey(
+          msgIdentifier.messageKey
+        );
+        if (header) {
+          current = this.getIdentifier(header);
+        }
+      } catch (ex) {
+        console.error(ex);
+      }
+      if (!current || !this._samePhysicalIdentifier(current, msgIdentifier)) {
+        // A retired event snapshot can receive an ID without replacing the
+        // lookup for a newer physical message at the same folder/key.
+        this._messages.set(id, { ...msgIdentifier, trackerId: id });
+        return id;
+      }
+    }
     this._set(id, msgIdentifier, msgHdr);
     return id;
   }
@@ -1362,11 +1472,25 @@ export class MessageTracker extends EventEmitter {
         msgIdentifier.folderURI
       );
       if (folder) {
-        const msgHdr = folder.msgDatabase.getMsgHdrForKey(
-          msgIdentifier.messageKey
-        );
-        if (msgHdr) {
-          return msgHdr;
+        try {
+          const database = folder.msgDatabase;
+          const epoch =
+            folder.server.type == "imap"
+              ? database.dBFolderInfo.imapUidValidity
+              : null;
+          const msgHdr = database.getMsgHdrForKey(msgIdentifier.messageKey);
+          if (
+            this._folderGenerations.get(folder.URI) ===
+              msgIdentifier.folderGeneration &&
+            epoch === msgIdentifier.uidValidity &&
+            msgHdr?.isLive &&
+            msgHdr.folder.URI == msgIdentifier.folderURI &&
+            msgHdr.messageId == msgIdentifier.headerMessageId
+          ) {
+            return msgHdr;
+          }
+        } catch (ex) {
+          console.error(ex);
         }
       }
     } else if (msgIdentifier.dummyMsgUrl.startsWith("file://")) {
@@ -1405,7 +1529,10 @@ export class MessageTracker extends EventEmitter {
           newProperties.new = !!(newFlag & Ci.nsMsgMessageFlags.New);
           // Remove message from the list of known new messages.
           if (!newProperties.new) {
-            this._knownNewMessages.delete(msgHdr.messageId);
+            const identifier = this.getIdentifier(msgHdr);
+            this._knownNewMessages.delete(
+              `${this.getHash(identifier)}, epoch: ${identifier.uidValidity}, generation: ${identifier.folderGeneration}`
+            );
           }
         }
         break;
@@ -1428,6 +1555,22 @@ export class MessageTracker extends EventEmitter {
   }
 
   /**
+   * Collect new messages from the ordinary folder listener as well as msgAdded.
+   * Native local batch publication delivers this existing notification.
+   *
+   * @param {nsIMsgFolder} folder - Folder that published the message.
+   * @param {nsIMsgDBHdr} msgHdr - Newly published physical header.
+   */
+  onMessageAdded(folder, msgHdr) {
+    const cachedHdr = new CachedMsgHeader(this, msgHdr, {
+      addToMessageTracker: false,
+    });
+    if (cachedHdr.flags & Ci.nsMsgMessageFlags.New) {
+      this.addPendingNewMessage(cachedHdr);
+    }
+  }
+
+  /**
    * Implements nsIFolderListener.onMessageRemoved().
    *
    * @param {nsIMsgFolder} folder
@@ -1445,6 +1588,48 @@ export class MessageTracker extends EventEmitter {
   }
 
   // Implements nsIMsgFolderListener.
+
+  /**
+   * Retire captured IDs and pending new-mail notices for a deleted folder tree.
+   *
+   * @param {nsIMsgFolder} folder - Deleted physical folder.
+   */
+  folderDeleted(folder) {
+    const uri = folder.URI;
+    const belongs = folderURI =>
+      folderURI == uri || folderURI?.startsWith(`${uri}/`);
+    for (const folderURI of this._folderGenerations.keys()) {
+      if (belongs(folderURI)) {
+        this._folderGenerations.set(
+          folderURI,
+          this._folderGenerations.get(folderURI) + 1
+        );
+      }
+    }
+    for (const identifier of this._messages.values()) {
+      if (belongs(identifier.folderURI)) {
+        this._remove(identifier);
+      }
+    }
+    for (const [pendingFolder, task] of this
+      ._deferredNewMessagesNotifications) {
+      if (belongs(pendingFolder.URI)) {
+        task.disarm();
+        this._deferredNewMessagesNotifications.delete(pendingFolder);
+        this._pendingNewMessages.delete(pendingFolder);
+      }
+    }
+  }
+
+  folderRenamed(originalFolder) {
+    this.folderDeleted(originalFolder);
+  }
+
+  folderMoveCopyCompleted(isMove, sourceFolder) {
+    if (isMove) {
+      this.folderDeleted(sourceFolder);
+    }
+  }
 
   /**
    * Implements nsIMsgFolderListener.msgPropertyChanged().
@@ -1527,9 +1712,21 @@ export class MessageTracker extends EventEmitter {
     // An IMAP copy/move operation may be waiting for a newly added header.
     const hash = `folderURI: ${cachedHdr.folder.URI}, headerMessageId: ${cachedHdr.messageId}`;
 
-    if (this._headerPromises.has(hash)) {
-      this._headerPromises.get(hash).resolve(cachedHdr);
-      this._headerPromises.delete(hash);
+    const waiting = this._headerPromises.get(hash);
+    if (waiting) {
+      const physical = this.getHash(this.getIdentifier(cachedHdr));
+      if (msgHdr.folder.msgDatabase !== waiting.database) {
+        for (const deferred of waiting.pending) {
+          deferred.reject(new ExtensionError("Message destination changed"));
+        }
+        this._headerPromises.delete(hash);
+      } else if (!waiting.seen.has(physical)) {
+        waiting.seen.add(physical);
+        waiting.pending.shift().resolve(cachedHdr);
+        if (!waiting.pending.length) {
+          this._headerPromises.delete(hash);
+        }
+      }
     }
 
     // If this is a new message, add it to the next messages-received event.
@@ -1585,7 +1782,16 @@ export class MessageTracker extends EventEmitter {
       const dstMsgsPromises = cachedSrcMsgs.map(msgHdr => {
         const hash = `folderURI: ${dstFolder.URI}, headerMessageId: ${msgHdr.messageId}`;
         const deferred = Promise.withResolvers();
-        this._headerPromises.set(hash, deferred);
+        if (!this._headerPromises.has(hash)) {
+          this._headerPromises.set(hash, {
+            database: dstFolder.msgDatabase,
+            pending: [],
+            seen: new Set(),
+          });
+        }
+        // Equal Message-IDs represent separate physical copies. Consume each
+        // destination notification only once for this pending group.
+        this._headerPromises.get(hash).pending.push(deferred);
         return deferred.promise;
       });
 
@@ -1675,7 +1881,10 @@ export class MessageTracker extends EventEmitter {
 
     // Update the tracker entries for the ID associated with the old key and make
     // it point to the new key.
-    this._set(idAssociatedWithOldKey, createIdentifier(newKey));
+    const previousNewIdentifier = this._messages.get(idAssociatedWithNewKey);
+    if (idAssociatedWithOldKey) {
+      this._set(idAssociatedWithOldKey, this.getIdentifier(newMsgHdr));
+    }
     automationOnlyLog(
       "msgKeyChanged",
       `associating new key ${newKey} with id ${idAssociatedWithOldKey}`
@@ -1684,7 +1893,10 @@ export class MessageTracker extends EventEmitter {
     if (idAssociatedWithNewKey) {
       // If the new key was already in use, make its associated ID point to the
       // old key (swapping the keys).
-      this._set(idAssociatedWithNewKey, createIdentifier(oldKey));
+      this._set(idAssociatedWithNewKey, {
+        ...previousNewIdentifier,
+        messageKey: oldKey,
+      });
       automationOnlyLog(
         "msgKeyChanged",
         `associating old key ${oldKey} with id ${idAssociatedWithNewKey}`
@@ -1733,7 +1945,34 @@ export class MessageTracker extends EventEmitter {
 
         if (oldId) {
           // Update the tracker entry for ID to point to the new key.
-          this._set(oldId, createIdentifier(data.newMessageKey));
+          const folder = MailServices.folderLookup.getFolderForURL(
+            data.folderURI
+          );
+          const previous = this._messages.get(oldId);
+          const database = folder?.msgDatabase;
+          const epoch =
+            folder?.server.type == "imap"
+              ? database.dBFolderInfo.imapUidValidity
+              : null;
+          if (
+            !previous ||
+            previous.folderGeneration !==
+              this._folderGenerations.get(data.folderURI) ||
+            previous.uidValidity !== epoch
+          ) {
+            if (previous) {
+              this._remove(previous);
+            }
+            return;
+          }
+          // The copy listener can announce this key before its header is
+          // published. Retain the selected source, epoch and Message-ID;
+          // getMessage still requires the actual live replacement to match all
+          // of them before exposing it. Do not read an unpublished key here.
+          this._set(oldId, {
+            ...previous,
+            messageKey: data.newMessageKey,
+          });
           automationOnlyLog(
             "attachment-delete-msgkey-changed",
             `associating new key ${data.newMessageKey} with id ${oldId}`
@@ -2044,7 +2283,7 @@ export class MessageListTracker {
     if (Array.isArray(messages)) {
       messages = this._createEnumerator(messages);
     }
-    while (messages.hasMoreElements()) {
+    while (!messageList.isDone && messages.hasMoreElements()) {
       const next = messages.getNext();
       await messageList.addMessage(next);
     }

@@ -890,6 +890,10 @@ class TestPanoramaAppWrittenDelimiterMigration(MarionetteTestCase):
                 root.createClientSubfolderInfo(name, delimiter, 0, true);
               }
               const folder = server.rootFolder.getChildNamed(name);
+              // A new server already has a client INBOX with an unknown
+              // delimiter; record the listed "/" like a server LIST would.
+              folder.QueryInterface(Ci.nsIMsgImapMailFolder).hierarchyDelimiter =
+                delimiter;
               const database = folder.msgDatabase;
               database.dBFolderInfo.setUint32Property("UIDValidity", 94);
               const header = database.createNewHdrWithSpecificMsgKey(40 + index);

@@ -81,9 +81,10 @@ add_task(function testSender() {
     "«ΠΟΛΙΤΗΣ»"
   );
 
+  // The canonical serialization collapses display-name whitespace.
   test(
     "John Doe \xF5  <db@null.invalid>",
-    "John Doe õ  <db@null.invalid>",
+    "John Doe õ <db@null.invalid>",
     "ISO-8859-1"
   );
 

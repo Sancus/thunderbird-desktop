@@ -118,7 +118,9 @@ add_task(function testRecipients() {
   );
   Assert.equal(message.recipients, "Chloë's Café <db@null.invalid>");
   Assert.equal(message.ccList, "Pedro's Piñata <db@null.invalid>");
-  Assert.equal(message.bccList, "Hidden Jalapeño <db@null.invalid>");
+  // One encoded word is a display phrase, so its decoded "<...>" is part of
+  // the quoted name rather than an address.
+  Assert.equal(message.bccList, '"Hidden Jalapeño <db@null.invalid>"');
 });
 
 add_task(function testSubject() {

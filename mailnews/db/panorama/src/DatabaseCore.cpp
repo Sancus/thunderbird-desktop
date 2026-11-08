@@ -342,6 +342,9 @@ nsresult RestorePending(nsIFile* profile, bool& pending,
   nsCOMPtr<nsIFile> work;
   MOZ_TRY(RestoreWork(profile, getter_AddRefs(work), false));
   if (!work) return NS_OK;
+  bool linked = false;
+  MOZ_TRY(work->IsSymlink(&linked));
+  if (linked) return NS_OK;
   nsCString path;
   MOZ_TRY(work->GetNativePath(path));
 #ifdef XP_WIN
@@ -596,7 +599,7 @@ DatabaseCore::Observe(nsISupports* aSubject, const char* aTopic,
     if (NS_SUCCEEDED(rv))
       rv = NS_GetSpecialDirectory(NS_APP_PROFILE_LOCAL_DIR_STARTUP,
                                   getter_AddRefs(local));
-    if (NS_SUCCEEDED(rv) && !hasRestore &&
+    if (NS_SUCCEEDED(rv) && !hasRestore && !hasAudit &&
         !StaticPrefs::mail_panorama_enabled_AtStartup())
       rv = NS_ERROR_NOT_AVAILABLE;
     if (NS_SUCCEEDED(rv)) rv = ArmProfileStartup(profile, local);
@@ -9495,8 +9498,6 @@ nsresult RestoreMeasure(StartupRestoreFD& node, StartupRestoreStamp& stamp) {
     NS_ENSURE_TRUE(PR_GetOpenFileInfo64(node.io, &info) == PR_SUCCESS,
                    NS_ERROR_FAILURE);
     stamp.size = info.size;
-    // Unix NSPR open-file times have whole seconds only; keep the millisecond
-    // nsIFile time, whose path is pinned to this descriptor below.
 #ifdef XP_WIN
     stamp.modified = info.modifyTime / 1000;
 #endif
@@ -9585,7 +9586,6 @@ nsresult RestoreOpen(nsIFile* file, StartupRestoreFD& node, bool writable) {
     NS_ENSURE_TRUE(actual.id == expected, NS_ERROR_NOT_AVAILABLE);
   }
 #else
-  // Writers need read-write IO; a lazy read-only one cannot be truncated.
   if (writable && !directory) {
     int fd = open(node.path.get(), O_RDWR | O_NOFOLLOW | O_CLOEXEC);
     NS_ENSURE_TRUE(fd >= 0, NS_ERROR_FILE_ACCESS_DENIED);
@@ -9850,7 +9850,6 @@ nsresult RestoreTree(ProfileRestoreState& state, StartupRestoreFD& root,
         !physical || (found != expected.end() && !found->nativeId.IsEmpty() &&
                       found->nativeId == item.nativeId),
         NS_ERROR_NOT_AVAILABLE);
-    // Manifest order differs from inventory order; match each path once.
     NS_ENSURE_TRUE(
         found != expected.end() &&
             (subset || std::count_if(expected.begin(), expected.end(),
@@ -12405,7 +12404,8 @@ nsresult RestoreExecute(JSContext* cx, ProfileStartupOperation& operation) {
   for (uint32_t i = 0; i < count; ++i) {
     auto& root = *state.roots[i];
     if (root.archive)
-      MOZ_TRY(RestoreTree(state, *root.archive, root.after, false));
+      MOZ_TRY(
+          RestoreTree(state, *root.archive, root.after, false, false, false));
     nsCString stage("root-"_ns), saved("saved-"_ns);
     stage.AppendInt(i);
     saved.AppendInt(i);
@@ -12601,7 +12601,8 @@ nsresult DatabaseCore::CheckProfileRestore(
   for (uint32_t i = 0; i < state.roots.Length(); ++i) {
     auto& root = *state.roots[i];
     if (root.archive)
-      MOZ_TRY(RestoreTree(state, *root.archive, root.after, false));
+      MOZ_TRY(
+          RestoreTree(state, *root.archive, root.after, false, false, false));
     MOZ_TRY(RestoreRetired(state, root));
     bool restored = state.outcome == "restored"_ns;
     NS_ENSURE_TRUE(root.phase == (restored ? 3U : 6U), NS_ERROR_NOT_AVAILABLE);

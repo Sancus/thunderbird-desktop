@@ -27201,6 +27201,7 @@ TEST_F(DeliveryCoreStartupRestore, RestoreRetainsDisplacedNewerData) {
 }
 TEST_F(DeliveryCoreStartupRestore,
        RestoreStreamingCopyHasBoundedChunksAndExactLength) {
+  ASSERT_EQ(NS_OK, WriteStartupFile("𐀀", "retained unicode path"_ns));
   ASSERT_EQ(NS_OK, PrepareRestore(4 * 65536 + 37));
   ASSERT_EQ(NS_OK, RunRestore());
   ExpectRestoreBytes(true);

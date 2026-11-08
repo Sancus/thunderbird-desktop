@@ -46,6 +46,7 @@
 
 #ifdef XP_WIN
 #  include "MigrationFileSystem.h"
+#  include "nsILocalFileWin.h"
 #endif
 
 #include <algorithm>
@@ -9481,6 +9482,16 @@ nsresult StartupBackup(JSContext* cx, ProfileStartupOperation& operation,
   NS_ENSURE_TRUE(rootCount, NS_ERROR_FILE_CORRUPTED);
   nsCOMPtr<nsIFile> archive;
   MOZ_TRY(manifest->GetParent(getter_AddRefs(archive)));
+#ifdef XP_WIN
+  // Copies live below the fixed panorama-migration-<profile>\backup\root-N
+  // prefix, longer than the profile's own, so a copy of a legacy file close to
+  // MAX_PATH exceeds it. Read copies through the extended-length spelling;
+  // clones and appended children keep it. Original paths stay plain, and the
+  // JS backup writer admitted every copy component (no ".", "..", reparse).
+  nsCOMPtr<nsILocalFileWin> longArchive = do_QueryInterface(archive);
+  NS_ENSURE_TRUE(longArchive, NS_ERROR_UNEXPECTED);
+  MOZ_TRY(longArchive->SetUseDOSDevicePathSyntax(true));
+#endif
   for (uint32_t i = 0; i < rootCount; ++i) {
     JS::Rooted<JSObject*> root(cx), entries(cx), entry(cx), parts(cx);
     MOZ_TRY(StartupItem(cx, roots, i, &root));

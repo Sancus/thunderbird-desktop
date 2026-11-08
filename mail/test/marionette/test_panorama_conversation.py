@@ -24,6 +24,8 @@ class TestPanoramaConversation(MarionetteTestCase):
         )
         prefs = {
             "mail.panorama.enabled": True,
+            # Startup refusals quit before any window; log their recovery reason.
+            "devtools.console.stdout.chrome": True,
             "mailnews.database.global.indexer.enabled": True,
             "mailnews.default_view_flags": 0,
             "mailnews.mark_message_read.auto": False,

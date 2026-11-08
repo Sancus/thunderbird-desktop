@@ -377,7 +377,9 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         """Use the ordinary runner after a normal quit, with a fresh profile."""
         self.stop_application()
         self.marionette.instance.restart(
-            prefs={**(self.original_prefs or {}), "mail.panorama.enabled": enabled},
+            # Startup refusals quit before any window; log their recovery reason.
+            prefs={**(self.original_prefs or {}), "mail.panorama.enabled": enabled,
+                   "devtools.console.stdout.chrome": True},
             clean=True,
         )
         self.marionette.raise_for_port(timeout=self.marionette.startup_timeout)

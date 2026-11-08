@@ -54,7 +54,12 @@ add_task(function test_messagePropertiesRoundTrip() {
     addedMessage.date,
     new Date(generatedMessage.headers.Date).valueOf() * 1000
   );
-  Assert.equal(addedMessage.author, generatedMessage.headers.From);
+  // Ingestion stores the canonical serialization of the parsed From header,
+  // which quotes a display name only when it requires quoting.
+  Assert.equal(
+    addedMessage.author,
+    `${generatedMessage.fromName} <${generatedMessage.fromAddress}>`
+  );
   Assert.equal(addedMessage.recipients, generatedMessage.headers.To.join());
   Assert.equal(addedMessage.ccList, generatedMessage.headers.Cc.join());
   Assert.equal(addedMessage.bccList, "");

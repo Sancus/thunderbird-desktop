@@ -10273,14 +10273,19 @@ nsresult RestoreRemoveTree(ProfileRestoreState& state, StartupRestoreFD& root,
   MOZ_TRY(RestoreBoundary(state));
   MOZ_TRY(root.SetPermissions(0700));
   const nsTArray<StartupRestoreEntry>* next = nullptr;
+  StartupRestoreFD* newer = nullptr;
   for (const auto& owner : state.roots)
-    if (owner->live.get() == &root)
+    if (owner->live.get() == &root) {
       next = state.action == "restore"_ns ? &owner->after : &owner->before;
-  nsTArray<StartupRestoreEntry> actual;
+      newer = owner->newer.get();
+    }
+  nsTArray<StartupRestoreEntry> actual, retained;
   MOZ_TRY(RestoreInventory(root, ""_ns, actual, profile, 0, &state));
+  if (newer)
+    MOZ_TRY(RestoreInventory(*newer, ""_ns, retained, false, 0, &state));
   for (const auto& item : actual) {
     bool known = false;
-    for (const auto* list : {&entries, next})
+    for (const auto* list : {&entries, next, &retained})
       if (list)
         for (const auto& e : *list)
           known |=
@@ -10302,7 +10307,11 @@ nsresult RestoreRemoveTree(ProfileRestoreState& state, StartupRestoreFD& root,
     bool keep = false;
     if (next)
       for (const auto& e : *next)
-        if (e.path == item.path && e.directory == item.directory) keep = true;
+        keep |= e.path == item.path && e.directory == item.directory &&
+                (!newer || item.directory ||
+                 (e.hash == item.hash && e.size == item.size &&
+                  e.modified == item.modified &&
+                  e.permissions == item.permissions));
     if (keep) continue;
     StartupRestoreFD parent;
     nsCString leaf;
@@ -10738,8 +10747,9 @@ nsresult ProfileRestoreState::Check() {
   for (auto* file : {work.get(), container.get(), parent.get()})
     if (file) MOZ_TRY(RestorePin(*file));
   for (const auto& root : roots)
-    for (auto* file : {root->live.get(), root->archive.get(), root->stage.get(),
-                       root->saved.get(), root->retired.get()})
+    for (auto* file :
+         {root->live.get(), root->archive.get(), root->stage.get(),
+          root->saved.get(), root->retired.get(), root->newer.get()})
       if (file) MOZ_TRY(RestorePin(*file));
   for (const auto& file : dependencies) MOZ_TRY(RestorePin(*file));
 #ifdef XP_WIN
@@ -10768,8 +10778,9 @@ nsresult ProfileRestoreState::Close() {
     if (NS_SUCCEEDED(first)) first = rv;
   };
   for (const auto& root : roots)
-    for (auto* file : {root->live.get(), root->archive.get(), root->stage.get(),
-                       root->saved.get(), root->retired.get()})
+    for (auto* file :
+         {root->live.get(), root->archive.get(), root->stage.get(),
+          root->saved.get(), root->retired.get(), root->newer.get()})
       close(file);
   for (const auto& file : dependencies) close(file.get());
   close(container.get());
@@ -11695,7 +11706,8 @@ nsresult RestoreProgress(JSContext* cx, ProfileRestoreState& state) {
                       std::pair{"archiveIdentity", &root.archiveIdentity},
                       std::pair{"stageIdentity", &root.stageIdentity},
                       std::pair{"savedIdentity", &root.savedIdentity},
-                      std::pair{"retiredIdentity", &root.retiredIdentity}})
+                      std::pair{"retiredIdentity", &root.retiredIdentity},
+                      std::pair{"newerIdentity", &root.newerIdentity}})
       MOZ_TRY(RestoreText(cx, record, pair.first, *pair.second));
     MOZ_TRY(RestoreSnapshot(cx, root.before, root.beforeMode,
                             root.beforeModified, &before));
@@ -12376,6 +12388,7 @@ nsresult RestoreExecute(JSContext* cx, ProfileStartupOperation& operation) {
       MOZ_TRY(StartupText(cx, saved, "stageIdentity", root->stageIdentity));
       MOZ_TRY(StartupText(cx, saved, "savedIdentity", root->savedIdentity));
       MOZ_TRY(StartupText(cx, saved, "retiredIdentity", root->retiredIdentity));
+      MOZ_TRY(StartupText(cx, saved, "newerIdentity", root->newerIdentity));
       MOZ_TRY(StartupNumber(cx, saved, "phase", 0, 6, number));
       root->phase = number;
     } else {
@@ -12523,7 +12536,19 @@ nsresult RestoreExecute(JSContext* cx, ProfileStartupOperation& operation) {
       if (!root.phase)
         MOZ_TRY(RestoreTree(state, *root.live, root.before, i == 0));
       else if (root.phase != 6) {
+        nsCString leaf("newer-"_ns);
+        leaf.AppendInt(i);
+        if (root.phase >= 2 && root.phase <= 4)
+          MOZ_TRY(
+              RestoreChild(state, leaf, root.newerIdentity, root.newer, cx));
         if (root.phase == 2 || root.phase == 3) {
+          // Retain the whole current, possibly newer, live root first.
+          nsTArray<StartupRestoreEntry> current;
+          MOZ_TRY(
+              RestoreInventory(*root.live, ""_ns, current, i == 0, 0, &state));
+          MOZ_TRY(RestoreCopyTree(state, *root.live, *root.newer, current,
+                                  root.live->identity.permissions,
+                                  root.live->identity.modified, false));
           root.phase = 4;
           MOZ_TRY(RestoreProgress(cx, state));
         }

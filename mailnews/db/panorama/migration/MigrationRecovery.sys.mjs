@@ -349,6 +349,30 @@ export async function requestMigrationRestoreRecovery(
   if ((await IOUtils.readUTF8(source)) !== before) {
     throw new Error("Restore progress changed during recovery request");
   }
+  const roots = request.progress?.roots;
+  if (
+    action === "retry" &&
+    pending &&
+    Array.isArray(roots) &&
+    roots.length &&
+    !request.progress.outcome &&
+    roots.every(root => root.phase === 0)
+  ) {
+    // No live root changed: keep this attempt, prepare the same one afresh.
+    const ledger = restoreFile(
+      PathUtils.join(
+        PathUtils.parent(path),
+        `restore-${request.operationId}-${request.progress.generation}.failed.json`
+      )
+    );
+    await IOUtils.writeUTF8(ledger.path, before, { mode: "create", flush: true });
+    delete request.progress;
+    request.stagingParent = await IOUtils.createUniqueDirectory(
+      PathUtils.parent(profilePath),
+      "panorama-restore-",
+      0o700
+    );
+  }
   request.action = action === "retry" ? "restore" : action;
   await writeRestoreRequest(path, request, {
     mode: pending ? "overwrite" : "create",

@@ -1154,6 +1154,31 @@ add_task(async function test_restoreRecoveryChangesOnlyTheRequestedAction() {
   Assert.deepEqual(await IOUtils.read(input.backup.path), input.manifest);
 });
 
+add_task(async function test_unmutatedRetryPreparesFreshAndKeepsLedger() {
+  const input = await restoreRequestInput();
+  const request = await input.request();
+  const path = migrationRestoreRequestPath(input.profilePath);
+  // Request-boundary fixture only: real custody and progress are native tests.
+  const failed = {
+    ...request,
+    progress: { generation: 2, firstError: 1, roots: [{ phase: 0 }] },
+  };
+  await IOUtils.writeJSON(path, failed);
+  const bytes = await IOUtils.readUTF8(path);
+  const fresh = await input.recover("retry");
+  Assert.deepEqual(fresh, { ...request, stagingParent: fresh.stagingParent });
+  Assert.notEqual(fresh.stagingParent, request.stagingParent);
+  Assert.ok(await IOUtils.exists(request.stagingParent), "Keep failed staging");
+  const ledger = PathUtils.join(
+    PathUtils.parent(path),
+    `restore-${request.operationId}-2.failed.json`
+  );
+  Assert.equal(await IOUtils.readUTF8(ledger), bytes, "Exact failed ledger");
+  failed.progress.roots = [{ phase: 1 }];
+  await IOUtils.writeJSON(path, failed);
+  Assert.deepEqual(await input.recover("retry"), failed, "Mutated roots stay");
+});
+
 add_task(async function test_changedArchiveCannotAuthorizeRestoreRetry() {
   const input = await restoreRequestInput();
   await input.request();

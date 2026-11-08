@@ -147,18 +147,20 @@ thunderbird --new-instance --profile /absolute/profile --panorama-restore-rollba
 
 These actions are mutually exclusive with a new restore request. This process
 rechecks identity, records only the supported action, and quits. Retry requires
-the original verified archive and dependencies. Explicit rollback after cutover
-can use the native-retained verified manifest, stage, saved-before data, ledger
-and physical custody when the original after-input is unavailable. Missing or
-conflicting retained proof refuses; JSON, timestamps or partial bytes alone
-grant no authority. After the request exits, run the ordinary command above for
-native recovery; it settles and quits. Only complete verified settlement allows
-a further fresh ordinary process. Changed, unknown or mixed-root states block.
+the original verified archive and dependencies; if no root was changed yet, it
+keeps that attempt's staging and exact `restore-<id>-<n>.failed.json` ledger and
+prepares the same approved operation in fresh owner-only staging. Rollback can
+use the native-retained verified manifest, stage, saved-before data and custody
+when the original after-input is unavailable. Missing or conflicting retained
+proof refuses; JSON or timestamps alone grant no authority. After the request
+exits, run the ordinary command above; it recovers, settles and quits. Only
+complete verified settlement allows a further ordinary process. Other changed,
+unknown or mixed states block.
 
-Successful full rollback returns every displaced root, rather than mixing roots
-from different attempts. Failed rollback retains the guard, first error and all
-remaining data: preserve its diagnostic and resolve that exact failure. The
-original archive and retained evidence are never discarded to make retry succeed.
+Full rollback first copies and verifies each current root, including data
+written since restoration, into `newer-<n>` beside its saved copy, then returns
+every saved root without mixing attempts. Failed rollback keeps its guard, first
+error and all data. Archive and retained evidence are never discarded.
 
 ### Validation
 

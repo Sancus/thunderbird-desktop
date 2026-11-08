@@ -91,9 +91,10 @@ struct StartupRestoreEntry {
 };
 struct StartupRestoreRoot {
   ~StartupRestoreRoot();
-  UniquePtr<StartupRestoreFD> live, archive, stage, saved, retired;
+  UniquePtr<StartupRestoreFD> live, archive, stage, saved, retired, newer;
   nsTArray<StartupRestoreEntry> before, after;
-  nsCString archiveIdentity, stageIdentity, savedIdentity, retiredIdentity;
+  nsCString archiveIdentity, stageIdentity, savedIdentity, retiredIdentity,
+      newerIdentity;
   uint32_t phase = 0, beforeMode = 0, afterMode = 0;
   int64_t beforeModified = 0, afterModified = 0;
 };

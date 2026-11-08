@@ -65,6 +65,7 @@ mime_stream_data::mime_stream_data()
       obj(nullptr),
       options(nullptr),
       headers(nullptr),
+      channel_headers_set(false),
       output_emitter(nullptr) {}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1575,8 +1576,11 @@ extern "C" nsresult mimeEmitterAddAllHeaders(MimeDisplayOptions* opt,
   mime_stream_data* msd = GetMSD(opt);
   if (!msd) return NS_ERROR_FAILURE;
 
+  // The outer most headers are written first; nested messages and attachments
+  // must not replace them, since they describe the message being displayed.
   nsCOMPtr<nsIMailChannel> mailChannel = do_QueryInterface(msd->channel);
-  if (mailChannel) {
+  if (mailChannel && !msd->channel_headers_set) {
+    msd->channel_headers_set = true;
     nsresult rv;
     nsCOMPtr<nsIMimeHeaders> mimeHeaders =
         do_CreateInstance(NS_IMIMEHEADERS_CONTRACTID, &rv);

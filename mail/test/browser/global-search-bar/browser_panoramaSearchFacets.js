@@ -4,6 +4,9 @@
 
 /* import-globals-from head_panoramaSearchFacets.js */
 
+// The shared native fixture setup alone takes about 70s on Windows ASan.
+requestLongerTimeout(2);
+
 // Use the same ordinary fixture for every bounded whole-file scenario.
 Services.scriptloader.loadSubScript(
   new URL("head_panoramaSearchFacets.js", gTestPath).href,

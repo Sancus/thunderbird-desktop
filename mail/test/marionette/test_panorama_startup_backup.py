@@ -5,7 +5,6 @@
 import hashlib
 import json
 import os
-import select
 import shutil
 import signal
 import sqlite3
@@ -1651,40 +1650,21 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.assertEqual(count, len(result["folders"]))
         return result
 
-    def kill_inside_selector_publication(self):
-        """Hold the real final selector write in a full FIFO, then SIGKILL it."""
-        import fcntl
-
-        fifo = self.profile / "panorama-profile.json.tmp"
-        os.mkfifo(fifo, 0o600)
-        holder = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
-        held = b""
-        try:
-            capacity = fcntl.fcntl(holder, getattr(fcntl, "F_SETPIPE_SZ", 1031), 4096)
-            self.marionette.instance.profile.set_preferences({"mail.panorama.enabled": True})
-            self.marionette.instance.start()
-            # Readable only once the process writes its publication; a record
-            # larger than the pipe keeps that real write blocked until the kill.
-            ready, _, _ = select.select([holder], [], [], self.marionette.startup_timeout)
-            self.assertTrue(ready, "The process must reach its final selector publication")
-            self.marionette.instance.runner.process_handler.kill(sig=signal.SIGKILL)
-            code = self.marionette.instance.runner.wait(
-                timeout=self.marionette.startup_timeout
-            )
-            self.assertEqual(-signal.SIGKILL, code)
-            while True:
-                try:
-                    chunk = os.read(holder, 65536)
-                except BlockingIOError:
-                    break
-                if not chunk:
-                    break
-                held += chunk
-        finally:
-            os.close(holder)
-            fifo.unlink(missing_ok=True)
-        self.assertEqual(capacity, len(held), "The publication write was still blocked")
-        self.assertTrue(held.startswith(b"{"))
+    def fail_selector_publication(self):
+        """Fail the real final selector write at its atomic temporary path."""
+        # Preparation writes the selector directly; only the final active
+        # publication uses this temporary path. A directory is an ordinary
+        # inventory entry, so migration reaches the actual cutover write.
+        blocker = self.profile / "panorama-profile.json.tmp"
+        blocker.mkdir(mode=0o700)
+        self.marionette.instance.profile.set_preferences({"mail.panorama.enabled": True})
+        self.marionette.instance.start()
+        code = self.marionette.instance.runner.wait(
+            timeout=self.marionette.startup_timeout
+        )
+        self.assertEqual(5, code, "An interrupted cutover exits with NS_ERROR_FAILURE")
+        self.assertEqual([], list(blocker.iterdir()))
+        blocker.rmdir()
 
     def native_unit_mappings(self):
         """Read committed native receipts from a copy, never the retained files."""
@@ -1774,9 +1754,9 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         for path, contents in originals.items():
             self.assertEqual(contents, path.read_bytes())
 
-    @unittest.skipUnless(sys.platform.startswith("linux"), "POSIX FIFO and signals")
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux process lifecycle")
     def test_interruptedActivationCutoverNeverExposesActiveState(self):
-        """S7-15.2/S7-15.3: kill after committed units inside the final publication."""
+        """S7-15.2/S7-15.3: fail the final publication after committed units."""
         self.clean_profile(False)
         source = self.create_legacy_folders(40)
         self.stop_application()
@@ -1785,14 +1765,17 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
                      for path in Path(source["root"]).rglob("*") if path.is_file()}
         work = self.profile.parent / ("panorama-migration-" + self.profile.name)
         self.created_work.add(work)
-        self.kill_inside_selector_publication()
+        self.fail_selector_publication()
 
         selector = self.profile / "panorama-profile.json"
         database = self.profile / "panorama.sqlite"
         record = json.loads(selector.read_bytes())
         self.assertEqual("prepared", record["state"], "Cutover never published active")
         journal = Path(record["identity"]["journalPath"])
-        self.assertEqual("complete", json.loads(journal.read_bytes())["stage"])
+        journal_state = json.loads(journal.read_bytes())
+        self.assertEqual("complete", journal_state["stage"],
+                         "Validation and activation finished before the failed publication")
+        self.assertIn("lastError", journal_state, "The interrupted cutover is recorded")
         mappings = self.native_unit_mappings()
         self.assertEqual(len(summaries), len(mappings))
         for folder_id, count, keys, messages in mappings.values():

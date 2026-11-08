@@ -6709,7 +6709,9 @@ DatabaseCore::MigrateFolderDatabase(nsIMsgFolder* srcFolder, JSContext* aCx,
 
 // Cache imports are separate from message-summary imports. These records never
 // confer a new physical identity or permission to replace derived folder state.
-#ifndef XP_WIN
+// Windows uses the same importer only inside the native selected-startup
+// migration, whose operation retains the profile and database leases; source
+// bytes are additionally read under a native no-reparse file lease.
 struct CacheFolder {
   nsCString originalKey, descriptor, cachePath, storePath, protocol, storeType;
   uint64_t id;
@@ -6728,6 +6730,17 @@ struct CacheImport {
   nsTArray<CacheFolder> folders;
 };
 namespace {
+
+// Retained profile paths are joined with the platform separator (PathUtils).
+#ifdef XP_WIN
+constexpr auto kCacheJSONLeaf = "\\folderCache.json"_ns;
+constexpr auto kCacheDatabaseLeaf = "\\panorama.sqlite"_ns;
+constexpr auto kCacheSelectorLeaf = "\\panorama-profile.json"_ns;
+#else
+constexpr auto kCacheJSONLeaf = "/folderCache.json"_ns;
+constexpr auto kCacheDatabaseLeaf = "/panorama.sqlite"_ns;
+constexpr auto kCacheSelectorLeaf = "/panorama-profile.json"_ns;
+#endif
 
 bool CacheText(JSContext* cx, JS::Handle<JSObject*> object, const char* name,
                const nsACString& text) {
@@ -6808,10 +6821,11 @@ nsresult CacheRequest(JSContext* cx, JS::Handle<JS::Value> value,
   input.size = number;
   if (input.version == 3) {
     nsCOMPtr<nsIFile> file;
-    MOZ_TRY(NS_NewNativeLocalFile(input.path, getter_AddRefs(file)));
-    nsCString leaf;
-    MOZ_TRY(file->GetNativeLeafName(leaf));
-    NS_ENSURE_TRUE(leaf == "folderCache.json"_ns, NS_ERROR_INVALID_ARG);
+    MOZ_TRY(NewComparableFile(input.path, getter_AddRefs(file)));
+    nsAutoString leaf;
+    MOZ_TRY(file->GetLeafName(leaf));
+    NS_ENSURE_TRUE(leaf.EqualsLiteral("folderCache.json"),
+                   NS_ERROR_INVALID_ARG);
   }
   if (input.version >= 2) {
     MOZ_TRY(ImportMember(cx, request, "proof", &field));
@@ -6840,7 +6854,7 @@ nsresult CacheRequest(JSContext* cx, JS::Handle<JS::Value> value,
     MOZ_TRY(ImportNumber(field, 1, UINT32_MAX - 1, number));
     input.manifestSize = number;
     if (input.version == 3) {
-      const nsCString expectedPath(input.profilePath + "/folderCache.json"_ns);
+      const nsCString expectedPath(input.profilePath + kCacheJSONLeaf);
       NS_ENSURE_TRUE(input.path == expectedPath, NS_ERROR_INVALID_ARG);
     }
   }
@@ -6873,8 +6887,7 @@ nsresult CacheRequest(JSContext* cx, JS::Handle<JS::Value> value,
                      NS_ERROR_FAILURE);
       NS_ENSURE_FALSE(hasSourceKey, NS_ERROR_INVALID_ARG);
       nsCOMPtr<nsIFile> original;
-      MOZ_TRY(
-          NS_NewNativeLocalFile(folder.originalKey, getter_AddRefs(original)));
+      MOZ_TRY(NewComparableFile(folder.originalKey, getter_AddRefs(original)));
       NS_ENSURE_TRUE(folder.originalKey == folder.descriptor,
                      NS_ERROR_NOT_AVAILABLE);
     } else {
@@ -7066,6 +7079,22 @@ nsresult ReadCacheBytes(const CacheImport& input, nsACString& bytes) {
   MOZ_TRY(file->GetPath(path));
   NS_ENSURE_TRUE(NS_ConvertUTF16toUTF8(path) == input.path,
                  NS_ERROR_NOT_AVAILABLE);
+#ifdef XP_WIN
+  // Hold the existing migration admission through the read: every component
+  // is a plain local directory/file and writers are denied until it closes.
+  nsCOMPtr<nsIFile> parent;
+  MOZ_TRY(file->GetParent(getter_AddRefs(parent)));
+  NS_ENSURE_TRUE(parent, NS_ERROR_FILE_INVALID_PATH);
+  RefPtr<MigrationFileSystem> fileSystem = new MigrationFileSystem();
+  nsCOMPtr<nsIPanoramaMigrationPath> lease;
+  MOZ_TRY(fileSystem->Admit(file, parent,
+                            nsIPanoramaMigrationFileSystem::KIND_FILE,
+                            getter_AddRefs(lease)));
+  auto closeLease = MakeScopeExit([&] { (void)lease->Close(); });
+  nsAutoString admitted;
+  MOZ_TRY(lease->GetCanonicalPath(admitted));
+  NS_ENSURE_TRUE(admitted == path, NS_ERROR_NOT_AVAILABLE);
+#endif
   int64_t size;
   MOZ_TRY(file->GetFileSize(&size));
   NS_ENSURE_TRUE(size == input.size, NS_ERROR_NOT_AVAILABLE);
@@ -7561,9 +7590,8 @@ nsresult CheckCacheProjectionProof(
       NS_ENSURE_FALSE(paths.Contains(path), NS_ERROR_INVALID_ARG);
       paths.InsertOrUpdate(path, true);
       if (!r) {
-        const nsCString databasePath{input.profilePath + "/panorama.sqlite"_ns};
-        const nsCString selectorPath{input.profilePath +
-                                     "/panorama-profile.json"_ns};
+        const nsCString databasePath{input.profilePath + kCacheDatabaseLeaf};
+        const nsCString selectorPath{input.profilePath + kCacheSelectorLeaf};
         NS_ENSURE_TRUE(path != databasePath && path != selectorPath,
                        NS_ERROR_NOT_AVAILABLE);
       }
@@ -7748,9 +7776,7 @@ nsresult ReadCacheReceipt(mozIStorageConnection* connection,
   return NS_OK;
 }
 }  // namespace
-#endif
 
-#ifndef XP_WIN
 nsresult DatabaseCore::ImportFolderCacheMetadataV2(
     CacheImport& input, JSContext* cx, JS::MutableHandle<JS::Value> output) {
   auto connection = sConnection;
@@ -8202,15 +8228,21 @@ nsresult DatabaseCore::ImportFolderCacheMetadataV2(
   output.set(prepared);
   return NS_OK;
 }
-#endif
 
 NS_IMETHODIMP
 DatabaseCore::GetFolderCacheImportReceipt(JS::Handle<JS::Value> request,
                                           JSContext* cx,
                                           JS::MutableHandle<JS::Value> output) {
 #ifdef XP_WIN
-  return NS_ERROR_NOT_AVAILABLE;
-#else
+  // A Windows caller has no original-path admission of its own here. Only the
+  // live selected-startup migration, whose native operation pins the profile
+  // and database physical identities, may import or read cache receipts.
+  NS_ENSURE_TRUE(
+      mProfileStartup && mProfileStartup->opened && !mProfileStartup->ready &&
+          mProfileStartup->mode == "migrate"_ns &&
+          NS_SUCCEEDED(CheckProfileStartup(ProfileStartupToken(), true)),
+      NS_ERROR_NOT_AVAILABLE);
+#endif
   NS_ENSURE_TRUE(sInstance.get() == this && sConnection,
                  NS_ERROR_NOT_AVAILABLE);
   bool active;
@@ -8243,7 +8275,6 @@ DatabaseCore::GetFolderCacheImportReceipt(JS::Handle<JS::Value> request,
       NS_ERROR_NOT_AVAILABLE);
   output.set(result);
   return NS_OK;
-#endif
 }
 
 NS_IMETHODIMP
@@ -8251,8 +8282,15 @@ DatabaseCore::ImportFolderCacheMetadata(JS::Handle<JS::Value> request,
                                         JSContext* cx,
                                         JS::MutableHandle<JS::Value> output) {
 #ifdef XP_WIN
-  return NS_ERROR_NOT_AVAILABLE;
-#else
+  // A Windows caller has no original-path admission of its own here. Only the
+  // live selected-startup migration, whose native operation pins the profile
+  // and database physical identities, may import or read cache receipts.
+  NS_ENSURE_TRUE(
+      mProfileStartup && mProfileStartup->opened && !mProfileStartup->ready &&
+          mProfileStartup->mode == "migrate"_ns &&
+          NS_SUCCEEDED(CheckProfileStartup(ProfileStartupToken(), true)),
+      NS_ERROR_NOT_AVAILABLE);
+#endif
   NS_ENSURE_TRUE(sInstance.get() == this && sConnection,
                  NS_ERROR_NOT_AVAILABLE);
   bool active;
@@ -8417,7 +8455,6 @@ DatabaseCore::ImportFolderCacheMetadata(JS::Handle<JS::Value> request,
   // flags or live-view caches were changed, so no speculative event is emitted.
   output.set(prepared);
   return NS_OK;
-#endif
 }
 
 FolderRelocationRecovery::FolderRelocationRecovery(nsCString&& sourceId,
@@ -9154,7 +9191,6 @@ nsresult StartupContained(nsIFile* root, const nsACString& path,
 // Independent on-disk inventory. Only selected-profile roots are admitted here;
 // a path or digest does not prove an external writer has been excluded.
 nsresult StartupJSONCache(nsIFile* file, bool& empty) {
-#ifndef XP_WIN
   nsCString bytes;
   MOZ_TRY(StartupRead(file, bytes));
   dom::AutoJSAPI jsapi;
@@ -9184,9 +9220,6 @@ nsresult StartupJSONCache(nsIFile* file, bool& empty) {
   NS_ENSURE_TRUE(after == bytes, NS_ERROR_NOT_AVAILABLE);
   empty = count == 0;
   return NS_OK;
-#else
-  return NS_ERROR_NOT_AVAILABLE;
-#endif
 }
 
 nsresult StartupInventory(
@@ -11133,6 +11166,39 @@ nsresult StartupFieldsEqual(JSContext* cx, JS::Handle<JSObject*> left,
   }
   return NS_OK;
 }
+#ifdef XP_WIN
+// A Windows startup source retains its committed version2 receipt, including
+// the measured original/canonical summary and store admission. Activation
+// re-admits exactly those paths and IDs (FolderImportAdmission); reuse only
+// compares them with the durable folder_import_windows row.
+nsresult StartupWindowsImportIdentity(JSContext* cx,
+                                      JS::Handle<JSObject*> source,
+                                      FolderImportIdentity& identity) {
+  JS::Rooted<JSObject*> receipt(cx), admission(cx);
+  MOZ_TRY(StartupObject(cx, source, "receipt", &receipt));
+  MOZ_TRY(StartupObject(cx, receipt, "windowsAdmission", &admission));
+  FolderImportWindowsIdentity paths;
+  for (auto pair :
+       {std::pair{"summary", &paths.summary}, {"store", &paths.store}}) {
+    JS::Rooted<JSObject*> path(cx);
+    MOZ_TRY(StartupObject(cx, admission, pair.first, &path));
+    MOZ_TRY(ImportOriginalPath(cx, path, *pair.second));
+    for (auto field : {std::pair{"canonicalPath", &pair.second->canonicalPath},
+                       {"canonicalRoot", &pair.second->canonicalRoot}}) {
+      nsCString utf8;
+      MOZ_TRY(StartupText(cx, path, field.first, utf8));
+      NS_ENSURE_TRUE(!utf8.IsEmpty() && utf8.FindChar(0) < 0,
+                     NS_ERROR_FILE_CORRUPTED);
+      CopyUTF8toUTF16(utf8, *field.second);
+    }
+  }
+  NS_ENSURE_TRUE(!paths.summary.id.IsEmpty() &&
+                     paths.summary.canonicalPath == identity.sourcePath,
+                 NS_ERROR_NOT_AVAILABLE);
+  identity.windows = Some(std::move(paths));
+  return NS_OK;
+}
+#endif
 nsresult StartupParseFile(JSContext* cx, nsIFile* file, const nsAString& module,
                           const char* parser,
                           JS::MutableHandle<JSObject*> result) {
@@ -13886,7 +13952,6 @@ nsresult DatabaseCore::SettleProfileStartup(nsresult failure) {
   return NS_OK;
 }
 
-#ifndef XP_WIN
 nsresult DatabaseCore::CheckStartupCachePublication(JSContext* cx,
                                                     const CacheImport& input) {
   MOZ_TRY(CheckProfileStartup(ProfileStartupToken()));
@@ -13953,7 +14018,6 @@ nsresult DatabaseCore::CheckStartupCachePublication(JSContext* cx,
   NS_ENSURE_TRUE(found, NS_ERROR_NOT_AVAILABLE);
   return CheckProfileStartup(ProfileStartupToken());
 }
-#endif
 
 // A stack-owned binding map is installed only after durable activation
 // readback. Folder construction must use it before discovery can reconcile a
@@ -14433,6 +14497,9 @@ nsresult DatabaseCore::CheckProfileActivation(
     NS_ENSURE_FALSE(declaredPaths.Contains(path), NS_ERROR_NOT_AVAILABLE);
     declaredPaths.Insert(path);
     native.databaseSourceId = current;
+#ifdef XP_WIN
+    MOZ_TRY(StartupWindowsImportIdentity(cx, source, native));
+#endif
     bool planned = false;
     for (const auto& retained : operation.sources) {
       planned |= retained.id == native.sourceId && retained.path == path &&
@@ -14494,6 +14561,13 @@ nsresult DatabaseCore::CheckProfileActivation(
     NS_ENSURE_TRUE(normalized, NS_ERROR_OUT_OF_MEMORY);
     for (const char* name : {"token", "sourceSha256", "folderId", "keys"})
       MOZ_TRY(StartupCopy(cx, full, normalized, name));
+#ifdef XP_WIN
+    // Physical journals retain the complete version2 receipt: the measured
+    // admission and source file ID that the native lookup has just matched.
+    for (const char* name : {"version", "sourceId", "databaseSourceId",
+                             "windowsAdmission", "sourcePhysicalIdentity"})
+      MOZ_TRY(StartupCopy(cx, full, normalized, name));
+#endif
     // Unix journals deliberately store this four-field projection. Identity
     // was independently checked by native receipt lookup and source hashing.
     actual.setObject(*normalized);
@@ -14959,7 +15033,6 @@ nsresult DatabaseCore::CheckProfileActivation(
             NS_ERROR_OUT_OF_MEMORY);
         actual.setObject(*request);
         if (reusing) {
-#ifndef XP_WIN
           CacheImport input;
           MOZ_TRY(CacheRequest(cx, actual, input));
           NS_ENSURE_TRUE(input.databaseId == current, NS_ERROR_NOT_AVAILABLE);
@@ -14993,15 +15066,11 @@ nsresult DatabaseCore::CheckProfileActivation(
             MOZ_TRY(
                 CheckStoredJSONCacheReceipt(cx, sConnection, input, receipt));
           MOZ_TRY(CacheParseJSON(cx, receipt, &expected));
-#else
-          return NS_ERROR_NOT_AVAILABLE;
-#endif
         } else {
           MOZ_TRY(GetFolderCacheImportReceipt(actual, cx, &expected));
         }
         actual.setObject(*saved);
         MOZ_TRY(StartupEqual(cx, expected, actual));
-#ifndef XP_WIN
         if (!reusing) {
           CacheImport input;
           JS::Rooted<JS::Value> requestValue(cx, JS::ObjectValue(*request));
@@ -15033,7 +15102,6 @@ nsresult DatabaseCore::CheckProfileActivation(
             cacheStoreRoots.AppendElement(folder.storePath);
           }
         }
-#endif
       }
     }
   }

@@ -356,12 +356,10 @@ class DatabaseCore : public nsIDatabaseCore,
   static StaticRefPtr<DatabaseCore> sInstance;
   static bool sDatabaseIsNew;  // If the database was created in this session.
   nsCString mCacheOriginGeneration;  // Empty after reopening an existing DB.
-#ifndef XP_WIN
   nsresult CheckStartupCachePublication(JSContext* cx,
                                         const CacheImport& input);
   nsresult ImportFolderCacheMetadataV2(CacheImport& input, JSContext* cx,
                                        JS::MutableHandle<JS::Value> output);
-#endif
   static nsCOMPtr<mozIStorageConnection> sConnection;
   static nsTHashMap<nsCString, nsCOMPtr<mozIStorageStatement>> sStatements;
 

@@ -393,7 +393,9 @@ nsMsgStatusFeedback.prototype = {
   _statusFeedbackProgress: -1,
   _statusLastShown: 0,
   _statusQueue: null,
-  _timeoutDelay: ChromeUtils.isInAutomation ? 50 : 500,
+  // Automation uses a short delay so tests can see idle gaps between brief
+  // background requests. Only Cu exposes isInAutomation.
+  _timeoutDelay: Cu.isInAutomation ? 50 : 500,
 
   // unload - call to remove links to listeners etc.
   unload() {

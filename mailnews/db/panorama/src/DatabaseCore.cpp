@@ -242,6 +242,16 @@ static nsresult GetComparablePath(nsIFile* file, nsACString& path) {
 #endif
 }
 
+// The inverse of GetComparablePath for retained UTF-8 path strings. Windows
+// native 8-bit paths use the ANSI code page, not UTF-8.
+static nsresult NewComparableFile(const nsACString& path, nsIFile** file) {
+#ifdef XP_WIN
+  return NS_NewLocalFile(NS_ConvertUTF8toUTF16(path), file);
+#else
+  return NS_NewNativeLocalFile(path, file);
+#endif
+}
+
 namespace {
 nsresult RestoreOpen(nsIFile*, StartupRestoreFD&, bool writable = false);
 nsresult RestorePin(StartupRestoreFD&);

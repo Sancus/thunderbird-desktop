@@ -2681,26 +2681,21 @@ function captureStartupMigration(signal, nativeAudit) {
   }
   const windows = AppConstants.platform === "win";
   if (windows) {
-    // Native IMAP protocol units have Windows import admission, but ordinary
-    // reuse revalidates their unit receipts (validateMorkFolderReceipt) by
-    // re-admitting the original summary/offline-store identities. Refuse
-    // before any copy or selection rather than let a later offline download
-    // or folder removal block every subsequent startup.
-    if (
-      serverSummaries.length ||
-      summaries.some(source => source.protocol !== "none")
-    ) {
-      throw new Error(
-        "Windows startup IMAP migration requires reuse admission"
-      );
-    }
+    // Native IMAP protocol units use the same Windows import admission as
+    // local folders. Migration and activation re-admit the original summary
+    // and offline-store identities; ordinary reuse compares the committed
+    // receipt with the durable native row and retained journal intent only
+    // (validateRetainedMorkProtocolUnitReceipt), so a later offline download,
+    // compaction or folder removal does not block subsequent startups.
     // Every retained identity below (journal4/7 normalizedPath, native target
     // descriptors and receipts) uses the admitted final spelling. A short-name,
     // case or other alias spelling would only fail after the work directory
     // exists, so require the actual physical spelling before creating it.
     checkWindowsStartupSpelling(
       [profile.path, ...servers.map(server => server.root)],
-      [...summaries, ...books, ...caches].map(input => input.path)
+      [...summaries, ...serverSummaries, ...books, ...caches].map(
+        input => input.path
+      )
     );
   }
   // The stable outside-profile path preserves discoverable failed attempts.

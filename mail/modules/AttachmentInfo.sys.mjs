@@ -192,6 +192,21 @@ export class AttachmentInfo {
       unavailable();
     }
     const current = selected.database.getMsgHdrForKey(selected.key);
+    dump(
+      "CI052-DIAG current " +
+        JSON.stringify({
+          current: !!current,
+          currentKey: current?.messageKey,
+          key: selected.key,
+          currentFolder: current?.folder?.URI,
+          folder: selected.folder.URI,
+          currentMessageId: current?.messageId,
+          messageId: selected.messageId,
+          selectedMessageKey: selected.message.messageKey,
+          selectedMessageFolder: selected.message.folder?.URI,
+        }) +
+        String.fromCharCode(10)
+    );
     if (
       !current ||
       current.messageKey !== selected.key ||

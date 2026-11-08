@@ -5046,7 +5046,7 @@ class DeliveryCoreReferences : public testing::Test {
           "[{\"role\":\"imap-server-root-summary\",\"protocol\":\"imap\","
           "\"id\":\"server-summary:startup-account-store.msf\",\"path\":"_ns +
           path + ",\"sha256\":\""_ns + rootHash + "\",\"size\":"_ns +
-          nsPrintfCString("%u", rootSummary->Length()) + ",\"serverKey\":"_ns +
+          nsPrintfCString("%zu", rootSummary->Length()) + ",\"serverKey\":"_ns +
           server + ",\"serverRoot\":"_ns + serverRoot +
           ",\"storeContractID\":\"@mozilla.org/msgstore/berkeleystore;1\","
           "\"storeType\":\"mbox\"}]"_ns;
@@ -5070,7 +5070,7 @@ class DeliveryCoreReferences : public testing::Test {
           path + ",\"storePath\":"_ns + store + ",\"serverRoot\":"_ns + root +
           ",\"serverKey\":"_ns + server + ",\"physicalRelativePath\":"_ns +
           relative + ",\"sha256\":\""_ns + hash + "\",\"size\":"_ns +
-          nsPrintfCString("%u", localBytes.Length()) + ",\"storeType\":\""_ns +
+          nsPrintfCString("%zu", localBytes.Length()) + ",\"storeType\":\""_ns +
           (maildir ? "maildir"_ns : "mbox"_ns) +
           "\",\"storeContractID\":\""_ns +
           (maildir ? "@mozilla.org/msgstore/maildirstore;1"_ns
@@ -5109,7 +5109,7 @@ class DeliveryCoreReferences : public testing::Test {
     if (completeCache)
       caches = "[{\"id\":\"native-json-source\",\"path\":"_ns + cachePath +
                ",\"sha256\":\""_ns + digest + "\",\"size\":"_ns +
-               nsPrintfCString("%u", raw.Length()) + "}]"_ns;
+               nsPrintfCString("%zu", raw.Length()) + "}]"_ns;
     const nsCString plan(
         "{\"profilePath\":@PROFILE@,\"mode\":\"migrate\",\"sources\":"_ns +
         sources + ",\"caches\":"_ns + caches + ",\"serverSummaries\":"_ns +

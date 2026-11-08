@@ -237,7 +237,7 @@ nsresult StartupDirectory(nsIFile* file, nsACString& path) {
   MOZ_TRY(file->IsDirectory(&directory));
   MOZ_TRY(file->IsSymlink(&linked));
   NS_ENSURE_TRUE(directory && !linked, NS_ERROR_FILE_ACCESS_DENIED);
-  MOZ_TRY(file->GetNativePath(path));
+  MOZ_TRY(GetComparablePath(file, path));
   // Every ancestor must retain its literal spelling; a link at any depth is
   // not a selected physical directory admission.
   nsCOMPtr<nsIFile> current = file;
@@ -252,7 +252,7 @@ nsresult StartupDirectory(nsIFile* file, nsACString& path) {
   MOZ_TRY(file->Clone(getter_AddRefs(normalized)));
   MOZ_TRY(normalized->Normalize());
   nsAutoCString actual;
-  MOZ_TRY(normalized->GetNativePath(actual));
+  MOZ_TRY(GetComparablePath(normalized, actual));
   NS_ENSURE_TRUE(actual == path, NS_ERROR_FILE_INVALID_PATH);
   return NS_OK;
 }
@@ -8972,7 +8972,7 @@ nsresult StartupContained(nsIFile* root, const nsACString& path,
                           nsIFile** file) {
   MOZ_TRY(NS_NewNativeLocalFile(path, file));
   nsAutoCString literal;
-  MOZ_TRY((*file)->GetNativePath(literal));
+  MOZ_TRY(GetComparablePath((*file), literal));
   NS_ENSURE_TRUE(literal == path, NS_ERROR_FILE_INVALID_PATH);
   bool inside;
   MOZ_TRY(root->Contains(*file, &inside));
@@ -9062,11 +9062,11 @@ nsresult StartupInventory(nsIFile* directory, nsTArray<nsCString>& sources,
                StringEndsWith(name, ".mab"_ns) ||
                name == "folderCache.json"_ns || name == "panacea.dat"_ns) {
       MOZ_TRY(StartupRegular(file));
-      MOZ_TRY(file->GetNativePath(path));
+      MOZ_TRY(GetComparablePath(file, path));
       sources.AppendElement(path);
     } else if (mailTree) {
       // A store without any summary still prevents empty initialization.
-      MOZ_TRY(file->GetNativePath(path));
+      MOZ_TRY(GetComparablePath(file, path));
       sources.AppendElement(path);
     }
   }
@@ -9128,7 +9128,7 @@ nsresult StartupConfiguredRoots(nsIFile* profile,
     if (output) {
       StartupServerRoot binding;
       binding.key = Substring(branch, 12, branch.Length() - 13);
-      MOZ_TRY(root->GetNativePath(binding.path));
+      MOZ_TRY(GetComparablePath(root, binding.path));
       MOZ_TRY(Preferences::GetCString(nsCString(branch + "type"_ns).get(),
                                       binding.protocol));
       Preferences::GetCString(nsCString(branch + "storeContractID"_ns).get(),
@@ -9211,7 +9211,7 @@ nsresult StartupJournalFile(ProfileStartupOperation& operation,
   MOZ_TRY(StartupDirectory(work, actual));
   nsCOMPtr<nsIFile> file;
   MOZ_TRY(StartupChild(work, "journal.json", getter_AddRefs(file)));
-  MOZ_TRY(file->GetNativePath(actual));
+  MOZ_TRY(GetComparablePath(file, actual));
   NS_ENSURE_TRUE(path == actual, NS_ERROR_NOT_AVAILABLE);
   MOZ_TRY(StartupRegular(file));
   file.forget(output);
@@ -9299,7 +9299,7 @@ nsresult StartupBackup(JSContext* cx, ProfileStartupOperation& operation,
         MOZ_TRY(destination->GetFileSize(&actualSize));
         NS_ENSURE_TRUE(size == actualSize, NS_ERROR_NOT_AVAILABLE);
         nsCString originalPath;
-        MOZ_TRY(originalEntry->GetNativePath(originalPath));
+        MOZ_TRY(GetComparablePath(originalEntry, originalPath));
         if (auto prior = operation.backupFiles.Lookup(originalPath))
           NS_ENSURE_TRUE(prior.Data() == expectedHash, NS_ERROR_NOT_AVAILABLE);
         operation.backupFiles.InsertOrUpdate(originalPath, expectedHash);
@@ -9619,7 +9619,7 @@ nsresult StartupServerSummaryInput(JSContext* cx, JS::Handle<JSObject*> source,
   nsCOMPtr<nsIFile> original;
   MOZ_TRY(NS_NewNativeLocalFile(output.path, getter_AddRefs(original)));
   nsCString literal, relative;
-  MOZ_TRY(original->GetNativePath(literal));
+  MOZ_TRY(GetComparablePath(original, literal));
   bool inside;
   MOZ_TRY(operation.profile->Contains(original, &inside));
   MOZ_TRY(original->GetRelativePath(operation.profile, relative));
@@ -9938,7 +9938,7 @@ nsresult DatabaseCore::ReadStartupMailSource(JSContext* cx,
   MOZ_TRY(activeJSON->Exists(&hasJSON));
   if (jsonCache) {
     nsCString actualPath;
-    MOZ_TRY(activeJSON->GetNativePath(actualPath));
+    MOZ_TRY(GetComparablePath(activeJSON, actualPath));
     auto archived = operation.backupFiles.Lookup(cachePath);
     NS_ENSURE_TRUE(hasJSON && actualPath == cachePath && archived &&
                        archived.Data() == cacheHash,
@@ -10211,7 +10211,7 @@ nsresult DatabaseCore::DescribeProfileStartup(
 #ifndef XP_WIN
     if (operation.existing) {
       nsAutoCString path;
-      MOZ_TRY(file->GetNativePath(path));
+      MOZ_TRY(GetComparablePath(file, path));
       operation.databaseFD =
           open(path.get(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
       NS_ENSURE_TRUE(
@@ -10645,7 +10645,7 @@ nsresult DatabaseCore::OpenProfileStartup(JSContext* cx,
 #ifndef XP_WIN
   // Pin the exact database file after SQLite open, not just its pathname.
   nsAutoCString databasePath;
-  MOZ_TRY(file->GetNativePath(databasePath));
+  MOZ_TRY(GetComparablePath(file, databasePath));
   if (operation.databaseFD < 0) {
     operation.databaseFD =
         open(databasePath.get(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
@@ -10980,8 +10980,8 @@ nsresult DatabaseCore::BuildStartupFolders() {
     MOZ_TRY(folder->GetSummaryFile(getter_AddRefs(summary)));
     MOZ_TRY(folder->GetFilePath(getter_AddRefs(store)));
     nsCString summaryPath, storePath;
-    MOZ_TRY(summary->GetNativePath(summaryPath));
-    MOZ_TRY(store->GetNativePath(storePath));
+    MOZ_TRY(GetComparablePath(summary, summaryPath));
+    MOZ_TRY(GetComparablePath(store, storePath));
     NS_ENSURE_TRUE(summaryPath == source.path && storePath == source.storePath,
                    NS_ERROR_NOT_AVAILABLE);
     uint64_t id;
@@ -11376,8 +11376,8 @@ nsresult DatabaseCore::BindStartupChildNames(uint64_t parentId,
     NS_ENSURE_TRUE(physical, NS_ERROR_NOT_AVAILABLE);
     MOZ_TRY(physical->GetParent(getter_AddRefs(parent)));
     nsCString expected, actual, leaf;
-    MOZ_TRY(directory->GetNativePath(expected));
-    MOZ_TRY(parent->GetNativePath(actual));
+    MOZ_TRY(GetComparablePath(directory, expected));
+    MOZ_TRY(GetComparablePath(parent, actual));
     NS_ENSURE_TRUE(actual == expected, NS_ERROR_NOT_AVAILABLE);
     MOZ_TRY(physical->GetNativeLeafName(leaf));
     nsCString decoded = DecodeFilename(NS_ConvertUTF8toUTF16(leaf));
@@ -11908,7 +11908,7 @@ nsresult DatabaseCore::CheckProfileActivation(
         for (uint32_t n = 0; n < leaves.Length(); ++n) {
           MOZ_TRY(physical->AppendNative(leaves[n]));
           nsCString body;
-          MOZ_TRY(physical->GetNativePath(body));
+          MOZ_TRY(GetComparablePath(physical, body));
           uint64_t currentId = n + 1 == leaves.Length()
                                    ? uint64_t(folder)
                                    : ancestors[ancestors.Length() - 2 - n];

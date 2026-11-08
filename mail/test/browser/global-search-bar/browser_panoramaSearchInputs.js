@@ -27,6 +27,56 @@ function diagStates(label) {
   info("DIAG013 " + label + " " + JSON.stringify(states));
 }
 
+// DIAG-015 (diagnostic only, never a candidate): who changes the fixture headers.
+function diagWatchHeaders(label) {
+  const stack = () =>
+    new Error().stack.split(String.fromCharCode(10)).slice(1, 9).join(" | ");
+  const watched = fixture.folders.slice(0, 2).map(folder => {
+    const db = folder.msgDatabase;
+    const listener = {
+      QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+      onHdrFlagsChanged(hdr, oldFlags, newFlags) {
+        info(`DIAG015 ${label} flags ${folder.name} key=${hdr.messageKey} ${oldFlags}->${newFlags} t=${Date.now()} ${stack()}`);
+      },
+      onHdrPropertyChanged(hdr, property, preChange) {
+        if (!preChange) {
+          info(`DIAG015 ${label} property ${folder.name} key=${hdr.messageKey} ${property} t=${Date.now()} ${stack()}`);
+        }
+      },
+      onHdrDeleted(hdr) {
+        info(`DIAG015 ${label} deleted ${folder.name} key=${hdr.messageKey} t=${Date.now()}`);
+      },
+      onHdrAdded(hdr) {
+        info(`DIAG015 ${label} added ${folder.name} key=${hdr.messageKey} t=${Date.now()}`);
+      },
+      onParentChanged() {},
+      onAnnouncerGoingAway() {
+        info(`DIAG015 ${label} announcer-going-away ${folder.name} t=${Date.now()} ${stack()}`);
+      },
+      onReadChanged() {
+        info(`DIAG015 ${label} read-changed ${folder.name} t=${Date.now()} ${stack()}`);
+      },
+      onJunkScoreChanged() {
+        info(`DIAG015 ${label} junk-changed ${folder.name} t=${Date.now()}`);
+      },
+      onEvent(db, event) {
+        info(`DIAG015 ${label} event ${folder.name} ${event} t=${Date.now()} ${stack()}`);
+      },
+    };
+    db.addListener(listener);
+    return [db, listener];
+  });
+  info(`DIAG015 ${label} watching t=${Date.now()}`);
+  return () => {
+    for (const [db, listener] of watched) {
+      try {
+        db.removeListener(listener);
+      } catch (e) {}
+    }
+    info(`DIAG015 ${label} unwatched t=${Date.now()}`);
+  };
+}
+
 add_task(
   async function test_nativeResultInputSurvivesControllerStopBeforeEnter() {
     await SpecialPowers.pushPrefEnv({
@@ -140,6 +190,8 @@ add_task(
 );
 
 add_task(async function test_nativeInputClearCancelsDeferredTypedSelection() {
+  const unwatch = diagWatchHeaders("test3");
+  registerCleanupFunction(unwatch);
   const owner = tabmail.openTab("glodaFacet", {
     mailSearch: { text: "nativecompletionneedle" },
   });

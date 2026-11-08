@@ -167,6 +167,23 @@ add_task(async function test_nativeInputClearCancelsDeferredTypedSelection() {
     const result = await completionResult("completionperson");
     diagStates("test3-after-completion");
     info("DIAG013 rows " + JSON.stringify(result.rows));
+    info(
+      "DIAG014 result " +
+        JSON.stringify({
+          same: result === provider.curResult,
+          searchString: result.searchString,
+          active: result.active,
+          ongoing: result.ongoing,
+          failed: result.failed,
+          sourceId: result.sourceId,
+          searchParam: input.searchParam,
+          indexer: Services.prefs.getBoolPref(
+            "mailnews.database.global.indexer.enabled"
+          ),
+          matchCount: input.controller.matchCount,
+          controllerSearch: input.controller.searchString,
+        })
+    );
     if (!result.rows.some(row => row.type == "person")) {
       info("DIAG013 direct " + JSON.stringify(await fixture.service.complete("completionperson")));
       let more;
@@ -257,9 +274,11 @@ add_task(async function test_nativeQuickFilterUsesStartupBackend() {
     do {
       progress = await fixture.service.update({ limit: 500 });
     } while (progress.moreWork);
+    diagStates("qfb-before-collect");
     const snapshot = await fixture.service.collectResults(
       "nativecompletionneedle"
     );
+    info("DIAG014 qfb-snapshot " + JSON.stringify({ sourceId: snapshot.sourceId, ids: snapshot.items.map(i => i.id) }));
     const current = fixture.expected.map(([, key]) =>
       fixture.service.resolveDocument(String(key))
     );
@@ -298,6 +317,10 @@ add_task(async function test_nativeQuickFilterUsesStartupBackend() {
       })
     );
     const tab = tabmail.currentTabInfo;
+    tab.searchPromise?.then(
+      () => info("DIAG014 qfb-facet fullSet " + tab.browser?.contentWindow?.FacetContext?.fullSet?.length),
+      e => info("DIAG014 qfb-facet rejected " + e)
+    );
     Assert.equal(tab.mode.name, "glodaFacet");
     Assert.equal(tab.mailSearch.text, "nativecompletionneedle");
     await TestUtils.waitForCondition(() => tab.searchPromise);

@@ -749,16 +749,13 @@ registerCleanupFunction(function queueFinalRssActivityLog() {
       "RSS strict cleanup entry: " +
         JSON.stringify({
           progressStarts: status._startRequests,
-          processes: status._activeProcesses.length,
-          observedProcesses: Array.from(
-            status._observedProcesses.values(),
-            process => ({
-              id: process.id,
-              state: process.state,
-              contextType: process.contextType,
-              displayText: process.displayText,
-            })
-          ),
+          runningProcesses: status._busyProcesses.size,
+          trackedProcesses: status._activeProcesses.map(process => ({
+            id: process.id,
+            state: process.state,
+            contextType: process.contextType,
+            displayText: process.displayText,
+          })),
           meteorsSpinning: status._meteorsSpinning,
           startTimer: Boolean(status._startTimeoutID),
           stopTimer: Boolean(status._stopTimeoutID),
@@ -770,7 +767,7 @@ registerCleanupFunction(function queueFinalRssActivityLog() {
         !status._startTimeoutID &&
         !status._meteorsSpinning &&
         !status._stopTimeoutID &&
-        status._activeProcesses.length == 0,
+        status._busyProcesses.size == 0,
       "The RSS fixture's real status requests finish"
     );
     Assert.equal(
@@ -779,9 +776,9 @@ registerCleanupFunction(function queueFinalRssActivityLog() {
       "RSS cleanup leaves no status requests"
     );
     Assert.equal(
-      status._activeProcesses.length,
+      status._busyProcesses.size,
       0,
-      "RSS cleanup leaves no activity processes"
+      "RSS cleanup leaves no running activity processes"
     );
     Assert.ok(
       BrowserTestUtils.isHidden(status._progressBar),

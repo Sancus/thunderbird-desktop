@@ -765,8 +765,12 @@ class TestPanoramaConversation(MarionetteTestCase):
             self.marionette.set_context(self.marionette.CONTEXT_CHROME)
 
 
-class TestPanoramaUnknownDelimiterMigration(MarionetteTestCase):
-    """Migrate app-written IMAP client folders whose delimiter is unknown or NIL."""
+class TestPanoramaAppWrittenDelimiterMigration(MarionetteTestCase):
+    """Migrate app-written IMAP client folders whose delimiter is unknown or NIL.
+
+    Sorted before TestPanoramaConversation so it starts from the healthy runner
+    profile; tearDown leaves a fresh clean profile for the next class.
+    """
 
     def setUp(self):
         super().setUp()

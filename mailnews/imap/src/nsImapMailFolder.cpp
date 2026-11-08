@@ -7150,7 +7150,8 @@ nsImapMailFolder::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
         nsTArray<RefPtr<nsIMsgDBHdr>> destinationHeaders;
         bool notifyCopy = true;
 #ifdef MOZ_PANORAMA
-        if (static_cast<nsImapUrl*>(imapUrl.get())->HasNativeOnlineCopyTargets()) {
+        if (static_cast<nsImapUrl*>(imapUrl.get())
+                ->HasNativeOnlineCopyTargets()) {
           notifyCopy = NS_SUCCEEDED(aExitCode);
           if (notifyCopy) {
             for (const auto& entry : m_copyState->m_nativeOnlineCopies) {
@@ -7162,7 +7163,8 @@ nsImapMailFolder::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
               RefPtr<nsIMsgDBHdr> header = entry->live.get();
               destinationHeaders.AppendElement(std::move(header));
             }
-            if (destinationHeaders.Length() != m_copyState->m_messages.Length()) {
+            if (destinationHeaders.Length() !=
+                m_copyState->m_messages.Length()) {
               aExitCode = NS_ERROR_NOT_AVAILABLE;
               notifyCopy = false;
             }

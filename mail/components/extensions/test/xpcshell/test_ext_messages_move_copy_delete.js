@@ -676,7 +676,9 @@ add_task(
                   action: imapUrl.imapAction,
                   uids: imapUrl.listOfMessageIds,
                   epoch: folder.msgDatabase.dBFolderInfo.imapUidValidity,
-                  keys: [...folder.messages].slice(0, 16).map(h => h.messageKey),
+                  keys: [...folder.messages]
+                    .slice(0, 16)
+                    .map(h => h.messageKey),
                 });
               } catch (ex) {
                 details.captureError = String(ex);

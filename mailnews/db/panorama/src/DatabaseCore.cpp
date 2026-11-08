@@ -9584,6 +9584,21 @@ nsresult RestoreOpen(nsIFile* file, StartupRestoreFD& node, bool writable) {
     MOZ_TRY(RestoreMeasure(node, actual));
     NS_ENSURE_TRUE(actual.id == expected, NS_ERROR_NOT_AVAILABLE);
   }
+#else
+  // Writers need read-write IO; a lazy read-only one cannot be truncated.
+  if (writable && !directory) {
+    int fd = open(node.path.get(), O_RDWR | O_NOFOLLOW | O_CLOEXEC);
+    NS_ENSURE_TRUE(fd >= 0, NS_ERROR_FILE_ACCESS_DENIED);
+    node.io = PR_ImportFile(fd);
+    if (!node.io) {
+      close(fd);
+      return NS_ERROR_FAILURE;
+    }
+    node.writable = true;
+    StartupRestoreStamp actual;
+    MOZ_TRY(RestoreMeasure(node, actual));
+    NS_ENSURE_TRUE(actual.id == node.identity.id, NS_ERROR_NOT_AVAILABLE);
+  }
 #endif
   return NS_OK;
 }
@@ -9835,8 +9850,13 @@ nsresult RestoreTree(ProfileRestoreState& state, StartupRestoreFD& root,
         !physical || (found != expected.end() && !found->nativeId.IsEmpty() &&
                       found->nativeId == item.nativeId),
         NS_ERROR_NOT_AVAILABLE);
+    // Manifest order differs from inventory order; match each path once.
     NS_ENSURE_TRUE(
-        found != expected.end() && (subset || expected[i].path == item.path) &&
+        found != expected.end() &&
+            (subset || std::count_if(expected.begin(), expected.end(),
+                                     [&](const auto& e) {
+                                       return e.path == item.path;
+                                     }) == 1) &&
             found->directory == item.directory &&
             (item.directory ||
              (found->size == item.size && found->hash == item.hash)) &&

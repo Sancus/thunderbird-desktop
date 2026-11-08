@@ -2539,7 +2539,9 @@ function captureStartupMigration(signal) {
       serverSummaries.length ||
       summaries.some(source => source.protocol !== "none")
     ) {
-      throw new Error("Windows startup IMAP migration requires reuse admission");
+      throw new Error(
+        "Windows startup IMAP migration requires reuse admission"
+      );
     }
     // Every retained identity below (journal4/7 normalizedPath, native target
     // descriptors and receipts) uses the admitted final spelling. A short-name,

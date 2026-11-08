@@ -782,10 +782,7 @@ export class MigrationJournal {
     await this.#change(async state => {
       // Only the native selected-startup journal binds cache units on Windows;
       // its #checkSource re-admits the cache file and compares its file ID.
-      if (
-        AppConstants.platform == "win" &&
-        state.version !== STARTUP_VERSION
-      ) {
+      if (AppConstants.platform == "win" && state.version !== STARTUP_VERSION) {
         throw new Error(
           "Windows cache migration requires native reparse admission"
         );

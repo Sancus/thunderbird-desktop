@@ -96,9 +96,10 @@ add_task(function testSender() {
   );
 
   // Encoded UTF-8 in a ISO-8859-2 message.
+  // A display name containing a comma stays quoted once decoded.
   test(
     "=?UTF-8?Q?H=C3=A5s=C3=A4ther=2C_David?= <db@null.invalid>",
-    "Håsäther, David <db@null.invalid>",
+    '"Håsäther, David" <db@null.invalid>',
     "ISO-8859-2"
   );
 });

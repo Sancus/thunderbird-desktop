@@ -1124,7 +1124,9 @@ var dbViewWrapperListener = {
     );
   },
   onFolderLoading() {},
-  onSearching() {},
+  onSearching() {
+    window.quickFilterBar?.reflectFiltererResults();
+  },
   onCreatedView() {
     this._allMessagesLoaded = false;
 

@@ -1000,7 +1000,15 @@ export class AttachmentInfo {
         if (
           actual &&
           expected &&
-          ["mailbox:", "imap:", "news:", "snews:"].includes(actual.protocol) &&
+          // Exchange part URLs carry the message key in their path.
+          [
+            "mailbox:",
+            "imap:",
+            "news:",
+            "snews:",
+            "x-moz-ews:",
+            "x-moz-graph:",
+          ].includes(actual.protocol) &&
           actual.protocol == expected.protocol &&
           actual.username == expected.username &&
           actual.host == expected.host &&

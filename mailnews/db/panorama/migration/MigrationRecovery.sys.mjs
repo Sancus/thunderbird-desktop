@@ -364,8 +364,8 @@ export async function requestMigrationRestoreRecovery(
         PathUtils.parent(path),
         `restore-${request.operationId}-${request.progress.generation}.failed.json`
       )
-    );
-    await IOUtils.writeUTF8(ledger.path, before, { mode: "create", flush: true });
+    ).path;
+    await IOUtils.writeUTF8(ledger, before, { mode: "create", flush: true });
     delete request.progress;
     request.stagingParent = await IOUtils.createUniqueDirectory(
       PathUtils.parent(profilePath),

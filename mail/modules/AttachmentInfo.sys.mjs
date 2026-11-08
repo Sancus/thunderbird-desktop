@@ -170,11 +170,9 @@ export class AttachmentInfo {
             containsKey: selected.database.containsKey(selected.key),
             live: selected.message.isLive,
           }) +
-          "
-" +
+          String.fromCharCode(10) +
           new Error().stack +
-          "
-"
+          String.fromCharCode(10)
       );
       throw new Components.Exception(
         "The selected attachment is no longer available",

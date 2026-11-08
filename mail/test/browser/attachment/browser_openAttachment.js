@@ -2130,5 +2130,12 @@ registerCleanupFunction(async function restoreMainWindowFocus() {
     }
   }
   info(`Active window: ${Services.focus.activeWindow?.document.documentURI}`);
+  if (AppConstants.platform == "macosx" && !Services.focus.activeWindow) {
+    // Another application became active during the save fixtures; a window
+    // focus request cannot reactivate this application on its own.
+    Cc["@mozilla.org/widget/macdocksupport;1"]
+      .getService(Ci.nsIMacDockSupport)
+      .activateApplication(true);
+  }
   await SimpleTest.promiseFocus(window);
 });

@@ -30,3 +30,4 @@ prefs = ["mail.graph.enabled=true"]
 ["test_undo.js"]
 verbose = true
 prefs = ["mail.graph.enabled=true"]
+requesttimeoutfactor = 2 # The added failure-path subtests take ~26s on every platform, near the default limit.

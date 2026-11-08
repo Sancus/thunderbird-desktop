@@ -11,6 +11,18 @@ from pathlib import Path
 
 from marionette_harness import MarionetteTestCase
 
+# CI052 DIAGNOSTIC ONLY: reach every new runner profile through a link above
+# it, like the macOS /tmp -> /private/tmp alias.
+import os as _diag_os
+import tempfile as _diag_tempfile
+if not getattr(_diag_tempfile, "_ci052_alias", None):
+    _diag_real = _diag_tempfile.mkdtemp(prefix="ci052-alias-real-")
+    _diag_link = _diag_real + "-link"
+    _diag_os.symlink(_diag_real, _diag_link)
+    _diag_tempfile.tempdir = _diag_link
+    _diag_tempfile._ci052_alias = _diag_link
+    print("CI052-DIAG alias", _diag_link, "->", _diag_real, flush=True)
+
 
 class TestPanoramaStartupBackup(MarionetteTestCase):
     """Copy the real stopped profile at ordinary comm app-startup."""

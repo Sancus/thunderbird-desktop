@@ -1749,10 +1749,13 @@ add_task(async function test_stageTransitionsPersistCancellationAndReceipts() {
  *   profilePath: string, source: string}>} Original files and retained plan.
  */
 async function startupJournalPlan() {
-  const root = await IOUtils.createUniqueDirectory(
-    PathUtils.tempDir,
-    "startup-journal-"
+  // Startup origins are compared with their normalized physical path, and the
+  // macOS temporary directory is reached through a /var link.
+  const rootFile = new FileUtils.File(
+    await IOUtils.createUniqueDirectory(PathUtils.tempDir, "startup-journal-")
   );
+  rootFile.normalize();
+  const root = rootFile.path;
   registerCleanupFunction(() => IOUtils.remove(root, { recursive: true }));
   const profilePath = PathUtils.join(root, "profile");
   const work = PathUtils.join(root, "work");

@@ -514,9 +514,10 @@ function physicalFile(path) {
   }
   const file = new FileUtils.File(path);
   if (AppConstants.platform == "win") {
-    const exists = file.exists();
+    // A plain spelling past MAX_PATH reports an existing directory as absent.
+    const io = ioFile(file);
     const kind =
-      exists && file.isDirectory()
+      io.exists() && io.isDirectory()
         ? Ci.nsIPanoramaMigrationFileSystem.KIND_DIRECTORY
         : Ci.nsIPanoramaMigrationFileSystem.KIND_FILE_OR_MISSING;
     const lease = admitWindowsMigrationPath(file, kind);
@@ -543,6 +544,33 @@ function physicalFile(path) {
   }
   file.normalize();
   return file;
+}
+
+/**
+ * Returns a clone for I/O on an admitted path that may exceed MAX_PATH.
+ * A backup copy lives below the fixed panorama-migration-<profile>\backup\
+ * root-N prefix, which is longer than the profile's own, so a copy of a legacy
+ * file close to MAX_PATH exceeds it. Windows uses the extended-length spelling;
+ * physicalFile/native admission already refuses every component spelling that
+ * this form would not normalize identically (".", "..", trailing dots/spaces,
+ * device names, reparse points). Path identity checks keep the plain spelling.
+ *
+ * @param {nsIFile} file - Admitted plain path.
+ * @returns {nsIFile} Independent clone for file-system calls only.
+ */
+function ioFile(file) {
+  const io = file.clone();
+  if (AppConstants.platform == "win") {
+    io.QueryInterface(Ci.nsILocalFileWin).useDOSDevicePathSyntax = true;
+  }
+  return io;
+}
+
+/** @param {string} path - Admitted plain path. @returns {string} IOUtils spelling. */
+function ioPath(path) {
+  return AppConstants.platform == "win"
+    ? ioFile(new FileUtils.File(path)).path
+    : path;
 }
 
 /**
@@ -680,12 +708,12 @@ async function verifyFile(path, entry) {
       : null;
   try {
     physicalFile(path);
-    const info = await IOUtils.stat(path);
+    const info = await IOUtils.stat(ioPath(path));
     if (
       info.type != "regular" ||
       info.size != entry.size ||
       !/^[a-f0-9]{64}$/.test(entry.sha256) ||
-      (await hashMigrationFile(path)) != entry.sha256
+      (await hashMigrationFile(ioPath(path))) != entry.sha256
     ) {
       throw new Error("Migration backup file differs from its source");
     }
@@ -725,7 +753,7 @@ async function verifyCopies(path, manifest) {
       const target = childPath(directory, entry.parts);
       physicalFile(target);
       if (entry.type == "directory") {
-        if ((await IOUtils.stat(target)).type != "directory") {
+        if ((await IOUtils.stat(ioPath(target))).type != "directory") {
           throw new Error("Missing migration backup directory");
         }
       } else if (entry.type == "regular") {
@@ -875,17 +903,19 @@ export function createMigrationBackupAtStartup(
       const target = new FileUtils.File(
         childPath(destination.path, entry.parts)
       );
+      // The admitted plain spelling above; file-system calls use ioFile.
+      const copy = ioFile(target);
       if (entry.type == "directory") {
-        if (!target.exists()) {
+        if (!copy.exists()) {
           if (manifest.complete) {
             throw new Error("A complete backup is missing a directory");
           }
-          target.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+          copy.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
         }
-        if (!target.isDirectory()) {
+        if (!copy.isDirectory()) {
           throw new Error("Migration backup directory is not a directory");
         }
-      } else if (target.exists()) {
+      } else if (copy.exists()) {
         checkStartupCopy(target, entry, signal);
       } else {
         if (manifest.complete) {
@@ -894,7 +924,7 @@ export function createMigrationBackupAtStartup(
         const source = new FileUtils.File(childPath(root.source, entry.parts));
         const temporary = scratch.clone();
         temporary.append("copy-" + Services.uuid.generateUUID());
-        source.copyTo(scratch, temporary.leafName);
+        ioFile(source).copyTo(ioFile(scratch), temporary.leafName);
         temporary.permissions = 0o600;
         checkStartupCopy(temporary, entry, signal);
         const output = Cc[
@@ -922,10 +952,10 @@ export function createMigrationBackupAtStartup(
         temporary.lastModifiedTime = entry.lastModified;
         temporary.permissions = entry.permissions;
         checkCancellation(signal);
-        if (target.exists()) {
+        if (copy.exists()) {
           throw new Error("Migration backup destination appeared during copy");
         }
-        temporary.moveTo(target.parent, target.leafName);
+        ioFile(temporary).moveTo(ioFile(target.parent), target.leafName);
       }
     }
   }
@@ -1064,18 +1094,19 @@ function startupPhysicalIdentity(file) {
  */
 function hashStartupFile(file, signal) {
   physicalFile(file.path);
-  if (!file.isFile()) {
+  const io = ioFile(file);
+  if (!io.isFile()) {
     throw new Error("Migration hash source is not a regular file");
   }
-  const size = file.fileSize;
-  const modified = file.lastModifiedTime;
+  const size = io.fileSize;
+  const modified = io.lastModifiedTime;
   if (!Number.isSafeInteger(size) || size < 0) {
     throw new Error("Unsupported migration hash file size");
   }
   const input = Cc["@mozilla.org/network/file-input-stream;1"].createInstance(
     Ci.nsIFileInputStream
   );
-  input.init(file, 0x01, 0, 0);
+  input.init(io, 0x01, 0, 0);
   let firstError;
   let digest;
   try {
@@ -1097,7 +1128,7 @@ function hashStartupFile(file, signal) {
       hash.update(bytes, bytes.length);
       remaining -= count;
     }
-    if (file.fileSize != size || file.lastModifiedTime != modified) {
+    if (io.fileSize != size || io.lastModifiedTime != modified) {
       throw new Error("Migration source changed while hashing");
     }
     digest = Array.from(hash.finish(false), byte =>
@@ -1129,9 +1160,10 @@ function hashStartupFile(file, signal) {
  * @param {AbortSignal} [signal] - Cancellation signal.
  */
 function checkStartupCopy(file, entry, signal) {
+  const io = ioFile(file);
   if (
-    !file.isFile() ||
-    file.fileSize != entry.size ||
+    !io.isFile() ||
+    io.fileSize != entry.size ||
     hashStartupFile(file, signal) != entry.sha256
   ) {
     throw new Error("Migration backup file differs from its source");

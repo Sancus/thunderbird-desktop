@@ -354,8 +354,13 @@ async function subtest_clear_status_bar() {
     0,
     "status bar should not have any start requests"
   );
+  // Paused and waiting processes stay tracked so they can resume; only running
+  // processes keep the status bar busy.
+  const running = status._activeProcesses.filter(
+    process => process.state == Ci.nsIActivityProcess.STATE_INPROGRESS
+  );
   Assert.equal(
-    status._activeProcesses.length,
+    running.length,
     0,
     "status bar should not have any active processes"
   );

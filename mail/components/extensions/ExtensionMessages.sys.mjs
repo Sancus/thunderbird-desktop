@@ -1804,7 +1804,17 @@ export class MessageTracker extends EventEmitter {
       if (cachedSrcMsgs.some(msgHdr => msgHdr.folder?.URI != dstFolder.URI)) {
         dstFolder.updateFolder(null);
       }
-      const deferredDstMsgs = await Promise.all(dstMsgsPromises);
+      let deferredDstMsgs;
+      try {
+        deferredDstMsgs = await Promise.all(dstMsgsPromises);
+      } catch (error) {
+        // A replaced destination database cannot identify these copies. Keep
+        // the refusal (no event) without leaving this listener rejected.
+        console.warn(
+          `Dropped ${emitMsg} notification for ${dstFolder.URI}: ${error.message}`
+        );
+        return;
+      }
       this.emit(emitMsg, cachedSrcMsgs, deferredDstMsgs);
     } else {
       const cachedDstMsgs = dstMsgs.map(

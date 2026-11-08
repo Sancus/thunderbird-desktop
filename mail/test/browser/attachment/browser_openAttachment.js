@@ -1949,7 +1949,9 @@ add_task(async function test_statusActivityMultipleWindowsAndMissedTerminal() {
     const closed = BrowserTestUtils.domWindowClosed(secondWindow);
     secondWindow.close();
     await closed;
-    Services.focus.focusedWindow = window;
+    // Assigning focusedWindow does not reactivate the main window on macOS,
+    // and the harness then waits for focus before the next test file.
+    await SimpleTest.promiseFocus(window);
     await SpecialPowers.popPrefEnv();
   }
 });

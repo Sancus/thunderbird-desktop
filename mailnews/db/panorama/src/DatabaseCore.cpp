@@ -5,6 +5,7 @@
 #include "DatabaseCore.h"
 #include "mozIStorageCompletionCallback.h"
 #include "mozilla/AutoRestore.h"
+#include "mozilla/ClearOnShutdown.h"
 #include "mozilla/StaticPrefs_mail.h"
 #include "nsContentUtils.h"
 #include "nsIAsyncShutdown.h"
@@ -425,6 +426,11 @@ nsresult DatabaseCore::CheckProfileStartup(nsISupports* token, bool metadata) {
 already_AddRefed<DatabaseCore> DatabaseCore::GetInstanceForService() {
   if (!sInstance) {
     sInstance = new DatabaseCore();
+    static bool registered = false;
+    if (!registered) {
+      ClearOnShutdown(&sInstance);
+      registered = true;
+    }
   }
   return do_AddRef(sInstance);
 }

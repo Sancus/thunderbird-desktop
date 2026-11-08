@@ -90,8 +90,10 @@ export class MigrationJournal {
         version = PROTOCOL_VERSION;
       }
       if (plan.startupInventory !== undefined) {
-        if (AppConstants.platform == "win" || plan.sources.length) {
-          throw new Error("Startup planning requires unbound Unix sources");
+        // Windows startup journals remain physical: original roots, profile,
+        // work, book and later bound source/cache file IDs are all retained.
+        if (plan.sources.length) {
+          throw new Error("Startup planning requires unbound sources");
         }
         version = STARTUP_VERSION;
       }
@@ -778,7 +780,9 @@ export class MigrationJournal {
     createMorkFolderCacheRequest(cache);
     getMorkFolderCacheCells(cache.folders);
     await this.#change(async state => {
-      if (AppConstants.platform == "win") {
+      // Only the native selected-startup journal binds cache units on Windows;
+      // its #checkSource re-admits the cache file and compares its file ID.
+      if (AppConstants.platform == "win" && state.version !== STARTUP_VERSION) {
         throw new Error(
           "Windows cache migration requires native reparse admission"
         );
@@ -1619,7 +1623,6 @@ export class MigrationJournal {
     }
     const startup = state.startup;
     if (
-      AppConstants.platform === "win" ||
       !startup ||
       typeof startup.bound !== "boolean" ||
       !Array.isArray(startup.inventory?.sources) ||
@@ -2097,8 +2100,11 @@ export class MigrationJournal {
     this.#validateProtocolUnits(state);
     if (
       isPhysicalJournal(state) &&
+      state.version !== STARTUP_VERSION &&
       ["activate", "complete"].includes(state.stage)
     ) {
+      // Explicit journal4/6 work has no native activation owner. The startup
+      // journal7 is activated only by the live native startup operation.
       throw new Error("Windows migration activation remains held");
     }
     if (
@@ -2147,7 +2153,9 @@ export class MigrationJournal {
 function isPhysicalJournal(state) {
   return (
     AppConstants.platform == "win" &&
-    [PHYSICAL_VERSION, PROTOCOL_VERSION].includes(state.version)
+    [PHYSICAL_VERSION, PROTOCOL_VERSION, STARTUP_VERSION].includes(
+      state.version
+    )
   );
 }
 

@@ -825,16 +825,17 @@ async function testSyncRecipients(mockServer, incomingServer) {
   // quotes, so we strip them out if present so we don't fail valid recipient
   // strings.
   const message = [...folder.messages][0];
+  const unquoted = addresses => addresses.replaceAll('"', "");
 
   Assert.equal(
-    message.recipients,
-    '"Tinderbox" <tinderbox@foo.invalid>, "Alice" <alice@foo.invalid>',
+    unquoted(message.recipients),
+    "Tinderbox <tinderbox@foo.invalid>, Alice <alice@foo.invalid>",
     "the recipients property on the message should match the ones in the message"
   );
 
   Assert.equal(
-    message.ccList,
-    '"Bob" <bob@foo.invalid>',
+    unquoted(message.ccList),
+    "Bob <bob@foo.invalid>",
     "the ccList property on the message should match the ones in the message"
   );
 }

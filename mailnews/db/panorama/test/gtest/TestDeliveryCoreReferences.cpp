@@ -5499,9 +5499,10 @@ class DeliveryCoreReferences : public testing::Test {
     ASSERT_EQ(NS_OK, directory->GetURI(uri));
     ASSERT_EQ(NS_OK, directory->GetUID(uid));
     ASSERT_EQ(NS_OK, directory->GetFileName(fileName));
+    const nsCString prefBranch(pref + "."_ns);
     auto cleanup = MakeScopeExit([&] {
       if (!deleted) EXPECT_EQ(NS_OK, manager->DeleteAddressBook(uri));
-      EXPECT_EQ(NS_OK, prefs->DeleteBranch((pref + "."_ns).get()));
+      EXPECT_EQ(NS_OK, prefs->DeleteBranch(prefBranch.get()));
     });
     nsCOMPtr<nsIFile> target, copy;
     ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(target)));
@@ -5566,7 +5567,7 @@ class DeliveryCoreReferences : public testing::Test {
         }));
     ASSERT_EQ(NS_ERROR_FILE_NOT_FOUND, settled);
     nsTArray<nsCString> names;
-    ASSERT_EQ(NS_OK, prefs->GetChildList((pref + "."_ns).get(), names));
+    ASSERT_EQ(NS_OK, prefs->GetChildList(prefBranch.get(), names));
     EXPECT_TRUE(names.IsEmpty());
     for (uint32_t repeat = 0; repeat < 2; ++repeat) {
       ASSERT_EQ(NS_OK, check());
@@ -5598,7 +5599,7 @@ class DeliveryCoreReferences : public testing::Test {
     EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, check());
     EXPECT_FALSE(read);
     ASSERT_EQ(NS_OK, target->Remove(false));
-    ASSERT_EQ(NS_OK, prefs->DeleteBranch((pref + "."_ns).get()));
+    ASSERT_EQ(NS_OK, prefs->DeleteBranch(prefBranch.get()));
     nsCString nativePath;
     ASSERT_EQ(NS_OK, target->GetNativePath(nativePath));
     ASSERT_EQ(0, symlink("missing-book-target", nativePath.get()));

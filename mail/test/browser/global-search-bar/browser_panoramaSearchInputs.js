@@ -145,10 +145,19 @@ add_task(async function test_nativeInputClearCancelsDeferredTypedSelection() {
     );
     const result = await completionResult("completionperson");
     assertCompletionInputOwnership(input);
-    input.popup.selectedIndex = result.rows.findIndex(
-      row => row.type == "person"
+    const index = result.rows.findIndex(row => row.type == "person");
+    Assert.greaterOrEqual(index, 0, "The native completion has a person row");
+    // The controller receives the settled provider result asynchronously.
+    await TestUtils.waitForCondition(
+      () => input.controller.matchCount > index,
+      "The popup holds the native completion rows"
     );
-    Assert.greaterOrEqual(input.popup.selectedIndex, 0);
+    input.popup.selectedIndex = index;
+    Assert.equal(
+      input.popup.selectedIndex,
+      index,
+      "The person completion is selected"
+    );
     provider.stopSearch();
     const count = tabmail.tabInfo.length;
     input.textObserver.observe(

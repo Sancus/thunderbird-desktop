@@ -1946,11 +1946,17 @@ add_task(async function test_statusActivityMultipleWindowsAndMissedTerminal() {
         manager.removeActivity(process.id);
       }
     }
+    // domwindowclosed is notified before the closing window is hidden, and on
+    // macOS hiding it lowers it in the focus manager while this task resumes
+    // inside that window's deactivate event. Raising the main window there is
+    // undone when the lowering completes: the focus manager forgets the active
+    // window while macOS keeps the main window key, so it never becomes active
+    // again. Only restore focus once the closing window has been destroyed.
+    const destroyed = TestUtils.topicObserved("xul-window-destroyed");
     const closed = BrowserTestUtils.domWindowClosed(secondWindow);
     secondWindow.close();
     await closed;
-    // Assigning focusedWindow does not reactivate the main window on macOS,
-    // and the harness then waits for focus before the next test file.
+    await destroyed;
     await SimpleTest.promiseFocus(window);
     await SpecialPowers.popPrefEnv();
   }
@@ -2119,23 +2125,3 @@ add_task(
     }
   }
 );
-
-// Registered last so it runs after the fixture cleanups above: on macOS the
-// next test file waits for this window to be active again. Report what holds
-// focus if it is not.
-registerCleanupFunction(async function restoreMainWindowFocus() {
-  for (const win of Services.wm.getEnumerator(null)) {
-    if (win != window && !win.closed) {
-      info(`Window left open: ${win.document.documentURI}`);
-    }
-  }
-  info(`Active window: ${Services.focus.activeWindow?.document.documentURI}`);
-  if (AppConstants.platform == "macosx" && !Services.focus.activeWindow) {
-    // Another application became active during the save fixtures; a window
-    // focus request cannot reactivate this application on its own.
-    Cc["@mozilla.org/widget/macdocksupport;1"]
-      .getService(Ci.nsIMacDockSupport)
-      .activateApplication(true);
-  }
-  await SimpleTest.promiseFocus(window);
-});

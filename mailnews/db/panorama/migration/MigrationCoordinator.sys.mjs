@@ -2391,7 +2391,7 @@ function captureStartupMigration(signal, nativeAudit) {
       "resource:///modules/panorama/MigrationBackup.sys.mjs"
     );
   const roots = collectMigrationRoots();
-  if (roots.profilePath !== profile.path) {
+  if (startupSourceFile(roots.profilePath).path !== profile.path) {
     throw new Error("Startup inventory selects another profile");
   }
   for (const path of roots.mailPaths) {
@@ -2787,12 +2787,40 @@ function startupEntryExists(file) {
 function startupSourceFile(path) {
   const file = new FileUtils.File(path);
   for (let part = file; part; part = part.parent) {
-    if (part.isSymlink()) {
+    if (part.isSymlink() && !startupAliasAboveProfile(part)) {
       throw new Error("Startup source path contains a link");
     }
   }
   file.normalize();
   return file;
+}
+
+/**
+ * Admits only an operating-system alias of the selected profile's location
+ * (macOS /var to /private/var): a link above the profile whose canonical
+ * target contains it. A link at or inside the profile is never admitted.
+ *
+ * @param {nsIFile} entry - A linked path component.
+ * @returns {boolean} Whether the link is such an alias.
+ */
+function startupAliasAboveProfile(entry) {
+  try {
+    const profile = Services.dirsvc.get("ProfDS", Ci.nsIFile).clone();
+    profile.normalize();
+    const location = entry.parent.clone();
+    location.normalize();
+    location.append(entry.leafName);
+    const target = entry.clone();
+    target.normalize();
+    return (
+      !profile.equals(location) &&
+      !profile.contains(location) &&
+      target.contains(profile)
+    );
+  } catch {
+    // An unresolvable link or unavailable profile is not an admitted alias.
+    return false;
+  }
 }
 
 /**

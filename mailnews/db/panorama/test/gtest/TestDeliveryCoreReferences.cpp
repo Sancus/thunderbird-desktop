@@ -3872,7 +3872,7 @@ class DeliveryCoreReferences : public testing::Test {
         MOZ_TRY(StartupHashControl(bytes, digest));
         MOZ_TRY(JSONCacheQuote(cx, digest, quoted));
         entries.AppendLiteral("\"regular\",\"size\":");
-        entries.AppendInt(bytes.Length());
+        entries.AppendInt(static_cast<uint64_t>(bytes.Length()));
         entries.AppendLiteral(",\"sha256\":");
         entries.Append(quoted);
         entries.Append('}');
@@ -3989,7 +3989,7 @@ class DeliveryCoreReferences : public testing::Test {
     result.AppendLiteral(",\"sha256\":");
     result.Append(quotedHash);
     result.AppendLiteral(",\"size\":");
-    result.AppendInt(raw.Length());
+    result.AppendInt(static_cast<uint64_t>(raw.Length()));
     result.Append('}');
     result.AppendLiteral(",\"proof\":{\"profilePath\":");
     result.Append(profileQuoted);
@@ -4000,7 +4000,7 @@ class DeliveryCoreReferences : public testing::Test {
     result.AppendLiteral(",\"sha256\":");
     result.Append(quotedHash);
     result.AppendLiteral(",\"size\":");
-    result.AppendInt(document.Length());
+    result.AppendInt(static_cast<uint64_t>(document.Length()));
     result.AppendLiteral("}},\"folders\":[");
     if (folder) {
       result.Append('{');

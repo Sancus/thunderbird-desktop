@@ -229,6 +229,19 @@ NS_IMPL_ISUPPORTS(ProfileStartupOperation, nsIAsyncShutdownBlocker)
 
 DatabaseCore::~DatabaseCore() = default;
 
+// A UTF-8 file path for comparison with stored path strings. Windows has no
+// native narrow path; there the UTF-16 path is converted, as PathUtils does.
+static nsresult GetComparablePath(nsIFile* file, nsACString& path) {
+#ifdef XP_WIN
+  nsAutoString wide;
+  MOZ_TRY(file->GetPath(wide));
+  CopyUTF16toUTF8(wide, path);
+  return NS_OK;
+#else
+  return file->GetNativePath(path);
+#endif
+}
+
 namespace {
 nsresult RestoreOpen(nsIFile*, StartupRestoreFD&, bool writable = false);
 nsresult RestorePin(StartupRestoreFD&);
@@ -402,11 +415,14 @@ nsresult DatabaseCore::ArmProfileStartup(nsIFile* profile, nsIFile* local) {
       operation, NS_LITERAL_STRING_FROM_CSTRING(__FILE__), __LINE__,
       u"Selected Panorama startup and native storage settlement"_ns));
   mProfileStartup = operation;
-  operation->onShutdown = [this]() {
-    NS_ENSURE_TRUE(
-        sInstance.get() == this && mProfileStartup && mProfileStartup->ready,
-        NS_ERROR_NOT_AVAILABLE);
-    return SettleProfileStartup(NS_OK);
+  // Only the identity of this instance is captured; it is used only while it
+  // is still the live singleton.
+  operation->onShutdown = [token = static_cast<const void*>(this)]() {
+    RefPtr<DatabaseCore> core = sInstance.get();
+    NS_ENSURE_TRUE(core && static_cast<const void*>(core.get()) == token &&
+                       core->mProfileStartup && core->mProfileStartup->ready,
+                   NS_ERROR_NOT_AVAILABLE);
+    return core->SettleProfileStartup(NS_OK);
   };
   nsCOMPtr<nsIObserverService> observers = services::GetObserverService();
   NS_ENSURE_TRUE(observers, NS_ERROR_NOT_AVAILABLE);
@@ -11541,7 +11557,7 @@ nsresult DatabaseCore::ReadStartupMailSource(JSContext* cx,
     }
   }
   nsCString expectedStore;
-  MOZ_TRY(physical->GetNativePath(expectedStore));
+  MOZ_TRY(GetComparablePath(physical, expectedStore));
   NS_ENSURE_TRUE(expectedStore == output.storePath, NS_ERROR_NOT_IMPLEMENTED);
   return NS_OK;
 }
@@ -11609,7 +11625,7 @@ nsresult DatabaseCore::BindStartupLocalNames(JSContext* cx,
     MOZ_TRY(base->Clone(getter_AddRefs(summary)));
     MOZ_TRY(summary->AppendNative(leaf + ".msf"_ns));
     nsCString path;
-    MOZ_TRY(summary->GetNativePath(path));
+    MOZ_TRY(GetComparablePath(summary, path));
     Maybe<nsCString> name;
     if (auto archived = operation.backupFiles.Lookup(path))
       MOZ_TRY(ReadStartupSummaryName(cx, summary, archived.Data(), name));
@@ -11620,7 +11636,7 @@ nsresult DatabaseCore::BindStartupLocalNames(JSContext* cx,
     MOZ_TRY(cache->Exists(&jsonCache));
     if (!jsonCache) MOZ_TRY(cache->SetNativeLeafName("panacea.dat"_ns));
     nsCString cachePath;
-    MOZ_TRY(cache->GetNativePath(cachePath));
+    MOZ_TRY(GetComparablePath(cache, cachePath));
     if (jsonCache)
       NS_ENSURE_TRUE(operation.backupFiles.Contains(cachePath),
                      NS_ERROR_NOT_AVAILABLE);
@@ -13185,7 +13201,7 @@ nsresult DatabaseCore::BuildStartupFolders() {
     nsCOMPtr<nsIFile> path;
     MOZ_TRY(server->GetLocalPath(getter_AddRefs(path)));
     nsAutoCString actualPath, protocol, contract;
-    MOZ_TRY(path->GetNativePath(actualPath));
+    MOZ_TRY(GetComparablePath(path, actualPath));
     MOZ_TRY(server->GetType(protocol));
     MOZ_TRY(server->GetStringValue("storeContractID", contract));
     if (contract.IsEmpty())
@@ -13213,8 +13229,8 @@ nsresult DatabaseCore::BuildStartupFolders() {
     MOZ_TRY(root.Data()->GetSummaryFile(getter_AddRefs(file)));
     MOZ_TRY(root.Data()->GetFilePath(getter_AddRefs(store)));
     nsCString filePath, storePath;
-    MOZ_TRY(file->GetNativePath(filePath));
-    MOZ_TRY(store->GetNativePath(storePath));
+    MOZ_TRY(GetComparablePath(file, filePath));
+    MOZ_TRY(GetComparablePath(store, storePath));
     NS_ENSURE_TRUE(filePath == summary.path && storePath == summary.serverRoot,
                    NS_ERROR_NOT_AVAILABLE);
     MOZ_TRY(StartupCheckHash(file, summary.hash, summary.size));
@@ -13394,7 +13410,7 @@ nsresult DatabaseCore::BuildStartupFolders() {
       }
       MOZ_TRY(path->AppendNative(source->localLeaves[i]));
       nsCString actual;
-      MOZ_TRY(path->GetNativePath(actual));
+      MOZ_TRY(GetComparablePath(path, actual));
       nsCOMPtr<nsIMsgFolder> child;
       MOZ_TRY(
           parent->GetChildNamed(source->localNames[i], getter_AddRefs(child)));

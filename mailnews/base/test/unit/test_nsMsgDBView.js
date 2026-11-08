@@ -2500,6 +2500,12 @@ add_task(async function test_physical_lookup_null_getter_errors_and_key_miss() {
 
 add_task(
   async function test_committed_expanded_root_preserves_physical_child() {
+    if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+      info(
+        "Native-only physical view control; the existing ordinary Mork cases remain unchanged"
+      );
+      return;
+    }
     const { PromiseTestUtils } = ChromeUtils.importESModule(
       "resource://testing-common/mailnews/PromiseTestUtils.sys.mjs"
     );

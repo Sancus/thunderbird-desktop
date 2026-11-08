@@ -595,10 +595,16 @@ add_task(async function test_restoreRequiredKeepsFloorAndRecoveryState() {
  * @returns {Promise<{profilePath: string, path: string, record: object}>} Fixture.
  */
 async function startupSelector(origin = "initialized-empty") {
-  const profilePath = await IOUtils.createUniqueDirectory(
-    PathUtils.tempDir,
-    "native-profile-selector-"
+  // The selector record binds the normalized physical profile path, and the
+  // macOS temporary directory is reached through a /var link.
+  const profileFile = new FileUtils.File(
+    await IOUtils.createUniqueDirectory(
+      PathUtils.tempDir,
+      "native-profile-selector-"
+    )
   );
+  profileFile.normalize();
+  const profilePath = profileFile.path;
   registerCleanupFunction(() =>
     IOUtils.remove(profilePath, { recursive: true })
   );

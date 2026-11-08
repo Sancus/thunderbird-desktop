@@ -9775,7 +9775,7 @@ nsresult RestoreInventory(StartupRestoreFD& root, const nsACString& base,
     if (state && base.IsEmpty())
       for (const auto& owner : state->roots)
         if (owner->live.get() == &root && owner->retired &&
-            path == state->prefix + "-retired"_ns) {
+            path.Equals(state->prefix + "-retired"_ns)) {
           MOZ_TRY(RestorePin(*owner->retired));
           path.Truncate();
           break;
@@ -9784,7 +9784,7 @@ nsresult RestoreInventory(StartupRestoreFD& root, const nsACString& base,
     if (state && base.IsEmpty() &&
         root.identity.id == state->work->identity.id &&
         (path == "restore.json"_ns || path == "restore-current.json"_ns ||
-         path == "cancel-"_ns + state->id ||
+         path.Equals("cancel-"_ns + state->id) ||
          (StringBeginsWith(path, "restore-"_ns + state->id + "-"_ns) &&
           (StringEndsWith(path, ".ordinary.json"_ns) ||
            StringEndsWith(path, ".complete.json"_ns))) ||
@@ -10566,7 +10566,7 @@ nsresult RestoreCompleted(JSContext* cx, ProfileStartupOperation& operation,
   nsCString id, text;
   MOZ_TRY(StartupText(cx, audit, "operationId", id));
   NS_ENSURE_TRUE(!id.IsEmpty() && id.Length() <= 64 &&
-                     std::all_of(id.begin(), id.end(),
+                     std::all_of(id.BeginReading(), id.EndReading(),
                                  [](char c) {
                                    return (c >= 'a' && c <= 'z') ||
                                           (c >= 'A' && c <= 'Z') ||
@@ -12167,7 +12167,7 @@ nsresult RestoreExecute(JSContext* cx, ProfileStartupOperation& operation) {
   MOZ_TRY(StartupNumber(cx, request, "formatVersion", 1, 1, number));
   MOZ_TRY(StartupText(cx, request, "operationId", state.id));
   NS_ENSURE_TRUE(!state.id.IsEmpty() && state.id.Length() <= 64 &&
-                     std::all_of(state.id.begin(), state.id.end(),
+                     std::all_of(state.id.BeginReading(), state.id.EndReading(),
                                  [](char c) {
                                    return (c >= 'a' && c <= 'z') ||
                                           (c >= 'A' && c <= 'Z') ||
@@ -12361,9 +12361,10 @@ nsresult RestoreExecute(JSContext* cx, ProfileStartupOperation& operation) {
       MOZ_TRY(RestoreInventory(*root->live, ""_ns, root->before, i == 0, 0,
                                &state));
       for (const auto& entry : root->before)
-        NS_ENSURE_TRUE(!StringBeginsWith(entry.path, state.prefix) &&
-                           entry.path.Find("/"_ns + state.prefix) < 0,
-                       NS_ERROR_FILE_ACCESS_DENIED);
+        NS_ENSURE_TRUE(
+            !StringBeginsWith(entry.path, state.prefix) &&
+                entry.path.Find(nsCString("/"_ns + state.prefix)) < 0,
+            NS_ERROR_FILE_ACCESS_DENIED);
     }
 #ifndef XP_WIN
     NS_ENSURE_TRUE(path != workPath || (root->afterMode & 0722) == 0700,

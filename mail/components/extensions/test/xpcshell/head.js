@@ -69,7 +69,7 @@ async function createAccount(type = "none", options = {}) {
   const account = MailServices.accounts.createAccount();
   const native = Services.prefs.getBoolPref("mail.panorama.enabled", false);
   account.incomingServer = MailServices.accounts.createIncomingServer(
-    native && type == "ews" ? "user" : `${account.key}user`,
+    native && ["imap", "ews"].includes(type) ? "user" : `${account.key}user`,
     "localhost",
     type
   );

@@ -157,6 +157,7 @@ tags = ["dataadapter"]
 ["test_mailSearchAutoComplete.js"]
 
 ["test_mailSearchConversation.js"]
+run-sequentially = true # Times out in parallel runs; passes well within the limit alone.
 
 ["test_mailSearchFacets.js"]
 
@@ -231,6 +232,7 @@ support-files = [
 ["test_searchOffsets.js"]
 
 ["test_searchPaging.js"]
+run-sequentially = true # Times out in parallel runs; passes well within the limit alone.
 
 ["test_searchPolicy.js"]
 

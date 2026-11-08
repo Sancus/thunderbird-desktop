@@ -2119,3 +2119,16 @@ add_task(
     }
   }
 );
+
+// Registered last so it runs after the fixture cleanups above: on macOS the
+// next test file waits for this window to be active again. Report what holds
+// focus if it is not.
+registerCleanupFunction(async function restoreMainWindowFocus() {
+  for (const win of Services.wm.getEnumerator(null)) {
+    if (win != window && !win.closed) {
+      info(`Window left open: ${win.document.documentURI}`);
+    }
+  }
+  info(`Active window: ${Services.focus.activeWindow?.document.documentURI}`);
+  await SimpleTest.promiseFocus(window);
+});

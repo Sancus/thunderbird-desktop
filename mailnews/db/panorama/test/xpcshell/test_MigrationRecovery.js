@@ -1061,6 +1061,13 @@ add_task(async function test_approvedRestoreWritesOnlyRequest() {
   );
   Assert.deepEqual(request.backup, input.backup);
   Assert.ok(!request.progress, "A request is not completion");
+  if (AppConstants.platform != "win") {
+    Assert.equal(
+      (await IOUtils.stat(request.stagingParent)).permissions,
+      0o700,
+      "Native restore admits only an owner-only staging parent"
+    );
+  }
   Assert.deepEqual(
     await IOUtils.readJSON(migrationRestoreRequestPath(input.profilePath)),
     request

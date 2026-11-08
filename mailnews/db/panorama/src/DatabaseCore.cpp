@@ -9495,7 +9495,11 @@ nsresult RestoreMeasure(StartupRestoreFD& node, StartupRestoreStamp& stamp) {
     NS_ENSURE_TRUE(PR_GetOpenFileInfo64(node.io, &info) == PR_SUCCESS,
                    NS_ERROR_FAILURE);
     stamp.size = info.size;
+    // Unix NSPR open-file times have whole seconds only; keep the millisecond
+    // nsIFile time, whose path is pinned to this descriptor below.
+#ifdef XP_WIN
     stamp.modified = info.modifyTime / 1000;
+#endif
   }
 #ifdef XP_WIN
   RefPtr<MigrationFileSystem> fs = new MigrationFileSystem();

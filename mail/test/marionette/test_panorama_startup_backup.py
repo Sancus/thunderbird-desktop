@@ -419,7 +419,7 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             self.created_work.add(Path(record["identity"]["backup"]["path"]).parent.parent)
         return result
 
-    def create_legacy_message(self, store, name="Inbox"):
+    def create_legacy_message(self, store, name="Inbox", user="s526"):
         """Write genuine Mork/store data through the normal legacy mail API."""
         result = self.marionette.execute_script(r"""
             const { MailServices } = ChromeUtils.importESModule(
@@ -434,7 +434,7 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             }
             file.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
             const server = MailServices.accounts.createIncomingServer(
-              's526', 'localhost', 'none');
+              arguments[2], 'localhost', 'none');
             server.setStringValue('storeContractID', arguments[0] === 'maildir'
               ? '@mozilla.org/msgstore/maildirstore;1'
               : '@mozilla.org/msgstore/berkeleystore;1');
@@ -459,7 +459,7 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             return {serverKey: server.key, root, summary: folder.summaryFile.path,
               key: header.messageKey, store: folder.msgStore.storeType,
               name: folder.name, flags: folder.msgDatabase.dBFolderInfo.flags};
-        """, script_args=[store, name])
+        """, script_args=[store, name, user])
         self.assertEqual(store, result["store"])
         return result
 
@@ -1332,7 +1332,8 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         """Back up real legacy stores/book before writers, then retain newer data."""
         self.clean_profile(False)
         mbox_source = self.create_legacy_message("mbox")
-        maildir_source = self.create_legacy_message("maildir")
+        # A second legacy server needs its own user; duplicates are refused.
+        maildir_source = self.create_legacy_message("maildir", user="s527-maildir")
         self.marionette.execute_script("""
             const { MailServices } = ChromeUtils.importESModule(
               'resource:///modules/MailServices.sys.mjs');

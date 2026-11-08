@@ -260,7 +260,8 @@ export async function requestMigrationRestore(
     ...plan,
     stagingParent: await IOUtils.createUniqueDirectory(
       PathUtils.parent(plan.profilePath),
-      "panorama-restore-"
+      "panorama-restore-",
+      0o700
     ),
   };
   // Exclusive creation preserves every older failed or completed transaction.
@@ -388,9 +389,16 @@ function restoreFile(path) {
       lease.close();
     }
   }
-  const normalized = file.clone();
+  // Unix normalize() resolves only existing paths; an absent leaf is
+  // canonical through its existing parent. The loop below rejects links.
+  const absent = !file.exists();
+  const normalized = (absent ? file.parent : file).clone();
   normalized.normalize();
-  if (normalized.path !== path) {
+  if (
+    (absent
+      ? PathUtils.join(normalized.path, file.leafName)
+      : normalized.path) !== path
+  ) {
     throw new Error("Restore path must be canonical");
   }
   for (let part = file; part; part = part.parent) {

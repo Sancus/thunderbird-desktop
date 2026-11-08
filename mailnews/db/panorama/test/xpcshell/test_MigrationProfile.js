@@ -1124,7 +1124,8 @@ const { getMigrationRestoreDependencies } = ChromeUtils.importESModule(
  * Archives an actual selector with its retained unit-boundary journal/archive.
  * Does not model native receipt validation, which runs in ordinary process tests.
  *
- * @param {boolean} [nested=false] - Archive the journal inside an external root.
+ * @param {boolean} [nested=false] - Archive the journal inside an external root
+ *   that is backed up but is not one of the journal's own source mail roots.
  * @returns {Promise<object>} Original selector and complete verified root copies.
  */
 async function archivedSelectorInput(nested = false) {
@@ -1135,7 +1136,7 @@ async function archivedSelectorInput(nested = false) {
     const original = input.journalPath;
     input.journalPath = PathUtils.join(
       input.root,
-      "external",
+      "retained",
       "metadata",
       "journal.json"
     );
@@ -1147,9 +1148,14 @@ async function archivedSelectorInput(nested = false) {
     input.profilePath
   );
   const archive = PathUtils.join(input.root, "restore-point");
+  const external = [PathUtils.join(input.root, "external")];
+  if (nested) {
+    // Journals stay outside their source roots; this extra root only archives it.
+    external.unshift(PathUtils.join(input.root, "retained"));
+  }
   const backup = await createMigrationBackup(
     input.profilePath,
-    [PathUtils.join(input.root, "external")],
+    external,
     archive
   );
   const manifest = await IOUtils.readJSON(backup.path);

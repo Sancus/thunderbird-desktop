@@ -13064,8 +13064,15 @@ nsresult DatabaseCore::CheckStartupMailStore(const nsACString& path,
   bool exists;
   MOZ_TRY(store->Exists(&exists));
   if (!exists) {
+#ifdef XP_WIN
+    // nsLocalFileWin::IsSymlink reports no link without probing the path, so
+    // a missing offline body is known only from Exists. Reparse points are
+    // refused by the Windows physical admission, not by this probe.
+    NS_ENSURE_TRUE(remote && NS_SUCCEEDED(linkStatus), NS_ERROR_NOT_AVAILABLE);
+#else
     NS_ENSURE_TRUE(remote && linkStatus == NS_ERROR_FILE_NOT_FOUND,
                    NS_ERROR_NOT_AVAILABLE);
+#endif
     return NS_OK;
   }
   // A failed lstat followed by an existing path is a changed input, not a
@@ -14174,7 +14181,15 @@ nsresult DatabaseCore::ReadStartupReusedBookDirectory(nsIFile* target,
   MOZ_TRY(target->GetNativeLeafName(fileName));
   bool linked;
   nsresult status = target->IsSymlink(&linked);
+#ifdef XP_WIN
+  // nsLocalFileWin::IsSymlink reports no link without probing the path, so a
+  // removed book is known only from Exists.
+  bool exists = false;
+  if (NS_SUCCEEDED(status)) MOZ_TRY(target->Exists(&exists));
+  const bool missing = NS_SUCCEEDED(status) && !exists;
+#else
   const bool missing = status == NS_ERROR_FILE_NOT_FOUND;
+#endif
   if (!missing) {
     MOZ_TRY(status);
     NS_ENSURE_FALSE(linked, NS_ERROR_FILE_ACCESS_DENIED);
@@ -14248,7 +14263,15 @@ nsresult DatabaseCore::ReadStartupReusedBookDirectory(nsIFile* target,
     // overlook a new occupant or a replaced physical parent.
     MOZ_TRY(StartupDirectory(parent, parentPath));
     status = target->IsSymlink(&linked);
+#ifdef XP_WIN
+    if (NS_SUCCEEDED(status)) {
+      bool exists = false;
+      MOZ_TRY(target->Exists(&exists));
+      if (!exists) return NS_OK;
+    }
+#else
     if (status == NS_ERROR_FILE_NOT_FOUND) return NS_OK;
+#endif
     MOZ_TRY(status);
     return NS_ERROR_NOT_AVAILABLE;
   }

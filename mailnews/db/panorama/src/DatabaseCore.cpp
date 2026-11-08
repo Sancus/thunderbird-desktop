@@ -11463,9 +11463,14 @@ nsresult DatabaseCore::ReadStartupMailSource(JSContext* cx,
   MOZ_TRY(StartupNumber(cx, origin, "boxFlags", 0, UINT32_MAX, retainedFlags));
   NS_ENSURE_TRUE(!output.onlineName.IsEmpty() &&
                      output.onlineName == retainedName &&
-                     delimiter == retainedDelimiter && flags == retainedFlags &&
-                     delimiter != kOnlineHierarchySeparatorUnknown &&
-                     delimiter != kOnlineHierarchySeparatorNil,
+                     delimiter == retainedDelimiter && flags == retainedFlags,
+                 NS_ERROR_NOT_AVAILABLE);
+  // Thunderbird keeps the unknown '^' or NIL '|' sentinel for a client folder
+  // the server never listed; only one slash-free level is then exact.
+  NS_ENSURE_TRUE((delimiter != kOnlineHierarchySeparatorUnknown &&
+                  delimiter != kOnlineHierarchySeparatorNil) ||
+                     (output.onlineName.FindChar('/') == kNotFound &&
+                      output.onlineName.FindChar(char(delimiter)) == kNotFound),
                  NS_ERROR_NOT_AVAILABLE);
   output.delimiter = char(delimiter);
   output.boxFlags = uint32_t(flags);

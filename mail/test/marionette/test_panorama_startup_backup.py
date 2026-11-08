@@ -632,8 +632,9 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.clean_profile(False)
         name = self.register_selected_profile()
         source = self.profile / "s526-original.mab"
-        fixture = Path(__file__).resolve().parents[3] / (
-            "mail/components/addrbook/test/browser/data/import.mab")
+        # A packaged copy of mail/components/addrbook/test/browser/data/import.mab;
+        # the marionette test archive does not contain other test directories.
+        fixture = Path(__file__).resolve().parent / "data" / "import.mab"
         source.write_bytes(fixture.read_bytes())
         self.marionette.execute_script("""
             Services.prefs.setStringPref('ldap_2.servers.s526.filename', arguments[0]);

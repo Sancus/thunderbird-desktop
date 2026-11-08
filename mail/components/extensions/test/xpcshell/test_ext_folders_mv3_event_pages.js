@@ -125,12 +125,9 @@ add_task(
     // Create a test folder before terminating the background script, to make sure
     // everything is sane.
 
+    // IMAP account setup already completed discovery and created its Trash.
     await createSubfolder(rootFolder, "TestFolder");
     await extension.awaitMessage("onCreated received");
-    if (IS_IMAP) {
-      // IMAP creates a default Trash folder on the fly.
-      await extension.awaitMessage("onCreated received");
-    }
 
     // Create SubFolder1.
 

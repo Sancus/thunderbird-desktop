@@ -742,10 +742,13 @@ add_task(
 add_task(
   { skip_if: () => AppConstants.platform === "win" },
   async function test_prepareStartupMigrationProfileRetainsActualRecoveryInputs() {
-    const root = await IOUtils.createUniqueDirectory(
-      PathUtils.tempDir,
-      "startup-profile-"
+    // Retained startup paths are normalized physical paths, and the macOS
+    // temporary directory is reached through a /tmp link.
+    const rootFile = new FileUtils.File(
+      await IOUtils.createUniqueDirectory(PathUtils.tempDir, "startup-profile-")
     );
+    rootFile.normalize();
+    const root = rootFile.path;
     registerCleanupFunction(() => IOUtils.remove(root, { recursive: true }));
     const profilePath = PathUtils.join(root, "profile");
     const work = PathUtils.join(root, "work");
@@ -936,7 +939,10 @@ async function checkStartupTargetFailure(failure) {
   const { startPanoramaProfileAtStartup } = ChromeUtils.importESModule(
     "resource:///modules/panorama/MigrationCoordinator.sys.mjs"
   );
-  const profile = do_get_profile();
+  // Native startup describes the canonical profile, and the macOS temporary
+  // directory is reached through a /tmp link.
+  const profile = do_get_profile().clone();
+  profile.normalize();
   const profilePath = profile.path;
   const directory = PathUtils.join(profilePath, "startup-open-failure");
   const work = PathUtils.join(

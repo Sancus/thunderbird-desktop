@@ -358,7 +358,6 @@ export async function requestMigrationRestoreRecovery(
     !request.progress.outcome &&
     roots.every(root => root.phase === 0)
   ) {
-    // No live root changed: keep this attempt, prepare the same one afresh.
     const ledger = restoreFile(
       PathUtils.join(
         PathUtils.parent(path),
@@ -413,8 +412,6 @@ function restoreFile(path) {
       lease.close();
     }
   }
-  // Unix normalize() resolves only existing paths; an absent leaf is
-  // canonical through its existing parent. The loop below rejects links.
   const absent = !file.exists();
   const normalized = (absent ? file.parent : file).clone();
   normalized.normalize();

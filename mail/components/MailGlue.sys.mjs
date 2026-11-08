@@ -559,17 +559,23 @@ MailGlue.prototype = {
         this._panoramaStartupController.signal
       );
       if (restoreRequest.exists()) {
-        // Native restored at app-startup; settle and verify it before
-        // profile-after-change services (such as cookie storage) write.
+        // Settle, then drop prefs XRE read before restoration replaced them.
         let settled = false;
-        MailGlue.panoramaStartup.then(
-          () => (settled = true),
-          () => (settled = true)
-        );
+        const settle = () => (settled = true);
+        MailGlue.panoramaStartup.then(settle, settle);
         Services.tm.spinEventLoopUntil(
           "MailGlue: Panorama restore settlement",
           () => settled || Services.startup.shuttingDown
         );
+        for (const name of Services.prefs.getChildList("")) {
+          if (Services.prefs.prefHasUserValue(name)) {
+            Services.prefs.clearUserPref(name);
+          }
+        }
+        const prefs = Services.dirsvc.get("PrefF", Ci.nsIFile);
+        if (prefs.exists()) {
+          Services.prefs.readUserPrefsFromFile(prefs);
+        }
       }
     } catch (error) {
       if (!this._panoramaStartupSurvival) {

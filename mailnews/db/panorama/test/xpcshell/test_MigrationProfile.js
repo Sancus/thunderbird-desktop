@@ -1150,7 +1150,6 @@ async function archivedSelectorInput(nested = false) {
   const archive = PathUtils.join(input.root, "restore-point");
   const external = [PathUtils.join(input.root, "external")];
   if (nested) {
-    // Journals stay outside their source roots; this extra root only archives it.
     external.unshift(PathUtils.join(input.root, "retained"));
   }
   const backup = await createMigrationBackup(

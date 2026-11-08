@@ -1158,7 +1158,6 @@ add_task(async function test_unmutatedRetryPreparesFreshAndKeepsLedger() {
   const input = await restoreRequestInput();
   const request = await input.request();
   const path = migrationRestoreRequestPath(input.profilePath);
-  // Request-boundary fixture only: real custody and progress are native tests.
   const failed = {
     ...request,
     progress: { generation: 2, firstError: 1, roots: [{ phase: 0 }] },

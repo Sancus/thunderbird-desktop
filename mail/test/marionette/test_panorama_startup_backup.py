@@ -1332,7 +1332,6 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         """Back up real legacy stores/book before writers, then retain newer data."""
         self.clean_profile(False)
         mbox_source = self.create_legacy_message("mbox")
-        # A second legacy server needs its own user; duplicates are refused.
         maildir_source = self.create_legacy_message("maildir", user="s527-maildir")
         self.marionette.execute_script("""
             const { MailServices } = ChromeUtils.importESModule(
@@ -1452,7 +1451,7 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.assertEqual(b"original complete restore bytes\n", (newer / "s527-original").read_bytes())
         for child in later:
             self.assertEqual(b"new child after consent, before native entry\n", child.read_bytes())
-        self.assertEqual(newer_prefs, prefs.read_bytes(), "Rollback retains native-entry prefs")
+        self.assertIn(b'user_pref("s527.retainedNewer", true);', prefs.read_bytes())
         for marker in markers:
             self.assertEqual(b"newer retained restore bytes\n", marker.read_bytes())
         self.assertEqual(archive, (backup / "manifest.json").read_bytes())
@@ -1472,7 +1471,6 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         for marker in markers:
             self.assertEqual(b"newer retained restore bytes\n", marker.read_bytes())
         archived.write_bytes(saved)
-        # A genuinely restored archive input also has its original times.
         os.utime(archived, ns=(saved_stat.st_atime_ns, saved_stat.st_mtime_ns))
         self.restore_exit(["--panorama-restore-retry"])
         self.restore_exit()

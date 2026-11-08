@@ -54,14 +54,21 @@ add_task(function test_messagePropertiesRoundTrip() {
     addedMessage.date,
     new Date(generatedMessage.headers.Date).valueOf() * 1000
   );
-  // Ingestion stores the canonical serialization of the parsed From header,
+  // Ingestion stores the canonical serialization of parsed address headers,
   // which quotes a display name only when it requires quoting.
+  const canonical = header =>
+    MailServices.headerParser.makeMimeHeader(
+      MailServices.headerParser.parseEncodedHeaderW(header)
+    );
+  Assert.equal(addedMessage.author, canonical(generatedMessage.headers.From));
   Assert.equal(
-    addedMessage.author,
-    `${generatedMessage.fromName} <${generatedMessage.fromAddress}>`
+    addedMessage.recipients,
+    canonical(generatedMessage.headers.To.join())
   );
-  Assert.equal(addedMessage.recipients, generatedMessage.headers.To.join());
-  Assert.equal(addedMessage.ccList, generatedMessage.headers.Cc.join());
+  Assert.equal(
+    addedMessage.ccList,
+    canonical(generatedMessage.headers.Cc.join())
+  );
   Assert.equal(addedMessage.bccList, "");
   Assert.equal(addedMessage.subject, generatedMessage.subject);
   Assert.equal(addedMessage.flags, 0);

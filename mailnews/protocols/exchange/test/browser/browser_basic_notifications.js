@@ -123,9 +123,11 @@ async function promiseAlert(expectedSender, expectedName, expectedPreview) {
     () => MockAlertsService.alert,
     `waiting for a notification about inbox`
   );
+  // The author is stored in its canonical form, which quotes a display name
+  // only when it requires quoting.
   Assert.stringContains(
     alert.text,
-    `from "${expectedSender}"`,
+    `from ${expectedSender}`,
     `notification should be about a message from ${expectedSender}`
   );
   Assert.stringContains(

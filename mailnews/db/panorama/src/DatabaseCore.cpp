@@ -10965,8 +10965,14 @@ nsresult StartupModuleCall(JSContext* cx, const nsAString& uri,
                  NS_ERROR_FAILURE);
   return NS_OK;
 }
+// The published book is a byte copy of its stage, so on Windows it has its own
+// file ID but retains the stage's migration_file_identity pin. Its Windows
+// readback therefore compares that pin with the journal receipt's
+// stagePhysicalIdentity, as AddrBookManager does for the same copy; it still
+// re-admits the target itself (no reparse/offline component).
 nsresult StartupBookReadback(JSContext* cx, nsIFile* target, nsIFile* source,
                              const nsACString& token,
+                             JS::Handle<JSObject*> stageIdentity,
                              JS::MutableHandle<JS::Value> output) {
   nsCString bytes;
   MOZ_TRY(StartupRead(source, bytes));
@@ -11004,6 +11010,11 @@ nsresult StartupBookReadback(JSContext* cx, nsIFile* target, nsIFile* source,
                      JS_DefineProperty(cx, options, "requireClosed", false,
                                        JSPROP_ENUMERATE),
                  NS_ERROR_OUT_OF_MEMORY);
+  if (stageIdentity) {
+    NS_ENSURE_TRUE(JS_DefineProperty(cx, options, "stageIdentity",
+                                     stageIdentity, JSPROP_ENUMERATE),
+                   NS_ERROR_OUT_OF_MEMORY);
+  }
   arguments[2].setString(storage);
   arguments[3].setObject(*options);
   NS_ENSURE_TRUE(
@@ -15002,10 +15013,18 @@ nsresult DatabaseCore::CheckProfileActivation(
         NS_ENSURE_TRUE(
             actualUid == uid && actualPref == pref && actualFile == fileName,
             NS_ERROR_NOT_AVAILABLE);
-        if (reusing)
+        if (reusing) {
           MOZ_TRY(StartupStoredBookReceipt(cx, target, &actual));
-        else
-          MOZ_TRY(StartupBookReadback(cx, target, original, token, &actual));
+        } else {
+          JS::Rooted<JSObject*> stageIdentity(cx);
+#ifdef XP_WIN
+          // A physical journal7 book receipt always retains the stage pin.
+          MOZ_TRY(StartupObject(cx, saved, "stagePhysicalIdentity",
+                                &stageIdentity));
+#endif
+          MOZ_TRY(StartupBookReadback(cx, target, original, token,
+                                      stageIdentity, &actual));
+        }
         JS::Rooted<JSObject*> readback(cx, &actual.toObject());
         nsCString storageToken;
         MOZ_TRY(StartupText(cx, readback, "sourceId", storageToken));

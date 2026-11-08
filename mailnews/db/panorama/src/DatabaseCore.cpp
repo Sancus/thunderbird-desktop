@@ -246,6 +246,33 @@ namespace {
 nsresult RestoreOpen(nsIFile*, StartupRestoreFD&, bool writable = false);
 nsresult RestorePin(StartupRestoreFD&);
 nsresult RestoreCompleted(JSContext*, ProfileStartupOperation&, bool&);
+// A link above a selected startup profile whose canonical target contains
+// that profile is the operating system's alias of its location (macOS /var
+// to /private/var). A link at or inside the profile is never such an alias.
+bool StartupAliasAboveProfile(nsIFile* entry) {
+  for (const char* key :
+       {NS_APP_PROFILE_DIR_STARTUP, NS_APP_PROFILE_LOCAL_DIR_STARTUP}) {
+    nsCOMPtr<nsIFile> profile, parent, location, target;
+    nsAutoString leaf;
+    bool equal = true, inside = true, contains = false;
+    if (NS_FAILED(NS_GetSpecialDirectory(key, getter_AddRefs(profile))) ||
+        NS_FAILED(profile->Normalize()) ||
+        NS_FAILED(entry->GetParent(getter_AddRefs(parent))) || !parent ||
+        NS_FAILED(parent->Clone(getter_AddRefs(location))) ||
+        NS_FAILED(location->Normalize()) ||
+        NS_FAILED(entry->GetLeafName(leaf)) ||
+        NS_FAILED(location->Append(leaf)) ||
+        NS_FAILED(entry->Clone(getter_AddRefs(target))) ||
+        NS_FAILED(target->Normalize()) ||
+        NS_FAILED(profile->Equals(location, &equal)) ||
+        NS_FAILED(profile->Contains(location, &inside)) ||
+        NS_FAILED(target->Contains(profile, &contains))) {
+      continue;
+    }
+    if (!equal && !inside && contains) return true;
+  }
+  return false;
+}
 nsresult StartupDirectory(nsIFile* file, nsACString& path) {
   NS_ENSURE_TRUE(file, NS_ERROR_INVALID_ARG);
   bool directory, linked;
@@ -253,12 +280,18 @@ nsresult StartupDirectory(nsIFile* file, nsACString& path) {
   MOZ_TRY(file->IsSymlink(&linked));
   NS_ENSURE_TRUE(directory && !linked, NS_ERROR_FILE_ACCESS_DENIED);
   MOZ_TRY(GetComparablePath(file, path));
-  // Every ancestor must retain its literal spelling; a link at any depth is
+  // Every ancestor must retain its literal spelling, except an operating
+  // system alias above the selected profile; any other link at any depth is
   // not a selected physical directory admission.
+  bool aliased = false;
   nsCOMPtr<nsIFile> current = file;
   while (current) {
     MOZ_TRY(current->IsSymlink(&linked));
-    NS_ENSURE_FALSE(linked, NS_ERROR_FILE_ACCESS_DENIED);
+    if (linked) {
+      NS_ENSURE_TRUE(StartupAliasAboveProfile(current),
+                     NS_ERROR_FILE_ACCESS_DENIED);
+      aliased = true;
+    }
     nsCOMPtr<nsIFile> parent;
     MOZ_TRY(current->GetParent(getter_AddRefs(parent)));
     current = parent;
@@ -268,6 +301,15 @@ nsresult StartupDirectory(nsIFile* file, nsACString& path) {
   MOZ_TRY(normalized->Normalize());
   nsAutoCString actual;
   MOZ_TRY(GetComparablePath(normalized, actual));
+  if (aliased) {
+    // The canonical spelling resolves only that alias; the leaf is unchanged.
+    nsAutoString leaf, actualLeaf;
+    MOZ_TRY(file->GetLeafName(leaf));
+    MOZ_TRY(normalized->GetLeafName(actualLeaf));
+    NS_ENSURE_TRUE(leaf == actualLeaf, NS_ERROR_FILE_INVALID_PATH);
+    path = actual;
+    return NS_OK;
+  }
   NS_ENSURE_TRUE(actual == path, NS_ERROR_FILE_INVALID_PATH);
   return NS_OK;
 }
@@ -378,14 +420,22 @@ nsresult DatabaseCore::ArmProfileStartup(nsIFile* profile, nsIFile* local) {
   RefPtr<ProfileStartupOperation> operation = new ProfileStartupOperation();
   MOZ_TRY(StartupDirectory(profile, operation->profilePath));
   MOZ_TRY(StartupDirectory(local, operation->localPath));
+#ifdef XP_WIN
   operation->profile = profile;
   operation->localProfile = local;
-#ifdef XP_WIN
   operation->profileLease = MakeUnique<StartupRestoreFD>();
   operation->localLease = MakeUnique<StartupRestoreFD>();
   MOZ_TRY(RestoreOpen(profile, *operation->profileLease));
   MOZ_TRY(RestoreOpen(local, *operation->localLease));
 #else
+  // Bind the canonical locations admitted above, not an aliased spelling.
+  nsCOMPtr<nsIFile> canonicalProfile, canonicalLocal;
+  MOZ_TRY(profile->Clone(getter_AddRefs(canonicalProfile)));
+  MOZ_TRY(canonicalProfile->Normalize());
+  MOZ_TRY(local->Clone(getter_AddRefs(canonicalLocal)));
+  MOZ_TRY(canonicalLocal->Normalize());
+  operation->profile = canonicalProfile;
+  operation->localProfile = canonicalLocal;
   operation->profileFD = open(operation->profilePath.get(),
                               O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   operation->localFD = open(operation->localPath.get(),

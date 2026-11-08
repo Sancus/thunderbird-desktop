@@ -270,7 +270,7 @@ add_task(async function test_accounts() {
       window.assertDeepEqual(
         {
           id: result2[0].id,
-          name: "Mail for user@localhost",
+          name: account2Name,
           type: "imap",
           rootFolder: {
             id: `${result2[0].id}://`,

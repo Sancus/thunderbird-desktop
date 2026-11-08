@@ -17,6 +17,10 @@ class TestPanoramaConversation(MarionetteTestCase):
         self.activity = None
         self.saved_prefs = {}
         self.instance_prefs = self.marionette.instance.prefs
+        # Start from a profile whose legacy contents this test owns: earlier
+        # tests leave ordinary leftovers (an unconfigured POP3 Mail/localhost
+        # summary) that selected-profile startup genuinely refuses to migrate.
+        self.restart_clean_profile()
         self.marionette.set_context(self.marionette.CONTEXT_CHROME)
         profile_before = self.marionette.execute_script(
             "return Services.dirsvc.get('ProfD', Ci.nsIFile).path;"

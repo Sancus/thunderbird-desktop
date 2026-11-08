@@ -461,8 +461,12 @@ var quickFilterBar = {
    * - A filter is active and we are still searching; class `searching` added.
    */
   reflectFiltererResults() {
-    // Bail early if the view is in the process of being created.
+    // Bail early if the view is in the process of being created, or has been
+    // closed; without a view a search can only have ended.
     if (!gDBView) {
+      if (!gViewWrapper?.searching) {
+        this.domNode.classList.remove("searching");
+      }
       return;
     }
     this.domNode.classList.toggle("searching", gViewWrapper.searching);

@@ -9217,6 +9217,23 @@ nsresult StartupInventory(nsIFile* directory, nsTArray<nsCString>& sources,
 // Read only the selected server's existing path preferences. In particular,
 // GetIncomingServer is not a path getter: it also constructs the cold root and
 // recursively reconciles its children before returning the server.
+// A configured server root in its canonical spelling. Only the operating
+// system alias above the selected profile is resolved (macOS /var or /tmp to
+// /private), as StartupDirectory and the JS capture admit it; any other link
+// is refused. Windows roots keep their literal admitted physical spelling.
+nsresult StartupCanonicalRoot(nsIFile* root, nsIFile** output) {
+#ifndef XP_WIN
+  bool exists = false;
+  MOZ_TRY(root->Exists(&exists));
+  if (exists) {
+    nsAutoCString canonical;
+    MOZ_TRY(StartupDirectory(root, canonical));
+    return NewComparableFile(canonical, output);
+  }
+#endif
+  return root->Clone(output);
+}
+
 nsresult StartupConfiguredPath(nsIPrefBranch* prefs, const nsACString& branch,
                                nsIFile** output) {
   bool relative;
@@ -9235,8 +9252,7 @@ nsresult StartupConfiguredPath(nsIPrefBranch* prefs, const nsACString& branch,
                                    NS_GET_IID(nsIFile), getter_AddRefs(root)));
   }
   NS_ENSURE_TRUE(root, NS_ERROR_NOT_AVAILABLE);
-  root.forget(output);
-  return NS_OK;
+  return StartupCanonicalRoot(root, output);
 }
 
 nsresult StartupConfiguredRoots(nsIFile* profile,
@@ -10864,8 +10880,9 @@ nsresult DatabaseCore::BuildStartupFolders() {
     nsCOMPtr<nsIMsgIncomingServer> server;
     MOZ_TRY(accounts->GetIncomingServer(source.key, getter_AddRefs(server)));
     NS_ENSURE_TRUE(server, NS_ERROR_NOT_AVAILABLE);
-    nsCOMPtr<nsIFile> path;
-    MOZ_TRY(server->GetLocalPath(getter_AddRefs(path)));
+    nsCOMPtr<nsIFile> localPath, path;
+    MOZ_TRY(server->GetLocalPath(getter_AddRefs(localPath)));
+    MOZ_TRY(StartupCanonicalRoot(localPath, getter_AddRefs(path)));
     nsAutoCString actualPath, protocol, contract;
     MOZ_TRY(GetComparablePath(path, actualPath));
     MOZ_TRY(server->GetType(protocol));
@@ -11529,9 +11546,10 @@ nsresult DatabaseCore::BindStartupFolderPath(uint64_t folderId,
   if (contract.IsEmpty())
     contract.AssignLiteral("@mozilla.org/msgstore/berkeleystore;1");
   NS_ENSURE_TRUE(protocol == "none"_ns, NS_ERROR_NOT_AVAILABLE);
-  nsCOMPtr<nsIFile> selected, serverPath, parent;
+  nsCOMPtr<nsIFile> selected, localPath, serverPath, parent;
   MOZ_TRY(NS_NewNativeLocalFile(retained.Data(), getter_AddRefs(selected)));
-  MOZ_TRY(server->GetLocalPath(getter_AddRefs(serverPath)));
+  MOZ_TRY(server->GetLocalPath(getter_AddRefs(localPath)));
+  MOZ_TRY(StartupCanonicalRoot(localPath, getter_AddRefs(serverPath)));
   bool inside;
   MOZ_TRY(serverPath->Contains(selected, &inside));
   NS_ENSURE_TRUE(inside, NS_ERROR_FILE_ACCESS_DENIED);

@@ -2466,9 +2466,10 @@ function captureStartupMigration(signal) {
     const profiles = Cc["@mozilla.org/toolkit/profile-service;1"].getService(
       Ci.nsIToolkitProfileService
     );
+    // The registered root may keep the operating-system alias spelling.
     if (
       !profiles.currentProfile ||
-      !profiles.currentProfile.rootDir.equals(profile)
+      !startupSourceFile(profiles.currentProfile.rootDir.path).equals(profile)
     ) {
       throw new Error(
         "Address-book migration requires the actual named startup profile"

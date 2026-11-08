@@ -21,7 +21,9 @@ namespace mozilla::mailnews {
 // handles deny deletion/renaming of checked components and source-file writes.
 // Directories allow child operations; stage files allow their owner's writes.
 // Writers still require caller ownership/quiescence and re-admission after
-// creation. This does not authorize profile activation.
+// creation. This does not authorize profile activation: selected-profile
+// startup retains these admissions only as its physical identity pins, while
+// DatabaseCore's selector/journal/receipt checks still decide activation.
 class WindowsMigrationPath final {
  public:
   enum class Kind { File, Directory, FileOrMissing };

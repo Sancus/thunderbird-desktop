@@ -295,6 +295,24 @@ function snapshot(uris) {
   };
 }
 
+/**
+ * Waits for a condition in this process without loading test modules.
+ *
+ * @param {Function} condition - Returns a truthy value when done.
+ * @param {string} message - Failure description.
+ * @param {number} [interval=100] - Milliseconds between checks.
+ * @param {number} [tries=600] - Maximum number of checks.
+ */
+async function waitFor(condition, message, interval = 100, tries = 600) {
+  for (let i = 0; i < tries; i++) {
+    if (await condition()) {
+      return;
+    }
+    await new Promise(resolve => win.setTimeout(resolve, interval));
+  }
+  throw new Error("Timed out: " + message);
+}
+
 /** @returns {Window} The first tab's about:3pane window. */
 function about3Pane() {
   const tabmail = win.document.getElementById("tabmail");
@@ -310,12 +328,9 @@ function about3Pane() {
  * @returns {Promise<Window>} The about:3pane window.
  */
 async function selectMessage(uri, messageId) {
-  const { TestUtils } = ChromeUtils.importESModule(
-    "resource://testing-common/TestUtils.sys.mjs"
-  );
   const pane = about3Pane();
   // A new folder's pane row can appear after creation; retry until shown.
-  await TestUtils.waitForCondition(
+  await waitFor(
     () => {
       if (pane.gFolder?.URI != uri) {
         pane.displayFolder(uri);
@@ -333,7 +348,7 @@ async function selectMessage(uri, messageId) {
     throw new Error(`${messageId} is not in ${uri}`);
   }
   pane.threadTree.selectedIndex = pane.gDBView.findIndexOfMsgHdr(header, true);
-  await TestUtils.waitForCondition(
+  await waitFor(
     () => pane.gDBView.hdrForFirstSelectedMessage?.messageId == messageId,
     "The message is selected",
     100,
@@ -351,12 +366,9 @@ async function selectMessage(uri, messageId) {
  * @returns {Promise<object>} Displayed identity and text.
  */
 async function display(uri, messageId, body) {
-  const { TestUtils } = ChromeUtils.importESModule(
-    "resource://testing-common/TestUtils.sys.mjs"
-  );
   const pane = await selectMessage(uri, messageId);
   const aboutMessage = pane.messageBrowser.contentWindow;
-  await TestUtils.waitForCondition(() => {
+  await waitFor(() => {
     const text =
       aboutMessage.getMessagePaneBrowser?.()?.contentDocument?.body?.textContent;
     return aboutMessage.gMessage?.messageId == messageId && text?.includes(body);
@@ -402,9 +414,6 @@ async function search(a) {
   const { getMailSearchService } = ChromeUtils.importESModule(
     "resource:///modules/panorama/MailSearch.sys.mjs"
   );
-  const { TestUtils } = ChromeUtils.importESModule(
-    "resource://testing-common/TestUtils.sys.mjs"
-  );
   const identity = h => ({
     folderURI: h.folder.URI,
     key: h.messageKey,
@@ -418,7 +427,7 @@ async function search(a) {
   const tabmail = win.document.getElementById("tabmail");
   const tab = tabmail.openTab("glodaFacet", { mailSearch: { text: a.term } });
   try {
-    await TestUtils.waitForCondition(
+    await waitFor(
       () => tab.searchPromise,
       "Facet query starts",
       100,
@@ -452,7 +461,7 @@ async function search(a) {
     if (!list) {
       throw new Error("The conversation list did not open");
     }
-    await TestUtils.waitForCondition(() => {
+    await waitFor(() => {
       const view = list.chromeBrowser?.contentWindow;
       return (
         view?.gViewWrapper?.isSynthetic &&

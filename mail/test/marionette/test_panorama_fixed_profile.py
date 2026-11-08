@@ -275,7 +275,15 @@ class TestPanoramaFixedProfile(MarionetteTestCase):
         recorded = self.perform("snapshot", uris=list(expected))
         self.assertFalse(recorded["native"], "The legacy default must stay in use")
         self.perform("stop-server")
+        self.stop_application()
         self.assertFalse((self.profile / "panorama.sqlite").exists())
+        # Keep the real legacy folder-cache rows in the log for diagnosis.
+        cache = self.profile / "folderCache.json"
+        rows = json.loads(cache.read_text()) if cache.exists() else None
+        imap_rows = {k: v for k, v in (rows or {}).items() if "ImapMail" in k}
+        print("S711 legacy folderCache.json IMAP rows: " + json.dumps(imap_rows))
+        panacea = (self.profile / "panacea.dat").exists()
+        print("S711 legacy panacea.dat exists: %s" % panacea)
 
         # Opt in and restart: the existing backup/import/activation flow runs.
         self.restart_same_profile(True)

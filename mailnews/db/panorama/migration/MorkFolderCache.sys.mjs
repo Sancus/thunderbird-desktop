@@ -7,6 +7,7 @@ import {
   MorkImportError,
 } from "resource:///modules/MorkParser.sys.mjs";
 import { MailStringUtils } from "resource:///modules/MailStringUtils.sys.mjs";
+import { MIGRATED_MAIL_PROTOCOLS } from "resource:///modules/panorama/MorkFolderImport.sys.mjs";
 
 const SCOPE = "ns:msg:db:row:scope:folders:all";
 const KIND = "ns:msg:db:table:kind:folders";
@@ -403,7 +404,7 @@ export function createMorkFolderCacheRequest(unit) {
       }
     }
     if (
-      !["none", "imap"].includes(folder.protocol) ||
+      !MIGRATED_MAIL_PROTOCOLS.includes(folder.protocol) ||
       !PathUtils.isAbsolute(folder.cachePath) ||
       !PathUtils.isAbsolute(folder.storePath)
     ) {

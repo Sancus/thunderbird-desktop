@@ -10,6 +10,66 @@ import { readMorkMigrationSource } from "resource:///modules/panorama/MigrationS
 import { getMorkThreadRelations } from "resource:///modules/panorama/MigrationMessageMap.sys.mjs";
 
 /**
+ * Server types whose folders keep every message in an ordinary local store
+ * (nsMsgLocalMailFolder, "mailbox" database): Local Folders, POP3 and RSS.
+ * Their folders follow the physical .msf/.sbd hierarchy; the actual server
+ * type stays the identity.
+ */
+export const LOCAL_STORE_PROTOCOLS = Object.freeze(["none", "pop3", "rss"]);
+
+/**
+ * Every server type whose Mork folder summaries startup migration imports.
+ * IMAP and news folders come from their provider; their bodies are optional
+ * offline copies.
+ */
+export const MIGRATED_MAIL_PROTOCOLS = Object.freeze([
+  ...LOCAL_STORE_PROTOCOLS,
+  "imap",
+  "nntp",
+]);
+
+/**
+ * Mirrors nsMsgLocalStoreUtils::nsShouldIgnoreFile for a file inside a
+ * server root: account-level data that is not a folder or a message store.
+ * It stays in place and is preserved by the complete profile backup.
+ *
+ * @param {string} leafName - Actual file leaf name.
+ * @returns {boolean} Whether the leaf is not folder/store data.
+ */
+export function isLegacyStoreIgnoredFile(leafName) {
+  const name = leafName.toLowerCase();
+  return (
+    !name ||
+    name.startsWith(".") ||
+    name.startsWith("#") ||
+    name.endsWith("~") ||
+    [
+      "msgfilterrules.dat",
+      "rules.dat",
+      "filterlog.html",
+      "junklog.html",
+      "rulesbackup.dat",
+      "popstate.dat",
+      "sort.dat",
+      "mailfilt.log",
+      "filters.js",
+      "feeds.json",
+      "feeds.json.tmp",
+      "feeds.json.backup",
+      "feeds.json.corrupt",
+      "feeditems.json",
+      "feeditems.json.tmp",
+      "feeditems.json.backup",
+      "feeditems.json.corrupt",
+      "feeds.rdf",
+      "feeditems.rdf",
+    ].includes(name) ||
+    name.startsWith("feeditems_error") ||
+    [".snm", ".toc", ".mozmsgs"].some(suffix => name.endsWith(suffix))
+  );
+}
+
+/**
  * @typedef {object} MorkImportMessageInput
  * @property {number} sourceKey - Original folder-local row key, not an allocation.
  * @property {number} rootSourceKey - Original semantic thread root.

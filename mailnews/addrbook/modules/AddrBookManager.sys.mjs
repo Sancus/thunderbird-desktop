@@ -451,8 +451,10 @@ function checkMigrationBookAuxiliaries(stage) {
  * acquires nor releases that lock. Its capability closes when the callback
  * settles; pending adoptions still drain before this operation ends.
  *
- * @param {nsIToolkitProfile} profile - Genuine named startup-selected profile,
- *   whose canonical root is the current ProfD.
+ * @param {?nsIToolkitProfile} profile - Genuine named startup-selected profile,
+ *   whose canonical root is the current ProfD, or null when the process was
+ *   started with an unregistered --profile path. The caller-held XRE lock then
+ *   selects exactly the current ProfD, and no registered profile may appear.
  * @param {function(object): *} callback - Complete import/publication and journal
  *   checkpoint, using only checkProfile() and adopt(options).
  * @returns {Promise<*>} Callback result after all started adoptions settle.
@@ -464,11 +466,17 @@ export async function withMigrationAddressBookPublication(profile, callback) {
   if (typeof callback != "function") {
     throw new TypeError("Expected a whole-book publication callback");
   }
-  const nativeProfile = profile.QueryInterface(Ci.nsIToolkitProfile);
+  const nativeProfile = profile
+    ? profile.QueryInterface(Ci.nsIToolkitProfile)
+    : null;
+  const profileRoot = () =>
+    nativeProfile
+      ? nativeProfile.rootDir
+      : Services.dirsvc.get("ProfD", Ci.nsIFile);
   const profiles = Cc["@mozilla.org/toolkit/profile-service;1"].getService(
     Ci.nsIToolkitProfileService
   );
-  const selected = migrationBookFile(nativeProfile.rootDir);
+  const selected = migrationBookFile(profileRoot());
   const current = migrationBookFile(Services.dirsvc.get("ProfD", Ci.nsIFile));
   if (profiles.currentProfile !== nativeProfile || !selected.equals(current)) {
     throw new Error("Migration book lock selects another profile");
@@ -490,7 +498,7 @@ export async function withMigrationAddressBookPublication(profile, callback) {
     if (!held) {
       throw closedError();
     }
-    const actual = migrationBookFile(nativeProfile.rootDir);
+    const actual = migrationBookFile(profileRoot());
     const now = migrationBookFile(Services.dirsvc.get("ProfD", Ci.nsIFile));
     if (
       profiles.currentProfile !== nativeProfile ||

@@ -5,6 +5,7 @@
 import { AppConstants } from "resource://gre/modules/AppConstants.sys.mjs";
 import { MailStringUtils } from "resource:///modules/MailStringUtils.sys.mjs";
 import {
+  LOCAL_STORE_PROTOCOLS,
   readMorkFolderImport,
   validateMorkFolderWindowsInventory,
   validateMorkFolderWindowsReceipt,
@@ -157,7 +158,14 @@ function convertMorkSnapshot(
       throw new Error("Windows snapshot physical binding changed");
     }
   }
-  if (input.folder.protocol !== (imap ? "imap" : "none")) {
+  // News folders have no IMAP UID/offline-operation unit; their optional
+  // offline bodies stay in the retained store, as local bodies do.
+  if (
+    imap
+      ? input.folder.protocol !== "imap"
+      : !LOCAL_STORE_PROTOCOLS.includes(input.folder.protocol) &&
+        input.folder.protocol !== "nntp"
+  ) {
     throw new Error("Unsupported Mork protocol identity/offline mapping");
   }
   const request = structuredClone(input);

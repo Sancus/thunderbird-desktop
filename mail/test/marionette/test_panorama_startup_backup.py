@@ -429,8 +429,11 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             self.created_work.add(Path(record["identity"]["backup"]["path"]).parent.parent)
         return result
 
-    def create_legacy_message(self, store, name="Inbox", user="s526"):
-        """Write genuine Mork/store data through the normal legacy mail API."""
+    def create_legacy_message(self, store, name="Inbox", user="s526", protocol="none"):
+        """Write genuine Mork/store data through the normal legacy mail API.
+
+        Local Folders, POP3 and RSS servers all keep local stores.
+        """
         result = self.marionette.execute_script(r"""
             const { MailServices } = ChromeUtils.importESModule(
               'resource:///modules/MailServices.sys.mjs');
@@ -444,7 +447,7 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             }
             file.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
             const server = MailServices.accounts.createIncomingServer(
-              arguments[2], 'localhost', 'none');
+              arguments[2], 'localhost', arguments[3]);
             server.setStringValue('storeContractID', arguments[0] === 'maildir'
               ? '@mozilla.org/msgstore/maildirstore;1'
               : '@mozilla.org/msgstore/berkeleystore;1');
@@ -468,9 +471,44 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             Services.prefs.savePrefFile(null);
             return {serverKey: server.key, root, summary: folder.summaryFile.path,
               key: header.messageKey, store: folder.msgStore.storeType,
-              name: folder.name, flags: folder.msgDatabase.dBFolderInfo.flags};
-        """, script_args=[store, name, user])
+              name: folder.name, flags: folder.msgDatabase.dBFolderInfo.flags,
+              protocol: server.type};
+        """, script_args=[store, name, user, protocol])
         self.assertEqual(store, result["store"])
+        self.assertEqual(protocol, result["protocol"])
+        return result
+
+    def create_legacy_newsgroup(self, user="s526"):
+        """Subscribe a genuine news server group and record one summary-only article."""
+        result = self.marionette.execute_script(r"""
+            const { MailServices } = ChromeUtils.importESModule(
+              'resource:///modules/MailServices.sys.mjs');
+            const server = MailServices.accounts.createIncomingServer(
+              arguments[0], 'localhost', 'nntp');
+            const account = MailServices.accounts.createAccount();
+            account.incomingServer = server;
+            const news = server.QueryInterface(Ci.nsINntpIncomingServer);
+            news.subscribeToNewsgroup('s526.migration');
+            const folder = server.rootFolder.getChildNamed('s526.migration');
+            const database = folder.msgDatabase;
+            // An article whose body was never downloaded: metadata only.
+            const header = database.createNewHdr(1);
+            header.messageId = 'activation-s526@invalid';
+            header.subject = 'Original startup migration';
+            header.author = 'source@example.invalid';
+            header.date = Date.UTC(2026, 10, 5) * 1000;
+            header.setStringProperty('s526-custom', 'retained');
+            database.addNewHdrToDB(header, true);
+            database.commit(Ci.nsMsgDBCommitType.kLargeCommit);
+            news.writeNewsrcFile();
+            Services.prefs.savePrefFile(null);
+            return {serverKey: server.key, root: server.localPath.path,
+              summary: folder.summaryFile.path, key: header.messageKey,
+              store: folder.msgStore.storeType, name: folder.name,
+              offline: folder.filePath.exists(), protocol: server.type};
+        """, script_args=[user])
+        self.assertEqual("nntp", result["protocol"])
+        self.assertFalse(result["offline"], "No article body was downloaded")
         return result
 
     def assert_message_after_activation(self, source):
@@ -493,10 +531,11 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.assertEqual("retained", result[0]["property"])
         return result
 
-    def assert_mork_migration(self, store):
+    def assert_mork_migration(self, store, protocol="none"):
         """Migrate genuine legacy data, then prove identity-preserving reuse."""
         self.clean_profile(False)
-        source = self.create_legacy_message(store)
+        source = (self.create_legacy_newsgroup() if protocol == "nntp"
+                  else self.create_legacy_message(store, protocol=protocol))
         self.stop_application()
         # Compare physical paths: macOS reaches the runner profile through a
         # /var or /tmp link, and the server root keeps that spelling.
@@ -634,8 +673,15 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.assertEqual(first["sourceId"], self.selection()["sourceId"])
 
     def test_migratesNamedBookAndReusesPublicDirectory(self):
+        self.assert_book_migration(True)
+
+    def test_migratesBookInUnregisteredProfilePath(self):
+        """A --profile <path> start has no registered profile; its lock selects it."""
+        self.assert_book_migration(False)
+
+    def assert_book_migration(self, registered):
         self.clean_profile(False)
-        name = self.register_selected_profile()
+        name = self.register_selected_profile() if registered else None
         source = self.profile / "s526-original.mab"
         # A packaged copy of mail/components/addrbook/test/browser/data/import.mab;
         # the marionette test archive does not contain other test directories.
@@ -1101,6 +1147,21 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
 
     def test_genuine_mork_maildir_migration_and_reuse(self):
         self.assert_mork_migration("maildir")
+
+    def test_genuine_pop3_mbox_migration_and_reuse(self):
+        """POP3 folders keep an ordinary local store under their own server."""
+        self.assert_mork_migration("mbox", "pop3")
+
+    def test_genuine_pop3_maildir_migration_and_reuse(self):
+        self.assert_mork_migration("maildir", "pop3")
+
+    def test_genuine_rss_mbox_migration_and_reuse(self):
+        """Feed folders keep an ordinary local store under their own server."""
+        self.assert_mork_migration("mbox", "rss")
+
+    def test_genuine_nntp_metadata_only_migration_and_reuse(self):
+        """A subscribed newsgroup migrates without any downloaded article body."""
+        self.assert_mork_migration("mbox", "nntp")
 
     def test_existing_native_database_without_selector_is_adopted_before_mork(self):
         """A valid existing native source wins even without a selection record."""

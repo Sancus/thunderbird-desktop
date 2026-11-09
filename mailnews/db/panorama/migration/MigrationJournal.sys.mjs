@@ -10,6 +10,8 @@ import {
   captureWindowsMigrationRoots,
 } from "resource:///modules/panorama/MigrationBackup.sys.mjs";
 import {
+  LOCAL_STORE_PROTOCOLS,
+  MIGRATED_MAIL_PROTOCOLS,
   validateMorkFolderWindowsInventory,
   validateMorkFolderWindowsReceipt,
 } from "resource:///modules/panorama/MorkFolderImport.sys.mjs";
@@ -1666,8 +1668,11 @@ export class MigrationJournal {
     const servers = new Set();
     for (const source of serverSummaries) {
       if (
-        source.role !== "imap-server-root-summary" ||
-        source.protocol !== "imap" ||
+        !MIGRATED_MAIL_PROTOCOLS.includes(source.protocol) ||
+        source.role !==
+          (source.protocol === "imap"
+            ? "imap-server-root-summary"
+            : "server-root-summary") ||
         source.size <= 0 ||
         source.size >= 0xffffffff ||
         typeof source.serverKey !== "string" ||
@@ -2264,15 +2269,19 @@ function validateStartupFolderOrigin(source, caches) {
     source.storePath !== source.path.slice(0, -4) ||
     !contract ||
     source.storeContractID !== contract ||
-    !["none", "imap"].includes(source.protocol) ||
+    !MIGRATED_MAIL_PROTOCOLS.includes(source.protocol) ||
     source.origin?.provider !==
-      (source.protocol === "none"
+      (LOCAL_STORE_PROTOCOLS.includes(source.protocol)
         ? "local-store-discovery"
-        : "imap-client-discovery")
+        : source.protocol === "nntp"
+          ? "news-provider-discovery"
+          : "imap-client-discovery") ||
+    (source.protocol === "nntp" &&
+      new FileUtils.File(source.path).parent.path !== source.serverRoot)
   ) {
     throw new Error("Invalid retained startup folder origin");
   }
-  if (source.protocol === "none") {
+  if (source.protocol !== "imap") {
     return;
   }
   const origin = source.origin;

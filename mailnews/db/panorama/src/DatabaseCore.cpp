@@ -263,6 +263,24 @@ nsresult RestoreCompleted(JSContext*, ProfileStartupOperation&, bool&);
 #ifdef XP_WIN
 nsresult StartupDatabasePin(nsIFile*, nsIFile*, UniquePtr<StartupRestoreFD>&);
 #endif
+}  // namespace
+
+// Local Folders, POP3 and RSS servers keep every message in an ordinary local
+// store (nsMsgLocalMailFolder, "mailbox" database); their folders follow the
+// physical .msf/.sbd hierarchy. The actual server type stays the identity.
+bool StartupLocalProtocol(const nsACString& protocol) {
+  return protocol == "none"_ns || protocol == "pop3"_ns || protocol == "rss"_ns;
+}
+// IMAP and news folders come from their provider; their bodies are optional
+// offline copies, so a metadata-only summary is ordinary state.
+bool StartupRemoteProtocol(const nsACString& protocol) {
+  return protocol == "imap"_ns || protocol == "nntp"_ns;
+}
+bool StartupMailProtocol(const nsACString& protocol) {
+  return StartupLocalProtocol(protocol) || StartupRemoteProtocol(protocol);
+}
+
+namespace {
 // A link above a selected startup profile whose canonical target contains
 // that profile is the operating system's alias of its location (macOS /var
 // to /private/var). A link at or inside the profile is never such an alias.
@@ -5465,7 +5483,10 @@ nsresult CheckFullImportRecords(JSContext* cx, JS::Handle<JSObject*> request,
   uint32_t folderFlags;
   MOZ_TRY(folder->GetIncomingServerType(protocol));
   MOZ_TRY(folder->GetFlags(&folderFlags));
-  NS_ENSURE_TRUE(protocol == (imap ? "imap"_ns : "none"_ns),
+  // News rows have no IMAP UID/offline-operation unit; their optional offline
+  // bodies stay in the retained store exactly as local bodies do.
+  NS_ENSURE_TRUE(imap ? protocol == "imap"_ns
+                      : StartupLocalProtocol(protocol) || protocol == "nntp"_ns,
                  NS_ERROR_NOT_IMPLEMENTED);
   JS::Rooted<JS::Value> field(cx);
   JS::Rooted<JSObject*> records(cx);
@@ -7004,9 +7025,7 @@ nsresult CheckCacheFolders(DatabaseCore* core,
                        protocol == folder.protocol &&
                        storeType == folder.storeType,
                    NS_ERROR_NOT_AVAILABLE);
-    NS_ENSURE_TRUE(
-        protocol.EqualsLiteral("none") || protocol.EqualsLiteral("imap"),
-        NS_ERROR_NOT_IMPLEMENTED);
+    NS_ENSURE_TRUE(StartupMailProtocol(protocol), NS_ERROR_NOT_IMPLEMENTED);
   }
   return NS_OK;
 }
@@ -9395,7 +9414,7 @@ nsresult StartupConfiguredRoots(
                               binding.contract);
       if (binding.contract.IsEmpty())
         binding.contract.AssignLiteral("@mozilla.org/msgstore/berkeleystore;1");
-      if (binding.protocol != "none"_ns && binding.protocol != "imap"_ns) {
+      if (!StartupMailProtocol(binding.protocol)) {
         NS_ENSURE_TRUE(files.IsEmpty(), NS_ERROR_NOT_IMPLEMENTED);
         continue;
       }
@@ -9417,6 +9436,24 @@ nsresult StartupStores(ProfileStartupOperation& operation,
     nsCOMPtr<nsIFile> file;
     MOZ_TRY(StartupContained(operation.profile, path, getter_AddRefs(file)));
     if (nsMsgLocalStoreUtils::nsShouldIgnoreFile(file)) continue;
+    // A news server keeps its group-list cache in its own root. It is account
+    // data, not a folder or store, and stays in place with its backup copy.
+    nsAutoCString leaf;
+    MOZ_TRY(file->GetNativeLeafName(leaf));
+    if (leaf == "hostinfo.dat"_ns) {
+      nsCOMPtr<nsIFile> parent;
+      MOZ_TRY(file->GetParent(getter_AddRefs(parent)));
+      nsCString parentPath;
+      MOZ_TRY(GetComparablePath(parent, parentPath));
+      bool newsRoot = false;
+      for (const auto& server : operation.servers)
+        newsRoot |= server.protocol == "nntp"_ns && server.path == parentPath;
+      if (newsRoot) {
+        auto saved = operation.backupFiles.Lookup(path);
+        NS_ENSURE_TRUE(saved, NS_ERROR_NOT_AVAILABLE);
+        continue;
+      }
+    }
     bool covered = false;
     for (const auto& source : operation.sources) {
       if (source.storePath == path) {
@@ -9429,7 +9466,8 @@ nsresult StartupStores(ProfileStartupOperation& operation,
       // CheckStartupMailStore admits a metadata-only IMAP summary without an
       // offline body; that absent store contains no other inventory file.
       nsresult status = store->IsDirectory(&directory);
-      if (status == NS_ERROR_FILE_NOT_FOUND && source.protocol == "imap"_ns)
+      if (status == NS_ERROR_FILE_NOT_FOUND &&
+          StartupRemoteProtocol(source.protocol))
         continue;
       MOZ_TRY(status);
       if (!directory) continue;
@@ -11411,8 +11449,12 @@ nsresult StartupServerSummaryInput(JSContext* cx, JS::Handle<JSObject*> source,
   nsCString role, protocol;
   MOZ_TRY(StartupText(cx, source, "role", role));
   MOZ_TRY(StartupText(cx, source, "protocol", protocol));
-  NS_ENSURE_TRUE(role == "imap-server-root-summary"_ns && protocol == "imap"_ns,
-                 NS_ERROR_NOT_IMPLEMENTED);
+  // IMAP keeps its original role name; other servers use the generic one.
+  NS_ENSURE_TRUE(
+      StartupMailProtocol(protocol) &&
+          role == (protocol == "imap"_ns ? "imap-server-root-summary"_ns
+                                         : "server-root-summary"_ns),
+      NS_ERROR_NOT_IMPLEMENTED);
   for (auto entry : {std::pair{"id", &output.id},
                      {"path", &output.path},
                      {"sha256", &output.hash},
@@ -11621,11 +11663,10 @@ nsresult DatabaseCore::ReadStartupMailSource(JSContext* cx,
     MOZ_TRY(StartupText(cx, source, entry.first, *entry.second));
     NS_ENSURE_FALSE(entry.second->IsEmpty(), NS_ERROR_INVALID_ARG);
   }
-  NS_ENSURE_TRUE(
-      output.serverKey.FindChar('.') < 0 &&
-          output.path.Equals(output.storePath + ".msf"_ns) &&
-          (output.protocol == "none"_ns || output.protocol == "imap"_ns),
-      NS_ERROR_NOT_IMPLEMENTED);
+  NS_ENSURE_TRUE(output.serverKey.FindChar('.') < 0 &&
+                     output.path.Equals(output.storePath + ".msf"_ns) &&
+                     StartupMailProtocol(output.protocol),
+                 NS_ERROR_NOT_IMPLEMENTED);
   int64_t size;
   MOZ_TRY(StartupNumber(cx, source, "size", 1, UINT32_MAX - 1, size));
   output.size = size;
@@ -11661,8 +11702,8 @@ nsresult DatabaseCore::ReadStartupMailSource(JSContext* cx,
                      (contract == "@mozilla.org/msgstore/berkeleystore;1"_ns ||
                       contract == "@mozilla.org/msgstore/maildirstore;1"_ns),
                  NS_ERROR_NOT_AVAILABLE);
-  MOZ_TRY(
-      CheckStartupMailStore(output.storePath, contract, protocol == "imap"_ns));
+  MOZ_TRY(CheckStartupMailStore(output.storePath, contract,
+                                StartupRemoteProtocol(protocol)));
   const bool directory = contract == "@mozilla.org/msgstore/maildirstore;1"_ns;
   nsCString storeType;
   MOZ_TRY(StartupText(cx, source, "storeType", storeType));
@@ -11677,7 +11718,7 @@ nsresult DatabaseCore::ReadStartupMailSource(JSContext* cx,
   nsCString retainedRelative;
   MOZ_TRY(StartupText(cx, source, "physicalRelativePath", retainedRelative));
   NS_ENSURE_TRUE(relativePath == retainedRelative, NS_ERROR_NOT_AVAILABLE);
-  if (protocol == "none"_ns) {
+  if (StartupLocalProtocol(protocol)) {
     NS_ENSURE_TRUE(provider == "local-store-discovery"_ns,
                    NS_ERROR_INVALID_ARG);
     nsCCharSeparatedTokenizer parts(relativePath, '/');
@@ -11693,6 +11734,18 @@ nsresult DatabaseCore::ReadStartupMailSource(JSContext* cx,
       output.localLeaves.AppendElement(part);
     }
     NS_ENSURE_FALSE(output.localLeaves.IsEmpty(), NS_ERROR_NOT_AVAILABLE);
+    return NS_OK;
+  }
+  if (protocol == "nntp"_ns) {
+    // A newsgroup is a flat <group>.msf directly below its news server root.
+    // The provider creates the folder from newsrc; startup binds it by this
+    // exact summary path, never by a name read from a possibly hashed leaf.
+    NS_ENSURE_TRUE(provider == "news-provider-discovery"_ns,
+                   NS_ERROR_INVALID_ARG);
+    NS_ENSURE_TRUE(relativePath.FindChar('/') < 0 &&
+                       relativePath.Length() > 4 &&
+                       StringEndsWith(relativePath, ".msf"_ns),
+                   NS_ERROR_NOT_AVAILABLE);
     return NS_OK;
   }
   NS_ENSURE_TRUE(provider == "imap-client-discovery"_ns, NS_ERROR_INVALID_ARG);
@@ -13337,7 +13390,7 @@ nsresult DatabaseCore::OpenProfileStartup(JSContext* cx,
         MOZ_TRY(StartupItem(cx, sources, i, &source));
         StartupMailSource native;
         MOZ_TRY(ReadStartupMailSource(cx, source, operation, native));
-        if (native.protocol == "none"_ns)
+        if (StartupLocalProtocol(native.protocol))
           MOZ_TRY(BindStartupLocalNames(cx, native));
         auto archived = operation.backupFiles.Lookup(native.path);
         NS_ENSURE_TRUE(archived && archived.Data() == native.hash,
@@ -13570,7 +13623,7 @@ nsresult DatabaseCore::BuildStartupFolders() {
   }
   nsTArray<const StartupMailSource*> local;
   for (const auto& source : operation.sources)
-    if (source.protocol == "none"_ns) local.AppendElement(&source);
+    if (StartupLocalProtocol(source.protocol)) local.AppendElement(&source);
   local.Sort([](const StartupMailSource* a, const StartupMailSource* b) -> int {
     if (a->localNames.Length() != b->localNames.Length())
       return a->localNames.Length() < b->localNames.Length() ? -1 : 1;
@@ -13805,10 +13858,28 @@ nsresult DatabaseCore::BuildStartupFolders() {
     auto root = roots.Lookup(source.serverKey);
     NS_ENSURE_TRUE(root, NS_ERROR_NOT_AVAILABLE);
     nsCOMPtr<nsIMsgFolder> folder = root.Data();
-    if (source.protocol == "none"_ns) {
+    if (StartupLocalProtocol(source.protocol)) {
       auto binding = localBindings.Lookup(source.id);
       NS_ENSURE_TRUE(binding, NS_ERROR_NOT_AVAILABLE);
       folder = binding.Data();
+    } else if (source.protocol == "nntp"_ns) {
+      // The news root above loaded newsrc and created every subscribed
+      // group. A leftover summary of an unsubscribed group has no such
+      // folder and is refused rather than silently dropped.
+      nsCOMPtr<nsIMsgFolder> bound;
+      nsTArray<RefPtr<nsIMsgFolder>> children;
+      MOZ_TRY(folder->GetSubFolders(children));
+      for (const auto& child : children) {
+        nsCOMPtr<nsIFile> childSummary;
+        MOZ_TRY(child->GetSummaryFile(getter_AddRefs(childSummary)));
+        nsCString childPath;
+        MOZ_TRY(GetComparablePath(childSummary, childPath));
+        if (childPath != source.path) continue;
+        NS_ENSURE_FALSE(bound, NS_ERROR_NOT_AVAILABLE);
+        bound = child;
+      }
+      NS_ENSURE_TRUE(bound, NS_ERROR_NOT_AVAILABLE);
+      folder = bound;
     } else {
       for (const auto& part : source.canonicalPath.Split('/')) {
         nsCOMPtr<nsIMsgFolder> child;
@@ -13904,7 +13975,7 @@ nsresult DatabaseCore::BuildStartupFolders() {
   // receipt.
   operation.createdEmptyStores.Clear();
   for (const auto& server : operation.servers) {
-    if (server.protocol != "none"_ns) continue;
+    if (!StartupLocalProtocol(server.protocol)) continue;
     nsCOMPtr<nsIFile> root;
     MOZ_TRY(NS_NewNativeLocalFile(server.path, getter_AddRefs(root)));
     nsTArray<nsCString> files;
@@ -14218,7 +14289,7 @@ nsresult DatabaseCore::BindStartupFolderPath(uint64_t folderId,
   MOZ_TRY(server->GetStringValue("storeContractID", contract));
   if (contract.IsEmpty())
     contract.AssignLiteral("@mozilla.org/msgstore/berkeleystore;1");
-  NS_ENSURE_TRUE(protocol == "none"_ns, NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_TRUE(StartupLocalProtocol(protocol), NS_ERROR_NOT_AVAILABLE);
   nsCOMPtr<nsIFile> selected, localPath, serverPath, parent;
   MOZ_TRY(NS_NewNativeLocalFile(retained.Data(), getter_AddRefs(selected)));
   MOZ_TRY(server->GetLocalPath(getter_AddRefs(localPath)));
@@ -14793,7 +14864,7 @@ nsresult DatabaseCore::CheckProfileActivation(
         MOZ_TRY(StartupText(cx, item, "id", id));
         if (id != native.sourceId) continue;
         MOZ_TRY(StartupText(cx, item, "protocol", protocol));
-        if (protocol != "none"_ns) continue;
+        if (!StartupLocalProtocol(protocol)) continue;
         nsCString serverKey, serverRoot, relative;
         MOZ_TRY(StartupText(cx, item, "serverKey", serverKey));
         MOZ_TRY(StartupText(cx, item, "serverRoot", serverRoot));
@@ -15296,8 +15367,7 @@ nsresult DatabaseCore::CheckProfileActivation(
               NS_ENSURE_TRUE(
                   server.path == folder.storePath &&
                       server.protocol == folder.protocol &&
-                      (server.protocol == "none"_ns ||
-                       server.protocol == "imap"_ns) &&
+                      StartupMailProtocol(server.protocol) &&
                       ((folder.storeType == "mbox"_ns &&
                         server.contract ==
                             "@mozilla.org/msgstore/berkeleystore;1"_ns) ||

@@ -6,7 +6,10 @@ import { AppConstants } from "resource://gre/modules/AppConstants.sys.mjs";
 import { FileUtils } from "resource://gre/modules/FileUtils.sys.mjs";
 import { MailStringUtils } from "resource:///modules/MailStringUtils.sys.mjs";
 import {
+  LOCAL_STORE_PROTOCOLS,
+  MIGRATED_MAIL_PROTOCOLS,
   captureMorkFolderWindowsInventory,
+  isLegacyStoreIgnoredFile,
   readMorkFolderImport,
   validateMorkFolderWindowsInventory,
 } from "resource:///modules/panorama/MorkFolderImport.sys.mjs";
@@ -366,7 +369,8 @@ async function resumeMorkBooksWithProfile(journal, checkLock, signal) {
  * book identity and full scoped maps instead of importing or notifying twice.
  *
  * @param {MigrationJournal} journal - Actual backed-up import/validation journal.
- * @param {nsIToolkitProfile} profile - Actual startup-selected current profile.
+ * @param {?nsIToolkitProfile} profile - Actual startup-selected current profile,
+ *   or null for an unregistered --profile start (the held ProfD is selected).
  *   The caller retains the startup profile lock through all settled work.
  * @param {Map<string, string>} bookNames - Exact planned ID/display-name pairs.
  * @param {AbortSignal} [signal] - Cancellation after a settled book boundary.
@@ -2560,14 +2564,18 @@ function captureStartupMigration(signal, nativeAudit) {
         new FileUtils.File(server.root).contains(file)
       );
       const rootMatches = servers.filter(
-        server =>
-          server.protocol === "imap" && file.path === server.root + ".msf"
+        server => file.path === server.root + ".msf"
       );
       if (rootMatches.length === 1 && matches.length === 0) {
         const server = rootMatches[0];
         serverSummaries.push({
           id: "server-summary:" + file.getRelativePath(profile),
-          role: "imap-server-root-summary",
+          // IMAP keeps its original role name; other servers use the
+          // generic one. Either way it is the server root folder summary.
+          role:
+            server.protocol === "imap"
+              ? "imap-server-root-summary"
+              : "server-root-summary",
           path: file.path,
           serverKey: server.key,
           serverRoot: server.root,
@@ -2587,7 +2595,7 @@ function captureStartupMigration(signal, nativeAudit) {
         );
       }
       const server = matches[0];
-      if (!["none", "imap"].includes(server.protocol)) {
+      if (!MIGRATED_MAIL_PROTOCOLS.includes(server.protocol)) {
         throw new Error("Native Mork migration does not support this protocol");
       }
       summaries.push({
@@ -2637,13 +2645,13 @@ function captureStartupMigration(signal, nativeAudit) {
     if (!server || file.leafName.endsWith(".msf")) {
       continue;
     }
+    // Account-level files are not folders or stores (native ignores them).
+    // A news server also keeps its group list cache in its own root.
     if (
-      [
-        "msgFilterRules.dat",
-        "popstate.dat",
-        "feeds.json",
-        "feeditems.json",
-      ].includes(file.leafName)
+      isLegacyStoreIgnoredFile(file.leafName) ||
+      (server.protocol === "nntp" &&
+        file.leafName === "hostinfo.dat" &&
+        file.parent.equals(new FileUtils.File(server.root)))
     ) {
       continue;
     }
@@ -2661,13 +2669,15 @@ function captureStartupMigration(signal, nativeAudit) {
     const profiles = Cc["@mozilla.org/toolkit/profile-service;1"].getService(
       Ci.nsIToolkitProfileService
     );
-    // The registered root may keep the operating-system alias spelling.
+    // The held XRE lock selects this profile, named or started with an
+    // unregistered --profile path. A registered current profile must be the
+    // same one; its root may keep the operating-system alias spelling.
     if (
-      !profiles.currentProfile ||
+      profiles.currentProfile &&
       !startupSourceFile(profiles.currentProfile.rootDir.path).equals(profile)
     ) {
       throw new Error(
-        "Address-book migration requires the actual named startup profile"
+        "Address-book migration profile differs from the registered one"
       );
     }
     const names = new Map();
@@ -2782,8 +2792,13 @@ function captureStartupMigration(signal, nativeAudit) {
  * @throws {Error} For absent, conflicting or unsupported retained IMAP metadata.
  */
 function startupFolderOrigin(source, summary, caches) {
-  if (source.protocol === "none") {
+  if (LOCAL_STORE_PROTOCOLS.includes(source.protocol)) {
     return { provider: "local-store-discovery" };
+  }
+  if (source.protocol === "nntp") {
+    // The news provider creates each subscribed group from newsrc; native
+    // startup binds it by the exact summary path.
+    return { provider: "news-provider-discovery" };
   }
   if (source.protocol !== "imap") {
     throw new Error("No native startup discovery provider for this protocol");
@@ -3170,11 +3185,8 @@ async function finishPanoramaProfileStartup(
         const profiles = Cc[
           "@mozilla.org/toolkit/profile-service;1"
         ].getService(Ci.nsIToolkitProfileService);
-        if (!profiles.currentProfile) {
-          throw new Error(
-            "Address-book migration requires a named selected profile"
-          );
-        }
+        // Null for an unregistered --profile start: publication then binds
+        // the held ProfD itself (withMigrationAddressBookPublication).
         startupMigrationDirectory(journal, database, operation);
         await resumeMorkBookImportsAndPublish(
           journal,

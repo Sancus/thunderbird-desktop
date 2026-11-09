@@ -212,7 +212,16 @@ async function createImapAccount(offline) {
     inbox.updateFolderWithListener(null, listener)
   );
   if (offline) {
+    // Same as Folder Properties > Synchronization: use offline, Download Now.
+    // The URL can finish before every body is stored, so wait for the store.
+    inbox.setFlag(Ci.nsMsgFolderFlags.Offline);
     await urlOperation(listener => inbox.downloadAllForOffline(listener, null));
+    await waitFor(
+      () =>
+        [...inbox.messages].length &&
+        [...inbox.messages].every(h => inbox.hasMsgOffline(h.messageKey)),
+      "INBOX bodies are stored offline"
+    );
   }
   return inbox;
 }
@@ -234,14 +243,15 @@ function localRoot() {
  * Reads one header's real stored message text.
  *
  * @param {nsIMsgDBHdr} header - Stored header.
- * @returns {string} Raw stored text, or null when no local body exists.
+ * @returns {{raw: ?string, error: ?string}} Raw stored text, or the actual
+ *   reason no local body could be opened.
  */
 function rawText(header) {
   let input;
   try {
     input = header.folder.getMsgInputStream(header);
-  } catch {
-    return null;
+  } catch (error) {
+    return { raw: null, error: String(error) };
   }
   const stream = Cc["@mozilla.org/scriptableinputstream;1"].createInstance(
     Ci.nsIScriptableInputStream
@@ -261,7 +271,7 @@ function rawText(header) {
   } finally {
     stream.close();
   }
-  return raw;
+  return { raw, error: null };
 }
 
 /**
@@ -279,14 +289,21 @@ function snapshot(uris) {
     const folder = MailServices.folderLookup.getFolderForURL(uri);
     folders[uri] = folder
       ? [...folder.messages]
-          .map(header => ({
-            key: header.messageKey,
-            messageId: header.messageId,
-            subject: header.mime2DecodedSubject,
-            author: header.mime2DecodedAuthor,
-            recipients: header.mime2DecodedRecipients,
-            raw: rawText(header),
-          }))
+          .map(header => {
+            const body = rawText(header);
+            return {
+              key: header.messageKey,
+              messageId: header.messageId,
+              subject: header.mime2DecodedSubject,
+              author: header.mime2DecodedAuthor,
+              recipients: header.mime2DecodedRecipients,
+              offline: !!(header.flags & Ci.nsMsgMessageFlags.Offline),
+              hasMsgOffline: folder.hasMsgOffline(header.messageKey),
+              storeToken: header.storeToken,
+              raw: body.raw,
+              rawError: body.error,
+            };
+          })
           .sort((a, b) => a.key - b.key)
       : null;
   }

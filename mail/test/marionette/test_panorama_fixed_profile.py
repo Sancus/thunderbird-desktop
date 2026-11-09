@@ -195,7 +195,9 @@ class TestPanoramaFixedProfile(MarionetteTestCase):
         self.assertEqual(expected["subject"], row["subject"])
         self.assertEqual(expected["from"], row["author"])
         self.assertEqual(expected["to"], row["recipients"])
-        self.assertIsNotNone(row["raw"], "The message body must be stored")
+        self.assertIsNotNone(
+            row["raw"], "The message body must be stored: %s" % row["rawError"]
+        )
         self.assertIn(expected["body"], row["raw"])
 
     def test_fresh_profile_fixed_sequence(self):
@@ -274,6 +276,13 @@ class TestPanoramaFixedProfile(MarionetteTestCase):
             self.wait_folder(uri, ids, "Legacy data exists")
         recorded = self.perform("snapshot", uris=list(expected))
         self.assertFalse(recorded["native"], "The legacy default must stay in use")
+        # The legacy data itself must hold every body, IMAP ones offline.
+        for uri, messages in expected.items():
+            rows = {r["messageId"]: r for r in recorded["folders"][uri]}
+            for m in messages:
+                self.assert_stored(rows[m["messageId"]], m)
+        for row in recorded["folders"][legacy["inbox"]]:
+            self.assertTrue(row["offline"] and row["hasMsgOffline"], row["messageId"])
         self.perform("stop-server")
         self.stop_application()
         self.assertFalse((self.profile / "panorama.sqlite").exists())

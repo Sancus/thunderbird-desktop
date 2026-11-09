@@ -2477,6 +2477,9 @@ function captureStartupMigration(signal, nativeAudit) {
     ChromeUtils.importESModule(
       "resource:///modules/panorama/MigrationBackup.sys.mjs"
     );
+  if (AppConstants.platform === "win") {
+    respellWindowsServerRoots();
+  }
   const roots = collectMigrationRoots();
   if (startupSourceFile(roots.profilePath).path !== profile.path) {
     throw new Error("Startup inventory selects another profile");
@@ -2938,6 +2941,71 @@ function startupEntryExists(file) {
  * @param {string} path - Existing absolute source directory.
  * @returns {nsIFile} Canonical unlinked file.
  */
+/**
+ * Windows: a configured server directory spelled through a case or 8.3 alias
+ * names the same physical directory as its admitted spelling. Persist that
+ * spelling before inventory and backup (mail services are not running yet),
+ * so every retained identity, native root and provider folder path uses one
+ * spelling. The directory and its contents are unchanged. Admission still
+ * refuses reparse/offline components, and a selected profile reached through
+ * an alias stays refused by checkWindowsStartupSpelling: this process cannot
+ * respell its own ProfD.
+ */
+function respellWindowsServerRoots() {
+  const branches = new Set();
+  for (const name of Services.prefs.getChildList("mail.server.")) {
+    const match = /^(mail\.server\.[^.]+\.)directory(?:-rel)?$/.exec(name);
+    if (match && match[1] !== "mail.server.default.") {
+      branches.add(match[1]);
+    }
+  }
+  let changed = false;
+  for (const branch of [...branches].sort()) {
+    const relative = Services.prefs.prefHasUserValue(branch + "directory-rel");
+    const directory = relative
+      ? Services.prefs.getComplexValue(
+          branch + "directory-rel",
+          Ci.nsIRelativeFilePref
+        ).file
+      : Services.prefs.getComplexValue(branch + "directory", Ci.nsIFile);
+    if (!directory.exists()) {
+      continue;
+    }
+    const lease = admitWindowsMigrationPath(
+      directory,
+      Ci.nsIPanoramaMigrationFileSystem.KIND_DIRECTORY
+    );
+    let canonical;
+    try {
+      canonical = lease.canonicalPath;
+    } finally {
+      lease.close();
+    }
+    if (canonical === directory.path) {
+      continue;
+    }
+    const file = new FileUtils.File(canonical);
+    Services.prefs.setComplexValue(branch + "directory", Ci.nsIFile, file);
+    if (relative) {
+      const value = Cc["@mozilla.org/pref-relativefile;1"].createInstance(
+        Ci.nsIRelativeFilePref
+      );
+      value.relativeToKey = "ProfD";
+      value.file = file;
+      Services.prefs.setComplexValue(
+        branch + "directory-rel",
+        Ci.nsIRelativeFilePref,
+        value
+      );
+    }
+    changed = true;
+  }
+  if (changed) {
+    // The complete backup then holds the same configuration startup uses.
+    Services.prefs.savePrefFile(null);
+  }
+}
+
 /**
  * The admitted root containing a captured summary: the selected profile, or
  * the external server root it belongs to.

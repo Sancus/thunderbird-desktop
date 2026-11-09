@@ -1248,6 +1248,36 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.assertEqual(headers, self.assert_message_after_activation(source))
         self.assertEqual(selector, (self.profile / "panorama-profile.json").read_bytes())
 
+    @unittest.skipUnless(sys.platform == "win32", "Windows case-insensitive spelling")
+    def test_windows_case_alias_server_root_migrates(self):
+        """A server directory spelled in another letter case is the same directory."""
+        self.clean_profile(False)
+        source = self.create_legacy_message("mbox")
+        alias = str(Path(source["root"])).upper()
+        self.assertNotEqual(source["root"], alias)
+        self.marionette.execute_script("""
+            const { FileUtils } = ChromeUtils.importESModule(
+              'resource://gre/modules/FileUtils.sys.mjs');
+            Services.prefs.clearUserPref('mail.server.' + arguments[0] + '.directory-rel');
+            Services.prefs.setComplexValue('mail.server.' + arguments[0] + '.directory',
+              Ci.nsIFile, new FileUtils.File(arguments[1]));
+            Services.prefs.savePrefFile(null);
+        """, script_args=[source["serverKey"], alias])
+        self.stop_application()
+        self.start_same_profile(True)
+        selected = self.selection()
+        self.assertEqual("migrated", selected["record"]["origin"])
+        headers = self.assert_message_after_activation(source)
+        respelled = self.marionette.execute_script("""
+            return Services.prefs.getComplexValue(
+              'mail.server.' + arguments[0] + '.directory', Ci.nsIFile).path;
+        """, script_args=[source["serverKey"]])
+        self.assertEqual(source["root"], respelled)
+        self.stop_application()
+        self.start_same_profile(True)
+        self.assertEqual(selected["sourceId"], self.selection()["sourceId"])
+        self.assertEqual(headers, self.assert_message_after_activation(source))
+
     def test_external_root_containing_profile_refuses(self):
         """A mail root that contains the profile has ambiguous ownership."""
         self.clean_profile(False)

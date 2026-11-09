@@ -306,6 +306,9 @@ class TestPanoramaFixedProfile(MarionetteTestCase):
         self.assertTrue(record["identity"]["imports"])
         archive = json.loads(Path(record["identity"]["backup"]["path"]).read_text())
         self.assertTrue(archive["complete"])
+        # The user's IMAP server is still there after the opt-in restart.
+        port = self.perform("resume-server", port=legacy["port"])
+        self.assertEqual(legacy["port"], port)
         migrated = self.perform("snapshot", uris=list(expected))
         self.assertTrue(migrated["native"])
         for uri, messages in expected.items():

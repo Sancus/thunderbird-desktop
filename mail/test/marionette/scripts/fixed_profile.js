@@ -140,14 +140,20 @@ function stopServer() {
  * Starts a real IMAP server whose INBOX holds the fixed messages.
  *
  * @param {string} set - Key into IMAP_MESSAGES.
+ * @param {number} [port] - Reuse the port of an earlier process's server.
  * @returns {object} The running IMAPServer.
  */
-function startServer(set) {
+function startServer(set, port) {
   registerModules();
   const { IMAPServer } = ChromeUtils.importESModule(
     "resource://testing-common/mailnews/IMAPServer.sys.mjs"
   );
   const server = (win.s711Imap = new IMAPServer());
+  if (port) {
+    // The same account keeps its server port across application restarts.
+    server.server.stop();
+    server.server.start(port);
+  }
   const inbox = server.daemon.getMailbox("INBOX");
   inbox.uidvalidity = UIDVALIDITY;
   server.addMessages(
@@ -592,8 +598,13 @@ function extensionReport(prefix) {
         local: local.URI,
         imapMessages: IMAP_MESSAGES.migrated,
         localMessages: LOCAL_THREAD,
+        port: win.s711Imap.port,
       };
     }
+    case "resume-server":
+      // The same server, mailbox, UIDVALIDITY and UIDs as before the restart.
+      startServer("migrated", args.port);
+      return win.s711Imap.port;
     case "stop-server":
       stopServer();
       return true;

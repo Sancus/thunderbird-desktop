@@ -2233,8 +2233,14 @@ export function startPanoramaRestoreCommand(commandLine) {
       ChromeUtils.importESModule(
         "resource:///modules/panorama/MigrationRecovery.sys.mjs"
       );
-    const profilePath = Services.dirsvc.get("ProfDS", Ci.nsIFile).path;
-    const localProfilePath = Services.dirsvc.get("ProfLD", Ci.nsIFile).path;
+    // Native restoration binds the canonical selected directories; resolve
+    // only an operating-system alias above the profile (macOS /var).
+    const [profilePath, localProfilePath] = ["ProfDS", "ProfLD"].map(key => {
+      const path = Services.dirsvc.get(key, Ci.nsIFile).path;
+      return AppConstants.platform == "win"
+        ? path
+        : startupSourceFile(path).path;
+    });
     let request;
     if (selected[0] === "panorama-restore") {
       const backupPath = commandLine.handleFlagWithParam(selected[0], false);

@@ -1142,6 +1142,13 @@ async function archivedSelectorInput(nested = false) {
   const input = await lifecycleProfile();
   await input.journal.finishStage("validate");
   input.journal.close();
+  // Restore binds the canonical selected profile and journal paths, and the
+  // macOS temporary directory is reached through a /var link.
+  for (const key of ["root", "profilePath", "journalPath"]) {
+    const file = new FileUtils.File(input[key]);
+    file.normalize();
+    input[key] = file.path;
+  }
   if (nested) {
     const original = input.journalPath;
     input.journalPath = PathUtils.join(

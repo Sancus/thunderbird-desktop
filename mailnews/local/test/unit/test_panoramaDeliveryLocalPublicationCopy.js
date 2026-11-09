@@ -638,7 +638,11 @@ add_task(async function test_copyDataPreservesNativeReadFailure() {
     [Cr.NS_ERROR_FILE_CORRUPTED],
     "CopyData returns the original zero-byte native Read failure"
   );
-  Assert.deepEqual(statuses, [Cr.NS_ERROR_FAILURE]);
+  Assert.deepEqual(
+    statuses,
+    [Cr.NS_ERROR_FILE_CORRUPTED],
+    "The failed move completes with that same native Read failure"
+  );
   Assert.deepEqual(db.listAllKeys(), [], "No failed member is published");
   PanoramaDelivery.assertFolder(destination, lane);
   PanoramaDelivery.assertFolder(source, lane);

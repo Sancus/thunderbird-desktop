@@ -30,6 +30,10 @@ tags = ["panorama"]
 run-if = ["nightly_build"]
 tags = ["panorama"]
 
+["test_panorama_protocol_migration.py"]
+run-if = ["nightly_build"]
+tags = ["panorama"]
+
 ["test_panorama_search_rebuild.py"]
 run-if = ["nightly_build"]
 tags = ["panorama"]

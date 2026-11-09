@@ -870,6 +870,28 @@ class TestPanoramaAppWrittenDelimiterMigration(MarionetteTestCase):
             script_args=[key, list(names)],
         )
 
+    def inbox_bodies(self, key):
+        """Read stored INBOX bodies through the ordinary folder stream."""
+        return self.marionette.execute_script(
+            """
+            const { MailServices } = ChromeUtils.importESModule(
+              "resource:///modules/MailServices.sys.mjs");
+            const folder = MailServices.accounts.getIncomingServer(arguments[0])
+              .rootFolder.getChildNamed("INBOX");
+            return [...folder.msgDatabase.enumerateMessages()].map(header => {
+              const stream = Cc["@mozilla.org/scriptableinputstream;1"]
+                .createInstance(Ci.nsIScriptableInputStream);
+              stream.init(folder.getMsgInputStream(header));
+              try {
+                return stream.read(header.messageSize);
+              } finally {
+                stream.close();
+              }
+            });
+            """,
+            script_args=[key],
+        )
+
     def test_migratesClientFoldersWithUnknownOrNilDelimiterThenReuses(self):
         def without_keys(folders):
             return {
@@ -994,12 +1016,29 @@ class TestPanoramaAppWrittenDelimiterMigration(MarionetteTestCase):
                 header.subject = "Retained " + name;
                 header.setUint32Property("uidOnServer", key);
                 database.addNewHdrToDB(header, false);
+                if (name == "INBOX") {
+                  // Like an IMAP offline download, store the body through the
+                  // ordinary pluggable store and record it on the header.
+                  const raw = [
+                    "From: Sender <sender@example.invalid>",
+                    "Subject: Retained " + name,
+                    "Message-ID: <" + header.messageId + ">",
+                    "",
+                    "Offline body of " + user,
+                    "",
+                  ].join("\\r\\n");
+                  const output = folder.msgStore.getNewMsgOutputStream(folder);
+                  output.write(raw, raw.length);
+                  header.setStringProperty(
+                    "storeToken",
+                    folder.msgStore.finishNewMessage(folder, output)
+                  );
+                  header.messageSize = raw.length;
+                  header.offlineMessageSize = raw.length;
+                  header.orFlags(Ci.nsMsgMessageFlags.Offline);
+                }
                 database.summaryValid = true;
                 database.commit(Ci.nsMsgDBCommitType.kLargeCommit);
-                if (name == "INBOX") {
-                  // The ordinary store API creates the offline INBOX store.
-                  folder.msgStore.ensureLocalStore(folder);
-                }
                 paths[name] = {
                   summary: folder.summaryFile.path,
                   store: folder.filePath.path,
@@ -1025,6 +1064,10 @@ class TestPanoramaAppWrittenDelimiterMigration(MarionetteTestCase):
             self.assertEqual(0x40000000, flags & 0x40000000, flags)
             self.assertEqual(0, flags & 0x2000, flags)
         legacy = {s["key"]: self.folders(s["key"], names) for s in sources}
+        bodies = {s["key"]: self.inbox_bodies(s["key"]) for s in sources}
+        for source in sources:
+            self.assertEqual(1, len(bodies[source["key"]]))
+            self.assertIn("Offline body of ", bodies[source["key"]][0])
         # A normal quit writes the cache; the stopped profile restarts opted in.
         self.stop()
         rows = json.loads((self.profile / "folderCache.json").read_text(encoding="utf-8"))
@@ -1048,6 +1091,7 @@ class TestPanoramaAppWrittenDelimiterMigration(MarionetteTestCase):
         self.assertEqual("migrated", selected["record"]["origin"])
         self.assertEqual(6, len(selected["record"]["identity"]["imports"]))
         migrated = {s["key"]: self.folders(s["key"], names) for s in sources}
+        self.assertEqual(bodies, {s["key"]: self.inbox_bodies(s["key"]) for s in sources})
         self.assertEqual(
             {key: without_keys(value) for key, value in legacy.items()},
             {key: without_keys(value) for key, value in migrated.items()},
@@ -1062,5 +1106,6 @@ class TestPanoramaAppWrittenDelimiterMigration(MarionetteTestCase):
         self.assertEqual(
             migrated, {s["key"]: self.folders(s["key"], names) for s in sources}
         )
+        self.assertEqual(bodies, {s["key"]: self.inbox_bodies(s["key"]) for s in sources})
         for path, data in originals.items():
             self.assertEqual(data, Path(path).read_bytes(), path)

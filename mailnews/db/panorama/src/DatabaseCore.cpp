@@ -9982,10 +9982,17 @@ nsresult RestoreNames(StartupRestoreFD& root, nsTArray<nsCString>& names,
   });
   return RestorePin(root);
 }
+bool RestoreStartupCache(const nsACString& path) {
+  // XRE opens (and on Windows maps without write sharing) its startup cache
+  // before app-startup; like the canary it belongs to the running process.
+  return path == "startupCache"_ns ||
+         StringBeginsWith(path, "startupCache/"_ns);
+}
 bool RestoreLock(const nsACString& path) {
   // XRE's startup canary belongs to the running process, like its locks.
   return path == "parent.lock"_ns || path == ".parentlock"_ns ||
-         path == "lock"_ns || path == ".startup-incomplete"_ns;
+         path == "lock"_ns || path == ".startup-incomplete"_ns ||
+         RestoreStartupCache(path);
 }
 nsresult RestoreMetadata(StartupRestoreFD& node, uint32_t mode,
                          int64_t modified) {
@@ -10673,7 +10680,8 @@ nsresult RestoreEntries(JSContext* cx, JS::Handle<JSObject*> root,
       if (part) entry.path.Append('/');
       entry.path.Append(text);
     }
-    if (profile && entry.path == ".startup-incomplete"_ns) {
+    if (profile && (entry.path == ".startup-incomplete"_ns ||
+                    RestoreStartupCache(entry.path))) {
       output.RemoveLastElement();
       continue;
     }

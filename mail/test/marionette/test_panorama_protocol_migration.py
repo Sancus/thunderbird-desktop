@@ -187,7 +187,8 @@ class TestPanoramaProtocolMigration(MarionetteTestCase):
               : '@mozilla.org/msgstore/berkeleystore;1');
             let server;
             try {
-              server = FeedUtils.createRssAccount('S526 Feeds');
+              // createRssAccount returns the account, not its server.
+              server = FeedUtils.createRssAccount('S526 Feeds').incomingServer;
             } finally {
               Services.prefs.setCharPref(pref, previous);
             }

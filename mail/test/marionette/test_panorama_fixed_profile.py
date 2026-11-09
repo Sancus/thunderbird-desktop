@@ -98,6 +98,8 @@ class TestPanoramaFixedProfile(MarionetteTestCase):
         self.marionette.instance.restart(prefs=self.prefs(enabled), clean=True)
         self.marionette.raise_for_port(timeout=self.marionette.startup_timeout)
         self.marionette.start_session()
+        # A new session starts with the default 30 second script timeout.
+        self.marionette.timeout.script = 240
         self.marionette.set_context(self.marionette.CONTEXT_CHROME)
         self.profile = Path(
             self.marionette.execute_script(
@@ -114,6 +116,8 @@ class TestPanoramaFixedProfile(MarionetteTestCase):
             {"mail.panorama.enabled": enabled}
         )
         self.marionette.start_session()
+        # A new session starts with the default 30 second script timeout.
+        self.marionette.timeout.script = 240
         self.marionette.set_context(self.marionette.CONTEXT_CHROME)
         selected = self.marionette.execute_script(
             "return Services.dirsvc.get('ProfD', Ci.nsIFile).path;"

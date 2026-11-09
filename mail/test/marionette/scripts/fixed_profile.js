@@ -216,12 +216,22 @@ async function createImapAccount(offline) {
     // The URL can finish before every body is stored, so wait for the store.
     inbox.setFlag(Ci.nsMsgFolderFlags.Offline);
     await urlOperation(listener => inbox.downloadAllForOffline(listener, null));
-    await waitFor(
-      () =>
-        [...inbox.messages].length &&
-        [...inbox.messages].every(h => inbox.hasMsgOffline(h.messageKey)),
-      "INBOX bodies are stored offline"
-    );
+    try {
+      await waitFor(
+        () =>
+          [...inbox.messages].length &&
+          [...inbox.messages].every(h => inbox.hasMsgOffline(h.messageKey)),
+        "INBOX bodies are stored offline"
+      );
+    } catch (error) {
+      const state = [...inbox.messages].map(h => ({
+        key: h.messageKey,
+        flags: h.flags,
+        storeToken: h.storeToken,
+        hasMsgOffline: inbox.hasMsgOffline(h.messageKey),
+      }));
+      throw new Error(error.message + " " + JSON.stringify(state));
+    }
   }
   return inbox;
 }

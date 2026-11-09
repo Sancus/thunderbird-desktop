@@ -63,12 +63,20 @@ add_setup(async function setupNativeProfiles() {
 /**
  * Creates and holds an actual toolkit profile lock, without a migration plan.
  *
+ * @param {boolean} [canonical=false] - Select the canonical profile spelling.
  * @returns {object} Native profile/lock and private per-case work directory.
  */
-async function lockedProfile() {
+async function lockedProfile(canonical = false) {
   const name = "migration-recovery-" + ++serial;
-  const root = PathUtils.join(home, name);
+  let root = PathUtils.join(home, name);
   await IOUtils.makeDirectory(root);
+  if (canonical) {
+    // Restore requests bind canonical selected paths, and the macOS temporary
+    // directory is reached through a /var link.
+    const file = new FileUtils.File(root);
+    file.normalize();
+    root = file.path;
+  }
   const profile = profileService.createProfile(
     new FileUtils.File(PathUtils.join(root, "profile")),
     name,
@@ -1016,7 +1024,7 @@ const {
  * @returns {Promise<object>} Exact root paths, retained bytes and verified archive.
  */
 async function restoreRequestInput() {
-  const input = await lockedProfile();
+  const input = await lockedProfile(true);
   const profilePath = input.lock.directory.path;
   const external = PathUtils.join(input.root, "external");
   await IOUtils.makeDirectory(external);
@@ -1108,7 +1116,7 @@ add_task(async function test_restoreRequestNeverReplacesAnOlderTransaction() {
 
 add_task(async function test_restoreRejectsAnotherProfileAndChangedArchive() {
   const input = await restoreRequestInput();
-  const other = await lockedProfile();
+  const other = await lockedProfile(true);
   await Assert.rejects(
     inspectMigrationRestorePlan(
       other.lock.directory.path,

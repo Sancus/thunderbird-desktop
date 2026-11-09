@@ -9515,6 +9515,9 @@ nsresult StartupVanishedNonMail(nsIFile* file, const nsACString& name,
   nsCOMPtr<nsIFile> parent;
   MOZ_TRY(file->GetParent(getter_AddRefs(parent)));
   NS_ENSURE_TRUE(parent, NS_ERROR_FILE_INVALID_PATH);
+  // Compare complete UTF-16 names: a Windows native (ANSI) leaf is lossy.
+  nsAutoString wanted;
+  MOZ_TRY(file->GetLeafName(wanted));
   nsCOMPtr<nsIDirectoryEnumerator> entries;
   MOZ_TRY(parent->GetDirectoryEntries(getter_AddRefs(entries)));
   auto close = MakeScopeExit([&] { entries->Close(); });
@@ -9522,9 +9525,9 @@ nsresult StartupVanishedNonMail(nsIFile* file, const nsACString& name,
     nsCOMPtr<nsIFile> entry;
     MOZ_TRY(entries->GetNextFile(getter_AddRefs(entry)));
     if (!entry) break;
-    nsAutoCString leaf;
-    MOZ_TRY(entry->GetNativeLeafName(leaf));
-    if (leaf == name) return NS_OK;
+    nsAutoString leaf;
+    MOZ_TRY(entry->GetLeafName(leaf));
+    if (leaf == wanted) return NS_OK;
   }
   MOZ_TRY(entries->Close());
   close.release();

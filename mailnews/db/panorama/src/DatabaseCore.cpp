@@ -9459,6 +9459,24 @@ nsresult StartupJSONCache(nsIFile* file, bool& empty) {
   return NS_OK;
 }
 
+// Names whose presence is migration input wherever they appear.
+bool StartupMailDataName(const nsACString& name) {
+  return StringEndsWith(name, ".msf"_ns) || StringEndsWith(name, ".mab"_ns) ||
+         name == "folderCache.json"_ns || name == "panacea.dat"_ns;
+}
+// The running application writes its own non-mail profile files while startup
+// inventories the tree (atomic *.tmp replacement, SQLite journals, cache
+// trash). Outside the mail trees, an entry that is gone again by the time it
+// is examined is not migration input; mail data and mail trees still refuse.
+bool StartupVanishedNonMail(nsIFile* file, const nsACString& name,
+                            bool mailTree, nsresult status) {
+  if (status != NS_ERROR_FILE_NOT_FOUND || mailTree ||
+      StartupMailDataName(name) || name == "Mail"_ns || name == "ImapMail"_ns ||
+      name == "News"_ns)
+    return false;
+  bool exists = true;
+  return NS_SUCCEEDED(file->Exists(&exists)) && !exists;
+}
 nsresult StartupInventory(
     nsIFile* directory, nsTArray<nsCString>& sources, bool mailTree = false,
     bool selectedRoot = true,
@@ -9485,10 +9503,14 @@ nsresult StartupInventory(
                          name == "lock"_ns))
       continue;
     bool linked;
-    MOZ_TRY(file->IsSymlink(&linked));
+    nsresult rv = file->IsSymlink(&linked);
+    if (StartupVanishedNonMail(file, name, mailTree, rv)) continue;
+    MOZ_TRY(rv);
     NS_ENSURE_FALSE(linked, NS_ERROR_FILE_ACCESS_DENIED);
     bool isDirectory;
-    MOZ_TRY(file->IsDirectory(&isDirectory));
+    rv = file->IsDirectory(&isDirectory);
+    if (StartupVanishedNonMail(file, name, mailTree, rv)) continue;
+    MOZ_TRY(rv);
     // Precedence never waives the original physical-file admission.
     if (selectedRoot && jsonCache &&
         (name == "panacea.dat"_ns ||
@@ -9510,10 +9532,16 @@ nsresult StartupInventory(
           continue;
         }
       }
-      MOZ_TRY(StartupInventory(file, sources,
-                               mailTree || name == "Mail"_ns ||
-                                   name == "ImapMail"_ns || name == "News"_ns,
-                               false, retired));
+      const bool childMailTree = mailTree || name == "Mail"_ns ||
+                                 name == "ImapMail"_ns || name == "News"_ns;
+      const size_t before = sources.Length();
+      rv = StartupInventory(file, sources, childMailTree, false, retired);
+      if (StartupVanishedNonMail(file, name, childMailTree, rv)) {
+        // The whole transient directory is gone, with anything it held.
+        sources.TruncateLength(before);
+        continue;
+      }
+      MOZ_TRY(rv);
     } else if (StringEndsWith(name, ".msf"_ns) ||
                StringEndsWith(name, ".mab"_ns) ||
                name == "folderCache.json"_ns || name == "panacea.dat"_ns) {

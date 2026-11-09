@@ -2273,9 +2273,9 @@ function validateStartupFolderOrigin(source, caches) {
     source.origin?.provider !==
       (LOCAL_STORE_PROTOCOLS.includes(source.protocol)
         ? "local-store-discovery"
-        : source.protocol === "nntp"
-          ? "news-provider-discovery"
-          : "imap-client-discovery") ||
+        : { nntp: "news-provider-discovery", imap: "imap-client-discovery" }[
+            source.protocol
+          ]) ||
     (source.protocol === "nntp" &&
       new FileUtils.File(source.path).parent.path !== source.serverRoot)
   ) {

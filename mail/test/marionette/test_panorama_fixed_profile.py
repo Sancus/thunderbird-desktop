@@ -380,7 +380,9 @@ class TestPanoramaFixedProfile(MarionetteTestCase):
             self.assertEqual(1, len(by_id[m["messageId"]]), m["messageId"])
             row = by_id[m["messageId"]][0]
             self.assertEqual(m["messageId"], row["headerMessageId"])
-            self.assertEqual(m["subject"], row["subject"])
+            # MessageHeader.subject is mime2DecodedSubject: "Re: " is a flag.
+            subject = m["subject"]
+            self.assertEqual(subject.removeprefix("Re: "), row["subject"])
             self.assertEqual(m["from"], row["author"])
             failure = "%s: %s" % (m["messageId"], row.get("error"))
             self.assertTrue(row["hasBody"], failure)

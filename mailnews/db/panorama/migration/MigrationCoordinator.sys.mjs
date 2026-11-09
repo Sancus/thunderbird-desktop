@@ -2298,8 +2298,22 @@ export function startPanoramaProfileAtStartup(signal) {
     request.append("restore.json");
     const pendingRestore = startupEntryExists(request);
     request.leafName = "restore-current.json";
-    if (pendingRestore || startupEntryExists(request)) {
+    if (pendingRestore) {
       return finishPanoramaRestoreStartup(database, pending, signal);
+    }
+    if (startupEntryExists(request)) {
+      // As ordinary startup does, capture before later profile notifications
+      // open profile stores (on Windows, NSS holds cert9.db/key4.db). The
+      // native token must still admit exactly this audit before it is used.
+      const early = {};
+      try {
+        early.captured = captureStartupMigration(signal, {
+          restoreAuditPath: startupRestoreAuditPath(),
+        });
+      } catch (error) {
+        early.captureError = error;
+      }
+      return finishPanoramaRestoreStartup(database, pending, signal, early);
     }
     captured = captureStartupMigration(signal);
   } catch (error) {
@@ -2320,10 +2334,11 @@ export function startPanoramaProfileAtStartup(signal) {
  * @param {nsIDatabaseCore} database - Actual native service.
  * @param {Promise<nsISupports>} pending - Native startup operation.
  * @param {AbortSignal} [signal] - Cancellation before settlement.
+ * @param {object} [early] - Capture taken at app-startup for a settled audit.
  * @returns {Promise<object>} Restore-only exit or native-validated ordinary entry.
  * @throws {Error} For failed/incomplete native restoration or settlement.
  */
-async function finishPanoramaRestoreStartup(database, pending, signal) {
+async function finishPanoramaRestoreStartup(database, pending, signal, early) {
   let operation;
   try {
     operation = await pending;
@@ -2357,6 +2372,18 @@ async function finishPanoramaRestoreStartup(database, pending, signal) {
       });
       return selected;
     }
+    if (early) {
+      if (selected.restoreAuditPath !== startupRestoreAuditPath()) {
+        throw new Error("Native restore audit is not admitted");
+      }
+      return finishPanoramaProfileStartup(
+        database,
+        pending,
+        early.captured,
+        early.captureError,
+        signal
+      );
+    }
     const captured = captureStartupMigration(signal, selected);
     return finishPanoramaProfileStartup(
       database,
@@ -2380,11 +2407,23 @@ async function finishPanoramaRestoreStartup(database, pending, signal) {
   }
 }
 
+/** @returns {string} Settled restore audit path of the selected profile. */
+function startupRestoreAuditPath() {
+  const profile = startupSourceFile(
+    Services.dirsvc.get("ProfDS", Ci.nsIFile).path
+  );
+  const audit = profile.parent.clone();
+  audit.append("panorama-migration-" + profile.leafName);
+  audit.append("restore-current.json");
+  return audit.path;
+}
+
 /**
  * Captures actual persisted input paths and a closed-writer startup backup.
  *
  * @param {AbortSignal} [signal] - Cancellation checked during the copy.
- * @param {object} [nativeAudit] - Descriptor from the actual validated token.
+ * @param {object} [nativeAudit] - Validated token descriptor, or the settled
+ *   audit path the token must admit before this capture is used.
  * @returns {object} Selected root, native-file presence and optional copy inputs.
  * @throws {Error} For unsafe roots, unconfigured data or unsupported protocols.
  */

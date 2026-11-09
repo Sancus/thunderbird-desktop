@@ -9278,7 +9278,12 @@ nsresult StartupStores(ProfileStartupOperation& operation,
       nsCOMPtr<nsIFile> store;
       MOZ_TRY(NS_NewNativeLocalFile(source.storePath, getter_AddRefs(store)));
       bool directory, contains;
-      MOZ_TRY(store->IsDirectory(&directory));
+      // CheckStartupMailStore admits a metadata-only IMAP summary without an
+      // offline body; that absent store contains no other inventory file.
+      nsresult status = store->IsDirectory(&directory);
+      if (status == NS_ERROR_FILE_NOT_FOUND && source.protocol == "imap"_ns)
+        continue;
+      MOZ_TRY(status);
       if (!directory) continue;
       MOZ_TRY(store->Contains(file, &contains));
       covered |= contains;

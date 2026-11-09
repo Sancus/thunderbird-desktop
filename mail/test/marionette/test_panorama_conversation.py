@@ -849,13 +849,13 @@ class TestPanoramaAppWrittenDelimiterMigration(MarionetteTestCase):
             self.work.append(Path(record["identity"]["backup"]["path"]).parent.parent)
         return result
 
-    def folders(self, key):
+    def folders(self, key, names=("INBOX", "Junk", "Flat")):
         return self.marionette.execute_script(
             """
             const { MailServices } = ChromeUtils.importESModule(
               "resource:///modules/MailServices.sys.mjs");
             const server = MailServices.accounts.getIncomingServer(arguments[0]);
-            return Object.fromEntries(["INBOX", "Junk", "Flat"].map(name => {
+            return Object.fromEntries(arguments[1].map(name => {
               const folder = server.rootFolder.getChildNamed(name);
               const imap = folder.QueryInterface(Ci.nsIMsgImapMailFolder);
               return [name, {
@@ -867,7 +867,7 @@ class TestPanoramaAppWrittenDelimiterMigration(MarionetteTestCase):
               }];
             }));
             """,
-            script_args=[key],
+            script_args=[key, list(names)],
         )
 
     def test_migratesClientFoldersWithUnknownOrNilDelimiterThenReuses(self):
@@ -951,5 +951,97 @@ class TestPanoramaAppWrittenDelimiterMigration(MarionetteTestCase):
         self.assertEqual(selected["sourceId"], repeated["sourceId"])
         self.assertEqual(selected["record"]["identity"], repeated["record"]["identity"])
         self.assertEqual(migrated, self.folders(source["key"]))
+        for path, data in originals.items():
+            self.assertEqual(data, Path(path).read_bytes(), path)
+
+    def test_migratesSummaryOnlyImapFoldersBesideOfflineStoresThenReuses(self):
+        def without_keys(folders):
+            return {
+                name: {**value, "messages": [m[1:] for m in value["messages"]]}
+                for name, value in folders.items()
+            }
+
+        # Two servers make the check independent of directory order: each
+        # server's offline INBOX store is visited beside the other server's
+        # summary-only Trash, which has no offline store yet.
+        sources = self.marionette.execute_script(
+            """
+            const { MailServices } = ChromeUtils.importESModule(
+              "resource:///modules/MailServices.sys.mjs");
+            Services.io.offline = true;
+            Services.prefs.setBoolPref("network.manage-offline-status", false);
+            Services.prefs.setIntPref("offline.startup_state", 2);
+            const result = ["s526targeta", "s526targetb"].map((user, server_index) => {
+              const server = MailServices.accounts.createIncomingServer(
+                user, "imap.invalid", "imap");
+              server.setBoolValue("login_at_startup", false);
+              server.setBoolValue("download_on_biff", false);
+              MailServices.accounts.createAccount().incomingServer = server;
+              const root = server.rootFolder.QueryInterface(Ci.nsIMsgImapMailFolder);
+              const paths = {};
+              for (const [index, name] of ["INBOX", "Trash"].entries()) {
+                if (!root.containsChildNamed(name)) {
+                  root.createClientSubfolderInfo(name, "/", 0, true);
+                }
+                const folder = server.rootFolder.getChildNamed(name);
+                folder.QueryInterface(Ci.nsIMsgImapMailFolder).hierarchyDelimiter =
+                  "/";
+                const database = folder.msgDatabase;
+                database.dBFolderInfo.setUint32Property("UIDValidity", 526);
+                const key = 60 + 10 * server_index + index;
+                const header = database.createNewHdrWithSpecificMsgKey(key);
+                header.messageId = user + "-" + name + "-target-s526@invalid";
+                header.subject = "Retained " + name;
+                header.setUint32Property("uidOnServer", key);
+                database.addNewHdrToDB(header, false);
+                database.summaryValid = true;
+                database.commit(Ci.nsMsgDBCommitType.kLargeCommit);
+                if (name == "INBOX") {
+                  // The ordinary store API creates the offline INBOX store.
+                  folder.msgStore.ensureLocalStore(folder);
+                }
+                paths[name] = {
+                  summary: folder.summaryFile.path,
+                  store: folder.filePath.path,
+                };
+              }
+              return { key: server.key, paths };
+            });
+            Services.prefs.savePrefFile(null);
+            return result;
+            """
+        )
+        names = ("INBOX", "Trash")
+        legacy = {s["key"]: self.folders(s["key"], names) for s in sources}
+        # A normal quit writes the cache; the stopped profile restarts opted in.
+        self.stop()
+        originals = {str(self.profile / "folderCache.json"): None}
+        for source in sources:
+            inbox, trash = source["paths"]["INBOX"], source["paths"]["Trash"]
+            self.assertTrue(Path(inbox["store"]).is_file(), inbox["store"])
+            self.assertFalse(Path(trash["store"]).exists(), trash["store"])
+            originals.update(
+                {inbox["store"]: None, inbox["summary"]: None, trash["summary"]: None}
+            )
+        originals = {path: Path(path).read_bytes() for path in originals}
+        self.start(True)
+        selected = self.selection()
+        self.assertEqual("migrated", selected["record"]["origin"])
+        self.assertEqual(4, len(selected["record"]["identity"]["imports"]))
+        migrated = {s["key"]: self.folders(s["key"], names) for s in sources}
+        self.assertEqual(
+            {key: without_keys(value) for key, value in legacy.items()},
+            {key: without_keys(value) for key, value in migrated.items()},
+        )
+        for path, data in originals.items():
+            self.assertEqual(data, Path(path).read_bytes(), path)
+        self.stop()
+        self.start(True)
+        repeated = self.selection()
+        self.assertEqual(selected["sourceId"], repeated["sourceId"])
+        self.assertEqual(selected["record"]["identity"], repeated["record"]["identity"])
+        self.assertEqual(
+            migrated, {s["key"]: self.folders(s["key"], names) for s in sources}
+        )
         for path, data in originals.items():
             self.assertEqual(data, Path(path).read_bytes(), path)

@@ -595,6 +595,7 @@ add_task(async function test_copyDataPreservesNativeReadFailure() {
   const listener = new PromiseTestUtils.PromiseCopyListener({
     onProgress(current, total) {
       progress.push([current, total]);
+      info(`CI052-DIAG onProgress ${current}/${total} t=${Date.now()} stack=${new Error().stack}`);
       if (progress.length != 1) {
         return;
       }
@@ -607,6 +608,7 @@ add_task(async function test_copyDataPreservesNativeReadFailure() {
       }
     },
     onStopCopy(status) {
+      info(`CI052-DIAG onStopCopy ${status} t=${Date.now()} readResults=${JSON.stringify(readResults)}`);
       statuses.push(status);
     },
   });
@@ -614,6 +616,7 @@ add_task(async function test_copyDataPreservesNativeReadFailure() {
     () => true,
     () => false
   );
+  info(`CI052-DIAG copyMessages call t=${Date.now()}`);
   MailServices.copy.copyMessages(
     source,
     messages,

@@ -1118,10 +1118,15 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             self.assertEqual(cache_bytes, cache.read_bytes())
             self.assertEqual(root_original, archived_root.read_bytes())
 
-    def create_legacy_offline_imap_shapes(self):
-        """Write the ordinary summaries of an IMAP account last used offline."""
+    def create_legacy_offline_imap_shapes(self, personal=False, unified=False,
+                                          readded=False, drafts=False):
+        """Write ordinary summaries of an IMAP account last used offline.
+
+        All data is fabricated. INBOX always holds two headers; the options add
+        one legacy shape each (see the tests below)."""
         self.clean_profile(False)
         return self.marionette.execute_script("""
+            const [personal, unified, readded, drafts] = arguments;
             const { MailServices } = ChromeUtils.importESModule(
               'resource:///modules/MailServices.sys.mjs');
             const { MorkParser } = ChromeUtils.importESModule(
@@ -1161,36 +1166,51 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
               header.setUint32Property('uidOnServer', key);
               database.addNewHdrToDB(header, false);
             };
-            // The summary word keeps the personal namespace flag of an
-            // earlier LIST; the cached box flags restored offline carry none.
-            // A unified folder view caches its hits in the summary.
+            const created = [];
             const inbox = create('INBOX', 526);
             let database = inbox.msgDatabase;
             add(database, 42, 'Inbox first');
             add(database, 43, 'Inbox second');
-            inbox.setFlag(Ci.nsMsgFolderFlags.ImapPersonal);
-            database.refreshCache('mailbox://nobody@smart%20mailboxes/Inbox', [42, 43]);
+            if (personal) {
+              // The summary word keeps the personal namespace flag of an
+              // earlier LIST; the cached box flags restored offline carry none.
+              inbox.setFlag(Ci.nsMsgFolderFlags.ImapPersonal);
+            }
+            if (unified) {
+              // A unified folder view caches its hits in the summary.
+              database.refreshCache('mailbox://nobody@smart%20mailboxes/Inbox',
+                                    [42, 43]);
+            }
             database.summaryValid = true;
             database.commit(Ci.nsMsgDBCommitType.kLargeCommit);
-            // Removing and adding a header again leaves a live thread outside
-            // the derived all-threads subject index.
-            const sent = create('Sent', 527);
-            database = sent.msgDatabase;
-            add(database, 1, 'Sent first');
-            add(database, 2, 'Sent second');
-            database.deleteHeader(database.getMsgHdrForKey(2), null, false, false);
-            database.commit(Ci.nsMsgDBCommitType.kSessionCommit);
-            add(database, 2, 'Sent second');
-            database.refreshCache('mailbox://nobody@smart%20mailboxes/Sent', [1, 2]);
-            database.summaryValid = true;
-            database.commit(Ci.nsMsgDBCommitType.kLargeCommit);
-            // A compress commit of an empty folder keeps only folder info.
-            const drafts = create('Drafts', 528);
-            database = drafts.msgDatabase;
-            database.summaryValid = true;
-            database.commit(Ci.nsMsgDBCommitType.kCompressCommit);
-            for (const [name, folder] of [['INBOX', inbox], ['Sent', sent],
-                                          ['Drafts', drafts]]) {
+            created.push(['INBOX', inbox]);
+            if (readded) {
+              // Removing and adding a header again leaves a live thread
+              // outside the derived all-threads subject index.
+              const sent = create('Sent', 527);
+              database = sent.msgDatabase;
+              add(database, 1, 'Sent first');
+              add(database, 2, 'Sent second');
+              database.deleteHeader(database.getMsgHdrForKey(2), null, false, false);
+              database.commit(Ci.nsMsgDBCommitType.kSessionCommit);
+              add(database, 2, 'Sent second');
+              if (unified) {
+                database.refreshCache('mailbox://nobody@smart%20mailboxes/Sent',
+                                      [1, 2]);
+              }
+              database.summaryValid = true;
+              database.commit(Ci.nsMsgDBCommitType.kLargeCommit);
+              created.push(['Sent', sent]);
+            }
+            if (drafts) {
+              // A compress commit of an empty folder keeps only folder info.
+              const folder = create('Drafts', 528);
+              database = folder.msgDatabase;
+              database.summaryValid = true;
+              database.commit(Ci.nsMsgDBCommitType.kCompressCommit);
+              created.push(['Drafts', folder]);
+            }
+            for (const [name, folder] of created) {
               folder.msgDatabase.forceClosed();
               const file = folder.summaryFile;
               const stream = Cc['@mozilla.org/network/file-input-stream;1']
@@ -1218,20 +1238,17 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             }
             Services.prefs.savePrefFile(null);
             return {serverKey: server.key, folders};
-        """)
+        """, script_args=[personal, unified, readded, drafts])
 
-    def test_migratesOrdinaryOfflineImapShapesThenReuses(self):
-        source = self.create_legacy_offline_imap_shapes()
+    def assert_offline_imap_migration(self, source, expected):
+        """Migrate the fabricated summaries, then reuse them twice unchanged."""
         folders = source["folders"]
-        self.assertEqual(0, folders["Drafts"]["messageTables"])
-        self.assertEqual(1, folders["INBOX"]["unifiedTables"])
-        self.assertEqual(1, folders["Sent"]["unifiedTables"])
-        self.assertLess(folders["Sent"]["indexedThreads"], folders["Sent"]["threadTables"])
-        self.assertTrue(int(folders["INBOX"]["flags"], 16) & 0x80000)
+        names = list(folders)
+        self.assertEqual(sorted(names), sorted(expected))
         self.stop_application()
-        names = ["INBOX", "Sent", "Drafts"]
         summaries = {name: Path(folders[name]["summary"]) for name in names}
-        self.assertEqual(folders["Drafts"]["size"], summaries["Drafts"].stat().st_size)
+        for name in names:
+            self.assertEqual(folders[name]["size"], summaries[name].stat().st_size)
         originals = {name: summaries[name].read_bytes() for name in names}
         cache = self.write_legacy_cache([{"key": str(summaries[name]), **{
             field: folders[name][field] for field in
@@ -1245,7 +1262,7 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
                   'resource:///modules/MailServices.sys.mjs');
                 const root = MailServices.accounts.getIncomingServer(arguments[0])
                   .rootFolder;
-                return Object.fromEntries(['INBOX', 'Sent', 'Drafts'].map(name => {
+                return Object.fromEntries(arguments[1].map(name => {
                   const folder = root.getChildNamed(name);
                   return [name, {
                     personal: !!(folder.flags & Ci.nsMsgFolderFlags.ImapPersonal),
@@ -1253,21 +1270,13 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
                       header => [header.getUint32Property('uidOnServer'),
                                  header.messageId, header.subject]).sort()}];
                 }));
-            """, script_args=[source["serverKey"]])
+            """, script_args=[source["serverKey"], names])
 
         self.start_same_profile(True)
         selected = self.selection()
         self.assertEqual("migrated", selected["record"]["origin"])
         state = imported()
-        self.assertEqual({
-            "INBOX": {"personal": True, "messages": [
-                [42, "shape-42-Inbox first@invalid", "Inbox first"],
-                [43, "shape-43-Inbox second@invalid", "Inbox second"]]},
-            "Sent": {"personal": False, "messages": [
-                [1, "shape-1-Sent first@invalid", "Sent first"],
-                [2, "shape-2-Sent second@invalid", "Sent second"]]},
-            "Drafts": {"personal": False, "messages": []},
-        }, state)
+        self.assertEqual(expected, state)
         for name in names:
             self.assertEqual(originals[name], summaries[name].read_bytes())
         self.assertEqual(cache_bytes, cache.read_bytes())
@@ -1279,6 +1288,50 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             self.assertEqual(selected["record"]["identity"],
                              repeated["record"]["identity"])
             self.assertEqual(state, imported())
+
+    INBOX_MESSAGES = [
+        [42, "shape-42-Inbox first@invalid", "Inbox first"],
+        [43, "shape-43-Inbox second@invalid", "Inbox second"]]
+    SENT_MESSAGES = [
+        [1, "shape-1-Sent first@invalid", "Sent first"],
+        [2, "shape-2-Sent second@invalid", "Sent second"]]
+
+    def test_migratesInfoOnlyEmptyImapSummary(self):
+        source = self.create_legacy_offline_imap_shapes(drafts=True)
+        self.assertEqual(0, source["folders"]["Drafts"]["messageTables"])
+        self.assert_offline_imap_migration(source, {
+            "INBOX": {"personal": False, "messages": self.INBOX_MESSAGES},
+            "Drafts": {"personal": False, "messages": []}})
+
+    def test_migratesOfflineImapPersonalNamespaceFlag(self):
+        source = self.create_legacy_offline_imap_shapes(personal=True)
+        self.assertTrue(int(source["folders"]["INBOX"]["flags"], 16) & 0x80000)
+        self.assert_offline_imap_migration(source, {
+            "INBOX": {"personal": True, "messages": self.INBOX_MESSAGES}})
+
+    def test_migratesUnifiedHitsAndUnindexedImapThread(self):
+        source = self.create_legacy_offline_imap_shapes(unified=True, readded=True)
+        folders = source["folders"]
+        self.assertEqual(1, folders["INBOX"]["unifiedTables"])
+        self.assertEqual(1, folders["Sent"]["unifiedTables"])
+        self.assertLess(folders["Sent"]["indexedThreads"], folders["Sent"]["threadTables"])
+        self.assert_offline_imap_migration(source, {
+            "INBOX": {"personal": False, "messages": self.INBOX_MESSAGES},
+            "Sent": {"personal": False, "messages": self.SENT_MESSAGES}})
+
+    def test_migratesOrdinaryOfflineImapShapesThenReuses(self):
+        """All shapes of the supplied real profile together, all data fabricated."""
+        source = self.create_legacy_offline_imap_shapes(
+            personal=True, unified=True, readded=True, drafts=True)
+        folders = source["folders"]
+        self.assertEqual(0, folders["Drafts"]["messageTables"])
+        self.assertEqual(1, folders["INBOX"]["unifiedTables"])
+        self.assertLess(folders["Sent"]["indexedThreads"], folders["Sent"]["threadTables"])
+        self.assertTrue(int(folders["INBOX"]["flags"], 16) & 0x80000)
+        self.assert_offline_imap_migration(source, {
+            "INBOX": {"personal": True, "messages": self.INBOX_MESSAGES},
+            "Sent": {"personal": False, "messages": self.SENT_MESSAGES},
+            "Drafts": {"personal": False, "messages": []}})
 
     def test_nativeImapRootSummaryRefusesUnknownAndMessageData(self):
         for case in ["message-data", "unknown-sibling"]:

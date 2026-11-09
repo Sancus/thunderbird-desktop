@@ -9982,17 +9982,32 @@ nsresult RestoreMetadata(StartupRestoreFD& node, uint32_t mode,
   MOZ_TRY(RestorePin(node));
   MOZ_TRY(node.SetPermissions(mode));
 #ifdef XP_WIN
+  NS_ENSURE_TRUE(modified >= -11644473600000LL &&
+                     modified <= INT64_MAX / 10000 - 11644473600000LL,
+                 NS_ERROR_INVALID_ARG);
+  uint64_t ticks = uint64_t(modified + 11644473600000LL) * 10000;
+  FILETIME time{DWORD(ticks), DWORD(ticks >> 32)};
   if (node.identity.directory) {
-    nsCOMPtr<nsIFile> io;
-    MOZ_TRY(RestoreIOFile(node.file, getter_AddRefs(io)));
-    MOZ_TRY(io->SetLastModifiedTime(modified));
+    // nsIFile::SetLastModifiedTime opens with share mode 0, which this node's
+    // own traverse lease refuses as a sharing violation (reported as "file is
+    // locked"). Attribute access is not share-checked; bind it to the pin.
+    nsString path;
+    MOZ_TRY(RestoreIOPath(node.file, path));
+    HANDLE handle = CreateFileW(
+        static_cast<const wchar_t*>(path.get()),
+        FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    NS_ENSURE_TRUE(handle != INVALID_HANDLE_VALUE, NS_ERROR_FILE_ACCESS_DENIED);
+    auto close = MakeScopeExit([&] { CloseHandle(handle); });
+    nsCString id;
+    MOZ_TRY(RestoreWinId(handle, id));
+    NS_ENSURE_TRUE(id == node.identity.id, NS_ERROR_NOT_AVAILABLE);
+    NS_ENSURE_TRUE(SetFileTime(handle, nullptr, nullptr, &time),
+                   NS_ERROR_FAILURE);
   } else {
     MOZ_TRY(RestoreIO(node, true));
-    NS_ENSURE_TRUE(modified >= -11644473600000LL &&
-                       modified <= INT64_MAX / 10000 - 11644473600000LL,
-                   NS_ERROR_INVALID_ARG);
-    uint64_t ticks = uint64_t(modified + 11644473600000LL) * 10000;
-    FILETIME time{DWORD(ticks), DWORD(ticks >> 32)};
     NS_ENSURE_TRUE(SetFileTime(RestoreHandle(node.io), nullptr, nullptr, &time),
                    NS_ERROR_FAILURE);
   }

@@ -197,6 +197,20 @@ async function createImapAccount(offline) {
   );
   incoming.port = win.s711Imap.port;
   incoming.password = "password";
+  // Remember the password, so later restarts of this profile do not prompt.
+  const login = Cc["@mozilla.org/login-manager/loginInfo;1"].createInstance(
+    Ci.nsILoginInfo
+  );
+  login.init(
+    "imap://localhost",
+    null,
+    "imap://localhost",
+    "user",
+    "password",
+    "",
+    ""
+  );
+  await Services.logins.addLoginAsync(login);
   incoming.setBoolValue("login_at_startup", false);
   incoming.setBoolValue("download_on_biff", false);
   incoming.QueryInterface(Ci.nsIImapIncomingServer).maximumConnectionsNumber =

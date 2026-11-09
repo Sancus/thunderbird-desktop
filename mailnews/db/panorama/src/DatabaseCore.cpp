@@ -11314,6 +11314,28 @@ nsresult StartupFieldsEqual(JSContext* cx, JS::Handle<JSObject*> left,
 // the measured original/canonical summary and store admission. Activation
 // re-admits exactly those paths and IDs (FolderImportAdmission); reuse only
 // compares them with the durable folder_import_windows row.
+// The committed receipt also records each path's measured canonical spelling,
+// which the durable folder_import_windows row compares exactly.
+nsresult StartupWindowsCanonicalPaths(JSContext* cx,
+                                      JS::Handle<JSObject*> receipt,
+                                      FolderImportWindowsIdentity& paths) {
+  JS::Rooted<JSObject*> admission(cx);
+  MOZ_TRY(StartupObject(cx, receipt, "windowsAdmission", &admission));
+  for (auto pair :
+       {std::pair{"summary", &paths.summary}, {"store", &paths.store}}) {
+    JS::Rooted<JSObject*> path(cx);
+    MOZ_TRY(StartupObject(cx, admission, pair.first, &path));
+    for (auto field : {std::pair{"canonicalPath", &pair.second->canonicalPath},
+                       {"canonicalRoot", &pair.second->canonicalRoot}}) {
+      nsCString utf8;
+      MOZ_TRY(StartupText(cx, path, field.first, utf8));
+      NS_ENSURE_TRUE(!utf8.IsEmpty() && utf8.FindChar(0) < 0,
+                     NS_ERROR_FILE_CORRUPTED);
+      CopyUTF8toUTF16(utf8, *field.second);
+    }
+  }
+  return NS_OK;
+}
 nsresult StartupWindowsImportIdentity(JSContext* cx,
                                       JS::Handle<JSObject*> source,
                                       FolderImportIdentity& identity) {
@@ -11326,15 +11348,8 @@ nsresult StartupWindowsImportIdentity(JSContext* cx,
     JS::Rooted<JSObject*> path(cx);
     MOZ_TRY(StartupObject(cx, admission, pair.first, &path));
     MOZ_TRY(ImportOriginalPath(cx, path, *pair.second));
-    for (auto field : {std::pair{"canonicalPath", &pair.second->canonicalPath},
-                       {"canonicalRoot", &pair.second->canonicalRoot}}) {
-      nsCString utf8;
-      MOZ_TRY(StartupText(cx, path, field.first, utf8));
-      NS_ENSURE_TRUE(!utf8.IsEmpty() && utf8.FindChar(0) < 0,
-                     NS_ERROR_FILE_CORRUPTED);
-      CopyUTF8toUTF16(utf8, *field.second);
-    }
   }
+  MOZ_TRY(StartupWindowsCanonicalPaths(cx, receipt, paths));
   NS_ENSURE_TRUE(!paths.summary.id.IsEmpty() &&
                      paths.summary.canonicalPath == identity.sourcePath,
                  NS_ERROR_NOT_AVAILABLE);
@@ -12381,6 +12396,7 @@ nsresult RestorePhysicalReceipts(JSContext* cx, nsIFile* database,
       NS_ENSURE_TRUE(expected.isObject(), NS_ERROR_FILE_CORRUPTED);
       JS::Rooted<JSObject*> object(cx, &expected.toObject());
       MOZ_TRY(ImportWindowsAdmission(cx, object, found));
+      MOZ_TRY(StartupWindowsCanonicalPaths(cx, object, *found.windows));
       MOZ_TRY(ReadWindowsImportReceipt(reader, found, found));
 #endif
       MOZ_TRY(reader->CreateStatement(

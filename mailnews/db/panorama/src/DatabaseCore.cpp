@@ -9607,6 +9607,41 @@ HANDLE RestoreHandle(PRFileDesc* io) {
   return reinterpret_cast<HANDLE>(PR_FileDesc2NativeHandle(io));
 }
 #endif
+// Restore copies live in the staging parent's restore-<id> container
+// (root-N, saved-N, newer-N-G), whose prefix is longer than the root each
+// copies, so an entry near MAX_PATH in the original (248 for a directory)
+// exceeds it only in the copy. Windows file-system calls on restore paths go
+// through an extended-length ("\\?\") clone. Nodes, admission (whose walk
+// opens each component in that form itself and refuses every spelling it
+// would not normalize identically: ".", "..", trailing dots or spaces, device
+// names, reparse points), comparisons and records keep the plain spelling.
+nsresult RestoreIOFile(nsIFile* file, nsIFile** output) {
+#ifdef XP_WIN
+  nsCOMPtr<nsIFile> io;
+  MOZ_TRY(file->Clone(getter_AddRefs(io)));
+  nsCOMPtr<nsILocalFileWin> win = do_QueryInterface(io);
+  NS_ENSURE_TRUE(win, NS_ERROR_UNEXPECTED);
+  MOZ_TRY(win->SetUseDOSDevicePathSyntax(true));
+  io.forget(output);
+#else
+  NS_ADDREF(*output = file);
+#endif
+  return NS_OK;
+}
+#ifdef XP_WIN
+nsresult RestoreIOPath(nsIFile* file, nsString& path) {
+  nsCOMPtr<nsIFile> io;
+  MOZ_TRY(RestoreIOFile(file, getter_AddRefs(io)));
+  return io->GetPath(path);
+}
+}  // namespace
+nsresult StartupRestoreFD::SetPermissions(uint32_t mode) {
+  nsCOMPtr<nsIFile> io;
+  MOZ_TRY(RestoreIOFile(file, getter_AddRefs(io)));
+  return io->SetPermissions(mode);
+}
+namespace {
+#endif
 nsresult RestorePath(nsIFile* file, nsCString& path) {
   nsString literal;
   MOZ_TRY(file->GetPath(literal));
@@ -9640,7 +9675,11 @@ bool RestoreInside(const nsACString& path, const nsACString& root) {
 }
 nsresult RestoreMeasure(StartupRestoreFD& node, StartupRestoreStamp& stamp) {
   nsCOMPtr<nsIFile> fresh;
+#ifdef XP_WIN
+  MOZ_TRY(RestoreIOFile(node.file, getter_AddRefs(fresh)));
+#else
   MOZ_TRY(node.file->Clone(getter_AddRefs(fresh)));
+#endif
   bool linked, file;
   MOZ_TRY(fresh->IsSymlink(&linked));
   MOZ_TRY(fresh->IsDirectory(&stamp.directory));
@@ -9697,12 +9736,19 @@ nsresult RestorePin(StartupRestoreFD& node) {
 nsresult RestoreOpen(nsIFile* file, StartupRestoreFD& node, bool writable) {
   node.file = file;
   MOZ_TRY(RestorePath(file, node.path));
+  nsCOMPtr<nsIFile> io, parent, checkedDirectory;
+  MOZ_TRY(RestoreIOFile(file, getter_AddRefs(io)));
   bool directory;
-  MOZ_TRY(file->IsDirectory(&directory));
-  nsCOMPtr<nsIFile> parent;
+  MOZ_TRY(io->IsDirectory(&directory));
   MOZ_TRY(file->GetParent(getter_AddRefs(parent)));
+  // Windows nsIFile link and spelling checks are path-only, so they see the
+  // same components in the extended-length form, as StartupBackup's do.
+  if (directory)
+    checkedDirectory = io;
+  else if (parent)
+    MOZ_TRY(RestoreIOFile(parent, getter_AddRefs(checkedDirectory)));
   nsCString checked;
-  MOZ_TRY(StartupDirectory(directory ? file : parent.get(), checked));
+  MOZ_TRY(StartupDirectory(checkedDirectory, checked));
 #ifdef XP_WIN
   RefPtr<MigrationFileSystem> fs = new MigrationFileSystem();
   MOZ_TRY(fs->Admit(file, directory ? file : parent.get(),
@@ -9726,7 +9772,7 @@ nsresult RestoreOpen(nsIFile* file, StartupRestoreFD& node, bool writable) {
                       nsIPanoramaMigrationFileSystem::KIND_DIRECTORY,
                       getter_AddRefs(node.lease)));
     nsString native;
-    MOZ_TRY(file->GetPath(native));
+    MOZ_TRY(io->GetPath(native));
     HANDLE handle = CreateFileW(
         static_cast<const wchar_t*>(native.get()),
         GENERIC_READ | GENERIC_WRITE | DELETE, FILE_SHARE_READ, nullptr,
@@ -9796,9 +9842,11 @@ nsresult RestoreDirectory(const nsACString& path,
 }
 nsresult RestoreIO(StartupRestoreFD& node, bool write = false) {
   MOZ_TRY(RestorePin(node));
-  if (!node.io)
-    MOZ_TRY(node.file->OpenNSPRFileDesc(write ? PR_RDWR : PR_RDONLY, 0600,
-                                        &node.io));
+  if (!node.io) {
+    nsCOMPtr<nsIFile> io;
+    MOZ_TRY(RestoreIOFile(node.file, getter_AddRefs(io)));
+    MOZ_TRY(io->OpenNSPRFileDesc(write ? PR_RDWR : PR_RDONLY, 0600, &node.io));
+  }
   return RestorePin(node);
 }
 nsresult RestoreSync(StartupRestoreFD& node) {
@@ -9903,8 +9951,10 @@ nsresult RestoreRead(StartupRestoreFD& parent, const nsACString& leaf,
 nsresult RestoreNames(StartupRestoreFD& root, nsTArray<nsCString>& names,
                       ProfileRestoreState* state = nullptr) {
   MOZ_TRY(RestorePin(root));
+  nsCOMPtr<nsIFile> io;
+  MOZ_TRY(RestoreIOFile(root.file, getter_AddRefs(io)));
   nsCOMPtr<nsIDirectoryEnumerator> iterator;
-  MOZ_TRY(root.file->GetDirectoryEntries(getter_AddRefs(iterator)));
+  MOZ_TRY(io->GetDirectoryEntries(getter_AddRefs(iterator)));
   auto close = MakeScopeExit([&] { iterator->Close(); });
   for (;;) {
     if (state) MOZ_TRY(RestoreBoundary(*state));
@@ -9932,9 +9982,11 @@ nsresult RestoreMetadata(StartupRestoreFD& node, uint32_t mode,
   MOZ_TRY(RestorePin(node));
   MOZ_TRY(node.SetPermissions(mode));
 #ifdef XP_WIN
-  if (node.identity.directory)
-    MOZ_TRY(node.file->SetLastModifiedTime(modified));
-  else {
+  if (node.identity.directory) {
+    nsCOMPtr<nsIFile> io;
+    MOZ_TRY(RestoreIOFile(node.file, getter_AddRefs(io)));
+    MOZ_TRY(io->SetLastModifiedTime(modified));
+  } else {
     MOZ_TRY(RestoreIO(node, true));
     NS_ENSURE_TRUE(modified >= -11644473600000LL &&
                        modified <= INT64_MAX / 10000 - 11644473600000LL,
@@ -10082,7 +10134,7 @@ nsresult RestoreCreate(StartupRestoreFD& parent, const nsACString& leaf,
                     nsIPanoramaMigrationFileSystem::KIND_DIRECTORY,
                     getter_AddRefs(output.lease)));
   nsString path;
-  MOZ_TRY(output.file->GetPath(path));
+  MOZ_TRY(RestoreIOPath(output.file, path));
   HANDLE handle = CreateFileW(
       static_cast<const wchar_t*>(path.get()),
       GENERIC_READ | GENERIC_WRITE | DELETE, FILE_SHARE_READ, nullptr,
@@ -10115,7 +10167,7 @@ nsresult RestoreCreate(StartupRestoreFD& parent, const nsACString& leaf,
 #ifdef XP_WIN
 nsresult RestoreWinRename(HANDLE handle, nsIFile* destination, bool replace) {
   nsString path;
-  MOZ_TRY(destination->GetPath(path));
+  MOZ_TRY(RestoreIOPath(destination, path));
   nsTArray<uint8_t> storage;
   storage.SetLength(sizeof(FILE_RENAME_INFO) + path.Length() * sizeof(wchar_t));
   auto* rename = reinterpret_cast<FILE_RENAME_INFO*>(storage.Elements());
@@ -10137,7 +10189,7 @@ nsresult RestoreMove(StartupRestoreFD& from, const nsACString& name,
   MOZ_TRY(RestoreAt(from.file, name, getter_AddRefs(file)));
   MOZ_TRY(RestoreAt(to.file, leaf, getter_AddRefs(destination)));
   nsString path;
-  MOZ_TRY(file->GetPath(path));
+  MOZ_TRY(RestoreIOPath(file, path));
   HANDLE handle = CreateFileW(
       static_cast<const wchar_t*>(path.get()), DELETE | FILE_READ_ATTRIBUTES,
       FILE_SHARE_READ, nullptr, OPEN_EXISTING,
@@ -10197,7 +10249,7 @@ nsresult RestoreDrop(StartupRestoreFD& parent, const nsACString& leaf,
   MOZ_TRY(RestoreAt(parent.file, leaf, getter_AddRefs(file)));
 #ifdef XP_WIN
   nsString path;
-  MOZ_TRY(file->GetPath(path));
+  MOZ_TRY(RestoreIOPath(file, path));
   HANDLE handle = CreateFileW(
       static_cast<const wchar_t*>(path.get()),
       DELETE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ,
@@ -10309,13 +10361,14 @@ nsresult RestoreCopyTree(ProfileRestoreState& state, StartupRestoreFD& source,
     StartupRestoreFD parent;
     nsCString leaf;
     MOZ_TRY(RestoreParent(target, entry.path, parent, leaf));
-    nsCOMPtr<nsIFile> file;
+    nsCOMPtr<nsIFile> file, io;
     MOZ_TRY(RestoreAt(parent.file, leaf, getter_AddRefs(file)));
+    MOZ_TRY(RestoreIOFile(file, getter_AddRefs(io)));
     bool exists;
-    MOZ_TRY(file->Exists(&exists));
+    MOZ_TRY(io->Exists(&exists));
     if (entry.directory) {
       if (!exists) {
-        MOZ_TRY(file->Create(nsIFile::DIRECTORY_TYPE, 0700));
+        MOZ_TRY(io->Create(nsIFile::DIRECTORY_TYPE, 0700));
         MOZ_TRY(RestoreSync(parent));
       }
       StartupRestoreFD directory;
@@ -10412,11 +10465,12 @@ nsresult RestoreRetired(ProfileRestoreState& state, StartupRestoreRoot& root,
     if (common) continue;
     nsCString leaf("entry-"_ns);
     leaf.AppendInt(i);
-    nsCOMPtr<nsIFile> saved, live;
+    nsCOMPtr<nsIFile> saved, live, io;
     MOZ_TRY(RestoreAt(root.retired->file, leaf, getter_AddRefs(saved)));
     MOZ_TRY(RestoreAt(root.live->file, before.path, getter_AddRefs(live)));
+    MOZ_TRY(RestoreIOFile(saved, getter_AddRefs(io)));
     bool exists;
-    MOZ_TRY(saved->Exists(&exists));
+    MOZ_TRY(io->Exists(&exists));
     if (exists) {
       ++retained;
       StartupRestoreFD pin;
@@ -10432,7 +10486,8 @@ nsresult RestoreRetired(ProfileRestoreState& state, StartupRestoreRoot& root,
         MOZ_TRY(RestoreFileMatches(pin, before, state));
       MOZ_TRY(pin.Close());
       if (returning) {
-        MOZ_TRY(live->Exists(&exists));
+        MOZ_TRY(RestoreIOFile(live, getter_AddRefs(io)));
+        MOZ_TRY(io->Exists(&exists));
         NS_ENSURE_FALSE(exists, NS_ERROR_NOT_AVAILABLE);
         StartupRestoreFD parent;
         nsCString name;
@@ -11954,13 +12009,14 @@ nsresult RestoreChild(ProfileRestoreState& state, const nsCString& leaf,
                       nsCString& identity, UniquePtr<StartupRestoreFD>& output,
                       JSContext* cx, StartupRestoreFD* parent = nullptr) {
   if (!parent) parent = state.container.get();
-  nsCOMPtr<nsIFile> file;
+  nsCOMPtr<nsIFile> file, io;
   MOZ_TRY(RestoreAt(parent->file, leaf, getter_AddRefs(file)));
+  MOZ_TRY(RestoreIOFile(file, getter_AddRefs(io)));
   bool exists;
-  MOZ_TRY(file->Exists(&exists));
+  MOZ_TRY(io->Exists(&exists));
   if (!exists) {
     NS_ENSURE_TRUE(identity.IsEmpty(), NS_ERROR_NOT_AVAILABLE);
-    MOZ_TRY(file->Create(nsIFile::DIRECTORY_TYPE, 0700));
+    MOZ_TRY(io->Create(nsIFile::DIRECTORY_TYPE, 0700));
     MOZ_TRY(RestoreSync(*parent));
   }
   nsCString path;

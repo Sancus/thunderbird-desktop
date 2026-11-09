@@ -215,7 +215,16 @@ async function createImapAccount(offline) {
     // Same as Folder Properties > Synchronization: use offline, Download Now.
     // The URL can finish before every body is stored, so wait for the store.
     inbox.setFlag(Ci.nsMsgFolderFlags.Offline);
-    await urlOperation(listener => inbox.downloadAllForOffline(listener, null));
+    await urlOperation(listener =>
+      inbox.downloadAllForOffline(listener, win.msgWindow)
+    );
+    // As "Download selected messages" does, fetch any body still missing.
+    const missing = [...inbox.messages].filter(
+      h => !inbox.hasMsgOffline(h.messageKey)
+    );
+    if (missing.length) {
+      inbox.downloadMessagesForOffline(missing, win.msgWindow);
+    }
     try {
       await waitFor(
         () =>

@@ -2712,12 +2712,15 @@ function startupFolderOrigin(source, summary, caches) {
     !Number.isInteger(hierDelim) ||
     hierDelim <= 0 ||
     hierDelim > 127 ||
-    [94, 124].includes(hierDelim) ||
+    ([94, 124].includes(hierDelim) &&
+      (onlineName.includes("/") ||
+        onlineName.includes(String.fromCharCode(hierDelim)))) ||
     !Number.isInteger(boxFlags) ||
     boxFlags < 0 ||
     boxFlags > 0xffffffff
   ) {
-    // '^' and '|' are the native unknown/NIL sentinels, not real delimiters.
+    // Thunderbird keeps the unknown '^' or NIL '|' sentinel for a client
+    // folder the server never listed. Only one slash-free level is exact.
     throw new Error(
       "IMAP discovery requires retained name, delimiter and flags"
     );

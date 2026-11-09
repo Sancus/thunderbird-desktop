@@ -1005,16 +1005,34 @@ class TestPanoramaAppWrittenDelimiterMigration(MarionetteTestCase):
                   store: folder.filePath.path,
                 };
               }
+              // Like Thunderbird's junk destination lookup, attach a client
+              // Junk folder without box state; the server never listed it.
+              const junk = server.rootFolder.addSubfolder("Junk");
+              junk.setFlag(Ci.nsMsgFolderFlags.Junk);
+              junk.msgDatabase.summaryValid = true;
+              junk.msgDatabase.commit(Ci.nsMsgDBCommitType.kLargeCommit);
+              paths.Junk = { summary: junk.summaryFile.path, flags: junk.flags };
               return { key: server.key, paths };
             });
             Services.prefs.savePrefFile(null);
             return result;
             """
         )
-        names = ("INBOX", "Trash")
+        names = ("INBOX", "Trash", "Junk")
+        for source in sources:
+            # Thunderbird keeps no box state for its never-listed client Junk.
+            flags = source["paths"]["Junk"]["flags"]
+            self.assertEqual(0x40000000, flags & 0x40000000, flags)
+            self.assertEqual(0, flags & 0x2000, flags)
         legacy = {s["key"]: self.folders(s["key"], names) for s in sources}
         # A normal quit writes the cache; the stopped profile restarts opted in.
         self.stop()
+        rows = json.loads((self.profile / "folderCache.json").read_text(encoding="utf-8"))
+        for source in sources:
+            row = rows[source["paths"]["Junk"]["summary"]]
+            self.assertEqual(("Junk", 94, 0), (row["onlineName"], row["hierDelim"], row["boxFlags"]))
+            self.assertEqual(0x40000000, row["flags"] & 0x40000000, row)
+            self.assertEqual(0, row["flags"] & 0x2000, row)
         originals = {str(self.profile / "folderCache.json"): None}
         for source in sources:
             inbox, trash = source["paths"]["INBOX"], source["paths"]["Trash"]
@@ -1023,11 +1041,12 @@ class TestPanoramaAppWrittenDelimiterMigration(MarionetteTestCase):
             originals.update(
                 {inbox["store"]: None, inbox["summary"]: None, trash["summary"]: None}
             )
+            originals[source["paths"]["Junk"]["summary"]] = None
         originals = {path: Path(path).read_bytes() for path in originals}
         self.start(True)
         selected = self.selection()
         self.assertEqual("migrated", selected["record"]["origin"])
-        self.assertEqual(4, len(selected["record"]["identity"]["imports"]))
+        self.assertEqual(6, len(selected["record"]["identity"]["imports"]))
         migrated = {s["key"]: self.folders(s["key"], names) for s in sources}
         self.assertEqual(
             {key: without_keys(value) for key, value in legacy.items()},

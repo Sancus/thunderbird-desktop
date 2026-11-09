@@ -1307,10 +1307,11 @@ add_task(async function test_detachFailureKeepsOriginalAndCleansStaging() {
       streamMessage(streamURI, listener, ...rest) {
         // Only the strip under test carries "attach&"; other readers of the
         // new message (e.g. global indexing on slow builds) stay real.
-        const header = String(rest[3] ?? "");
-        if (!header.startsWith("attach&")) {
-          otherReaders.push(header);
-          return service.streamMessage(streamURI, listener, ...rest);
+        const additionalHeader = String(rest[3] ?? "");
+        if (!additionalHeader.startsWith("attach&")) {
+          otherReaders.push(additionalHeader);
+          service.streamMessage(streamURI, listener, ...rest);
+          return;
         }
         stripCalls++;
         listener.onStartRequest(null);

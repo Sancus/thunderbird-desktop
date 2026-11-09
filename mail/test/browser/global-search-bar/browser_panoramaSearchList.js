@@ -6,6 +6,9 @@
 
 "use strict";
 
+// The 102-message native fixture setup alone takes about 90s on Windows ASan.
+requestLongerTimeout(2);
+
 Services.scriptloader.loadSubScript(
   new URL("head_panoramaSearchList.js", gTestPath).href,
   this

@@ -603,9 +603,8 @@ async function extensionReport(id) {
         .createLocalSubfolder("S711Migrated")
         .QueryInterface(Ci.nsIMsgLocalMailFolder);
       for (const m of LOCAL_THREAD) {
-        local.addMessage(
-          "From - Sun Nov 08 12:00:00 2026\r\n" + messageText(m)
-        );
+        // The mbox store writes its own separator; pass only the message.
+        local.addMessage(messageText(m));
       }
       local.msgDatabase.commit(Ci.nsMsgDBCommitType.kLargeCommit);
       inbox.msgDatabase.commit(Ci.nsMsgDBCommitType.kLargeCommit);

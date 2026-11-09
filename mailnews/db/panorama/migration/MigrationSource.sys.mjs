@@ -71,9 +71,15 @@ export function admitWindowsMigrationPath(file, kind) {
   if (AppConstants.platform != "win") {
     return null;
   }
-  return Cc["@mozilla.org/mailnews/panorama-migration-file-system;1"]
-    .getService(Ci.nsIPanoramaMigrationFileSystem)
-    .admit(file, file.parent ?? file, kind);
+  try {
+    return Cc["@mozilla.org/mailnews/panorama-migration-file-system;1"]
+      .getService(Ci.nsIPanoramaMigrationFileSystem)
+      .admit(file, file.parent ?? file, kind);
+  } catch (error) {
+    // The native refusal names neither the path nor its kind.
+    console.error("Windows migration path admission refused", file.path, kind);
+    throw error;
+  }
 }
 
 /**

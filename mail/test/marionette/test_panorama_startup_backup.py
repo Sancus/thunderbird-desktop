@@ -1292,9 +1292,11 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.marionette.instance.app_args = self.original_args + list(flags)
         self.marionette.instance.start()
         # A restore process copies, verifies and settles every approved root
-        # with write-through IO before it exits; that is not a startup.
+        # with write-through IO before it exits; that is not a startup. A
+        # native restore with retained dependencies takes over 8 minutes on
+        # Windows CI while still progressing per file.
         code = self.marionette.instance.runner.wait(
-            timeout=self.marionette.startup_timeout * 4
+            timeout=self.marionette.startup_timeout * 12
         )
         self.assertEqual(expected, code, "Restore processes must settle and exit")
         self.marionette.instance.app_args = self.original_args

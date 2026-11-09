@@ -33,7 +33,12 @@ task-defaults:
 marionette:
     description: "Marionette unittest run"
     treeherder-symbol: Mn
-    max-run-time: 2700
+    max-run-time:
+        by-test-platform:
+            # Native profile restores write through and re-verify every root on
+            # Windows CI disks; the whole suite exceeds 45 minutes there.
+            windows.*: 5400
+            default: 2700
     instance-size: default
     chunks: 1
 

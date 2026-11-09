@@ -362,11 +362,6 @@ add_setup(function setupLocalPublicationWitness() {
   const nativeService = Cc[mailboxWitnessContract].getService(
     Ci.nsIMsgMessageService
   );
-  // Components.classesByID is gone: a private contract keeps the native store
-  // CID reachable after its public contract is remapped.
-  const nativeStoreContract =
-    "@mozilla.org/msgstore/publication-witness-native;1";
-  registrar.registerFactory(storeCID, "", nativeStoreContract, null);
 
   // Restore only these registrations, after all forwarded stop stacks returned.
   registerCleanupFunction(async () => {
@@ -405,15 +400,22 @@ add_setup(function setupLocalPublicationWitness() {
       observeMailboxService(nativeService)
     )
   );
-  witnessRegistrations.push(
-    MockRegistrar.register(storeContract, () => {
-      const native = Cc[nativeStoreContract].createInstance(
-        Ci.nsIMsgPluggableStore
-      );
-      witnessStoreInstances++;
-      return observeMailboxStore(native);
-    })
-  );
+  // Components.classesByID is gone and a static CID cannot gain another
+  // contract, so briefly restore the native mapping (as
+  // MockRegistrar.unregister does) to create each observed native store,
+  // then re-map the mock.
+  const storeMockCID = MockRegistrar.register(storeContract, () => {
+    registrar.registerFactory(storeCID, "", storeContract, null);
+    let native;
+    try {
+      native = Cc[storeContract].createInstance(Ci.nsIMsgPluggableStore);
+    } finally {
+      registrar.registerFactory(storeMockCID, "", storeContract, null);
+    }
+    witnessStoreInstances++;
+    return observeMailboxStore(native);
+  });
+  witnessRegistrations.push(storeMockCID);
   // nsMsgIncomingServer caches its store; both remaps must precede this call.
   witnessFixture = PanoramaDelivery.createLocalFixture("publication-witness");
 });

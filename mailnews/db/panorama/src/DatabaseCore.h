@@ -61,13 +61,14 @@ struct StartupRestoreFD {
   PRFileDesc* io = nullptr;
   int fd = -1;
   bool writable = false;
-  nsresult SetPermissions(uint32_t mode) {
 #ifdef XP_WIN
-    return file->SetPermissions(mode);
+  // Through the extended-length spelling; see RestoreIOFile.
+  nsresult SetPermissions(uint32_t mode);
 #else
+  nsresult SetPermissions(uint32_t mode) {
     return fchmod(fd, mode) ? NS_ERROR_FILE_ACCESS_DENIED : NS_OK;
-#endif
   }
+#endif
   nsresult Close() {
     nsresult result = NS_OK;
     if (io && PR_Close(std::exchange(io, nullptr)) != PR_SUCCESS)

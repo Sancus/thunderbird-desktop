@@ -1291,8 +1291,10 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.stop_application()
         self.marionette.instance.app_args = self.original_args + list(flags)
         self.marionette.instance.start()
+        # A restore process copies, verifies and settles every approved root
+        # with write-through IO before it exits; that is not a startup.
         code = self.marionette.instance.runner.wait(
-            timeout=self.marionette.startup_timeout
+            timeout=self.marionette.startup_timeout * 4
         )
         self.assertEqual(expected, code, "Restore processes must settle and exit")
         self.marionette.instance.app_args = self.original_args

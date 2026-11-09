@@ -2013,6 +2013,37 @@ add_task(
     Assert.deepEqual(reopened.state, state);
     reopened.close();
     Assert.deepEqual(await IOUtils.read(path), before);
+    // Thunderbird writes the unknown '^' (94) or NIL '|' (124) sentinel for a
+    // client folder the server never listed; only one exact level is admitted.
+    const retainedOrigin = state.startup.inventory.sources[0].origin;
+    for (const [hierarchyDelimiter, onlineName, admitted] of [
+      [94, "Junk", true],
+      [124, "Junk", true],
+      [94, "Junk/Spam", false],
+      [94, "Junk^Spam", false],
+      [124, "Junk|Spam", false],
+    ]) {
+      state.startup.inventory.sources[0].origin = {
+        ...retainedOrigin,
+        hierarchyDelimiter,
+        onlineName,
+      };
+      await IOUtils.writeJSON(path, state);
+      const bytes = await IOUtils.read(path);
+      if (admitted) {
+        const unknown = await MigrationJournal.open(path, profilePath);
+        Assert.deepEqual(unknown.state, state, `${onlineName} is exact`);
+        unknown.close();
+      } else {
+        await Assert.rejects(
+          MigrationJournal.open(path, profilePath),
+          /startup IMAP cache origin/,
+          `${onlineName} is ambiguous without a known delimiter`
+        );
+      }
+      Assert.deepEqual(await IOUtils.read(path), bytes);
+    }
+    state.startup.inventory.sources[0].origin = retainedOrigin;
     state.startup.inventory.sources[0].origin.cache.originalKey = raw;
     await IOUtils.writeJSON(path, state);
     const invalid = await IOUtils.read(path);

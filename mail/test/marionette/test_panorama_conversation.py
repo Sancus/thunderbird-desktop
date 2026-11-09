@@ -3,6 +3,7 @@
 # file, you can obtain one at http://mozilla.org/MPL/2.0/.
 
 import json
+import shutil
 from pathlib import Path
 
 from marionette_driver import Wait
@@ -762,3 +763,193 @@ class TestPanoramaConversation(MarionetteTestCase):
             # Keep the same profile; restore startup backend selection too.
             self.marionette.restart(in_app=True, clean=False)
             self.marionette.set_context(self.marionette.CONTEXT_CHROME)
+
+
+class TestPanoramaAppWrittenDelimiterMigration(MarionetteTestCase):
+    """Migrate app-written IMAP client folders whose delimiter is unknown or NIL.
+
+    Sorted before TestPanoramaConversation so it starts from the healthy runner
+    profile; tearDown leaves a fresh clean profile for the next class.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.instance_prefs = self.marionette.instance.prefs
+        self.work = []
+        self.restart_clean({"mail.panorama.enabled": False})
+
+    def tearDown(self):
+        try:
+            self.restart_clean({})
+            for path in self.work:
+                shutil.rmtree(path, ignore_errors=True)
+        finally:
+            super().tearDown()
+
+    def restart_clean(self, prefs):
+        """Use the ordinary runner after a normal quit, with a fresh profile."""
+        if self.marionette.session:
+            self.marionette.set_context(self.marionette.CONTEXT_CHROME)
+            self.marionette.quit(in_app=True)
+        self.marionette.instance.restart(
+            prefs={**(self.instance_prefs or {}), **prefs}, clean=True
+        )
+        self.marionette.raise_for_port(timeout=self.marionette.startup_timeout)
+        self.marionette.start_session()
+        self.marionette.set_context(self.marionette.CONTEXT_CHROME)
+        self.profile = Path(
+            self.marionette.execute_script(
+                "return Services.dirsvc.get('ProfD', Ci.nsIFile).path;"
+            )
+        ).resolve()
+
+    def stop(self):
+        """Quit normally; the application writes its folder cache on exit."""
+        self.marionette.set_context(self.marionette.CONTEXT_CHROME)
+        self.marionette.execute_script("Services.prefs.savePrefFile(null);")
+        self.marionette.quit(in_app=True)
+
+    def start(self, enabled):
+        """Start the same stopped profile with the pref."""
+        self.marionette.instance.profile.set_preferences(
+            {"mail.panorama.enabled": enabled}
+        )
+        self.marionette.start_session()
+        self.marionette.set_context(self.marionette.CONTEXT_CHROME)
+        selected = self.marionette.execute_script(
+            "return Services.dirsvc.get('ProfD', Ci.nsIFile).path;"
+        )
+        self.assertEqual(self.profile, Path(selected).resolve())
+        self.assertEqual(enabled, self.marionette.get_pref("mail.panorama.enabled"))
+
+    def selection(self):
+        """Read the durable backend selector after ordinary opted-in startup."""
+        result = self.marionette.execute_async_script(
+            """
+            const done = arguments[arguments.length - 1];
+            (async () => {
+              const { MailGlue } = ChromeUtils.importESModule(
+                "resource:///modules/MailGlue.sys.mjs");
+              await MailGlue.panoramaStartup;
+              const record = await IOUtils.readJSON(PathUtils.join(
+                Services.dirsvc.get("ProfD", Ci.nsIFile).path,
+                "panorama-profile.json"));
+              const core = Cc["@mozilla.org/mailnews/database-core;1"]
+                .getService(Ci.nsIDatabaseCore);
+              return { record, sourceId: core.sourceId };
+            })().then(done, error => done({ error: String(error) }));
+            """
+        )
+        self.assertNotIn("error", result)
+        record = result["record"]
+        self.assertEqual("active", record["state"])
+        self.assertEqual("panorama", record["backend"])
+        self.assertEqual(result["sourceId"], record["identity"]["databaseSourceId"])
+        if record["identity"]["backup"]:
+            self.work.append(Path(record["identity"]["backup"]["path"]).parent.parent)
+        return result
+
+    def folders(self, key):
+        return self.marionette.execute_script(
+            """
+            const { MailServices } = ChromeUtils.importESModule(
+              "resource:///modules/MailServices.sys.mjs");
+            const server = MailServices.accounts.getIncomingServer(arguments[0]);
+            return Object.fromEntries(["INBOX", "Junk", "Flat"].map(name => {
+              const folder = server.rootFolder.getChildNamed(name);
+              const imap = folder.QueryInterface(Ci.nsIMsgImapMailFolder);
+              return [name, {
+                onlineName: imap.onlineName,
+                delimiter: imap.hierarchyDelimiter.charCodeAt(0),
+                messages: [...folder.msgDatabase.enumerateMessages()].map(
+                  header => [header.messageKey, header.messageId,
+                    header.getUint32Property("uidOnServer")]),
+              }];
+            }));
+            """,
+            script_args=[key],
+        )
+
+    def test_migratesClientFoldersWithUnknownOrNilDelimiterThenReuses(self):
+        def without_keys(folders):
+            return {
+                name: {**value, "messages": [m[1:] for m in value["messages"]]}
+                for name, value in folders.items()
+            }
+
+        source = self.marionette.execute_script(
+            """
+            const { MailServices } = ChromeUtils.importESModule(
+              "resource:///modules/MailServices.sys.mjs");
+            Services.io.offline = true;
+            Services.prefs.setBoolPref("network.manage-offline-status", false);
+            Services.prefs.setIntPref("offline.startup_state", 2);
+            const server = MailServices.accounts.createIncomingServer(
+              "s526delim", "imap.invalid", "imap");
+            server.setBoolValue("login_at_startup", false);
+            server.setBoolValue("download_on_biff", false);
+            MailServices.accounts.createAccount().incomingServer = server;
+            const root = server.rootFolder.QueryInterface(Ci.nsIMsgImapMailFolder);
+            const summaries = {};
+            // INBOX was listed with "/"; Junk and Flat are client folders the
+            // server never listed, so Thunderbird keeps the "^"/"|" sentinel.
+            const folders = [["INBOX", "/"], ["Junk", "^"], ["Flat", "|"]];
+            for (const [index, [name, delimiter]] of folders.entries()) {
+              if (!root.containsChildNamed(name)) {
+                root.createClientSubfolderInfo(name, delimiter, 0, true);
+              }
+              const folder = server.rootFolder.getChildNamed(name);
+              // A new server already has a client INBOX with an unknown
+              // delimiter; record the listed "/" like a server LIST would.
+              folder.QueryInterface(Ci.nsIMsgImapMailFolder).hierarchyDelimiter =
+                delimiter;
+              const database = folder.msgDatabase;
+              database.dBFolderInfo.setUint32Property("UIDValidity", 94);
+              const header = database.createNewHdrWithSpecificMsgKey(40 + index);
+              header.messageId = name + "-delimiter-s526@invalid";
+              header.subject = "Retained " + name;
+              header.setUint32Property("uidOnServer", 40 + index);
+              database.addNewHdrToDB(header, false);
+              database.summaryValid = true;
+              database.commit(Ci.nsMsgDBCommitType.kLargeCommit);
+              summaries[name] = folder.summaryFile.path;
+            }
+            Services.prefs.savePrefFile(null);
+            return { key: server.key, summaries };
+            """
+        )
+        legacy = self.folders(source["key"])
+        self.assertEqual(
+            {"INBOX": 47, "Junk": 94, "Flat": 124},
+            {name: value["delimiter"] for name, value in legacy.items()},
+        )
+        # A normal quit lets the real application write its folder cache,
+        # then the stopped legacy profile restarts opted in, as in S7-11.
+        self.stop()
+        cache = self.profile / "folderCache.json"
+        rows = json.loads(cache.read_text(encoding="utf-8"))
+        for name, delimiter in [("INBOX", 47), ("Junk", 94), ("Flat", 124)]:
+            row = rows[source["summaries"][name]]
+            self.assertEqual((name, delimiter), (row["onlineName"], row["hierDelim"]))
+        originals = {
+            path: Path(path).read_bytes()
+            for path in [str(cache), *source["summaries"].values()]
+        }
+        self.start(True)
+        selected = self.selection()
+        self.assertEqual("migrated", selected["record"]["origin"])
+        self.assertEqual(3, len(selected["record"]["identity"]["imports"]))
+        migrated = self.folders(source["key"])
+        # Native import assigns its own message keys; names, delimiters,
+        # Message-IDs and server UIDs are retained exactly.
+        self.assertEqual(without_keys(legacy), without_keys(migrated))
+        for path, data in originals.items():
+            self.assertEqual(data, Path(path).read_bytes(), path)
+        self.stop()
+        self.start(True)
+        repeated = self.selection()
+        self.assertEqual(selected["sourceId"], repeated["sourceId"])
+        self.assertEqual(selected["record"]["identity"], repeated["record"]["identity"])
+        self.assertEqual(migrated, self.folders(source["key"]))
+        for path, data in originals.items():
+            self.assertEqual(data, Path(path).read_bytes(), path)

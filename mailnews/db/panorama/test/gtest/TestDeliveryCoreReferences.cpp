@@ -26510,13 +26510,18 @@ class DeliveryCoreStartupRestore : public DeliveryCoreReferences {
     DeliveryCoreReferences::SetUp();
     if (HasFatalFailure()) return;
     (void)StaticPrefs::mail_panorama_enabled_AtStartup();
-    mRestorePref = MakeUnique<AutoRestore<bool>>(
-        StaticPrefs::sMirror_mail_panorama_enabled_AtStartup);
+    // AutoRestore is stack-only; keep the mirror's value for TearDown.
+    mSavedPref = StaticPrefs::sMirror_mail_panorama_enabled_AtStartup;
+    mPrefSaved = true;
     StaticPrefs::sMirror_mail_panorama_enabled_AtStartup = true;
   }
   void TearDown() override {
     DeliveryCoreReferences::TearDown();
     if (mRestoreControl) EXPECT_EQ(NS_OK, mRestoreControl->Remove(true));
+    if (mPrefSaved) {
+      StaticPrefs::sMirror_mail_panorama_enabled_AtStartup = mSavedPref;
+      mPrefSaved = false;
+    }
   }
   nsresult RunArmedRestore() {
     dom::AutoJSAPI jsapi;
@@ -26597,7 +26602,7 @@ class DeliveryCoreStartupRestore : public DeliveryCoreReferences {
         MOZ_TRY(StartupHashControl(bytes, hash));
         MOZ_TRY(RestoreQuote(cx, hash, quoted));
         entries.AppendLiteral("\"regular\",\"size\":");
-        entries.AppendInt(bytes.Length());
+        entries.AppendInt(static_cast<uint64_t>(bytes.Length()));
         entries.AppendLiteral(",\"sha256\":");
         entries.Append(quoted);
         entries.Append('}');
@@ -26812,7 +26817,7 @@ class DeliveryCoreStartupRestore : public DeliveryCoreReferences {
     dependency.AppendLiteral(",\"sourcePath\":");
     dependency.Append(quoted);
     dependency.AppendLiteral(",\"size\":");
-    dependency.AppendInt(bytes.Length() + (fault == 1));
+    dependency.AppendInt(static_cast<uint64_t>(bytes.Length() + (fault == 1)));
     dependency.AppendLiteral(",\"sha256\":\"");
     dependency.Append(hash);
     dependency.AppendLiteral("\"},");
@@ -26993,7 +26998,8 @@ class DeliveryCoreStartupRestore : public DeliveryCoreReferences {
   nsCOMPtr<nsIFile> mRestoreControl, mRestoreArchive, mRestoreStage,
       mRestoreExternal, mRestoreRequest;
   nsCString mArchivedBody, mRestoreOriginal;
-  UniquePtr<AutoRestore<bool>> mRestorePref;
+  bool mSavedPref = false;
+  bool mPrefSaved = false;
   static inline nsresult sRestoreReentry = NS_OK;
   static inline bool sRestoreUnchanged = false;
 };

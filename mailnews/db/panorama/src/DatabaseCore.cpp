@@ -407,7 +407,7 @@ nsresult RestorePending(nsIFile* profile, bool& pending,
   MOZ_TRY(work->IsSymlink(&linked));
   if (linked) return NS_OK;
   nsCString path;
-  MOZ_TRY(work->GetNativePath(path));
+  MOZ_TRY(GetComparablePath(work, path));
 #ifdef XP_WIN
   nsCOMPtr<nsIFile> request;
   MOZ_TRY(StartupChild(work, leaf, getter_AddRefs(request)));
@@ -9728,7 +9728,7 @@ nsresult RestoreOpen(nsIFile* file, StartupRestoreFD& node, bool writable) {
     nsString native;
     MOZ_TRY(file->GetPath(native));
     HANDLE handle = CreateFileW(
-        reinterpret_cast<const wchar_t*>(native.get()),
+        static_cast<const wchar_t*>(native.get()),
         GENERIC_READ | GENERIC_WRITE | DELETE, FILE_SHARE_READ, nullptr,
         OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH,
         nullptr);
@@ -10084,7 +10084,7 @@ nsresult RestoreCreate(StartupRestoreFD& parent, const nsACString& leaf,
   nsString path;
   MOZ_TRY(output.file->GetPath(path));
   HANDLE handle = CreateFileW(
-      reinterpret_cast<const wchar_t*>(path.get()),
+      static_cast<const wchar_t*>(path.get()),
       GENERIC_READ | GENERIC_WRITE | DELETE, FILE_SHARE_READ, nullptr,
       CREATE_NEW, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH,
       nullptr);
@@ -10139,8 +10139,8 @@ nsresult RestoreMove(StartupRestoreFD& from, const nsACString& name,
   nsString path;
   MOZ_TRY(file->GetPath(path));
   HANDLE handle = CreateFileW(
-      reinterpret_cast<const wchar_t*>(path.get()),
-      DELETE | FILE_READ_ATTRIBUTES, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+      static_cast<const wchar_t*>(path.get()), DELETE | FILE_READ_ATTRIBUTES,
+      FILE_SHARE_READ, nullptr, OPEN_EXISTING,
       FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
   NS_ENSURE_TRUE(handle != INVALID_HANDLE_VALUE, NS_ERROR_FILE_ACCESS_DENIED);
   auto close = MakeScopeExit([&] { CloseHandle(handle); });
@@ -10199,7 +10199,7 @@ nsresult RestoreDrop(StartupRestoreFD& parent, const nsACString& leaf,
   nsString path;
   MOZ_TRY(file->GetPath(path));
   HANDLE handle = CreateFileW(
-      reinterpret_cast<const wchar_t*>(path.get()),
+      static_cast<const wchar_t*>(path.get()),
       DELETE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ,
       nullptr, OPEN_EXISTING,
       FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
@@ -10944,7 +10944,7 @@ nsresult ProfileRestoreState::Check() {
   for (auto entry = physicalPins.Iter(); !entry.Done(); entry.Next()) {
     nsString path = NS_ConvertUTF8toUTF16(entry.Key());
     HANDLE handle = CreateFileW(
-        reinterpret_cast<const wchar_t*>(path.get()), FILE_READ_ATTRIBUTES,
+        static_cast<const wchar_t*>(path.get()), FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
         OPEN_EXISTING,
         FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);

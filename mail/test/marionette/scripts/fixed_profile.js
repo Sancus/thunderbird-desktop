@@ -344,6 +344,7 @@ function snapshot(uris) {
                 header.mime2DecodedSubject,
               author: header.mime2DecodedAuthor,
               recipients: header.mime2DecodedRecipients,
+              messageSize: header.messageSize,
               offline: !!(header.flags & Ci.nsMsgMessageFlags.Offline),
               hasMsgOffline: folder.hasMsgOffline(header.messageKey),
               storeToken: header.storeToken,
@@ -557,22 +558,24 @@ async function search(a) {
 }
 
 /**
- * Reads the temporary extension's reported result from the console API store.
+ * Reads the temporary extension's report from its own storage.local data.
  *
- * @param {string} prefix - Fixed message prefix.
- * @returns {object|null} Parsed report, or null before it is written.
+ * @param {string} id - Extension ID.
+ * @returns {Promise<object|null>} Saved report, or null before it is written.
  */
-function extensionReport(prefix) {
-  const storage = Cc["@mozilla.org/consoleAPI-storage;1"].getService(
-    Ci.nsIConsoleAPIStorage
-  );
-  for (const event of storage.getEvents()) {
-    const first = event.arguments?.[0];
-    if (typeof first == "string" && first.startsWith(prefix)) {
-      return JSON.parse(first.slice(prefix.length));
-    }
+async function extensionReport(id) {
+  const extension = WebExtensionPolicy.getByID(id)?.extension;
+  if (!extension) {
+    return null;
   }
-  return null;
+  const { ExtensionStorageIDB } = ChromeUtils.importESModule(
+    "resource://gre/modules/ExtensionStorageIDB.sys.mjs"
+  );
+  const db = await ExtensionStorageIDB.open(
+    ExtensionStorageIDB.getStoragePrincipal(extension)
+  );
+  const { s711report } = await db.get(["s711report"]);
+  return s711report ?? null;
 }
 
 (async () => {
@@ -632,7 +635,7 @@ function extensionReport(prefix) {
     case "search":
       return search(args);
     case "extension-report":
-      return extensionReport(args.prefix);
+      return extensionReport(args.id);
     default:
       throw new Error("Unknown action " + action);
   }

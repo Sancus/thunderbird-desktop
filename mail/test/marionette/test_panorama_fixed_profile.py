@@ -14,7 +14,6 @@ from marionette_harness import MarionetteTestCase
 SCRIPT = (Path(__file__).parent / "scripts" / "fixed_profile.js").read_text(
     encoding="utf-8"
 )
-EXTENSION_PREFIX = "S711EXT "
 EXTENSION_ID = "s711-fixed-profile@example.invalid"
 EXTENSION_BACKGROUND = r"""
 (async () => {
@@ -26,23 +25,29 @@ EXTENSION_BACKGROUND = r"""
     });
     const rows = [];
     for (const message of page.messages) {
-      let raw = await messenger.messages.getRaw(message.id);
-      if (typeof raw != "string") {
-        raw = await raw.text();
-      }
-      rows.push({
+      const row = {
         headerMessageId: message.headerMessageId,
         subject: message.subject,
         author: message.author,
         folderPath: message.folder?.path ?? null,
-        hasBody: raw.includes(item.body),
-      });
+      };
+      try {
+        let raw = await messenger.messages.getRaw(message.id);
+        if (typeof raw != "string") {
+          raw = await raw.text();
+        }
+        row.hasBody = raw.includes(item.body);
+      } catch (error) {
+        row.hasBody = false;
+        row.error = String(error);
+      }
+      rows.push(row);
     }
     report.push({ messageId: item.messageId, rows });
   }
-  console.log("__PREFIX__" + JSON.stringify(report));
+  await messenger.storage.local.set({ s711report: report });
 })().catch(error =>
-  console.log("__PREFIX__" + JSON.stringify({ error: String(error) }))
+  messenger.storage.local.set({ s711report: { error: String(error) } })
 );
 """
 
@@ -317,7 +322,9 @@ class TestPanoramaFixedProfile(MarionetteTestCase):
             self.assertEqual(sorted(old), sorted(new))
             for m in messages:
                 self.assert_stored(new[m["messageId"]], m)
-                self.assertEqual(old[m["messageId"]]["raw"], new[m["messageId"]]["raw"])
+                before, after = old[m["messageId"]], new[m["messageId"]]
+                self.assertEqual(before["raw"], after["raw"])
+                self.assertEqual(before["messageSize"], after["messageSize"])
                 self.assert_display(uri, m)
 
         # Search, facets and conversation over the migrated data.
@@ -355,17 +362,16 @@ class TestPanoramaFixedProfile(MarionetteTestCase):
             "version": "1.0",
             "browser_specific_settings": {"gecko": {"id": EXTENSION_ID}},
             "background": {"scripts": ["background.js"]},
-            "permissions": ["accountsRead", "messagesRead"],
+            "permissions": ["accountsRead", "messagesRead", "storage"],
         }
         (self.extension_dir / "manifest.json").write_text(json.dumps(manifest))
         wanted = [{"messageId": m["messageId"], "body": m["body"]} for m in everything]
-        background = EXTENSION_BACKGROUND.replace("__PREFIX__", EXTENSION_PREFIX)
         (self.extension_dir / "background.js").write_text(
-            background.replace("__EXPECTED__", json.dumps(wanted))
+            EXTENSION_BACKGROUND.replace("__EXPECTED__", json.dumps(wanted))
         )
         Addons(self.marionette).install(str(self.extension_dir), temp=True)
         report = Wait(self.marionette, timeout=60).until(
-            lambda _: self.perform("extension-report", prefix=EXTENSION_PREFIX),
+            lambda _: self.perform("extension-report", id=EXTENSION_ID),
             message="The extension reports its message access",
         )
         self.assertNotIn("error", report if isinstance(report, dict) else {})
@@ -376,7 +382,8 @@ class TestPanoramaFixedProfile(MarionetteTestCase):
             self.assertEqual(m["messageId"], row["headerMessageId"])
             self.assertEqual(m["subject"], row["subject"])
             self.assertEqual(m["from"], row["author"])
-            self.assertTrue(row["hasBody"], m["messageId"])
+            failure = "%s: %s" % (m["messageId"], row.get("error"))
+            self.assertTrue(row["hasBody"], failure)
         Addons(self.marionette).uninstall(EXTENSION_ID)
 
         # Later restarts reuse the migrated database without importing again.

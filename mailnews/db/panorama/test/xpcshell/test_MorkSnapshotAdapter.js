@@ -1386,3 +1386,102 @@ add_task(async function test_rejectsInvalidMetadataWithNoNewestDateCache() {
     "Refusal variants change only owned parsed models"
   );
 });
+
+add_task(async function test_imapUnitAccountsLegacyDerivedAndDeletedRecords() {
+  const entries = await genuineImapEntries();
+  const convertUnit = values =>
+    convertMorkProtocolUnit(values, "snapshot-imap-derived", database.sourceId);
+  const MESSAGES = "ns:msg:db:row:scope:msgs:all";
+  const kindOf = table => table.cells.find(cell => cell.k == "k")?.v;
+  const memberOf = values =>
+    values.find(entry =>
+      entry.input.records.tables.some(
+        table =>
+          kindOf(table) == "ns:msg:db:table:kind:allthreads" &&
+          table.rows.length
+      )
+    );
+  const withTable = (kind, rows) => {
+    const values = structuredClone(entries);
+    const records = memberOf(values).input.records;
+    records.tables.push({
+      id: 0xfffffff0,
+      scope: MESSAGES,
+      cells: [
+        { k: "k", v: kind },
+        { k: "s", v: "9" },
+      ],
+      rows: rows(records),
+      metaRow: null,
+    });
+    return values;
+  };
+  const liveHeaders = records =>
+    records.tables.find(table => kindOf(table) == "ns:msg:db:table:kind:msgs")
+      .rows;
+
+  // A unified folder view caches hits on live headers of this folder.
+  const unified = withTable(
+    "mailbox://nobody@smart%20mailboxes/Inbox",
+    liveHeaders
+  );
+  const converted = convertUnit(unified);
+  Assert.ok(
+    converted.folders.every(folder => folder.recordsComplete),
+    "Cached unified folder hits are accounted"
+  );
+  Assert.throws(
+    () =>
+      convertUnit(
+        withTable("mailbox://nobody@smart%20mailboxes/Inbox", records => [
+          ...liveHeaders(records),
+          "999999:" + MESSAGES,
+        ])
+      ),
+    /Unsupported Mork unified folder hit/
+  );
+  Assert.throws(
+    () =>
+      convertUnit(
+        withTable("mailbox://nobody@Local%20Folders/Saved", liveHeaders)
+      ),
+    /Unsupported Mork structural\/offline table/,
+    "Other search folder caches stay unsupported"
+  );
+
+  // A live thread may be missing from the derived all-threads subject index.
+  const unindexed = structuredClone(entries);
+  const records = memberOf(unindexed).input.records;
+  const index = records.tables.find(
+    table => kindOf(table) == "ns:msg:db:table:kind:allthreads"
+  );
+  const subjectKey = index.rows.shift();
+  convertUnit(unindexed);
+  const subject = records.rows.find(
+    row => row.id + ":" + row.scope == subjectKey
+  );
+  subject.cells.find(cell => cell.k == "threadSubject").v += " changed";
+  Assert.throws(
+    () => convertUnit(unindexed),
+    /Unsupported Mork thread subject index/,
+    "A detached subject row must still be exact"
+  );
+
+  // A played-back offline operation or pending attribute is deleted by
+  // cutting it from its table and cutting all its cells.
+  const deleted = structuredClone(entries);
+  const deletedRecords = memberOf(deleted).input.records;
+  for (const scope of [
+    "ns:msg:db:row:scope:ops:all",
+    "ns:msg:db:row:scope:pending:all",
+  ]) {
+    deletedRecords.rows.push({ id: 777, scope, cells: [] });
+  }
+  convertUnit(deleted);
+  deletedRecords.rows.at(-2).cells.push({ k: "op", v: "1" });
+  Assert.throws(
+    () => convertUnit(deleted),
+    /Unsupported unaccounted Mork row/,
+    "A detached operation with state is never dropped"
+  );
+});

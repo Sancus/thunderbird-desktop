@@ -18,6 +18,9 @@ const INFO = "ns:msg:db:row:scope:dbfolderinfo:all";
 const KIND = "ns:msg:db:table:kind:";
 const OFFLINE = "ns:msg:db:row:scope:ops:all";
 const PENDING = "ns:msg:db:row:scope:pending:all";
+// nsMsgDatabase caches a unified folder's hits in a message-scope table named
+// by that folder's URI. Panorama does not migrate unified folders.
+const UNIFIED_HITS = "mailbox://nobody@smart%20mailboxes/";
 // Named legacy getters, never the spelling of an unknown cell's value.
 const UINT32_PROPERTIES = new Set([
   "numMsgs",
@@ -1061,7 +1064,8 @@ function validateRetainedWindowsReceipt(request, receipt) {
  * @param {boolean} imap - Accept the saved offline and empty pending tables.
  * @returns {{messageTable: object|undefined, infoTable: object|undefined,
  *   allThreads: object|undefined, offlineTable: object|undefined,
- *   threadTables: Map<number, object>}} The selected tables and thread ID map.
+ *   threadTables: Map<number, object>, unifiedHits: object[]}} The selected
+ *   tables, thread ID map and cached unified folder hits.
  * @throws {Error} If a table has an unsupported or duplicate shape.
  */
 function classifyRecordTables(tables, imap) {
@@ -1071,6 +1075,7 @@ function classifyRecordTables(tables, imap) {
   let offlineTable;
   let pendingTable;
   const threadTables = new Map();
+  const unifiedHits = [];
   for (const [key, table] of tables) {
     const kind = table.cells.get("k");
     if (
@@ -1120,11 +1125,24 @@ function classifyRecordTables(tables, imap) {
       // Adding an IMAP header creates this pending-attributes table even when
       // no pending attributes exist. Nonempty pending state stays unsupported.
       pendingTable = table;
+    } else if (
+      table.scope == MESSAGE &&
+      kind?.startsWith(UNIFIED_HITS) &&
+      table.metaRow === null
+    ) {
+      unifiedHits.push(table);
     } else {
       throw new Error("Unsupported Mork structural/offline table: " + key);
     }
   }
-  return { messageTable, infoTable, allThreads, offlineTable, threadTables };
+  return {
+    messageTable,
+    infoTable,
+    allThreads,
+    offlineTable,
+    threadTables,
+    unifiedHits,
+  };
 }
 
 /**
@@ -1185,18 +1203,36 @@ function accountRecords(request, folderFlags, imap = false) {
   if (!sameKeys([...messages.keys()], request.source.messageKeys)) {
     throw new Error("Incomplete Mork physical source key set");
   }
-  const { messageTable, infoTable, allThreads, offlineTable, threadTables } =
-    classifyRecordTables(tables, imap);
+  const {
+    messageTable,
+    infoTable,
+    allThreads,
+    offlineTable,
+    threadTables,
+    unifiedHits,
+  } = classifyRecordTables(tables, imap);
+  // Only an empty folder's summary may lack both the all-headers and the
+  // all-threads table; nsMsgDatabase recreates them when it opens one.
+  const infoOnly =
+    !messageTable && !allThreads && !messages.size && !threadTables.size;
   if (
-    !messageTable ||
     !infoTable ||
-    !allThreads ||
-    !sameKeys(
-      messageTable.rows,
-      [...messages.keys()].map(key => key + ":" + MESSAGE)
-    )
+    (!infoOnly &&
+      (!messageTable ||
+        !allThreads ||
+        !sameKeys(
+          messageTable.rows,
+          [...messages.keys()].map(key => key + ":" + MESSAGE)
+        )))
   ) {
     throw new Error("Incomplete Mork message/folder/thread tables");
+  }
+  // A cached unified folder hit is derived from live headers of this folder.
+  // It is accounted, not imported, and never stands in for a missing header.
+  for (const table of unifiedHits) {
+    if (!table.rows.every(key => messageTable?.rows.includes(key))) {
+      throw new Error("Unsupported Mork unified folder hit");
+    }
   }
   const relations = getMorkThreadRelations({
     source: { rows, tables },
@@ -1253,14 +1289,10 @@ function accountRecords(request, folderFlags, imap = false) {
     remaining.delete(table.metaRow);
     grouped.delete(id);
   }
-  if (
-    grouped.size ||
-    allThreads.rows.length != threadTables.size - retiredThreads.size
-  ) {
+  if (grouped.size) {
     throw new Error("Missing Mork thread membership/index");
   }
-  for (const key of allThreads.rows) {
-    const row = rows.get(key);
+  const checkSubject = (key, row) => {
     const table = row && threadTables.get(row.id);
     const root = table && hex(rows.get(table.metaRow).cells.get("threadRoot"));
     const subject = messages.get(root)?.row.cells.get("subject") ?? "";
@@ -1275,6 +1307,19 @@ function accountRecords(request, folderFlags, imap = false) {
       throw new Error("Unsupported Mork thread subject index");
     }
     remaining.delete(key);
+  };
+  for (const key of allThreads?.rows ?? []) {
+    checkSubject(key, rows.get(key));
+  }
+  // The all-threads table is legacy's derived subject index. nsMsgDatabase
+  // can leave a live thread out of it, e.g. after a header is removed and
+  // added again; the thread table and headers above stay authoritative. A
+  // present subject row must still be exact, indexed or not.
+  for (const id of threadTables.keys()) {
+    const key = id + ":" + THREAD;
+    if (!retiredThreads.has(id) && remaining.has(key)) {
+      checkSubject(key, rows.get(key));
+    }
   }
   if (infoTable.rows.length != 1) {
     throw new Error("Unsupported Mork folder-info membership");
@@ -1327,6 +1372,17 @@ function accountRecords(request, folderFlags, imap = false) {
     ) {
       // A removed source can leave its inactive subject index outside the live
       // all-threads table. Its zero-member metadata was checked above.
+      continue;
+    }
+    if (
+      imap &&
+      (row.scope == OFFLINE || row.scope == PENDING) &&
+      !row.cells.size &&
+      !offlineTable?.rows.includes(key)
+    ) {
+      // nsMsgDatabase deletes a played-back offline operation or pending
+      // attribute row by cutting it from its table and cutting all its cells.
+      // Such a detached cell-less row has no state left to import.
       continue;
     }
     if (

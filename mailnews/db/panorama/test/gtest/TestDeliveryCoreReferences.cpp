@@ -10146,10 +10146,113 @@ TEST_F(DeliveryCoreReferences, ImapRawRecordsPreserveMembershipAndUnknownRows) {
       u"\"rows\":[\"5001:ns:msg:db:row:scope:threads:all\",\"5000:ns:msg:db:"
       u"row:scope:threads:all\"]");
   EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED, CheckRawImport(changed));
-  changed = RawImportRecords(false, true, false);
+}
+
+TEST_F(DeliveryCoreReferences, ImapRawRecordsAcceptUnindexedLiveThread) {
+  ASSERT_EQ(NS_OK, Start());
+  // The all-threads table is a derived subject index. A legacy header removal
+  // and re-add leaves the live thread out of it (genuine Sent Items history).
+  auto changed = RawImportRecords(false, true, false);
   changed.ReplaceSubstring(
       u"\"rows\":[\"5001:ns:msg:db:row:scope:threads:all\"]", u"\"rows\":[]");
+  EXPECT_EQ(NS_OK, CheckRawImport(changed));
+  auto absent = changed;
+  absent.ReplaceSubstring(
+      u"{\"id\":5001,\"scope\":\"ns:msg:db:row:scope:threads:all\",\"cells\":"
+      u"[{\"k\":\"threadSubject\",\"v\":\"live\"}]},",
+      u"");
+  ASSERT_NE(changed, absent);
+  EXPECT_EQ(NS_OK, CheckRawImport(absent));
+  // A detached subject row must still be exact.
+  changed.ReplaceSubstring(u"threadSubject\",\"v\":\"live",
+                           u"threadSubject\",\"v\":\"other");
   EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED, CheckRawImport(changed));
+}
+
+TEST_F(DeliveryCoreReferences, RawRecordsAccountUnifiedFolderHits) {
+  ASSERT_EQ(NS_OK, Start());
+  const nsString thread =
+      u"\"metaRow\":\"1:m\",\"rows\":[\"5001:ns:msg:db:row:scope:msgs:all\"]}"_ns;
+  auto withHits = [&](const nsAString& kind, const nsAString& member,
+                      bool imap) {
+    auto data = RawImportRecords(false, imap, false);
+    nsString table =
+        thread + u",{\"id\":4294967295,\"scope\":\"ns:msg:db:"_ns +
+        u"row:scope:msgs:all\",\"cells\":[{\"k\":\"k\",\"v\":\""_ns + kind +
+        u"\"}],\"metaRow\":null,\"rows\":[\""_ns + member +
+        u":ns:msg:db:row:scope:msgs:all\"]}"_ns;
+    data.ReplaceSubstring(thread, table);
+    return data;
+  };
+  const auto unified = u"mailbox://nobody@smart%20mailboxes/Inbox"_ns;
+  EXPECT_EQ(NS_OK, CheckRawImport(withHits(unified, u"5001"_ns, true)));
+  EXPECT_EQ(NS_OK, CheckRawImport(withHits(unified, u"5001"_ns, false), false));
+  EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED,
+            CheckRawImport(withHits(unified, u"5002"_ns, true)));
+  EXPECT_EQ(
+      NS_ERROR_NOT_IMPLEMENTED,
+      CheckRawImport(withHits(u"mailbox://nobody@Local%20Folders/Saved"_ns,
+                              u"5001"_ns, true)));
+}
+
+TEST_F(DeliveryCoreReferences, ImapRawRecordsAccountDeletedOperationRows) {
+  ASSERT_EQ(NS_OK, Start());
+  // Legacy deletes a played-back operation or pending attribute row by cutting
+  // it from its table and cutting all of its cells.
+  const nsString subject =
+      u"{\"id\":5001,\"scope\":\"ns:msg:db:row:scope:threads:all\""_ns;
+  auto withRows = [&](bool imap, const nsAString& cells) {
+    auto data = RawImportRecords(false, imap, false);
+    nsString rows;
+    for (const char16_t* scope : {u"ops", u"pending"}) {
+      rows += u"{\"id\":777,\"scope\":\"ns:msg:db:row:scope:"_ns +
+              nsDependentString(scope) + u":all\",\"cells\":["_ns + cells +
+              u"]},"_ns;
+    }
+    data.ReplaceSubstring(subject, nsString(rows + subject));
+    return data;
+  };
+  EXPECT_EQ(NS_OK, CheckRawImport(withRows(true, u""_ns)));
+  EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED,
+            CheckRawImport(withRows(true, u"{\"k\":\"op\",\"v\":\"1\"}"_ns)));
+  EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED,
+            CheckRawImport(withRows(false, u""_ns), false));
+}
+
+TEST_F(DeliveryCoreReferences, RawRecordsAcceptInfoOnlyEmptySummary) {
+  ASSERT_EQ(NS_OK, Start());
+  // A legacy compress commit of an empty folder keeps only its folder info.
+  const nsString info =
+      uR"json({
+      "unhandledRecords": [],
+      "folderProperties": [
+        {"name":"UIDValidity","text":"3d","integer":61},
+        {"name":"originalFolderURI","text":"imap://captured/source"}],
+      "records": {
+        "tables": [
+          {"id":1,"scope":"ns:msg:db:row:scope:dbfolderinfo:all","cells":[{"k":"k","v":"ns:msg:db:table:kind:dbfolderinfo"},{"k":"s","v":"9u"}],"metaRow":null,"rows":["1:ns:msg:db:row:scope:dbfolderinfo:all"]}
+          @EXTRA@
+        ],
+        "rows": [
+          {"id":1,"scope":"ns:msg:db:row:scope:dbfolderinfo:all","cells":[{"k":"UIDValidity","v":"3d"},{"k":"originalFolderURI","v":"imap://captured/source"}]}
+        ]},
+      "imap":{"version":1,"originalFolderURI":"imap://captured/source","uidValidity":{"present":true,"value":61},
+        "operations":[],"serverUids":[]}
+    })json"_ns;
+  auto exact = info;
+  exact.ReplaceSubstring(u"@EXTRA@", u"");
+  EXPECT_EQ(NS_OK, CheckRawImport(exact, true, false, Nothing(), true));
+  EXPECT_EQ(NS_OK, CheckRawImport(exact, false, false, Nothing(), true));
+  // A summary with messages, or with any thread state, needs its tables.
+  EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED, CheckRawImport(exact));
+  auto threaded = info;
+  threaded.ReplaceSubstring(
+      u"@EXTRA@",
+      u",{\"id\":4294967293,\"scope\":\"ns:msg:db:row:scope:threads:all\","
+      u"\"cells\":[{\"k\":\"k\",\"v\":\"ns:msg:db:table:kind:allthreads\"}],"
+      u"\"metaRow\":null,\"rows\":[]}");
+  EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED,
+            CheckRawImport(threaded, true, false, Nothing(), true));
 }
 
 TEST_F(DeliveryCoreReferences, LocalRawRecordsKeepExplicitUnreadAndNoPending) {

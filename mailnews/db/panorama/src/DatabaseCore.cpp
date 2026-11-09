@@ -5517,6 +5517,7 @@ nsresult CheckFullImportRecords(JSContext* cx, JS::Handle<JSObject*> request,
                      *allThreads = nullptr, *offlineTable = nullptr,
                      *pendingTable = nullptr;
   nsTHashMap<uint32_t, uint32_t> threadTables;
+  nsTArray<const ImportSourceRecord*> unifiedHits;
   for (uint32_t i = 0; i < tables.Length(); ++i) {
     auto& table = *tables[i];
     for (auto cell = table.cells.ConstIter(); !cell.Done(); cell.Next()) {
@@ -5548,22 +5549,44 @@ nsresult CheckFullImportRecords(JSContext* cx, JS::Handle<JSObject*> request,
                !pendingTable && table.meta.IsEmpty() &&
                table.members.IsEmpty()) {
       pendingTable = &table;
+    } else if (table.scope == messageScope &&
+               StringBeginsWith(kind,
+                                "mailbox://nobody@smart%20mailboxes/"_ns) &&
+               table.meta.IsEmpty()) {
+      // nsMsgDatabase caches a unified folder's hits in a message-scope
+      // table named by that folder's URI. Panorama does not migrate unified
+      // folders; the cache is accounted against live headers below.
+      unifiedHits.AppendElement(&table);
     } else {
       return NS_ERROR_NOT_IMPLEMENTED;
     }
   }
+  // Only an empty folder's summary may lack both the all-headers and the
+  // all-threads table; nsMsgDatabase recreates them when it opens one.
+  const bool infoOnly = !messageTable && !allThreads &&
+                        input.messages.IsEmpty() && threadTables.IsEmpty();
   // Native empty local folders have no per-thread table. Only the exact
   // empty message/allthreads shape with a lone folder-info row can omit it;
   // every record, info cell and live count is still checked below.
   NS_ENSURE_TRUE(
-      messageTable && infoTable && allThreads &&
-          (imap || !threadTables.IsEmpty() ||
-           (input.messages.IsEmpty() && messageTable->members.IsEmpty() &&
-            allThreads->members.IsEmpty() && rows.Length() == 1)),
+      infoTable && (infoOnly ? imap || rows.Length() == 1
+                             : messageTable && allThreads &&
+                                   (imap || !threadTables.IsEmpty() ||
+                                    (input.messages.IsEmpty() &&
+                                     messageTable->members.IsEmpty() &&
+                                     allThreads->members.IsEmpty() &&
+                                     rows.Length() == 1))),
       NS_ERROR_NOT_IMPLEMENTED);
-  NS_ENSURE_TRUE(messageTable->members.Length() == input.messages.Length() &&
-                     infoTable->members.Length() == 1,
-                 NS_ERROR_INVALID_ARG);
+  NS_ENSURE_TRUE(
+      (infoOnly || messageTable->members.Length() == input.messages.Length()) &&
+          infoTable->members.Length() == 1,
+      NS_ERROR_INVALID_ARG);
+  for (const auto* hits : unifiedHits) {
+    for (const auto& key : hits->members) {
+      NS_ENSURE_TRUE(messageTable && messageTable->memberSet.Contains(key),
+                     NS_ERROR_NOT_IMPLEMENTED);
+    }
+  }
   nsTHashMap<nsMsgKey, uint32_t> messages;
   nsCOMPtr<nsIMimeConverter> converter =
       mozilla::components::MimeConverter::Service();
@@ -5615,6 +5638,7 @@ nsresult CheckFullImportRecords(JSContext* cx, JS::Handle<JSObject*> request,
     return NS_OK;
   };
   nsTHashMap<uint32_t, bool> retiredThreads;
+  uint32_t indexedThreads = 0;
   constexpr uint32_t retiring = nsIMsgOfflineImapOperation::kMsgMoved |
                                 nsIMsgOfflineImapOperation::kDeletedMsg |
                                 nsIMsgOfflineImapOperation::kMsgMarkedDeleted;
@@ -5685,18 +5709,26 @@ nsresult CheckFullImportRecords(JSContext* cx, JS::Handle<JSObject*> request,
     if (!rootRow->cells.Get("subject"_ns, &rawSubject)) {
       rawSubject.Truncate();
     }
-    NS_ENSURE_TRUE(subject && !subject->accounted &&
-                       subject->cells.Count() == 1 &&
-                       subject->cells.Get("threadSubject"_ns, &threadSubject) &&
-                       threadSubject == rawSubject &&
-                       allThreads->memberSet.Contains(subjectKey),
-                   NS_ERROR_NOT_IMPLEMENTED);
-    subject->accounted = true;
+    // The all-threads table is legacy's derived subject index. nsMsgDatabase
+    // can leave a live thread out of it, e.g. after a header is removed and
+    // added again; the thread table and headers above stay authoritative. A
+    // present subject row must still be exact, indexed or not.
+    const bool indexed = allThreads->memberSet.Contains(subjectKey);
+    if (subject || indexed) {
+      NS_ENSURE_TRUE(
+          subject && !subject->accounted && subject->cells.Count() == 1 &&
+              subject->cells.Get("threadSubject"_ns, &threadSubject) &&
+              threadSubject == rawSubject,
+          NS_ERROR_NOT_IMPLEMENTED);
+      subject->accounted = true;
+      indexedThreads += indexed;
+    }
   }
-  NS_ENSURE_TRUE(assigned.Count() == input.messages.Length() &&
-                     allThreads->members.Length() ==
-                         threadTables.Count() - retiredThreads.Count(),
-                 NS_ERROR_INVALID_ARG);
+  // Every index member must be the subject of a distinct live thread.
+  NS_ENSURE_TRUE(
+      assigned.Count() == input.messages.Length() &&
+          (infoOnly || allThreads->members.Length() == indexedThreads),
+      NS_ERROR_INVALID_ARG);
   auto* info = find(infoTable->members[0]);
   NS_ENSURE_TRUE(info && info->id == 1 && info->scope == infoScope,
                  NS_ERROR_NOT_IMPLEMENTED);
@@ -5720,6 +5752,16 @@ nsresult CheckFullImportRecords(JSContext* cx, JS::Handle<JSObject*> request,
                      ImportSourceKey(row->id, messageScope))) {
         row->accounted = true;
       }
+    }
+    // nsMsgDatabase deletes a played-back offline operation or pending
+    // attribute row by cutting it from its table and cutting all its cells.
+    // Such a detached cell-less row has no state left to import.
+    if (imap && !row->accounted && row->cells.IsEmpty() &&
+        (row->scope == "ns:msg:db:row:scope:ops:all"_ns ||
+         row->scope == "ns:msg:db:row:scope:pending:all"_ns) &&
+        !(offlineTable && offlineTable->memberSet.Contains(
+                              ImportSourceKey(row->id, row->scope)))) {
+      row->accounted = true;
     }
     if (!row->accounted) {
       uint32_t root;
@@ -14038,7 +14080,18 @@ nsresult DatabaseCore::BuildStartupFolders() {
       // which the exact retained word replaces.
       const bool boxless = source.protocol == "imap"_ns && !source.boxFlags &&
                            !(wanted & protocolMask);
-      NS_ENSURE_TRUE((boxless || !((wanted ^ before) & protocolMask)) &&
+      // Only a server LIST reports a mailbox namespace. Box flags restored
+      // offline carry none, while Thunderbird keeps the namespace flag in the
+      // summary's word; when discovery derived no namespace, the exact
+      // retained word supplies it. A derived namespace must still match.
+      const uint32_t namespaceMask = nsMsgFolderFlags::ImapPersonal |
+                                     nsMsgFolderFlags::ImapPublic |
+                                     nsMsgFolderFlags::ImapOtherUser;
+      const uint32_t comparedMask =
+          source.protocol == "imap"_ns && !(before & namespaceMask)
+              ? protocolMask & ~namespaceMask
+              : protocolMask;
+      NS_ENSURE_TRUE((boxless || !((wanted ^ before) & comparedMask)) &&
                          !(before & nsMsgFolderFlags::SpecialUse & ~wanted),
                      NS_ERROR_NOT_AVAILABLE);
       if (wanted != before) {

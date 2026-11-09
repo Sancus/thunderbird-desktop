@@ -48,7 +48,16 @@ export function parseMorkSummary(bytes) {
       table.scope == "ns:msg:db:row:scope:msgs:all" &&
       table.cells.get("k") == "ns:msg:db:table:kind:msgs"
   );
-  if (tables.length != 1) {
+  // A legacy compress commit leaves an empty folder's summary with only its
+  // folder info: nsMsgDatabase recreates the absent all-headers table on open.
+  // Such a summary has no messages; callers still validate every record. Mork
+  // without folder info is not a mail summary.
+  const folderInfo = [...source.tables.values()].some(
+    table =>
+      table.scope == "ns:msg:db:row:scope:dbfolderinfo:all" &&
+      table.cells.get("k") == "ns:msg:db:table:kind:dbfolderinfo"
+  );
+  if (tables.length > 1 || (!tables.length && !folderInfo)) {
     throw new MorkImportError(
       "UNSUPPORTED_MORK",
       0,
@@ -67,7 +76,7 @@ export function parseMorkSummary(bytes) {
       );
     }
   };
-  const messages = tables[0].rows.map(key => {
+  const messages = (tables[0]?.rows ?? []).map(key => {
     const row = source.rows.get(key);
     if (row.scope != tables[0].scope) {
       throw new MorkImportError(

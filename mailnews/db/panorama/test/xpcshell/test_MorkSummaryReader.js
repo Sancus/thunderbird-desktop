@@ -530,3 +530,36 @@ add_task(async function test_genuineFolderCacheConsumer() {
   Assert.deepEqual(bytes, original);
   Assert.deepEqual(await IOUtils.read(path), original);
 });
+
+add_task(async function test_genuineInfoOnlyEmptyFolderSummary() {
+  // A legacy compress commit of an empty folder keeps only its folder info.
+  const path = do_get_file("data/migration-info-only-summary.msf").path;
+  const bytes = await IOUtils.read(path);
+  const original = bytes.slice();
+  const summary = parseMorkSummary(bytes);
+  Assert.deepEqual(summary.messages, [], "An empty folder has no messages");
+  Assert.deepEqual(
+    [...summary.source.tables.values()].map(table => table.cells.get("k")),
+    ["ns:msg:db:table:kind:dbfolderinfo"]
+  );
+  const info = [...summary.source.rows.values()];
+  Assert.equal(info.length, 1);
+  Assert.equal(info[0].scope, "ns:msg:db:row:scope:dbfolderinfo:all");
+  Assert.equal(info[0].cells.get("onlineName"), "Drafts");
+  Assert.deepEqual(bytes, original, "The reader does not mutate its input");
+
+  // A second all-headers table is still refused.
+  const body = MailStringUtils.uint8ArrayToByteString(bytes);
+  const tables = "{1:^80 {(k^96:c)(s=9)} }\n{2:^80 {(k^96:c)(s=9)} }\n";
+  Assert.throws(
+    () =>
+      parseMorkSummary(
+        MailStringUtils.byteStringToUint8Array(
+          body.replace("{1:^9F", tables + "{1:^9F")
+        )
+      ),
+    error =>
+      error.name == "MorkImportError" &&
+      error.message == "Expected one message table at byte 0"
+  );
+});

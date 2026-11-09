@@ -21,6 +21,7 @@ import {
   hashMigrationFile,
   migrationPhysicalIdentity,
   isMigrationPhysicalIdentity,
+  originalPathIdentity,
 } from "resource:///modules/panorama/MigrationSource.sys.mjs";
 
 import {
@@ -774,6 +775,9 @@ export class MigrationJournal {
         : {}),
       ...(snapshot.requestVersion === 3
         ? { sourceFormat: snapshot.sourceFormat }
+        : {}),
+      ...(snapshot.unboundKeys?.length
+        ? { unboundKeys: snapshot.unboundKeys }
         : {}),
       token: Services.uuid.generateUUID().toString(),
       state: "pending",
@@ -2244,6 +2248,31 @@ function samePhysical(left, right) {
 }
 
 /**
+ * Checks that a retained IMAP origin cache key names its summary file: the
+ * summary's exact descriptor, or another spelling of the same existing file
+ * that Thunderbird used when it wrote the entry.
+ *
+ * @param {string} key - Retained original cache key.
+ * @param {string} path - Original summary path.
+ * @returns {boolean} Whether the key is this summary's entry.
+ */
+function startupOriginKeyNamesSummary(key, path) {
+  const descriptor = new TextDecoder("utf-8", {
+    fatal: true,
+    ignoreBOM: true,
+  }).decode(
+    MailStringUtils.byteStringToUint8Array(
+      new FileUtils.File(path).persistentDescriptor
+    )
+  );
+  if (key === descriptor) {
+    return true;
+  }
+  const identity = originalPathIdentity(path);
+  return !!identity && originalPathIdentity(key) === identity;
+}
+
+/**
  * Validates retained discovery inputs independently of native target outputs.
  * Native startup also verifies their original backed-up bytes and provider.
  *
@@ -2296,12 +2325,7 @@ function validateStartupFolderOrigin(source, caches) {
           ? input.sourceFormat === "json"
           : !Object.hasOwn(input, "sourceFormat"))
     ) ||
-    cache.originalKey !==
-      new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
-        MailStringUtils.byteStringToUint8Array(
-          new FileUtils.File(source.path).persistentDescriptor
-        )
-      ) ||
+    !startupOriginKeyNamesSummary(cache.originalKey, source.path) ||
     (cache.sourceFormat === "json"
       ? Object.hasOwn(cache, "sourceKey")
       : Object.hasOwn(cache, "sourceFormat") ||

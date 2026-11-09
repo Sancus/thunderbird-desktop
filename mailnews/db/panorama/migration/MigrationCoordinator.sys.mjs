@@ -22,6 +22,7 @@ import {
 } from "resource:///modules/panorama/MorkSnapshotAdapter.sys.mjs";
 import {
   admitWindowsMigrationPath,
+  originalPathIdentity,
   migrationPhysicalIdentity,
   readMorkMigrationSource,
   readMorkAddressBookSource,
@@ -550,6 +551,8 @@ export async function resumeMorkBookImportsAndPublish(
  *   An original native JSON input uses explicit version3 reconciliation.
  * @param {?nsISupports} [startupOperation=null] - Native operation for the
  *   distinct startup caller; otherwise profileLock must be a genuine held lock.
+ * @param {string[]} [unboundKeys=[]] - Original keys that reach no current
+ *   folder (startupCacheKeyPlan). They stay in the backed-up original only.
  * @returns {Promise<object>} Owned source bytes/raw records and exact folder
  *   bindings/properties. This is read-only input, never an import completion.
  * @throws {Error} For unsupported paths, changed identity or incomplete mapping.
@@ -561,7 +564,8 @@ export async function prepareMorkFolderCacheImport(
   path,
   bindings,
   requestVersion = 2,
-  startupOperation = null
+  startupOperation = null,
+  unboundKeys = []
 ) {
   if (![1, 2, 3].includes(requestVersion)) {
     throw new Error("Unsupported native cache request version");
@@ -594,7 +598,11 @@ export async function prepareMorkFolderCacheImport(
   }
   if (
     Object.prototype.toString.call(bindings) != "[object Map]" ||
-    bindings.size != cache.entries.size
+    !Array.isArray(unboundKeys) ||
+    (unboundKeys.length && requestVersion === 1) ||
+    new Set(unboundKeys).size != unboundKeys.length ||
+    unboundKeys.some(key => bindings.has(key) || !cache.entries.has(key)) ||
+    bindings.size + unboundKeys.length != cache.entries.size
   ) {
     throw new Error("Incomplete native folder-cache mapping");
   }
@@ -681,6 +689,7 @@ export async function prepareMorkFolderCacheImport(
     ...(requestVersion >= 2 ? { requestVersion, proof } : {}),
     ...(requestVersion === 3 ? { sourceFormat: "json" } : {}),
     folders: folders.map(folder => bindMorkFolderCacheRecord(folder, cache)),
+    ...(unboundKeys.length ? { unboundKeys: unboundKeys.toSorted() } : {}),
   };
 }
 
@@ -1020,7 +1029,10 @@ export async function resumeMorkCacheImports(
           cache.path,
           startupOperation
         );
-        if (input.cache.entries.size !== cache.folders.length) {
+        if (
+          input.cache.entries.size !==
+          cache.folders.length + (cache.unboundKeys?.length ?? 0)
+        ) {
           throw new Error("Cache snapshot differs from the journal plan");
         }
         const current = {
@@ -1062,7 +1074,8 @@ export async function resumeMorkCacheImports(
         cache.path,
         await resolveBindings(cache.id),
         cache.requestVersion ?? 1,
-        startupOperation
+        startupOperation,
+        cache.unboundKeys ?? []
       );
       const current = {
         ...cache,
@@ -2846,10 +2859,25 @@ function startupFolderOrigin(source, summary, caches) {
       new FileUtils.File(source.path).persistentDescriptor
     )
   );
-  const matches = caches.flatMap(({ identity, input }) => {
+  let matches = caches.flatMap(({ identity, input }) => {
     const row = input.entries.get(originalKey);
-    return row ? [{ identity, row, format: input.format }] : [];
+    return row ? [{ identity, row, format: input.format, originalKey }] : [];
   });
+  if (!matches.length) {
+    // Thunderbird keyed the entry by the spelling it used then; another
+    // spelling of this same summary file is still its entry.
+    const physical = originalPathIdentity(source.path);
+    matches = caches.flatMap(({ identity, input }) =>
+      [...input.entries]
+        .filter(([key]) => physical && originalPathIdentity(key) === physical)
+        .map(([key, row]) => ({
+          identity,
+          row,
+          format: input.format,
+          originalKey: key,
+        }))
+    );
+  }
   if (matches.length !== 1) {
     throw new Error("IMAP summary has no unique original folder-cache entry");
   }
@@ -2897,7 +2925,7 @@ function startupFolderOrigin(source, summary, caches) {
     provider: "imap-client-discovery",
     cache: {
       ...identity,
-      originalKey,
+      originalKey: matches[0].originalKey,
       ...(format === "json"
         ? { sourceFormat: "json" }
         : { sourceKey: row.sourceKey }),
@@ -3264,17 +3292,17 @@ async function finishPanoramaProfileStartup(
         : new Map();
       const cacheBindings = new Map();
       for (const cache of caches) {
-        const mapping = new Map(
-          cache.cacheKeys.map(key => {
-            const binding = bindings.get(key);
-            if (!binding) {
-              throw new Error(
-                "Original cache key has no exact native folder binding"
-              );
-            }
-            return [key, binding];
-          })
+        const { mapping, unboundKeys } = startupCacheKeyPlan(
+          cache.cacheKeys,
+          bindings
         );
+        if (unboundKeys.length) {
+          console.warn(
+            "Panorama migration omits obsolete folder-cache entries; the " +
+              "original cache stays in the backup",
+            unboundKeys.length
+          );
+        }
         const snapshot = await prepareMorkFolderCacheImport(
           journal,
           database,
@@ -3282,7 +3310,8 @@ async function finishPanoramaProfileStartup(
           cache.path,
           mapping,
           2,
-          operation
+          operation,
+          unboundKeys
         );
         await journal.planCacheImport(cache.id, snapshot);
         cacheBindings.set(cache.id, mapping);
@@ -3454,6 +3483,62 @@ function startupCacheBindings(captured, database, folders) {
     result.set(descriptor, { folder, descriptor });
   }
   return result;
+}
+
+/**
+ * Classifies every original cache key against the current folders. Legacy
+ * Thunderbird never prunes entries left by a moved or copied profile or a
+ * removed account; such an obsolete entry reaches no current folder and is
+ * omitted (the whole original stays in the verified backup). An entry under
+ * another spelling of a current folder's own file is that folder's entry,
+ * unless the folder's exact current entry exists and is imported instead.
+ *
+ * @param {string[]} keys - Every key of one original cache.
+ * @param {Map<string, {folder: nsIMsgFolder, descriptor: string}>} bindings -
+ *   Current folders by exact canonical descriptor (startupCacheBindings).
+ * @returns {{mapping: Map<string, object>, unboundKeys: string[]}} Bound keys
+ *   and sorted obsolete keys.
+ * @throws {Error} For two other spellings of one folder and no exact entry.
+ */
+function startupCacheKeyPlan(keys, bindings) {
+  const mapping = new Map();
+  const remaining = [];
+  for (const key of keys) {
+    const binding = bindings.get(key);
+    if (binding) {
+      mapping.set(key, binding);
+    } else {
+      remaining.push(key);
+    }
+  }
+  const unboundKeys = [];
+  if (!remaining.length) {
+    return { mapping, unboundKeys };
+  }
+  const exact = new Set(mapping.values());
+  const current = new Map();
+  for (const binding of new Set(bindings.values())) {
+    const identity = originalPathIdentity(binding.descriptor);
+    if (identity) {
+      current.set(identity, binding);
+    }
+  }
+  const aliases = new Map();
+  for (const key of remaining) {
+    const identity = originalPathIdentity(key);
+    const binding = identity && current.get(identity);
+    if (!binding || exact.has(binding)) {
+      unboundKeys.push(key);
+    } else if (aliases.has(binding)) {
+      throw new Error("Several cache spellings name one current folder");
+    } else {
+      aliases.set(binding, key);
+    }
+  }
+  for (const [binding, key] of aliases) {
+    mapping.set(key, binding);
+  }
+  return { mapping, unboundKeys: unboundKeys.toSorted() };
 }
 
 /**

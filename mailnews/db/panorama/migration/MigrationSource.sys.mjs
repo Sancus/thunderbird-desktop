@@ -83,6 +83,44 @@ export function admitWindowsMigrationPath(file, kind) {
 }
 
 /**
+ * Returns a comparable physical identity of an existing original path, or
+ * null when nothing exists there. Windows compares volume/file IDs, so case
+ * and short-name spellings of one object agree; elsewhere the normalized
+ * path is compared. Native import checks the same physically again.
+ *
+ * @param {string} path - Original absolute path, e.g. a retained cache key.
+ * @returns {?string} Identity, or null for an absent or non-local path.
+ */
+export function originalPathIdentity(path) {
+  let file;
+  try {
+    file = new FileUtils.File(path);
+    if (!file.exists()) {
+      return null;
+    }
+  } catch {
+    // Not a local absolute path on this system: no current folder is there.
+    return null;
+  }
+  if (AppConstants.platform == "win") {
+    const lease = admitWindowsMigrationPath(
+      file,
+      file.isDirectory()
+        ? Ci.nsIPanoramaMigrationFileSystem.KIND_DIRECTORY
+        : Ci.nsIPanoramaMigrationFileSystem.KIND_FILE
+    );
+    try {
+      return "win:" + lease.identity;
+    } finally {
+      lease.close();
+    }
+  }
+  const normalized = file.clone();
+  normalized.normalize();
+  return "path:" + normalized.path;
+}
+
+/**
  * @param {nsIPanoramaMigrationPath} lease - Open native existing-path lease.
  * @returns {object} Version1 exact physical identity for manifests/journals.
  */

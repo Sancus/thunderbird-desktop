@@ -6815,6 +6815,9 @@ struct CacheImport {
   nsCString profilePath, manifestPath, manifestSha256;
   uint32_t manifestSize{0};
   nsTArray<CacheFolder> folders;
+  // Sorted original keys of obsolete entries: no current folder is reachable
+  // through them. They stay in the backed-up original, never in Panorama.
+  nsTArray<nsCString> unboundKeys;
 };
 namespace {
 
@@ -6975,10 +6978,10 @@ nsresult CacheRequest(JSContext* cx, JS::Handle<JS::Value> value,
       NS_ENSURE_TRUE(JS_HasOwnProperty(cx, object, "sourceKey", &hasSourceKey),
                      NS_ERROR_FAILURE);
       NS_ENSURE_FALSE(hasSourceKey, NS_ERROR_INVALID_ARG);
+      // An original key spelled differently from the current descriptor must
+      // be the same physical object; the first import checks that.
       nsCOMPtr<nsIFile> original;
       MOZ_TRY(NewComparableFile(folder.originalKey, getter_AddRefs(original)));
-      NS_ENSURE_TRUE(folder.originalKey == folder.descriptor,
-                     NS_ERROR_NOT_AVAILABLE);
     } else {
       MOZ_TRY(ImportMember(cx, object, "sourceKey", &field));
       MOZ_TRY(ImportNumber(field, 1, UINT32_MAX, number));
@@ -7012,6 +7015,102 @@ nsresult CacheRequest(JSContext* cx, JS::Handle<JS::Value> value,
             [](const auto& a, const auto& b) {
               return Compare(a.originalKey, b.originalKey) < 0;
             });
+  bool hasUnbound;
+  NS_ENSURE_TRUE(JS_HasOwnProperty(cx, request, "unboundKeys", &hasUnbound),
+                 NS_ERROR_FAILURE);
+  if (hasUnbound) {
+    NS_ENSURE_TRUE(input.version >= 2, NS_ERROR_INVALID_ARG);
+    MOZ_TRY(ImportMember(cx, request, "unboundKeys", &field));
+    MOZ_TRY(ImportArray(cx, field, &array, length));
+    NS_ENSURE_TRUE(length, NS_ERROR_INVALID_ARG);
+    for (uint32_t i = 0; i < length; ++i) {
+      NS_ENSURE_TRUE(JS_GetElement(cx, array, i, &field), NS_ERROR_FAILURE);
+      nsCString key;
+      MOZ_TRY(ImportText(cx, field, key));
+      NS_ENSURE_TRUE(!key.IsEmpty() && key.FindChar(0) < 0 &&
+                         (input.unboundKeys.IsEmpty() ||
+                          Compare(input.unboundKeys.LastElement(), key) < 0),
+                     NS_ERROR_INVALID_ARG);
+      for (const auto& folder : input.folders) {
+        NS_ENSURE_TRUE(key != folder.originalKey && key != folder.descriptor,
+                       NS_ERROR_INVALID_ARG);
+      }
+      input.unboundKeys.AppendElement(std::move(key));
+    }
+  }
+  return NS_OK;
+}
+
+// Physical identity of an existing original path in its original spelling,
+// or empty when nothing exists there. Windows compares volume/file IDs, so
+// case and short-name spellings of one object agree; POSIX compares
+// device/inode. A linked leaf or reparse point is refused, never classified.
+nsresult CachePhysicalIdentity(const nsACString& path, nsCString& identity) {
+  identity.Truncate();
+  nsCOMPtr<nsIFile> file;
+  MOZ_TRY(NewComparableFile(path, getter_AddRefs(file)));
+  bool exists;
+  MOZ_TRY(file->Exists(&exists));
+  if (!exists) return NS_OK;
+#ifdef XP_WIN
+  bool directory;
+  MOZ_TRY(file->IsDirectory(&directory));
+  nsCOMPtr<nsIFile> parent;
+  MOZ_TRY(file->GetParent(getter_AddRefs(parent)));
+  NS_ENSURE_TRUE(directory || parent, NS_ERROR_FILE_INVALID_PATH);
+  RefPtr<MigrationFileSystem> fileSystem = new MigrationFileSystem();
+  nsCOMPtr<nsIPanoramaMigrationPath> lease;
+  MOZ_TRY(fileSystem->Admit(file, directory ? file.get() : parent.get(),
+                            directory
+                                ? nsIPanoramaMigrationFileSystem::KIND_DIRECTORY
+                                : nsIPanoramaMigrationFileSystem::KIND_FILE,
+                            getter_AddRefs(lease)));
+  nsresult rv = lease->GetIdentity(identity);
+  nsresult closed = lease->Close();
+  MOZ_TRY(rv);
+  MOZ_TRY(closed);
+#else
+  struct stat st{};
+  NS_ENSURE_TRUE(
+      !lstat(PromiseFlatCString(path).get(), &st) && !S_ISLNK(st.st_mode),
+      NS_ERROR_FILE_ACCESS_DENIED);
+  identity.AppendInt(uint64_t(st.st_dev));
+  identity.Append(':');
+  identity.AppendInt(uint64_t(st.st_ino));
+#endif
+  NS_ENSURE_TRUE(!identity.IsEmpty(), NS_ERROR_NOT_AVAILABLE);
+  return NS_OK;
+}
+
+// Before the first import: an alias-spelled key must name its folder's own
+// object, and an obsolete key may name a current folder only when that
+// folder's exact current entry is the one imported. Reuse compares the
+// retained receipt identity instead; the originals may have changed since.
+nsresult CheckCacheKeyReachability(const CacheImport& input) {
+  nsTArray<nsCString> identities;
+  for (const auto& folder : input.folders) {
+    nsCString identity;
+    MOZ_TRY(CachePhysicalIdentity(folder.cachePath, identity));
+    // Version 3 binds only the exact descriptor or this same object.
+    if (input.version == 3 && folder.originalKey != folder.descriptor) {
+      NS_ENSURE_TRUE(!identity.IsEmpty(), NS_ERROR_NOT_AVAILABLE);
+      nsCString original;
+      MOZ_TRY(CachePhysicalIdentity(folder.originalKey, original));
+      NS_ENSURE_TRUE(original == identity, NS_ERROR_NOT_AVAILABLE);
+    }
+    identities.AppendElement(std::move(identity));
+  }
+  for (const auto& key : input.unboundKeys) {
+    nsCString identity;
+    MOZ_TRY(CachePhysicalIdentity(key, identity));
+    if (identity.IsEmpty()) continue;
+    for (uint32_t i = 0; i < input.folders.Length(); ++i) {
+      NS_ENSURE_TRUE(
+          identities[i] != identity ||
+              input.folders[i].originalKey == input.folders[i].descriptor,
+          NS_ERROR_NOT_AVAILABLE);
+    }
+  }
   return NS_OK;
 }
 
@@ -7154,6 +7253,24 @@ nsresult CacheIdentity(JSContext* cx, const CacheImport& input,
   NS_ENSURE_TRUE(
       JS_DefineProperty(cx, result, "folders", folders, JSPROP_ENUMERATE),
       NS_ERROR_OUT_OF_MEMORY);
+  // Recorded only when present, so earlier receipts keep their identity.
+  if (!input.unboundKeys.IsEmpty()) {
+    JS::Rooted<JSObject*> unbound(
+        cx, JS::NewArrayObject(cx, input.unboundKeys.Length()));
+    NS_ENSURE_TRUE(unbound && JS_SetPrototype(cx, unbound, nullptr),
+                   NS_ERROR_OUT_OF_MEMORY);
+    for (uint32_t i = 0; i < input.unboundKeys.Length(); ++i) {
+      NS_ConvertUTF8toUTF16 text(input.unboundKeys[i]);
+      JS::Rooted<JSString*> key(
+          cx, JS_NewUCStringCopyN(cx, text.get(), text.Length()));
+      NS_ENSURE_TRUE(
+          key && JS_DefineElement(cx, unbound, i, key, JSPROP_ENUMERATE),
+          NS_ERROR_OUT_OF_MEMORY);
+    }
+    NS_ENSURE_TRUE(
+        JS_DefineProperty(cx, result, "unboundKeys", unbound, JSPROP_ENUMERATE),
+        NS_ERROR_OUT_OF_MEMORY);
+  }
   return NS_OK;
 }
 
@@ -7281,20 +7398,32 @@ nsresult ParseCacheBytes(JSContext* cx, const nsACString& bytes,
   MOZ_TRY(ImportMember(cx, object, "source", &field));
   NS_ENSURE_TRUE(field.isObject(), NS_ERROR_FAILURE);
   source = &field.toObject();
+  // Every original entry is either bound to a current folder or an explicit
+  // obsolete key; none is silently dropped.
+  const size_t expected = input.folders.Length() + input.unboundKeys.Length();
   if (input.version == 3) {
     JS::Rooted<JS::IdVector> keys(cx, JS::IdVector(cx));
     NS_ENSURE_TRUE(JS_Enumerate(cx, source, &keys), NS_ERROR_FAILURE);
-    NS_ENSURE_TRUE(keys.length() == input.folders.Length(),
-                   NS_ERROR_NOT_IMPLEMENTED);
+    NS_ENSURE_TRUE(keys.length() == expected, NS_ERROR_NOT_IMPLEMENTED);
   } else {
     MOZ_TRY(ImportMember(cx, source, "rows", &field));
     NS_ENSURE_TRUE(field.isObject(), NS_ERROR_FAILURE);
     rows = &field.toObject();
-    NS_ENSURE_TRUE(JS::MapSize(cx, rows) == input.folders.Length(),
-                   NS_ERROR_NOT_IMPLEMENTED);
+    NS_ENSURE_TRUE(JS::MapSize(cx, rows) == expected, NS_ERROR_NOT_IMPLEMENTED);
   }
-  NS_ENSURE_TRUE(JS::MapSize(cx, entries) == input.folders.Length(),
+  NS_ENSURE_TRUE(JS::MapSize(cx, entries) == expected,
                  NS_ERROR_NOT_IMPLEMENTED);
+  for (const auto& unbound : input.unboundKeys) {
+    NS_ConvertUTF8toUTF16 text(unbound);
+    JS::Rooted<JSString*> key(
+        cx, JS_NewUCStringCopyN(cx, text.get(), text.Length()));
+    NS_ENSURE_TRUE(key, NS_ERROR_OUT_OF_MEMORY);
+    JS::Rooted<JS::Value> keyValue(cx, JS::StringValue(key));
+    bool present;
+    NS_ENSURE_TRUE(JS::MapHas(cx, entries, keyValue, &present),
+                   NS_ERROR_FAILURE);
+    NS_ENSURE_TRUE(present, NS_ERROR_INVALID_ARG);
+  }
   for (auto& folder : input.folders) {
     JS::Rooted<JSString*> key(
         cx, JS_NewUCStringCopyN(
@@ -7894,6 +8023,7 @@ nsresult DatabaseCore::ImportFolderCacheMetadataV2(
     return NS_OK;
   }
   MOZ_TRY(CheckCacheFolders(this, connection, input));
+  MOZ_TRY(CheckCacheKeyReachability(input));
   nsCString bytes;
   MOZ_TRY(ReadCacheBytes(input, bytes));
   MOZ_TRY(ParseCacheBytes(cx, bytes, input));
@@ -11937,7 +12067,14 @@ nsresult DatabaseCore::ReadStartupMailSource(JSContext* cx,
   }
   nsCString actualKey;
   MOZ_TRY(file->GetPersistentDescriptor(actualKey));
-  NS_ENSURE_TRUE(key == actualKey, NS_ERROR_NOT_AVAILABLE);
+  if (key != actualKey) {
+    // A retained entry under another spelling of this same summary file.
+    nsCString summaryIdentity, keyIdentity;
+    MOZ_TRY(CachePhysicalIdentity(actualKey, summaryIdentity));
+    MOZ_TRY(CachePhysicalIdentity(key, keyIdentity));
+    NS_ENSURE_TRUE(!summaryIdentity.IsEmpty() && keyIdentity == summaryIdentity,
+                   NS_ERROR_NOT_AVAILABLE);
+  }
   nsCOMPtr<nsIFile> cacheFile;
   MOZ_TRY(StartupContained(operation.profile, cachePath,
                            getter_AddRefs(cacheFile)));
@@ -15458,6 +15595,10 @@ nsresult DatabaseCore::CheckProfileActivation(
         for (const char* field :
              {"token", "databaseSourceId", "folders", "proof"})
           MOZ_TRY(StartupCopy(cx, unit, request, field));
+        bool unbound;
+        NS_ENSURE_TRUE(JS_HasOwnProperty(cx, unit, "unboundKeys", &unbound),
+                       NS_ERROR_FAILURE);
+        if (unbound) MOZ_TRY(StartupCopy(cx, unit, request, "unboundKeys"));
         MOZ_TRY(StartupCopy(cx, unit, request, "id", "sourceId"));
         MOZ_TRY(StartupCopy(cx, unit, request, "requestVersion", "version"));
         JS::Rooted<JS::Value> requestVersion(cx);

@@ -428,6 +428,26 @@ export function createMorkFolderCacheRequest(unit) {
     }
     return Object.fromEntries(fields.map(name => [name, folder[name]]));
   });
+  // Obsolete original keys reach no current folder; they are listed so that
+  // every original entry is accounted, and stay in the verified backup.
+  const unboundKeys = unit.unboundKeys ?? [];
+  if (
+    !Array.isArray(unboundKeys) ||
+    (unit.unboundKeys !== undefined && !unboundKeys.length) ||
+    (unboundKeys.length && version === 1) ||
+    unboundKeys.some(
+      (key, index) =>
+        typeof key != "string" ||
+        !key ||
+        key.includes("\0") ||
+        (index && unboundKeys[index - 1] >= key) ||
+        folders.some(
+          folder => folder.originalKey === key || folder.descriptor === key
+        )
+    )
+  ) {
+    throw new Error("Invalid obsolete folder-cache keys");
+  }
   return {
     version,
     ...(json
@@ -439,6 +459,7 @@ export function createMorkFolderCacheRequest(unit) {
     source: { path: unit.path, size: unit.size, sha256: unit.sha256 },
     ...(proof ? { proof } : {}),
     folders,
+    ...(unboundKeys.length ? { unboundKeys: [...unboundKeys] } : {}),
   };
 }
 
@@ -555,6 +576,8 @@ export function validateMorkFolderCacheReceipt(unit, receipt) {
     identity.path !== unit.path ||
     identity.sha256 !== unit.sha256 ||
     identity.size !== unit.size ||
+    JSON.stringify(identity.unboundKeys ?? []) !==
+      JSON.stringify(expected.unboundKeys ?? []) ||
     !Array.isArray(receipt.cells)
   ) {
     throw new Error("Invalid native cache receipt identity");

@@ -1717,3 +1717,108 @@ add_task(
     );
   }
 );
+
+add_task(function test_JSONCacheObsoleteKeysAreExplicitAndRetained() {
+  const key = PathUtils.join(PathUtils.profileDir, "CurrentInbox.msf");
+  // Keys left by an earlier profile location; no current folder is there.
+  const obsolete = [
+    PathUtils.join(PathUtils.tempDir, "earlier", "CurrentInbox.msf"),
+    PathUtils.join(PathUtils.tempDir, "other", "CurrentInbox.msf"),
+  ].sort();
+  const unit = {
+    requestVersion: 3,
+    sourceFormat: "json",
+    id: "json-obsolete",
+    token: "json-obsolete-token",
+    databaseSourceId: "json-obsolete-database",
+    path: PathUtils.join(PathUtils.profileDir, "folderCache.json"),
+    size: 2,
+    sha256: "a".repeat(64),
+    proof: {
+      profilePath: PathUtils.profileDir,
+      manifest: {
+        path: PathUtils.join(PathUtils.profileDir, "backup", "manifest.json"),
+        size: 1,
+        sha256: "b".repeat(64),
+      },
+    },
+    folders: [
+      {
+        originalKey: key,
+        id: 1,
+        isServer: false,
+        descriptor: key,
+        cachePath: key,
+        storePath: PathUtils.join(PathUtils.profileDir, "CurrentInbox"),
+        originalSummaryPath: key,
+        protocol: "none",
+        storeType: "mbox",
+        properties: [{ name: "key", text: key }],
+      },
+    ],
+    unboundKeys: obsolete,
+  };
+  const request = createMorkFolderCacheRequest(unit);
+  Assert.deepEqual(request.unboundKeys, obsolete);
+  Assert.ok(
+    !Object.hasOwn(
+      createMorkFolderCacheRequest({ ...unit, unboundKeys: undefined }),
+      "unboundKeys"
+    ),
+    "A cache without obsolete keys keeps its earlier request"
+  );
+  for (const unboundKeys of [
+    [],
+    [...obsolete].reverse(),
+    [obsolete[0], obsolete[0]],
+    [key],
+    [""],
+  ]) {
+    Assert.throws(
+      () => createMorkFolderCacheRequest({ ...unit, unboundKeys }),
+      /Invalid obsolete folder-cache keys/
+    );
+  }
+  Assert.throws(
+    () =>
+      createMorkFolderCacheRequest({
+        ...unit,
+        requestVersion: undefined,
+        sourceFormat: undefined,
+        proof: undefined,
+        path: PathUtils.join(PathUtils.profileDir, "panacea.dat"),
+        folders: unit.folders.map(folder => ({ ...folder, sourceKey: 1 })),
+      }),
+    /Invalid obsolete folder-cache keys/,
+    "Version1 has no explicit obsolete-key accounting"
+  );
+  const receipt = {
+    identity: {
+      version: 3,
+      sourceFormat: "json",
+      policy: "native-reconciled-json-v3",
+      token: unit.token,
+      sourceId: unit.id,
+      databaseSourceId: unit.databaseSourceId,
+      path: unit.path,
+      size: unit.size,
+      sha256: unit.sha256,
+      proof: request.proof,
+      folders: request.folders,
+      unboundKeys: obsolete,
+    },
+    cells: [
+      { id: 1, name: "key", text: key, target: "key", disposition: "binding" },
+    ],
+  };
+  Assert.deepEqual(validateMorkFolderCacheReceipt(unit, receipt), receipt);
+  for (const unboundKeys of [undefined, obsolete.slice(1)]) {
+    const changed = structuredClone(receipt);
+    changed.identity.unboundKeys = unboundKeys;
+    Assert.throws(
+      () => validateMorkFolderCacheReceipt(unit, changed),
+      /Invalid native cache receipt identity/,
+      "The receipt records exactly the omitted original keys"
+    );
+  }
+});

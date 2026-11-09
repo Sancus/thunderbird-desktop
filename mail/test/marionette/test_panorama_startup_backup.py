@@ -858,6 +858,92 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.assertEqual(original, cache.read_bytes())
         self.assertEqual(obsolete_bytes, obsolete.read_bytes())
 
+    def create_cache_only_root(self, name):
+        """Persist an ordinary local account whose root has only cache metadata."""
+        self.clean_profile(False)
+        accounts = self.marionette.execute_script("""
+            return Services.prefs.getCharPref('mail.accountmanager.accounts', '');
+        """)
+        self.stop_application()
+        root = self.profile / "Mail" / name
+        root.mkdir(parents=True)
+        self.marionette.instance.profile.set_preferences({
+            "mail.accountmanager.accounts": ",".join(
+                [value for value in [accounts, "accountS526"] if value]),
+            "mail.account.accountS526.server": "serverS526",
+            "mail.server.serverS526.type": "none",
+            "mail.server.serverS526.hostname": "localhost",
+            "mail.server.serverS526.userName": name,
+            "mail.server.serverS526.name": "Cache only",
+            "mail.server.serverS526.directory-rel": "[ProfD]Mail/" + name,
+            "mail.server.serverS526.storeContractID":
+                "@mozilla.org/msgstore/berkeleystore;1",
+        })
+        self.assertFalse(list(root.rglob("*.msf")))
+        return root
+
+    def outside_profile(self):
+        """A temporary directory outside the profile, removed after the test."""
+        path = Path(tempfile.mkdtemp(prefix="comm-cache-history-")).resolve()
+        self.addCleanup(shutil.rmtree, path, True)
+        return path
+
+    def assert_json_cache_migration(self, cache, entries, bound, unbound):
+        """Migrate a native JSON cache, then reuse it twice unchanged."""
+        cache.write_text(json.dumps(entries), encoding="utf-8")
+        original = cache.read_bytes()
+        self.start_same_profile(True)
+        selected = self.selection()
+        self.assertEqual("migrated", selected["record"]["origin"])
+        self.assertEqual(1, len(selected["record"]["identity"]["caches"]))
+        identity = selected["record"]["identity"]["caches"][0]["receipt"]["identity"]
+        self.assertEqual(3, identity["version"])
+        self.assertEqual([bound], [folder["originalKey"] for folder in identity["folders"]])
+        self.assertEqual(sorted(unbound), identity.get("unboundKeys", []))
+        # The complete original, obsolete entries included, stays unchanged
+        # in place and in the verified backup.
+        self.assertEqual(original, cache.read_bytes())
+        backup = Path(selected["record"]["identity"]["backup"]["path"]).parent
+        self.assertEqual(original, (backup / "root-0" / cache.name).read_bytes())
+        for _ in range(2):
+            self.stop_application()
+            self.start_same_profile(True)
+            repeated = self.selection()
+            self.assertEqual(selected["sourceId"], repeated["sourceId"])
+            self.assertEqual(selected["record"]["identity"],
+                             repeated["record"]["identity"])
+            self.assertEqual(original, cache.read_bytes())
+
+    def test_movedProfileJsonCacheSkipsObsoleteEntries(self):
+        root = self.create_cache_only_root("cache-moved")
+        current = {"folderName": "Cache only"}
+        outside = self.outside_profile()
+        # Legacy never prunes entries of an earlier profile location.
+        absent = outside / "old-location" / "Mail" / "cache-moved"
+        unrelated = outside / "other-profile" / "Mail" / "cache-moved"
+        unrelated.mkdir(parents=True)
+        entries = {str(root): current, str(absent): current,
+                   str(unrelated): current}
+        if sys.platform != "win32":
+            # Another spelling of the current root, superseded by its exact entry.
+            link = outside / "linked-mail"
+            link.symlink_to(root.parent, target_is_directory=True)
+            entries[str(link / root.name)] = {"folderName": "Superseded"}
+        self.assert_json_cache_migration(
+            self.profile / "folderCache.json", entries, str(root),
+            [key for key in entries if key != str(root)])
+        self.assertTrue(unrelated.is_dir())
+
+    @unittest.skipIf(sys.platform == "win32", "needs a POSIX directory link")
+    def test_jsonCacheEntryUnderAnotherSpellingStaysBound(self):
+        root = self.create_cache_only_root("cache-spelled")
+        link = self.outside_profile() / "spelled-mail"
+        link.symlink_to(root.parent, target_is_directory=True)
+        spelled = str(link / root.name)
+        self.assert_json_cache_migration(
+            self.profile / "folderCache.json",
+            {spelled: {"folderName": "Cache only"}}, spelled, [])
+
     def create_legacy_imap_source(self):
         """Create genuine root and UID-bearing child summaries with legacy APIs."""
         self.clean_profile(False)

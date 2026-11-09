@@ -1296,6 +1296,7 @@ add_task(async function test_detachFailureKeepsOriginalAndCleansStaging() {
   let stripCalls = 0;
   let copyCalls = 0;
   let stagingPath;
+  const otherReaders = [];
   MailServices.messageServiceFromURI = function (messageURI) {
     const service = originalService.call(this, messageURI);
     if (messageURI != uri) {
@@ -1303,7 +1304,14 @@ add_task(async function test_detachFailureKeepsOriginalAndCleansStaging() {
     }
     return {
       getUrlForUri: (...args) => service.getUrlForUri(...args),
-      streamMessage(_uri, listener) {
+      streamMessage(streamURI, listener, ...rest) {
+        // Only the strip under test carries "attach&"; other readers of the
+        // new message (e.g. global indexing on slow builds) stay real.
+        const header = String(rest[3] ?? "");
+        if (!header.startsWith("attach&")) {
+          otherReaders.push(header);
+          return service.streamMessage(streamURI, listener, ...rest);
+        }
         stripCalls++;
         listener.onStartRequest(null);
         listener.onStopRequest(null, failure);
@@ -1329,6 +1337,7 @@ add_task(async function test_detachFailureKeepsOriginalAndCleansStaging() {
       AttachmentInfo.detachAttachments(header, [attachment], directory),
       error => error.result == failure
     );
+    info(`Other readers during the detach: ${JSON.stringify(otherReaders)}`);
     Assert.equal(
       stripCalls,
       1,

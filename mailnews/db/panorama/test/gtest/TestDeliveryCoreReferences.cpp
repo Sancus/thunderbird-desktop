@@ -3233,6 +3233,14 @@ class DeliveryCoreReferences : public testing::Test {
         cx, request, folder, member.snapshot, imap ? &member : nullptr);
   }
 
+  // The startup inventory's rule for an entry examined as not found.
+  static nsresult StartupVanishedEntry(
+      nsIFile* file, const nsACString& name, bool mailTree, nsresult status,
+      const nsTArray<nsCOMPtr<nsIFile>>& mailRoots, bool& vanished) {
+    return DatabaseCore::StartupVanishedEntryForTesting(
+        file, name, mailTree, status, mailRoots, vanished);
+  }
+
   nsresult MigrationHoldCounts(int64_t& holds, int64_t& attempts) {
     nsCOMPtr<mozIStorageStatement> stmt;
     MOZ_TRY(mConnection->CreateStatement(
@@ -10217,6 +10225,82 @@ TEST_F(DeliveryCoreReferences, ImapRawRecordsAccountDeletedOperationRows) {
             CheckRawImport(withRows(true, u"{\"k\":\"op\",\"v\":\"1\"}"_ns)));
   EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED,
             CheckRawImport(withRows(false, u""_ns), false));
+}
+
+// A fabricated profile directory: only an entry that its directory no longer
+// lists, is no mail data and touches no mail tree or configured mail root is a
+// transient non-mail file. Everything else examined as not found still refuses.
+TEST_F(DeliveryCoreReferences,
+       StartupInventorySkipsOnlyUnlistedNonMailEntries) {
+  nsCOMPtr<nsIFile> directory;
+  ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(directory)));
+  ASSERT_EQ(NS_OK, directory->Append(u"fabricated-startup-inventory"_ns));
+  ASSERT_EQ(NS_OK, directory->Create(nsIFile::DIRECTORY_TYPE, 0700));
+  auto child = [&](const char* leaf) {
+    nsCOMPtr<nsIFile> file;
+    EXPECT_EQ(NS_OK, directory->Clone(getter_AddRefs(file)));
+    EXPECT_EQ(NS_OK, file->AppendNative(nsDependentCString(leaf)));
+    return file;
+  };
+  // Listed entries: an ordinary file and an account directory outside the
+  // standard Mail tree that a server uses as its configured root.
+  nsCOMPtr<nsIFile> listed = child("listed-state.tmp");
+  ASSERT_EQ(NS_OK, listed->Create(nsIFile::NORMAL_FILE_TYPE, 0600));
+  nsCOMPtr<nsIFile> accounts = child("fabricated-accounts");
+  nsCOMPtr<nsIFile> root;
+  ASSERT_EQ(NS_OK, accounts->Clone(getter_AddRefs(root)));
+  ASSERT_EQ(NS_OK, root->AppendNative("pop.invalid"_ns));
+  ASSERT_EQ(NS_OK, root->Create(nsIFile::DIRECTORY_TYPE, 0700));
+  nsTArray<nsCOMPtr<nsIFile>> roots;
+  roots.AppendElement(root);
+  auto rule = [&](nsIFile* file, const char* name, bool mailTree,
+                  nsresult status) {
+    bool vanished = true;
+    EXPECT_EQ(NS_OK, StartupVanishedEntry(file, nsDependentCString(name),
+                                          mailTree, status, roots, vanished))
+        << name;
+    return vanished;
+  };
+  const nsresult gone = NS_ERROR_FILE_NOT_FOUND;
+
+  // The one admitted case: unlisted, not mail data, outside every mail root.
+  EXPECT_TRUE(
+      rule(child("session-state.tmp"), "session-state.tmp", false, gone));
+
+  // Still listed by its directory (unreadable or beyond a path limit).
+  EXPECT_FALSE(rule(listed, "listed-state.tmp", false, gone));
+  // Any other result, including success, is never this rule.
+  EXPECT_FALSE(rule(child("session-state.tmp"), "session-state.tmp", false,
+                    NS_ERROR_FILE_ACCESS_DENIED));
+  EXPECT_FALSE(
+      rule(child("session-state.tmp"), "session-state.tmp", false, NS_OK));
+  // Mail data by name, the standard mail trees, and anything in a mail tree.
+  for (const char* name : {"Inbox.msf", "abook.mab", "folderCache.json",
+                           "panacea.dat", "Mail", "ImapMail", "News"}) {
+    EXPECT_FALSE(rule(child(name), name, false, gone)) << name;
+  }
+  EXPECT_FALSE(
+      rule(child("session-state.tmp"), "session-state.tmp", true, gone));
+  // A configured root itself, an entry holding one, and an entry inside one.
+  nsCOMPtr<nsIFile> absentRoot = child("fabricated-external");
+  roots.AppendElement(absentRoot);
+  EXPECT_FALSE(rule(absentRoot, "fabricated-external", false, gone));
+  nsCOMPtr<nsIFile> holder = child("fabricated-holder");
+  nsCOMPtr<nsIFile> held;
+  ASSERT_EQ(NS_OK, holder->Clone(getter_AddRefs(held)));
+  ASSERT_EQ(NS_OK, held->AppendNative("news.invalid"_ns));
+  roots.AppendElement(held);
+  EXPECT_FALSE(rule(holder, "fabricated-holder", false, gone));
+  nsCOMPtr<nsIFile> inside;
+  ASSERT_EQ(NS_OK, root->Clone(getter_AddRefs(inside)));
+  ASSERT_EQ(NS_OK, inside->AppendNative("store.tmp"_ns));
+  EXPECT_FALSE(rule(inside, "store.tmp", false, gone));
+  // Without the configured roots nothing is ever skipped.
+  bool vanished = true;
+  EXPECT_EQ(NS_OK, StartupVanishedEntry(
+                       child("session-state.tmp"), "session-state.tmp"_ns,
+                       false, gone, nsTArray<nsCOMPtr<nsIFile>>(), vanished));
+  EXPECT_TRUE(vanished) << "An empty configured-root list is still a list";
 }
 
 TEST_F(DeliveryCoreReferences, RawRecordsAcceptInfoOnlyEmptySummary) {

@@ -418,7 +418,7 @@ nsresult nsMsgNewsFolder::AddNewsgroupWithFolderId(const nsACString& name,
   auto& folderDB = core->FolderDB();
   uint64_t id = MOZ_TRY(folderDB.GetFolderChildNamed(mFolderId, name));
   if (!id) {
-    MOZ_TRY(folderDB.InsertFolder(mFolderId, name, &id));
+    MOZ_TRY(InsertProviderListedChild(name, id));
   }
 
   // The native database captures its protocol at opening. Publish the group

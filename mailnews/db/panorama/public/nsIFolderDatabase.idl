@@ -6,7 +6,7 @@
 
 interface nsIMsgFolder;
 
-[scriptable, builtinclass, uuid(2842d879-e52f-4812-926c-dfde62b77881)]
+[scriptable, builtinclass, uuid(92fd83a0-761b-454e-86d3-294be7ce9eeb)]
 interface nsIFolderDatabase : nsISupports {
   /**
    * Get a folder identified by its path.
@@ -45,6 +45,17 @@ interface nsIFolderDatabase : nsISupports {
    * An error will be thrown if the folder already exists.
    */
   unsigned long long insertRoot(in AUTF8String aServerKey);
+
+  /**
+   * Return the root folder of an incoming server, creating it if absent.
+   *
+   * This is the root birth of an incoming server implemented in JavaScript
+   * (POP3, NNTP). It is the same provider discovery birth as a native
+   * incoming server's root, so folders the provider then discovers below
+   * it can receive retained legacy folder-cache metadata during migration.
+   * A root added with `insertRoot` never gains that origin.
+   */
+  unsigned long long ensureServerRoot(in AUTF8String aServerKey);
 
   /**
    * Add a folder named `name` to the database as a child of `parent`.

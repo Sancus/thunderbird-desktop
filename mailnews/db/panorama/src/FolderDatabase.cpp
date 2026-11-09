@@ -440,9 +440,12 @@ nsresult FolderDatabase::InsertCacheDiscoveryFolder(
     uint64_t& folderId) {
   MOZ_TRY(CheckCacheOriginSource(expectedSourceId));
   MOZ_TRY(RequireCommittedHierarchyMutation());
+  // A provider-listed child (a subscribed newsgroup) is an initial child
+  // exactly like one discovered in a local store.
   NS_ENSURE_TRUE(
       (!parentId && site == CacheDiscoveryFlagSite::CommonRoot) ||
-          (parentId && site == CacheDiscoveryFlagSite::ImapInitialBoxFlags),
+          (parentId && (site == CacheDiscoveryFlagSite::ImapInitialBoxFlags ||
+                        site == CacheDiscoveryFlagSite::LocalInitialChild)),
       NS_ERROR_INVALID_ARG);
   nsCString name = MOZ_TRY(DatabaseUtils::Normalize(nativeName));
   NS_ENSURE_FALSE(name.IsEmpty(), NS_ERROR_INVALID_ARG);
@@ -567,6 +570,23 @@ NS_IMETHODIMP FolderDatabase::InsertRoot(const nsACString& serverKey,
   // `serverKey` is almost certainly ASCII, but normalize it and be sure.
   nsCString nfcServerKey = MOZ_TRY(DatabaseUtils::Normalize(serverKey));
   return InternalInsertFolder(0, nfcServerKey, rootId);
+}
+
+NS_IMETHODIMP FolderDatabase::EnsureServerRoot(const nsACString& serverKey,
+                                               uint64_t* rootId) {
+  NS_ENSURE_ARG_POINTER(rootId);
+  RefPtr<DatabaseCore> core = DatabaseCore::sInstance.get();
+  NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
+  nsCString sourceId;
+  MOZ_TRY(core->GetSourceId(sourceId));
+  // Exactly nsMsgIncomingServer::CreateRootFolder: native row birth precedes
+  // factory exposure; an existing root stays as it is.
+  uint64_t id = 0;
+  MOZ_TRY(InsertCacheDiscoveryFolder(sourceId, 0, serverKey,
+                                     CacheDiscoveryFlagSite::CommonRoot, id));
+  MOZ_TRY(ObserveCacheFolderInitialization(sourceId, id, 0));
+  *rootId = id;
+  return NS_OK;
 }
 
 NS_IMETHODIMP FolderDatabase::InsertFolder(uint64_t parentId,

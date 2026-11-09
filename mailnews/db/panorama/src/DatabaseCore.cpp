@@ -9464,25 +9464,87 @@ bool StartupMailDataName(const nsACString& name) {
   return StringEndsWith(name, ".msf"_ns) || StringEndsWith(name, ".mab"_ns) ||
          name == "folderCache.json"_ns || name == "panacea.dat"_ns;
 }
+nsresult StartupConfiguredPath(nsIPrefBranch* prefs, const nsACString& branch,
+                               nsIFile** output);
+// Every configured server root, as StartupConfiguredRoots reads it.
+nsresult StartupConfiguredRootFiles(nsTArray<nsCOMPtr<nsIFile>>& roots) {
+  nsCOMPtr<nsIPrefBranch> prefs =
+      do_GetService("@mozilla.org/preferences-service;1");
+  NS_ENSURE_TRUE(prefs, NS_ERROR_NOT_AVAILABLE);
+  nsTArray<nsCString> names;
+  MOZ_TRY(prefs->GetChildList("mail.server.", names));
+  nsTHashSet<nsCString> servers;
+  for (const auto& name : names) {
+    if (!StringEndsWith(name, ".directory"_ns) &&
+        !StringEndsWith(name, ".directory-rel"_ns))
+      continue;
+    int32_t dot = name.FindChar('.', 12);
+    NS_ENSURE_TRUE(dot > 12, NS_ERROR_FILE_CORRUPTED);
+    nsCString branch(Substring(name, 0, dot + 1));
+    if (servers.Contains(branch)) continue;
+    servers.Insert(branch);
+    nsCOMPtr<nsIFile> root;
+    MOZ_TRY(StartupConfiguredPath(prefs, branch, getter_AddRefs(root)));
+    roots.AppendElement(std::move(root));
+  }
+  return NS_OK;
+}
 // The running application writes its own non-mail profile files while startup
 // inventories the tree (atomic *.tmp replacement, SQLite journals, cache
-// trash). Outside the mail trees, an entry that is gone again by the time it
-// is examined is not migration input; mail data and mail trees still refuse.
-bool StartupVanishedNonMail(nsIFile* file, const nsACString& name,
-                            bool mailTree, nsresult status) {
-  if (status != NS_ERROR_FILE_NOT_FOUND || mailTree ||
+// trash). An entry examined with NS_ERROR_FILE_NOT_FOUND is skipped only when
+// its directory no longer lists it at all, it is no mail data, and neither it
+// nor anything inside it is a mail tree or a configured mail root. An entry
+// that is still listed (e.g. a Windows path beyond MAX_PATH, or one that
+// cannot be read) still refuses; so does any other error.
+nsresult StartupVanishedNonMail(nsIFile* file, const nsACString& name,
+                                bool mailTree, nsresult status,
+                                const nsTArray<nsCOMPtr<nsIFile>>* mailRoots,
+                                bool& vanished) {
+  vanished = false;
+  if (status != NS_ERROR_FILE_NOT_FOUND || mailTree || !mailRoots ||
       StartupMailDataName(name) || name == "Mail"_ns || name == "ImapMail"_ns ||
       name == "News"_ns)
-    return false;
-  bool exists = true;
-  return NS_SUCCEEDED(file->Exists(&exists)) && !exists;
+    return NS_OK;
+  for (const auto& root : *mailRoots) {
+    bool same, inside, holds;
+    MOZ_TRY(root->Equals(file, &same));
+    MOZ_TRY(root->Contains(file, &inside));
+    MOZ_TRY(file->Contains(root, &holds));
+    if (same || inside || holds) return NS_OK;
+  }
+  nsCOMPtr<nsIFile> parent;
+  MOZ_TRY(file->GetParent(getter_AddRefs(parent)));
+  NS_ENSURE_TRUE(parent, NS_ERROR_FILE_INVALID_PATH);
+  nsCOMPtr<nsIDirectoryEnumerator> entries;
+  MOZ_TRY(parent->GetDirectoryEntries(getter_AddRefs(entries)));
+  auto close = MakeScopeExit([&] { entries->Close(); });
+  while (true) {
+    nsCOMPtr<nsIFile> entry;
+    MOZ_TRY(entries->GetNextFile(getter_AddRefs(entry)));
+    if (!entry) break;
+    nsAutoCString leaf;
+    MOZ_TRY(entry->GetNativeLeafName(leaf));
+    if (leaf == name) return NS_OK;
+  }
+  MOZ_TRY(entries->Close());
+  close.release();
+  vanished = true;
+  return NS_OK;
 }
 nsresult StartupInventory(
     nsIFile* directory, nsTArray<nsCString>& sources, bool mailTree = false,
     bool selectedRoot = true,
-    const nsTHashMap<nsCString, nsCString>* retired = nullptr) {
+    const nsTHashMap<nsCString, nsCString>* retired = nullptr,
+    const nsTArray<nsCOMPtr<nsIFile>>* mailRoots = nullptr) {
   nsAutoCString ignored;
   MOZ_TRY(StartupDirectory(directory, ignored));
+  // The selected profile walk knows every configured mail root up front, so
+  // a root under any name is never treated as transient.
+  nsTArray<nsCOMPtr<nsIFile>> configuredRoots;
+  if (selectedRoot && !mailRoots) {
+    MOZ_TRY(StartupConfiguredRootFiles(configuredRoots));
+    mailRoots = &configuredRoots;
+  }
   bool jsonCache = false, emptyJSON = false;
   if (selectedRoot) {
     nsCOMPtr<nsIFile> file;
@@ -9502,14 +9564,18 @@ nsresult StartupInventory(
     if (selectedRoot && (name == "parent.lock"_ns || name == ".parentlock"_ns ||
                          name == "lock"_ns))
       continue;
-    bool linked;
+    bool linked, vanished;
     nsresult rv = file->IsSymlink(&linked);
-    if (StartupVanishedNonMail(file, name, mailTree, rv)) continue;
+    MOZ_TRY(
+        StartupVanishedNonMail(file, name, mailTree, rv, mailRoots, vanished));
+    if (vanished) continue;
     MOZ_TRY(rv);
     NS_ENSURE_FALSE(linked, NS_ERROR_FILE_ACCESS_DENIED);
     bool isDirectory;
     rv = file->IsDirectory(&isDirectory);
-    if (StartupVanishedNonMail(file, name, mailTree, rv)) continue;
+    MOZ_TRY(
+        StartupVanishedNonMail(file, name, mailTree, rv, mailRoots, vanished));
+    if (vanished) continue;
     MOZ_TRY(rv);
     // Precedence never waives the original physical-file admission.
     if (selectedRoot && jsonCache &&
@@ -9535,8 +9601,11 @@ nsresult StartupInventory(
       const bool childMailTree = mailTree || name == "Mail"_ns ||
                                  name == "ImapMail"_ns || name == "News"_ns;
       const size_t before = sources.Length();
-      rv = StartupInventory(file, sources, childMailTree, false, retired);
-      if (StartupVanishedNonMail(file, name, childMailTree, rv)) {
+      rv = StartupInventory(file, sources, childMailTree, false, retired,
+                            mailRoots);
+      MOZ_TRY(StartupVanishedNonMail(file, name, childMailTree, rv, mailRoots,
+                                     vanished));
+      if (vanished) {
         // The whole transient directory is gone, with anything it held.
         sources.TruncateLength(before);
         continue;
@@ -9558,6 +9627,14 @@ nsresult StartupInventory(
   close.release();
   return NS_OK;
 }
+}  // namespace
+nsresult DatabaseCore::StartupVanishedEntryForTesting(
+    nsIFile* file, const nsACString& name, bool mailTree, nsresult status,
+    const nsTArray<nsCOMPtr<nsIFile>>& mailRoots, bool& vanished) {
+  return StartupVanishedNonMail(file, name, mailTree, status, &mailRoots,
+                                vanished);
+}
+namespace {
 // Read only the selected server's existing path preferences. In particular,
 // GetIncomingServer is not a path getter: it also constructs the cold root and
 // recursively reconciles its children before returning the server.

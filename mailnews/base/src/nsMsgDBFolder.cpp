@@ -5253,6 +5253,22 @@ nsresult nsMsgDBFolder::InitializeLocalCacheDefaultChild(
                                                       before | roleFlag);
 }
 
+nsresult nsMsgDBFolder::InsertProviderListedChild(const nsACString& name,
+                                                  uint64_t& childId) {
+  NS_ENSURE_STATE(mFolderId);
+  RefPtr<mozilla::mailnews::DatabaseCore> core =
+      mozilla::mailnews::DatabaseCore::GetInstanceForService();
+  NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
+  auto& folders = core->FolderDB();
+  bool tracked;
+  MOZ_TRY(folders.HasCacheDiscoveryOrigin(mFolderDatabaseSourceId, mFolderId,
+                                          tracked));
+  if (!tracked) return folders.InsertFolder(mFolderId, name, &childId);
+  return folders.InsertCacheDiscoveryFolder(
+      mFolderDatabaseSourceId, mFolderId, name,
+      mozilla::mailnews::CacheDiscoveryFlagSite::LocalInitialChild, childId);
+}
+
 nsresult nsMsgDBFolder::InitializeLocalCacheDefaultChildren() {
   for (const auto& role : kLocalCacheDefaultRoles) {
     MOZ_TRY(InitializeLocalCacheDefaultChild(role.name, role.flag));

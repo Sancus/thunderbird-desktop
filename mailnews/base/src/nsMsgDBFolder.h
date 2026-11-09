@@ -195,6 +195,14 @@ class nsMsgDBFolder : public nsSupportsWeakReference,
   nsresult InitializeLocalCacheDefaultChild(const nsACString& canonicalName,
                                             uint32_t roleFlag);
   nsresult InitializeLocalCacheDefaultChildren();
+
+ protected:
+  // A child row born from this folder's own provider listing (a subscribed
+  // newsgroup). Below a live discovery root it is an initial child like a
+  // locally discovered folder; otherwise it is an ordinary row.
+  nsresult InsertProviderListedChild(const nsACString& name, uint64_t& childId);
+
+ private:
   // Validate the pinned wrapper before the native cache import commits.
   nsresult CheckCacheImportFlags(const nsACString& expectedSourceId,
                                  uint64_t folderId, uint32_t beforeFlags);

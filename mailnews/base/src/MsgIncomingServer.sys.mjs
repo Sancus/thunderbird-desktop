@@ -539,9 +539,8 @@ export class MsgIncomingServer {
         );
         const folders = core.folderDB;
 
-        const root =
-          folders.getFolderChildNamed(0, this._key) ||
-          folders.insertRoot(this._key);
+        // The same discovery root birth as a native incoming server.
+        const root = folders.ensureServerRoot(this._key);
         const rootFolder = Cc[
           "@mozilla.org/mail/folder;1?name=mailbox"
         ].createInstance(Ci.nsIMsgFolder);

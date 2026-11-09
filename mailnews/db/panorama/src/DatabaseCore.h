@@ -385,6 +385,10 @@ class DatabaseCore : public nsIDatabaseCore,
                                                nsIMsgFolder* folder,
                                                FolderImportSnapshot& input,
                                                ImapImportFolder* imap);
+  // The same fixture checks the startup inventory's transient-entry rule.
+  static nsresult StartupVanishedEntryForTesting(
+      nsIFile* file, const nsACString& name, bool mailTree, nsresult status,
+      const nsTArray<nsCOMPtr<nsIFile>>& mailRoots, bool& vanished);
   nsresult CheckFolderImportIdentity(const FolderImportIdentity& identity);
   nsresult ReadFolderImportReceipt(const FolderImportIdentity& identity,
                                    Maybe<FolderImportReceipt>& output);

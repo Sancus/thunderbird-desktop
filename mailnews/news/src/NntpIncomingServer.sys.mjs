@@ -97,9 +97,8 @@ export class NntpIncomingServer extends MsgIncomingServer {
       const core = Cc["@mozilla.org/mailnews/database-core;1"].getService(
         Ci.nsIDatabaseCore
       );
-      const rootId =
-        core.folderDB.getFolderChildNamed(0, this.key) ||
-        core.folderDB.insertRoot(this.key);
+      // The same discovery root birth as a native incoming server.
+      const rootId = core.folderDB.ensureServerRoot(this.key);
       const folder = Cc[
         "@mozilla.org/mail/folder-factory;1?name=news"
       ].createInstance(Ci.nsIMsgFolder);

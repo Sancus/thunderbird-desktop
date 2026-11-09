@@ -9606,6 +9606,15 @@ nsresult RestoreWinId(HANDLE handle, nsCString& id) {
 HANDLE RestoreHandle(PRFileDesc* io) {
   return reinterpret_cast<HANDLE>(PR_FileDesc2NativeHandle(io));
 }
+// A refused restore open names its exact path and Windows error in debug
+// builds; the result stays the existing access refusal.
+nsresult RestoreWinRefused(DWORD error, const nsAString& path) {
+  NS_WARNING(nsPrintfCString("Panorama restore open refused (Windows error "
+                             "%lu): %s",
+                             error, NS_ConvertUTF16toUTF8(path).get())
+                 .get());
+  return NS_ERROR_FILE_ACCESS_DENIED;
+}
 #endif
 // Restore copies live in the staging parent's restore-<id> container
 // (root-N, saved-N, newer-N-G), whose prefix is longer than the root each
@@ -9778,7 +9787,8 @@ nsresult RestoreOpen(nsIFile* file, StartupRestoreFD& node, bool writable) {
         GENERIC_READ | GENERIC_WRITE | DELETE, FILE_SHARE_READ, nullptr,
         OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH,
         nullptr);
-    NS_ENSURE_TRUE(handle != INVALID_HANDLE_VALUE, NS_ERROR_FILE_ACCESS_DENIED);
+    if (handle == INVALID_HANDLE_VALUE)
+      return RestoreWinRefused(GetLastError(), native);
     node.io = PR_ImportFile(reinterpret_cast<PROsfd>(handle));
     if (!node.io) {
       CloseHandle(handle);
@@ -9999,7 +10009,8 @@ nsresult RestoreMetadata(StartupRestoreFD& node, uint32_t mode,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
         OPEN_EXISTING,
         FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-    NS_ENSURE_TRUE(handle != INVALID_HANDLE_VALUE, NS_ERROR_FILE_ACCESS_DENIED);
+    if (handle == INVALID_HANDLE_VALUE)
+      return RestoreWinRefused(GetLastError(), path);
     auto close = MakeScopeExit([&] { CloseHandle(handle); });
     nsCString id;
     MOZ_TRY(RestoreWinId(handle, id));
@@ -10155,7 +10166,8 @@ nsresult RestoreCreate(StartupRestoreFD& parent, const nsACString& leaf,
       GENERIC_READ | GENERIC_WRITE | DELETE, FILE_SHARE_READ, nullptr,
       CREATE_NEW, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH,
       nullptr);
-  NS_ENSURE_TRUE(handle != INVALID_HANDLE_VALUE, NS_ERROR_FILE_ACCESS_DENIED);
+  if (handle == INVALID_HANDLE_VALUE)
+    return RestoreWinRefused(GetLastError(), path);
   output.io = PR_ImportFile(reinterpret_cast<PROsfd>(handle));
   if (!output.io) {
     CloseHandle(handle);
@@ -10209,7 +10221,8 @@ nsresult RestoreMove(StartupRestoreFD& from, const nsACString& name,
       static_cast<const wchar_t*>(path.get()), DELETE | FILE_READ_ATTRIBUTES,
       FILE_SHARE_READ, nullptr, OPEN_EXISTING,
       FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-  NS_ENSURE_TRUE(handle != INVALID_HANDLE_VALUE, NS_ERROR_FILE_ACCESS_DENIED);
+  if (handle == INVALID_HANDLE_VALUE)
+    return RestoreWinRefused(GetLastError(), path);
   auto close = MakeScopeExit([&] { CloseHandle(handle); });
   nsCString id;
   FILE_ATTRIBUTE_TAG_INFO attributes{};
@@ -10270,7 +10283,8 @@ nsresult RestoreDrop(StartupRestoreFD& parent, const nsACString& leaf,
       DELETE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ,
       nullptr, OPEN_EXISTING,
       FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-  NS_ENSURE_TRUE(handle != INVALID_HANDLE_VALUE, NS_ERROR_FILE_ACCESS_DENIED);
+  if (handle == INVALID_HANDLE_VALUE)
+    return RestoreWinRefused(GetLastError(), path);
   auto close = MakeScopeExit([&] { CloseHandle(handle); });
   nsCString identity;
   MOZ_TRY(RestoreWinId(handle, identity));
@@ -11018,7 +11032,8 @@ nsresult ProfileRestoreState::Check() {
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
         OPEN_EXISTING,
         FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-    NS_ENSURE_TRUE(handle != INVALID_HANDLE_VALUE, NS_ERROR_FILE_ACCESS_DENIED);
+    if (handle == INVALID_HANDLE_VALUE)
+      return RestoreWinRefused(GetLastError(), path);
     auto close = MakeScopeExit([&] { CloseHandle(handle); });
     nsCString id;
     MOZ_TRY(RestoreWinId(handle, id));

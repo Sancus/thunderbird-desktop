@@ -18,6 +18,8 @@ tags = ["panorama-delivery"]
 
 ["test_panoramaDeliveryLocalMove.js"]
 
+["test_panoramaDeliveryLocalMaildirFastPath.js"]
+
 ["test_panoramaDeliveryLocalPublicationCopy.js"]
 support-files = [
   "../../src/nsLocalMailFolder.cpp",

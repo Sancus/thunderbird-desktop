@@ -13504,7 +13504,12 @@ nsresult DatabaseCore::BuildStartupFolders() {
           nsMsgFolderFlags::ImapBox | nsMsgFolderFlags::ImapPersonal |
           nsMsgFolderFlags::ImapPublic | nsMsgFolderFlags::ImapOtherUser |
           nsMsgFolderFlags::ImapNoselect | nsMsgFolderFlags::ImapNoinferiors;
-      NS_ENSURE_TRUE(!((wanted ^ before) & protocolMask) &&
+      // Thunderbird's junk/client folder lookup leaves a never-listed folder
+      // without any box state; native discovery necessarily created a box,
+      // which the exact retained word replaces.
+      const bool boxless = source.protocol == "imap"_ns && !source.boxFlags &&
+                           !(wanted & protocolMask);
+      NS_ENSURE_TRUE((boxless || !((wanted ^ before) & protocolMask)) &&
                          !(before & nsMsgFolderFlags::SpecialUse & ~wanted),
                      NS_ERROR_NOT_AVAILABLE);
       if (wanted != before) {

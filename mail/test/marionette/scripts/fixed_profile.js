@@ -276,7 +276,12 @@ function rawText(header) {
     Ci.nsIScriptableInputStream
   );
   stream.init(input);
-  let remaining = header.messageSize;
+  // An offline IMAP copy is longer than the server size (local status
+  // headers); offlineMessageSize is the exact stored length.
+  let remaining =
+    header.flags & Ci.nsMsgMessageFlags.Offline && header.offlineMessageSize
+      ? header.offlineMessageSize
+      : header.messageSize;
   let raw = "";
   try {
     while (remaining > 0) {

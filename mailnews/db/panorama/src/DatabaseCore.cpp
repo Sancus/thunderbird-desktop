@@ -9496,8 +9496,48 @@ nsresult StartupStores(ProfileStartupOperation& operation,
                        const nsTArray<nsCString>& inventory,
                        const nsTHashSet<nsCString>& declared,
                        const nsTArray<nsCString>& cacheRoots = {}) {
+  // A news server keeps its newsrc (subscriptions and read state) beside its
+  // root in the News tree. It is account data: kept in place and backed up.
+  nsTHashSet<nsCString> newsrc;
+  nsCOMPtr<nsIPrefBranch> prefs =
+      do_GetService("@mozilla.org/preferences-service;1");
+  NS_ENSURE_TRUE(prefs, NS_ERROR_NOT_AVAILABLE);
+  for (const auto& server : operation.servers) {
+    if (server.protocol != "nntp"_ns) continue;
+    nsCString branch("mail.server."_ns + server.key + ".newsrc.file"_ns);
+    bool relative = false;
+    MOZ_TRY(prefs->PrefHasUserValue(nsCString(branch + "-rel"_ns).get(),
+                                    &relative));
+    nsCOMPtr<nsIFile> file;
+    if (relative) {
+      nsCOMPtr<nsIRelativeFilePref> value;
+      MOZ_TRY(prefs->GetComplexValue(nsCString(branch + "-rel"_ns).get(),
+                                     NS_GET_IID(nsIRelativeFilePref),
+                                     getter_AddRefs(value)));
+      NS_ENSURE_TRUE(value, NS_ERROR_NOT_AVAILABLE);
+      MOZ_TRY(value->GetFile(getter_AddRefs(file)));
+    } else if (NS_FAILED(prefs->GetComplexValue(
+                   branch.get(), NS_GET_IID(nsIFile), getter_AddRefs(file)))) {
+      continue;
+    }
+    NS_ENSURE_TRUE(file, NS_ERROR_NOT_AVAILABLE);
+    nsCOMPtr<nsIFile> parent, canonical;
+    nsAutoString leaf;
+    MOZ_TRY(file->GetLeafName(leaf));
+    MOZ_TRY(file->GetParent(getter_AddRefs(parent)));
+    MOZ_TRY(StartupCanonicalRoot(parent, getter_AddRefs(canonical)));
+    MOZ_TRY(canonical->Append(leaf));
+    nsCString path;
+    MOZ_TRY(GetComparablePath(canonical, path));
+    newsrc.Insert(path);
+  }
   for (const auto& path : inventory) {
     if (declared.Contains(path)) continue;
+    if (newsrc.Contains(path)) {
+      NS_ENSURE_TRUE(operation.backupFiles.Lookup(path),
+                     NS_ERROR_NOT_AVAILABLE);
+      continue;
+    }
     nsCOMPtr<nsIFile> file;
     MOZ_TRY(StartupContainedMail(operation, path, getter_AddRefs(file)));
     if (nsMsgLocalStoreUtils::nsShouldIgnoreFile(file)) continue;

@@ -456,7 +456,10 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             const account = MailServices.accounts.createAccount();
             account.incomingServer = server;
             const parent = server.rootFolder;
-            parent.createSubfolder(arguments[1], null);
+            // A POP3 account already created its default Inbox.
+            if (!parent.containsChildNamed(arguments[1])) {
+              parent.createSubfolder(arguments[1], null);
+            }
             const folder = parent.getChildNamed(arguments[1])
               .QueryInterface(Ci.nsIMsgLocalMailFolder);
             const header = folder.addMessage(

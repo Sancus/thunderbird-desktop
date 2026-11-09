@@ -362,6 +362,11 @@ add_setup(function setupLocalPublicationWitness() {
   const nativeService = Cc[mailboxWitnessContract].getService(
     Ci.nsIMsgMessageService
   );
+  // Components.classesByID is gone: a private contract keeps the native store
+  // CID reachable after its public contract is remapped.
+  const nativeStoreContract =
+    "@mozilla.org/msgstore/publication-witness-native;1";
+  registrar.registerFactory(storeCID, "", nativeStoreContract, null);
 
   // Restore only these registrations, after all forwarded stop stacks returned.
   registerCleanupFunction(async () => {
@@ -402,7 +407,7 @@ add_setup(function setupLocalPublicationWitness() {
   );
   witnessRegistrations.push(
     MockRegistrar.register(storeContract, () => {
-      const native = Components.classesByID[storeCID].createInstance(
+      const native = Cc[nativeStoreContract].createInstance(
         Ci.nsIMsgPluggableStore
       );
       witnessStoreInstances++;

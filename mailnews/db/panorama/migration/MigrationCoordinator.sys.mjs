@@ -2481,13 +2481,34 @@ function captureStartupMigration(signal, nativeAudit) {
   if (startupSourceFile(roots.profilePath).path !== profile.path) {
     throw new Error("Startup inventory selects another profile");
   }
+  // An ordinary account Local Directory outside the profile is its own
+  // inventory/backup root. The profile lock does not exclude its other
+  // writers, so every file is hashed into the complete backup and rechecked
+  // before import and activation; a change refuses instead of migrating a
+  // torn state. Ambiguous ownership (overlap with the profile, its migration
+  // work directory or another external root) and links stay refused.
+  const externalRoots = [];
   for (const path of roots.mailPaths) {
     const directory = startupSourceFile(path);
-    if (!profile.equals(directory) && !profile.contains(directory)) {
-      throw new Error(
-        "External mail root has no closed-writer startup ownership"
-      );
+    if (profile.equals(directory) || profile.contains(directory)) {
+      continue;
     }
+    if (
+      !directory.isDirectory() ||
+      directory.contains(profile) ||
+      directory.equals(work) ||
+      directory.contains(work) ||
+      work.contains(directory) ||
+      externalRoots.some(
+        other =>
+          other.equals(directory) ||
+          other.contains(directory) ||
+          directory.contains(other)
+      )
+    ) {
+      throw new Error("External mail root has ambiguous startup ownership");
+    }
+    externalRoots.push(directory);
   }
   const servers = [];
   const branches = new Set();
@@ -2554,6 +2575,9 @@ function captureStartupMigration(signal, nativeAudit) {
     }
   };
   visit(profile);
+  for (const root of externalRoots) {
+    visit(root);
+  }
   const summaries = [];
   const serverSummaries = [];
   const books = [];
@@ -2599,7 +2623,11 @@ function captureStartupMigration(signal, nativeAudit) {
         throw new Error("Native Mork migration does not support this protocol");
       }
       summaries.push({
-        id: "mail:" + file.getRelativePath(profile),
+        // An external root has no path relative to the profile (Windows
+        // drives differ); its absolute path is the stable unique identity.
+        id:
+          "mail:" +
+          (profile.contains(file) ? file.getRelativePath(profile) : file.path),
         path: file.path,
         storePath: file.path.slice(0, -4),
         serverKey: server.key,
@@ -2759,17 +2787,19 @@ function captureStartupMigration(signal, nativeAudit) {
     work.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
   }
   const backupPath = PathUtils.join(work.path, "backup");
-  // Startup already requires every configured mail root inside the selected
-  // profile, so the profile is the only backup root. On Windows the journal7
-  // inventory and backup3 originalRoots must then be the same profile spelling.
+  // The profile and every admitted external root are backup roots. On
+  // Windows the journal7 inventory and backup3 originalRoots use exactly
+  // these admitted spellings; in-profile roots are part of the profile.
+  const mailPaths = externalRoots.map(root => root.path);
   const backup = createMigrationBackupAtStartup(
     profile.path,
-    windows ? [] : roots.mailPaths,
+    windows ? mailPaths : roots.mailPaths,
     backupPath,
     signal
   );
   return {
     profilePath: profile.path,
+    mailPaths,
     servers,
     summaries,
     serverSummaries,
@@ -2908,6 +2938,21 @@ function startupEntryExists(file) {
  * @param {string} path - Existing absolute source directory.
  * @returns {nsIFile} Canonical unlinked file.
  */
+/**
+ * The admitted root containing a captured summary: the selected profile, or
+ * the external server root it belongs to.
+ *
+ * @param {{profilePath: string}} selected - Selected startup profile.
+ * @param {{path: string, serverRoot: string}} source - Captured summary.
+ * @returns {nsIFile} Root for the retained Windows physical inventory.
+ */
+function startupInventoryRoot(selected, source) {
+  const profile = new FileUtils.File(selected.profilePath);
+  return profile.contains(new FileUtils.File(source.path))
+    ? profile
+    : new FileUtils.File(source.serverRoot);
+}
+
 function startupSourceFile(path) {
   const file = new FileUtils.File(path);
   for (let part = file; part; part = part.parent) {
@@ -3094,9 +3139,9 @@ async function finishPanoramaProfileStartup(
             ? {
                 inventory: captureMorkFolderWindowsInventory(
                   new FileUtils.File(source.path),
-                  new FileUtils.File(selected.profilePath),
+                  startupInventoryRoot(selected, source),
                   new FileUtils.File(source.storePath),
-                  new FileUtils.File(selected.profilePath)
+                  startupInventoryRoot(selected, source)
                 ),
               }
             : {}),
@@ -3106,7 +3151,7 @@ async function finishPanoramaProfileStartup(
       const journalPath = PathUtils.join(captured.workPath, "journal.json");
       journal = await MigrationJournal.create(journalPath, {
         profilePath: selected.profilePath,
-        mailPaths: [],
+        mailPaths: captured.mailPaths,
         backupPath: captured.backupPath,
         sources: [],
         ...(books.length ? { books } : {}),

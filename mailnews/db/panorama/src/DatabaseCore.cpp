@@ -194,6 +194,8 @@ class ProfileStartupOperation final : public nsIAsyncShutdownBlocker {
   nsTArray<StartupServerSummary> serverSummaries;
   nsTArray<StartupMailSource> sources;
   nsTArray<StartupServerRoot> servers;
+  // Admitted configured mail roots outside the selected profile.
+  nsTArray<nsCString> mailRoots;
   nsTHashMap<nsCString, nsCString> backupFiles;
   nsTHashMap<nsCString, nsCOMPtr<nsIFile>> backupCopies;
   nsTHashMap<nsCString, nsCString> createdEmptyStores;
@@ -9231,6 +9233,26 @@ nsresult StartupContained(nsIFile* root, const nsACString& path,
   MOZ_TRY(StartupRegular(*file));
   return NS_OK;
 }
+// Selected-profile containment, or containment in an admitted external mail
+// root of this startup operation.
+nsresult StartupContainedMail(ProfileStartupOperation& operation,
+                              const nsACString& path, nsIFile** file) {
+  nsCOMPtr<nsIFile> result;
+  nsresult rv =
+      StartupContained(operation.profile, path, getter_AddRefs(result));
+  for (uint32_t i = 0;
+       rv == NS_ERROR_FILE_ACCESS_DENIED && i < operation.mailRoots.Length();
+       ++i) {
+    nsCOMPtr<nsIFile> root;
+    MOZ_TRY(
+        NS_NewNativeLocalFile(operation.mailRoots[i], getter_AddRefs(root)));
+    result = nullptr;
+    rv = StartupContained(root, path, getter_AddRefs(result));
+  }
+  MOZ_TRY(rv);
+  result.forget(file);
+  return NS_OK;
+}
 // Independent on-disk inventory. Only selected-profile roots are admitted here;
 // a path or digest does not prove an external writer has been excluded.
 nsresult StartupJSONCache(nsIFile* file, bool& empty) {
@@ -9377,16 +9399,60 @@ nsresult StartupConfiguredPath(nsIPrefBranch* prefs, const nsACString& branch,
   return StartupCanonicalRoot(root, output);
 }
 
+// A configured mail root outside the selected profile (an ordinary account
+// "Local Directory") is its own backup/inventory root when it is an existing,
+// link-free directory that neither contains nor lies inside the profile, its
+// sibling migration work directory or another external root. The profile
+// lock does not exclude its other writers: every file is hashed into the
+// complete backup and rechecked before import and activation, so a change
+// refuses instead of migrating a torn state. Ambiguous ownership is refused.
+nsresult StartupAdmitMailRoot(nsIFile* profile, nsIFile* root,
+                              nsTArray<nsCString>& external) {
+  bool same, inside;
+  MOZ_TRY(profile->Equals(root, &same));
+  MOZ_TRY(profile->Contains(root, &inside));
+  if (same || inside) return NS_OK;
+  nsAutoCString canonical;
+  MOZ_TRY(StartupDirectory(root, canonical));
+  bool contains;
+  MOZ_TRY(root->Contains(profile, &contains));
+  NS_ENSURE_FALSE(contains, NS_ERROR_FILE_ACCESS_DENIED);
+  nsCOMPtr<nsIFile> work;
+  MOZ_TRY(profile->GetParent(getter_AddRefs(work)));
+  nsAutoCString leaf;
+  MOZ_TRY(profile->GetNativeLeafName(leaf));
+  MOZ_TRY(work->AppendNative("panorama-migration-"_ns + leaf));
+  bool overlap[3];
+  MOZ_TRY(work->Equals(root, &overlap[0]));
+  MOZ_TRY(work->Contains(root, &overlap[1]));
+  MOZ_TRY(root->Contains(work, &overlap[2]));
+  NS_ENSURE_FALSE(overlap[0] || overlap[1] || overlap[2],
+                  NS_ERROR_FILE_ACCESS_DENIED);
+  for (const auto& path : external) {
+    nsCOMPtr<nsIFile> other;
+    MOZ_TRY(NS_NewNativeLocalFile(path, getter_AddRefs(other)));
+    MOZ_TRY(other->Equals(root, &overlap[0]));
+    MOZ_TRY(other->Contains(root, &overlap[1]));
+    MOZ_TRY(root->Contains(other, &overlap[2]));
+    NS_ENSURE_FALSE(overlap[0] || overlap[1] || overlap[2],
+                    NS_ERROR_FILE_ACCESS_DENIED);
+  }
+  external.AppendElement(canonical);
+  return NS_OK;
+}
+
 nsresult StartupConfiguredRoots(
     nsIFile* profile, nsTArray<nsCString>& inventory,
     nsTArray<StartupServerRoot>* output = nullptr,
-    const nsTHashMap<nsCString, nsCString>* retired = nullptr) {
+    const nsTHashMap<nsCString, nsCString>* retired = nullptr,
+    nsTArray<nsCString>* admitted = nullptr) {
   nsCOMPtr<nsIPrefBranch> prefs =
       do_GetService("@mozilla.org/preferences-service;1");
   NS_ENSURE_TRUE(prefs, NS_ERROR_NOT_AVAILABLE);
   nsTArray<nsCString> names;
   MOZ_TRY(prefs->GetChildList("mail.server.", names));
   nsTHashSet<nsCString> servers;
+  nsTArray<nsCString> external;
   for (const auto& name : names) {
     if (!StringEndsWith(name, ".directory"_ns) &&
         !StringEndsWith(name, ".directory-rel"_ns))
@@ -9398,9 +9464,7 @@ nsresult StartupConfiguredRoots(
     servers.Insert(branch);
     nsCOMPtr<nsIFile> root;
     MOZ_TRY(StartupConfiguredPath(prefs, branch, getter_AddRefs(root)));
-    bool inside;
-    MOZ_TRY(profile->Contains(root, &inside));
-    NS_ENSURE_TRUE(inside, NS_ERROR_FILE_ACCESS_DENIED);
+    MOZ_TRY(StartupAdmitMailRoot(profile, root, external));
     nsTArray<nsCString> files;
     MOZ_TRY(StartupInventory(root, files, true, false, retired));
     inventory.AppendElements(files);
@@ -9425,6 +9489,7 @@ nsresult StartupConfiguredRoots(
       output->AppendElement(std::move(binding));
     }
   }
+  if (admitted) *admitted = std::move(external);
   return NS_OK;
 }
 nsresult StartupStores(ProfileStartupOperation& operation,
@@ -9434,7 +9499,7 @@ nsresult StartupStores(ProfileStartupOperation& operation,
   for (const auto& path : inventory) {
     if (declared.Contains(path)) continue;
     nsCOMPtr<nsIFile> file;
-    MOZ_TRY(StartupContained(operation.profile, path, getter_AddRefs(file)));
+    MOZ_TRY(StartupContainedMail(operation, path, getter_AddRefs(file)));
     if (nsMsgLocalStoreUtils::nsShouldIgnoreFile(file)) continue;
     // A news server keeps its group-list cache in its own root. It is account
     // data, not a folder or store, and stays in place with its backup copy.
@@ -9566,7 +9631,11 @@ nsresult StartupBackup(JSContext* cx, ProfileStartupOperation& operation,
     bool same, contained;
     MOZ_TRY(operation.profile->Equals(original, &same));
     MOZ_TRY(operation.profile->Contains(original, &contained));
-    NS_ENSURE_TRUE((i == 0 && same) || (i > 0 && contained),
+    nsCString originalPath;
+    MOZ_TRY(GetComparablePath(original, originalPath));
+    NS_ENSURE_TRUE((i == 0 && same) ||
+                       (i > 0 && (contained ||
+                                  operation.mailRoots.Contains(originalPath))),
                    NS_ERROR_FILE_ACCESS_DENIED);
     MOZ_TRY(StartupChild(archive, leaf.get(), getter_AddRefs(copy)));
     uint32_t count;
@@ -11671,8 +11740,7 @@ nsresult DatabaseCore::ReadStartupMailSource(JSContext* cx,
   MOZ_TRY(StartupNumber(cx, source, "size", 1, UINT32_MAX - 1, size));
   output.size = size;
   nsCOMPtr<nsIFile> file, root, storedRoot;
-  MOZ_TRY(
-      StartupContained(operation.profile, output.path, getter_AddRefs(file)));
+  MOZ_TRY(StartupContainedMail(operation, output.path, getter_AddRefs(file)));
   MOZ_TRY(StartupCheckHash(file, output.hash, output.size));
   MOZ_TRY(NS_NewNativeLocalFile(output.serverRoot, getter_AddRefs(root)));
   nsAutoCString normalized;
@@ -13128,8 +13196,10 @@ nsresult DatabaseCore::DescribeProfileStartup(
       nsTArray<nsCString> inventory;
       MOZ_TRY(StartupInventory(operation.profile, inventory, false, true,
                                &operation.retiredPaths));
+      operation.mailRoots.Clear();
       MOZ_TRY(StartupConfiguredRoots(operation.profile, inventory, nullptr,
-                                     &operation.retiredPaths));
+                                     &operation.retiredPaths,
+                                     &operation.mailRoots));
       operation.mode = inventory.IsEmpty() ? "initialize"_ns : "migrate"_ns;
     }
     operation.selected = true;
@@ -13396,8 +13466,8 @@ nsresult DatabaseCore::OpenProfileStartup(JSContext* cx,
         NS_ENSURE_TRUE(archived && archived.Data() == native.hash,
                        NS_ERROR_NOT_AVAILABLE);
         nsCOMPtr<nsIFile> summary;
-        MOZ_TRY(StartupContained(operation.profile, native.path,
-                                 getter_AddRefs(summary)));
+        MOZ_TRY(StartupContainedMail(operation, native.path,
+                                     getter_AddRefs(summary)));
         JS::Rooted<JSObject*> parsed(cx), original(cx), rows(cx);
         MOZ_TRY(StartupParseFile(
             cx, summary,
@@ -13984,7 +14054,7 @@ nsresult DatabaseCore::BuildStartupFolders() {
     for (const auto& path : files) {
       if (operation.backupFiles.Contains(path)) continue;
       nsCOMPtr<nsIFile> file;
-      MOZ_TRY(StartupContained(operation.profile, path, getter_AddRefs(file)));
+      MOZ_TRY(StartupContainedMail(operation, path, getter_AddRefs(file)));
       int64_t size;
       MOZ_TRY(file->GetFileSize(&size));
       if (size) continue;
@@ -14806,8 +14876,7 @@ nsresult DatabaseCore::CheckProfileActivation(
       MOZ_TRY(ReadFolderImportReceipt(native, receipt));
     } else {
       nsCOMPtr<nsIFile> original;
-      MOZ_TRY(
-          StartupContained(operation.profile, path, getter_AddRefs(original)));
+      MOZ_TRY(StartupContainedMail(operation, path, getter_AddRefs(original)));
       nsCString hash;
       MOZ_TRY(StartupHash(original, hash));
       NS_ENSURE_TRUE(hash == native.sourceSha256, NS_ERROR_NOT_AVAILABLE);
@@ -15023,7 +15092,7 @@ nsresult DatabaseCore::CheckProfileActivation(
       NS_ENSURE_TRUE(protocol == "imap"_ns && unitToken == token,
                      NS_ERROR_NOT_AVAILABLE);
       nsCOMPtr<nsIFile> file;
-      MOZ_TRY(StartupContained(operation.profile, path, getter_AddRefs(file)));
+      MOZ_TRY(StartupContainedMail(operation, path, getter_AddRefs(file)));
       MOZ_TRY(StartupParseFile(
           cx, file,
           u"resource:///modules/panorama/MorkSummaryReader.sys.mjs"_ns,
@@ -15143,8 +15212,8 @@ nsresult DatabaseCore::CheckProfileActivation(
       NS_ENSURE_TRUE(state == "imported"_ns, NS_ERROR_NOT_AVAILABLE);
       nsCOMPtr<nsIFile> original;
       if (!reusing) {
-        MOZ_TRY(StartupContained(operation.profile, path,
-                                 getter_AddRefs(original)));
+        MOZ_TRY(
+            StartupContainedMail(operation, path, getter_AddRefs(original)));
         MOZ_TRY(StartupCheckHash(original, hash, size));
       }
       // Reuse verifies the committed book/cache receipt below, not backup

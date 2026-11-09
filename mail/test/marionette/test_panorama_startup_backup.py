@@ -429,7 +429,8 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             self.created_work.add(Path(record["identity"]["backup"]["path"]).parent.parent)
         return result
 
-    def create_legacy_message(self, store, name="Inbox", user="s526", protocol="none"):
+    def create_legacy_message(self, store, name="Inbox", user="s526", protocol="none",
+                              root=None):
         """Write genuine Mork/store data through the normal legacy mail API.
 
         Local Folders, POP3 and RSS servers all keep local stores.
@@ -439,7 +440,7 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
               'resource:///modules/MailServices.sys.mjs');
             const { FileUtils } = ChromeUtils.importESModule(
               'resource://gre/modules/FileUtils.sys.mjs');
-            const root = PathUtils.join(PathUtils.profileDir, 'Mail',
+            const root = arguments[4] || PathUtils.join(PathUtils.profileDir, 'Mail',
               's526-' + Services.uuid.generateUUID().toString());
             const file = new FileUtils.File(root);
             if (!file.parent.exists()) {
@@ -473,7 +474,7 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
               key: header.messageKey, store: folder.msgStore.storeType,
               name: folder.name, flags: folder.msgDatabase.dBFolderInfo.flags,
               protocol: server.type};
-        """, script_args=[store, name, user, protocol])
+        """, script_args=[store, name, user, protocol, str(root) if root else None])
         self.assertEqual(store, result["store"])
         self.assertEqual(protocol, result["protocol"])
         return result
@@ -1210,6 +1211,58 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.stop_application()
         self.assert_startup_refuses(
             [data, Path(source["summary"])],
+            absent=[self.profile / "panorama.sqlite", self.profile / "panorama-profile.json"],
+        )
+        work = self.profile.parent / ("panorama-migration-" + self.profile.name)
+        self.assertFalse(work.exists(), "Refusal precedes even backup/target work")
+
+    def test_safe_external_root_migration_and_reuse(self):
+        """An ordinary Local Directory outside the profile is its own backup root."""
+        self.clean_profile(False)
+        external = tempfile.TemporaryDirectory(prefix="s526-external-root-")
+        self.addCleanup(external.cleanup)
+        root = Path(external.name).resolve() / "account"
+        source = self.create_legacy_message("mbox", root=root)
+        self.stop_application()
+        before = {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
+        self.assertIn(Path(source["summary"]).resolve(), before)
+        self.start_same_profile(True)
+        selected = self.selection()
+        record = selected["record"]
+        self.assertEqual("migrated", record["origin"])
+        headers = self.assert_message_after_activation(source)
+        backup = Path(record["identity"]["backup"]["path"])
+        manifest = json.loads(backup.read_text())
+        sources = [Path(item["source"]).resolve() for item in manifest["roots"]]
+        self.assertEqual([self.profile, root], sources)
+        for path, original in before.items():
+            self.assertEqual(original, path.read_bytes())
+            archived = backup.parent / "root-1" / path.relative_to(root)
+            self.assertEqual(original, archived.read_bytes())
+        journal = json.loads(Path(record["identity"]["journalPath"]).read_text())
+        self.assertEqual([str(root)], [str(Path(p).resolve()) for p in journal["mailPaths"]])
+        self.stop_application()
+        selector = (self.profile / "panorama-profile.json").read_bytes()
+        self.start_same_profile(True)
+        self.assertEqual(selected["sourceId"], self.selection()["sourceId"])
+        self.assertEqual(headers, self.assert_message_after_activation(source))
+        self.assertEqual(selector, (self.profile / "panorama-profile.json").read_bytes())
+
+    def test_external_root_containing_profile_refuses(self):
+        """A mail root that contains the profile has ambiguous ownership."""
+        self.clean_profile(False)
+        source = self.create_legacy_message("mbox")
+        self.marionette.execute_script("""
+            const { FileUtils } = ChromeUtils.importESModule(
+              'resource://gre/modules/FileUtils.sys.mjs');
+            Services.prefs.clearUserPref('mail.server.' + arguments[0] + '.directory-rel');
+            Services.prefs.setComplexValue('mail.server.' + arguments[0] + '.directory',
+              Ci.nsIFile, new FileUtils.File(arguments[1]));
+            Services.prefs.savePrefFile(null);
+        """, script_args=[source["serverKey"], str(self.profile.parent)])
+        self.stop_application()
+        self.assert_startup_refuses(
+            [Path(source["summary"])],
             absent=[self.profile / "panorama.sqlite", self.profile / "panorama-profile.json"],
         )
         work = self.profile.parent / ("panorama-migration-" + self.profile.name)

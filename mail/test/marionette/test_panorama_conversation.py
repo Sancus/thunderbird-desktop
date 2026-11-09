@@ -803,11 +803,14 @@ class TestPanoramaAppWrittenDelimiterMigration(MarionetteTestCase):
             )
         ).resolve()
 
-    def restart_same(self, enabled):
-        """Quit normally, then start the same stopped profile with the pref."""
+    def stop(self):
+        """Quit normally; the application writes its folder cache on exit."""
         self.marionette.set_context(self.marionette.CONTEXT_CHROME)
         self.marionette.execute_script("Services.prefs.savePrefFile(null);")
         self.marionette.quit(in_app=True)
+
+    def start(self, enabled):
+        """Start the same stopped profile with the pref."""
         self.marionette.instance.profile.set_preferences(
             {"mail.panorama.enabled": enabled}
         )
@@ -868,6 +871,12 @@ class TestPanoramaAppWrittenDelimiterMigration(MarionetteTestCase):
         )
 
     def test_migratesClientFoldersWithUnknownOrNilDelimiterThenReuses(self):
+        def without_keys(folders):
+            return {
+                name: {**value, "messages": [m[1:] for m in value["messages"]]}
+                for name, value in folders.items()
+            }
+
         source = self.marionette.execute_script(
             """
             const { MailServices } = ChromeUtils.importESModule(
@@ -914,8 +923,9 @@ class TestPanoramaAppWrittenDelimiterMigration(MarionetteTestCase):
             {"INBOX": 47, "Junk": 94, "Flat": 124},
             {name: value["delimiter"] for name, value in legacy.items()},
         )
-        # A normal quit lets the real application write its folder cache.
-        self.restart_same(False)
+        # A normal quit lets the real application write its folder cache,
+        # then the stopped legacy profile restarts opted in, as in S7-11.
+        self.stop()
         cache = self.profile / "folderCache.json"
         rows = json.loads(cache.read_text(encoding="utf-8"))
         for name, delimiter in [("INBOX", 47), ("Junk", 94), ("Flat", 124)]:
@@ -925,17 +935,21 @@ class TestPanoramaAppWrittenDelimiterMigration(MarionetteTestCase):
             path: Path(path).read_bytes()
             for path in [str(cache), *source["summaries"].values()]
         }
-        self.restart_same(True)
+        self.start(True)
         selected = self.selection()
         self.assertEqual("migrated", selected["record"]["origin"])
         self.assertEqual(3, len(selected["record"]["identity"]["imports"]))
-        self.assertEqual(legacy, self.folders(source["key"]))
+        migrated = self.folders(source["key"])
+        # Native import assigns its own message keys; names, delimiters,
+        # Message-IDs and server UIDs are retained exactly.
+        self.assertEqual(without_keys(legacy), without_keys(migrated))
         for path, data in originals.items():
             self.assertEqual(data, Path(path).read_bytes(), path)
-        self.restart_same(True)
+        self.stop()
+        self.start(True)
         repeated = self.selection()
         self.assertEqual(selected["sourceId"], repeated["sourceId"])
         self.assertEqual(selected["record"]["identity"], repeated["record"]["identity"])
-        self.assertEqual(legacy, self.folders(source["key"]))
+        self.assertEqual(migrated, self.folders(source["key"]))
         for path, data in originals.items():
             self.assertEqual(data, Path(path).read_bytes(), path)

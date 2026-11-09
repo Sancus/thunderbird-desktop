@@ -318,7 +318,10 @@ function snapshot(uris) {
             return {
               key: header.messageKey,
               messageId: header.messageId,
-              subject: header.mime2DecodedSubject,
+              // A reply's "Re: " is stored as the HasRe flag, as the UI shows it.
+              subject:
+                (header.flags & Ci.nsMsgMessageFlags.HasRe ? "Re: " : "") +
+                header.mime2DecodedSubject,
               author: header.mime2DecodedAuthor,
               recipients: header.mime2DecodedRecipients,
               offline: !!(header.flags & Ci.nsMsgMessageFlags.Offline),
@@ -429,7 +432,9 @@ async function display(uri, messageId, body) {
   return {
     folderURI: shown.folder.URI,
     messageId: shown.messageId,
-    subject: shown.mime2DecodedSubject,
+    subject:
+      (shown.flags & Ci.nsMsgMessageFlags.HasRe ? "Re: " : "") +
+      shown.mime2DecodedSubject,
     author: shown.mime2DecodedAuthor,
     text: aboutMessage.getMessagePaneBrowser().contentDocument.body.textContent,
   };

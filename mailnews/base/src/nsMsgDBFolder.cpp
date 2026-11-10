@@ -5296,18 +5296,6 @@ void nsMsgDBFolder::PublishCacheImportFlags(uint32_t committedFlags) {
   mFlags = committedFlags;
 }
 
-void nsMsgDBFolder::PublishCacheImportPending(
-    const mozilla::Maybe<int64_t>& total,
-    const mozilla::Maybe<int64_t>& unread) {
-  // As PublishCacheImportFlags: committed values, no persistence, no notice.
-  if (total && *total >= INT32_MIN && *total <= INT32_MAX) {
-    mNumPendingTotalMessages = int32_t(*total);
-  }
-  if (unread && *unread >= INT32_MIN && *unread <= INT32_MAX) {
-    mNumPendingUnreadMessages = int32_t(*unread);
-  }
-}
-
 nsresult nsMsgDBFolder::ApplyInitialCacheDiscoveryFlags(
     mozilla::mailnews::CacheDiscoveryFlagWrite&& write,
     uint32_t proposedNativeFlags) {

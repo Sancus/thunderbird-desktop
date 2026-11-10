@@ -5138,7 +5138,7 @@ nsresult ImportFolderProperties(JSContext* cx, JS::Handle<JSObject*> request,
                                 const ImportSourceRecord& info, uint32_t flags,
                                 uint32_t total, uint32_t unread,
                                 nsTArray<FolderImportProperty>& output,
-                                bool imap = false) {
+                                bool imap = false, bool localStore = false) {
   JS::Rooted<JS::Value> field(cx);
   JS::Rooted<JSObject*> array(cx);
   uint32_t count;
@@ -5217,6 +5217,10 @@ nsresult ImportFolderProperties(JSContext* cx, JS::Handle<JSObject*> request,
         // IMAP may clear its pending-work marker without changing saved state.
         // Preserve the raw property; every other flag must still match.
         uint32_t allowed = imap ? nsMsgFolderFlags::OfflineEvents : 0;
+        // A local store folder is Mail even when its summary word predates
+        // legacy discovery setting it; never the reverse.
+        if (localStore && (flags & nsMsgFolderFlags::Mail))
+          allowed |= nsMsgFolderFlags::Mail;
         NS_ENSURE_TRUE(((uint32_t(expected) ^ flags) & ~allowed) == 0,
                        NS_ERROR_NOT_IMPLEMENTED);
       } else if (value.name == "numMsgs"_ns || value.name == "numNewMsgs"_ns) {
@@ -5746,9 +5750,9 @@ nsresult CheckFullImportRecords(JSContext* cx, JS::Handle<JSObject*> request,
   auto* info = find(infoTable->members[0]);
   NS_ENSURE_TRUE(info && info->id == 1 && info->scope == infoScope,
                  NS_ERROR_NOT_IMPLEMENTED);
-  MOZ_TRY(ImportFolderProperties(cx, request, *info, folderFlags,
-                                 input.messages.Length(), unread,
-                                 input.folderProperties, bool(imap)));
+  MOZ_TRY(ImportFolderProperties(
+      cx, request, *info, folderFlags, input.messages.Length(), unread,
+      input.folderProperties, bool(imap), StartupLocalProtocol(protocol)));
   info->accounted = true;
   if (imap) {
     MOZ_TRY(
@@ -14330,9 +14334,9 @@ nsresult DatabaseCore::BuildStartupFolders() {
                     (before & nsMsgFolderFlags::OfflineEvents)
           // Legacy discovery marks every local store folder Mail each
           // time it loads it; the copy of the word in the summary can
-          // predate that. Never drop it.
+          // predate that (a maildir POP3 Inbox). It is a mail folder.
           : StartupLocalProtocol(source.protocol)
-              ? *source.originalFlags | (before & nsMsgFolderFlags::Mail)
+              ? *source.originalFlags | nsMsgFolderFlags::Mail
               : *source.originalFlags;
       const uint32_t protocolMask =
           nsMsgFolderFlags::Newsgroup | nsMsgFolderFlags::Virtual |

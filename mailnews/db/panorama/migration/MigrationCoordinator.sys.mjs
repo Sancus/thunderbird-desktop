@@ -1982,6 +1982,11 @@ function verifyNativeMessageProjection(database, folder, request, receipt) {
       throw new Error("Native migration message projection differs: " + name);
     }
   };
+  // A news header is an article through its native binding, and the read set
+  // from newsrc owns the Read flag of every bound article.
+  const news = request.folder.protocol === "nntp";
+  const readMask = news ? Ci.nsMsgMessageFlags.Read : 0;
+  let incarnation = null;
   for (const message of request.messages) {
     const key = keys.get(message.sourceKey);
     const actual = headers.get(key);
@@ -1989,7 +1994,14 @@ function verifyNativeMessageProjection(database, folder, request, receipt) {
     // Public flags include transient NewList status; the imported word must
     // still match exactly, including a persisted New bit added after import.
     const stored = database.messageDB.getSearchState(key);
-    equal(stored?.flags, expected.flags, "stored flags");
+    if (!stored) {
+      throw new Error("Native migration message projection differs: stored");
+    }
+    equal(
+      (stored.flags & ~readMask) >>> 0,
+      (expected.flags & ~readMask) >>> 0,
+      "stored flags"
+    );
     equal(actual.messageKey, key, "messageKey");
     equal(actual.folder.id, request.folder.id, "folder");
     for (const [name, value] of [
@@ -2000,11 +2012,6 @@ function verifyNativeMessageProjection(database, folder, request, receipt) {
       ["ccList", expected.ccList],
       ["bccList", expected.bccList],
       ["subject", expected.subject],
-      [
-        "flags",
-        (expected.flags | (newKeys.has(key) ? Ci.nsMsgMessageFlags.New : 0)) >>>
-          0,
-      ],
       ["priority", expected.priority],
       ["charset", expected.charset],
       ["threadId", keys.get(message.rootSourceKey)],
@@ -2017,6 +2024,13 @@ function verifyNativeMessageProjection(database, folder, request, receipt) {
     ]) {
       equal(actual[name], value, name);
     }
+    equal(
+      (actual.flags & ~readMask) >>> 0,
+      ((expected.flags | (newKeys.has(key) ? Ci.nsMsgMessageFlags.New : 0)) &
+        ~readMask) >>>
+        0,
+      "flags"
+    );
     equal(actual.numReferences, expected.references.length, "References count");
     expected.references.forEach((reference, ordinal) => {
       equal(
@@ -2065,6 +2079,18 @@ function verifyNativeMessageProjection(database, folder, request, receipt) {
       // The explicit native binding materializes the canonical hex property.
       equal(actual.getUint32Property("uidOnServer"), uid.uid, "uidOnServer");
       properties.set("uidOnServer", uid.uid.toString(16));
+    }
+    if (news) {
+      properties.set("newsArticleNumber", String(message.sourceKey));
+      const group = database.messageDB.getMessageProperty(
+        key,
+        "newsGroupIncarnation"
+      );
+      if (!group || (incarnation !== null && group !== incarnation)) {
+        throw new Error("Native migration news article binding differs");
+      }
+      incarnation = group;
+      properties.set("newsGroupIncarnation", group);
     }
     const present = new Set(actual.properties);
     if (

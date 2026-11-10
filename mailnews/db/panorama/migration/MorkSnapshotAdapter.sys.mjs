@@ -1329,7 +1329,12 @@ function accountRecords(request, folderFlags, imap = false) {
   if (!info || info.scope != INFO || info.id != 1) {
     throw new Error("Invalid Mork folder-info row");
   }
-  const properties = folderProperties(info.cells, folderFlags, imap);
+  const properties = folderProperties(
+    info.cells,
+    folderFlags,
+    imap,
+    LOCAL_STORE_PROTOCOLS.includes(request.folder.protocol)
+  );
   for (const [name, expected] of [
     ["numMsgs", messages.size],
     [
@@ -1453,7 +1458,13 @@ function checkMeta(row, id, members, messages, imap = false) {
  * @param {boolean} [imap=false] - Retain pending counters and the offline event flag.
  * @returns {object[]} Explicit typed properties; original text also retained.
  */
-function folderProperties(original, flags, imap = false) {
+function folderProperties(original, flags, imap = false, localStore = false) {
+  // A local store folder is Mail even when its summary word predates legacy
+  // discovery setting it; never the reverse.
+  const mail =
+    localStore && flags & Ci.nsMsgFolderFlags.Mail
+      ? Ci.nsMsgFolderFlags.Mail
+      : 0;
   return [...original].map(([bytes, value]) => {
     const name = decode(bytes);
     const text = decode(value);
@@ -1485,7 +1496,7 @@ function folderProperties(original, flags, imap = false) {
         (name == "flags" &&
           (imap
             ? (property.integer ^ flags) & ~Ci.nsMsgFolderFlags.OfflineEvents
-            : property.integer != flags)) ||
+            : (property.integer ^ flags) & ~mail)) ||
         ((imap
           ? name == "forceReparse"
           : ["totPendingMsgs", "unreadPendingMsgs", "forceReparse"].includes(

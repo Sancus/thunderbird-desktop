@@ -966,7 +966,8 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             """, script_args=[source["serverKey"]])
 
         expected = {
-            "subjects": ["Another thread", "No account cell", "Re: Watched thread",
+            # A header's subject is stored without its "Re: "; a flag keeps it.
+            "subjects": ["Another thread", "No account cell", "Watched thread",
                          "Watched thread"],
             "bareAccount": True,
             "total": 4, "watched": True, "otherWatched": False,
@@ -2528,18 +2529,16 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         work.mkdir(mode=0o700)
         self.created_work.add(work)
         journal = work / "journal.json"
-        leftover = b'{"interrupted":"a journal no migration finished"}\n'
-        journal.write_bytes(leftover)
-        # Work without a selector or a database is an attempt that never
-        # activated. It is never read as progress or resumed: startup sets it
-        # aside whole and proceeds from the unchanged profile.
-        self.start_same_profile(True)
-        fresh = self.selection()
-        self.assertNotEqual(selected["sourceId"], fresh["sourceId"])
-        aside = work / "incomplete-1"
-        self.assertEqual(["journal.json"], [path.name for path in aside.iterdir()])
-        self.assertEqual(leftover, (aside / "journal.json").read_bytes())
-        self.assertFalse((work / "incomplete-2").exists())
+        journal.write_bytes(b'{"interrupted":"retained journal requires recovery"}\n')
+        # The database is gone but its sidecar files are still there: that is
+        # recovery state, not what a migration leaves before it has a
+        # database. Nothing is set aside and startup stops.
+        self.assert_startup_refuses(
+            [saved_selector, saved_database, journal], absent=[database, selector]
+        )
+        self.assertFalse((work / "backup").exists(),
+                         "An existing journal cannot be hidden behind another backup")
+        self.assertFalse((work / "incomplete-1").exists())
 
     def tearDown(self):
         try:

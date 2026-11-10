@@ -36,10 +36,12 @@ add_task(function test_accountsIsTriedAgainAfterAFailedStart() {
   const { MailServices } = ChromeUtils.importESModule(
     "resource:///modules/MailServices.sys.mjs"
   );
-  Assert.throws(() => MailServices.accounts, /NS_ERROR_NOT_AVAILABLE/);
+  // The service manager reports the failed start as its own failure.
+  const failed = /NS_ERROR_XPC_GS_RETURNED_FAILURE|NS_ERROR_NOT_AVAILABLE/;
+  Assert.throws(() => MailServices.accounts, failed);
   Assert.throws(
     () => MailServices.accounts,
-    /NS_ERROR_NOT_AVAILABLE/,
+    failed,
     "A failed start is an error each time, never an undefined service"
   );
   starting = false;

@@ -3034,7 +3034,15 @@ function startupMailFiles(profile, serverRoots) {
 function startupIndexSelection(profile, servers, serverRoots, inputs) {
   const key = file => {
     const normalized = file.clone();
-    normalized.normalize();
+    try {
+      normalized.normalize();
+    } catch (error) {
+      // A dangling link or a path that is gone has no other spelling, and is
+      // none of the inputs.
+      if (error.result !== Cr.NS_ERROR_FILE_NOT_FOUND) {
+        throw error;
+      }
+    }
     return normalized.path;
   };
   const copied = new Set(

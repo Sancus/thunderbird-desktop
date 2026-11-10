@@ -3432,6 +3432,12 @@ class DeliveryCoreReferences : public testing::Test {
     MOZ_TRY(work->AppendNative("panorama-migration-"_ns + leaf));
     bool exists;
     MOZ_TRY(work->Exists(&exists));
+    // Tests share this profile path: what an earlier one left is not this
+    // test's fixture.
+    if (exists && !mStartupFixtureWork) {
+      MOZ_TRY(work->Remove(true));
+      exists = false;
+    }
     if (!exists) MOZ_TRY(work->Create(nsIFile::DIRECTORY_TYPE, 0700));
     mStartupFixtureWork = work;
     work.forget(output);

@@ -385,10 +385,18 @@ class TestPanoramaProtocolMigration(MarionetteTestCase):
         backup = Path(record["identity"]["backup"]["path"])
         manifest = json.loads(backup.read_text())
         self.assertTrue(manifest["complete"])
+        # An index migration copies the metadata it reads. A message store is
+        # measured where it is and never copied.
+        entries = {tuple(entry["parts"]): entry
+                   for entry in manifest["roots"][0]["entries"]}
         for path, data in {**files, **state}.items():
             self.assertEqual(data, path.read_bytes(), "source changed: %s" % path)
-            archived = backup.parent / "root-0" / path.relative_to(self.profile)
-            self.assertEqual(data, archived.read_bytes(), "not backed up: %s" % path)
+            relative = path.relative_to(self.profile)
+            archived = backup.parent / "root-0" / relative
+            if entries[relative.parts]["type"] == "in-place":
+                self.assertFalse(archived.exists(), "store copied: %s" % path)
+            else:
+                self.assertEqual(data, archived.read_bytes(), "not backed up: %s" % path)
 
         # Stale legacy Mork must never be imported again on reuse.
         self.stop_application()

@@ -9135,6 +9135,18 @@ nsresult StartupSetAsideIncomplete(JSContext* cx, nsIFile* profile,
   // Without a selector, only what a migration left in its work directory
   // before it had a database is such an attempt.
   if (!hasSelector && (hasDatabase || !hasWork)) return NS_OK;
+  if (!hasSelector) {
+    // Sidecar files of a database that is gone are recovery state, not what
+    // a migration leaves before it has a database. Nothing is moved.
+    for (const char* name : {"panorama.sqlite-journal", "panorama.sqlite-wal",
+                             "panorama.sqlite-shm"}) {
+      nsCOMPtr<nsIFile> sidecar;
+      MOZ_TRY(StartupChild(profile, name, getter_AddRefs(sidecar)));
+      bool orphan;
+      MOZ_TRY(sidecar->Exists(&orphan));
+      if (orphan) return NS_OK;
+    }
+  }
   nsAutoCString profilePath, current;
   MOZ_TRY(StartupDirectory(profile, profilePath));
   nsCOMPtr<nsIXULAppInfo> app = do_GetService("@mozilla.org/xre/app-info;1");
@@ -11477,7 +11489,7 @@ nsresult RestoreEntries(JSContext* cx, JS::Handle<JSObject*> root,
                         nsTArray<StartupRestoreEntry>& output,
                         uint32_t& permissions, int64_t& modified,
                         const nsACString& prefix, bool profile,
-                        bool metadata = true) {
+                        bool metadata = true, bool indexScope = false) {
   int64_t mode;
   if (metadata) {
     MOZ_TRY(StartupNumber(cx, root, "permissions", 0, 0777, mode));
@@ -11527,6 +11539,12 @@ nsresult RestoreEntries(JSContext* cx, JS::Handle<JSObject*> root,
     if (!nativeId.isUndefined())
       MOZ_TRY(ImportText(cx, nativeId, entry.nativeId));
     MOZ_TRY(StartupText(cx, item, "type", type));
+    if (indexScope && type == "in-place"_ns) {
+      // A message store an index backup measured where it is: the archive
+      // holds no copy of it.
+      output.RemoveLastElement();
+      continue;
+    }
     NS_ENSURE_TRUE(type == "regular"_ns || type == "directory"_ns,
                    NS_ERROR_FILE_CORRUPTED);
     entry.directory = type == "directory"_ns;
@@ -12557,8 +12575,19 @@ nsresult DatabaseCore::ReadStartupMailSource(JSContext* cx,
                      (contract == "@mozilla.org/msgstore/berkeleystore;1"_ns ||
                       contract == "@mozilla.org/msgstore/maildirstore;1"_ns),
                  NS_ERROR_NOT_AVAILABLE);
-  MOZ_TRY(CheckStartupMailStore(output.storePath, contract,
-                                StartupRemoteProtocol(protocol)));
+  // A saved search is its summary and its entry in virtualFolders.dat. It has
+  // no message store, and whatever lies at that path is no migration input.
+  StartupSummaryFacts storeFacts;
+  MOZ_TRY(StartupSummaryFactsFor(cx, operation, file, output.path, storeFacts));
+  uint64_t storeWord = 0;
+  const bool savedSearch =
+      storeFacts.flags &&
+      NS_SUCCEEDED(ImportHex(*storeFacts.flags, 8, storeWord)) &&
+      (storeWord & nsMsgFolderFlags::Virtual);
+  if (!savedSearch) {
+    MOZ_TRY(CheckStartupMailStore(output.storePath, contract,
+                                  StartupRemoteProtocol(protocol)));
+  }
   const bool directory = contract == "@mozilla.org/msgstore/maildirstore;1"_ns;
   nsCString storeType;
   MOZ_TRY(StartupText(cx, source, "storeType", storeType));
@@ -13067,6 +13096,17 @@ nsresult RestoreDependencies(JSContext* cx, ProfileRestoreState& state,
                      NS_ERROR_NOT_AVAILABLE);
       int64_t version;
       MOZ_TRY(StartupNumber(cx, manifest, "version", 1, 3, version));
+      // The migration's own backup is an index backup: it is retained as it
+      // is, and never the archive a profile is restored from.
+      JS::Rooted<JS::Value> scope(cx);
+      MOZ_TRY(ImportMember(cx, manifest, "scope", &scope, true));
+      bool indexScope = false;
+      if (!scope.isUndefined()) {
+        nsCString text;
+        MOZ_TRY(ImportText(cx, scope, text));
+        NS_ENSURE_TRUE(text == "index"_ns, NS_ERROR_FILE_CORRUPTED);
+        indexScope = true;
+      }
       uint32_t rootsCount;
       MOZ_TRY(StartupArray(cx, manifest, "roots", &roots, rootsCount));
       NS_ENSURE_TRUE(rootsCount, NS_ERROR_FILE_CORRUPTED);
@@ -13088,7 +13128,7 @@ nsresult RestoreDependencies(JSContext* cx, ProfileRestoreState& state,
         uint32_t mode;
         int64_t modified;
         MOZ_TRY(RestoreEntries(cx, root, rows, mode, modified, state.prefix,
-                               r == 0, version != 1));
+                               r == 0, version != 1, indexScope));
         MOZ_TRY(RestoreTree(state, *held, rows, r == 0, false, false));
         for (const auto& row : rows)
           if (!row.directory) {
@@ -15189,7 +15229,11 @@ nsresult DatabaseCore::BindStartupFolderPath(uint64_t folderId,
   MOZ_TRY(selected->GetParent(getter_AddRefs(parent)));
   nsCString physicalParent;
   MOZ_TRY(StartupDirectory(parent, physicalParent));
-  MOZ_TRY(CheckStartupMailStore(retained.Data(), contract, false));
+  // As at import: a saved search has no message store.
+  if (!(MOZ_TRY(mFolderDatabase->GetFolderFlags(folderId)) &
+        nsMsgFolderFlags::Virtual)) {
+    MOZ_TRY(CheckStartupMailStore(retained.Data(), contract, false));
+  }
   MOZ_TRY(CheckProfileStartup(ProfileStartupToken(), true));
   path = selected;
   return NS_OK;

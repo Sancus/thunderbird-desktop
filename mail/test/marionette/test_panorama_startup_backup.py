@@ -840,6 +840,9 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.assertFalse(source["draftsFlags"] & 0x400)
         summary = Path(source["virtualSummary"])
         original = summary.read_bytes()
+        # The old application's own cache describes the saved search too.
+        cache = json.loads((self.profile / "folderCache.json").read_text(encoding="utf-8"))
+        self.assertIn(str(summary), cache)
 
         def state():
             return self.marionette.execute_script("""
@@ -869,6 +872,12 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.assertEqual("migrated", selected["record"]["origin"])
         self.assertEqual(expected, state())
         self.assertEqual(original, summary.read_bytes())
+        # A search folder's cache entry is a recomputed view: not applied, counted.
+        report = json.loads(
+            (Path(selected["record"]["identity"]["journalPath"]).parent /
+             "report.json").read_text(encoding="utf-8"))
+        self.assertIn("search-folder-cache-entries",
+                      [entry["code"] for entry in report["notImported"]])
         for _ in range(2):
             self.stop_application()
             self.start_same_profile(True)

@@ -3590,6 +3590,25 @@ async function finishPanoramaProfileStartup(
           );
           note("obsolete-cache-entries", cache.id, unboundKeys.length);
         }
+        // A saved search holds no messages of its own: what the cache says
+        // about it describes a view that is recomputed, and the native cache
+        // import applies no cache metadata to a search folder. Its entry
+        // stays in the original, like an obsolete one.
+        let searchFolders = 0;
+        for (const [key, binding] of mapping) {
+          if (
+            database.folderDB.getFolderFlags(binding.folder.id) &
+            Ci.nsMsgFolderFlags.Virtual
+          ) {
+            mapping.delete(key);
+            unboundKeys.push(key);
+            searchFolders++;
+          }
+        }
+        if (searchFolders) {
+          unboundKeys.sort();
+          note("search-folder-cache-entries", cache.id, searchFolders);
+        }
         const snapshot = await prepareMorkFolderCacheImport(
           journal,
           database,

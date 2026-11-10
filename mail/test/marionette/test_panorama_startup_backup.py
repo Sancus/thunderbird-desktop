@@ -1479,14 +1479,14 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             self.assertEqual(root_original, archived_root.read_bytes())
 
     def create_legacy_offline_imap_shapes(self, personal=False, unified=False,
-                                          readded=False, drafts=False):
+                                          readded=False, drafts=False, stale=False):
         """Write ordinary summaries of an IMAP account last used offline.
 
         All data is fabricated. INBOX always holds two headers; the options add
         one legacy shape each (see the tests below)."""
         self.clean_profile(False)
         return self.marionette.execute_script("""
-            const [personal, unified, readded, drafts] = arguments;
+            const [personal, unified, readded, drafts, stale] = arguments;
             const { MailServices } = ChromeUtils.importESModule(
               'resource:///modules/MailServices.sys.mjs');
             const { MorkParser } = ChromeUtils.importESModule(
@@ -1540,6 +1540,20 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
               // A unified folder view caches its hits in the summary.
               database.refreshCache('mailbox://nobody@smart%20mailboxes/Inbox',
                                     [42, 43]);
+            }
+            if (stale) {
+              // What an offline move leaves in its destination once the source
+              // folder's operation is gone: a pseudo header and a move result
+              // naming a source no folder has an operation for.
+              const ghost = database.createNewHdrWithSpecificMsgKey(0xffffff80);
+              ghost.messageId = 'shape-ghost@invalid';
+              ghost.subject = 'Moved here offline';
+              ghost.setUint32Property('pseudoHdr', 1);
+              database.addNewHdrToDB(ghost, false);
+              const result = database.QueryInterface(Ci.nsIMsgOfflineOpsDatabase)
+                .getOfflineOpForKey(0xffffff80, true);
+              result.sourceFolderURI = server.rootFolder.URI + '/Elsewhere';
+              result.srcMessageKey = 77;
             }
             database.summaryValid = true;
             database.commit(Ci.nsMsgDBCommitType.kLargeCommit);
@@ -1598,7 +1612,7 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             }
             Services.prefs.savePrefFile(null);
             return {serverKey: server.key, folders};
-        """, script_args=[personal, unified, readded, drafts])
+        """, script_args=[personal, unified, readded, drafts, stale])
 
     def assert_offline_imap_migration(self, source, expected):
         """Migrate the fabricated summaries, then reuse them twice unchanged."""
@@ -1678,6 +1692,23 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.assert_offline_imap_migration(source, {
             "INBOX": {"personal": False, "messages": self.INBOX_MESSAGES},
             "Sent": {"personal": False, "messages": self.SENT_MESSAGES}})
+
+    def test_leavesStaleOfflineMoveResultOutAndReportsIt(self):
+        """Old Thunderbird discards a move result at its next playback and
+        Panorama cannot hold one without its source operation. The migration
+        leaves it out, counts it, and keeps the original summary. All data is
+        fabricated."""
+        source = self.create_legacy_offline_imap_shapes(readded=True, stale=True)
+        summary = Path(source["folders"]["INBOX"]["summary"])
+        self.assertIn(b"shape-ghost@invalid", summary.read_bytes())
+        self.assertIn(b"ns:msg:db:row:scope:ops:all", summary.read_bytes())
+        self.assert_offline_imap_migration(source, {
+            "INBOX": {"personal": False, "messages": self.INBOX_MESSAGES},
+            "Sent": {"personal": False, "messages": self.SENT_MESSAGES}})
+        work = self.profile.parent / ("panorama-migration-" + self.profile.name)
+        report = json.loads((work / "report.json").read_text(encoding="utf-8"))
+        self.assertIn({"code": "stale-move-results", "sources": 1, "count": 1},
+                      report["notImported"])
 
     def test_migratesOrdinaryOfflineImapShapesThenReuses(self):
         """All shapes of the supplied real profile together, all data fabricated."""

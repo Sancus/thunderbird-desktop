@@ -1906,6 +1906,16 @@ export class MigrationJournal {
         !Array.isArray(source.messageKeys) ||
         new Set(source.messageKeys).size != source.messageKeys.length ||
         source.messageKeys.some(key => !isKey(key, true)) ||
+        // Stale offline move results left out of the plan
+        // (findStaleMoveResults): never also a message of it.
+        (source.omittedMessageKeys !== undefined &&
+          (!Array.isArray(source.omittedMessageKeys) ||
+            !source.omittedMessageKeys.length ||
+            new Set(source.omittedMessageKeys).size !=
+              source.omittedMessageKeys.length ||
+            source.omittedMessageKeys.some(
+              key => !isKey(key, true) || source.messageKeys.includes(key)
+            ))) ||
         !["pending", "importing", "imported"].includes(source.state)
       ) {
         throw new Error("Invalid migration source identity");

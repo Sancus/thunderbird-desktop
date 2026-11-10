@@ -140,6 +140,78 @@ export function parseMorkSummary(bytes) {
 }
 
 /**
+ * The pending offline moves and copies of one summary, as findStaleMoveResults
+ * needs them. Only operations their table still holds are pending.
+ *
+ * @param {ReturnType<typeof parseMorkSummary>} summary - Parsed summary.
+ * @returns {{results: {key: number, sourceMessageKey: number}[],
+ *   origins: Set<number>}} Its move results with the source key each names,
+ *   and the keys of its own pending moves and copies.
+ */
+export function getMorkMoveResults(summary) {
+  const operations = "ns:msg:db:row:scope:ops:all";
+  const results = [];
+  const origins = new Set();
+  for (const table of summary.source.tables.values()) {
+    if (table.scope != operations) {
+      continue;
+    }
+    for (const key of table.rows) {
+      const row = summary.source.rows.get(key);
+      if (row?.scope != operations) {
+        continue;
+      }
+      const operation = parseInt(row.cells.get("op") ?? "0", 16);
+      // nsIMsgOfflineImapOperation: kMoveResult alone, as old playback tests
+      // it; kMsgMoved or kMsgCopy.
+      if (operation == 0x8 && row.cells.has("srcFolderURI")) {
+        results.push({
+          key: row.id,
+          sourceMessageKey: parseInt(row.cells.get("srcMsgKey") ?? "", 16),
+        });
+      } else if (operation & 0x6) {
+        origins.add(row.id);
+      }
+    }
+  }
+  return { results, origins };
+}
+
+/**
+ * An offline move or copy shows its message in the destination folder at
+ * once: a pseudo header with a "move result" operation that names the source
+ * folder and key. The server work itself is the source folder's operation.
+ * When that is gone (played back, or lost with a rebuilt summary) the result
+ * is a leftover. Old Thunderbird discards every move result with its pseudo
+ * header the next time it plays the folder's operations back
+ * (nsImapOfflineSync::ProcessNextOperation), and the real message arrives
+ * with the next sync. Panorama cannot hold a result without its source
+ * operation, so such a result is not migrated.
+ *
+ * Folder addresses are not known when this is asked. A result counts as
+ * pending when any other folder has a pending move or copy under its source
+ * key; whether that really is its source is checked exactly at import.
+ *
+ * @param {ReturnType<typeof getMorkMoveResults>[]} folders - The IMAP
+ *   summaries migrated together.
+ * @returns {number[][]} For each folder, the keys of its stale move results.
+ */
+export function findStaleMoveResults(folders) {
+  return folders.map((folder, index) =>
+    folder.results
+      .filter(
+        result =>
+          !folders.some(
+            (other, at) =>
+              at != index && other.origins.has(result.sourceMessageKey)
+          )
+      )
+      .map(result => result.key)
+      .sort((a, b) => a - b)
+  );
+}
+
+/**
  * Reads only the folder-info cells native startup needs to place a summary:
  * one parse, no message conversion. Cells are original byte strings.
  *

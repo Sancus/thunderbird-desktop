@@ -105,6 +105,8 @@ function convertMorkSnapshot(
   imap,
   note
 ) {
+  // Offline move results the plan found stale (findStaleMoveResults).
+  const omitted = new Set(source.omittedMessageKeys ?? []);
   if (
     (input.version !== 1 &&
       !(AppConstants.platform == "win" && input.version === 2)) ||
@@ -131,7 +133,10 @@ function convertMorkSnapshot(
     !Number.isSafeInteger(source.size) ||
     source.size < 0 ||
     source.size !== input.source.size ||
-    !sameKeys(source.messageKeys, input.source.messageKeys)
+    !sameKeys(
+      source.messageKeys,
+      input.source.messageKeys.filter(key => !omitted.has(key))
+    )
   ) {
     throw new Error("Mork snapshot conflicts with journal/database identity");
   }
@@ -174,11 +179,33 @@ function convertMorkSnapshot(
     throw new Error("Unsupported Mork protocol identity/offline mapping");
   }
   const request = structuredClone(input);
+  if (omitted.size) {
+    // Neither the pseudo header nor its operation is imported. Their rows
+    // stay among the raw records, as rows no table holds.
+    request.messages = request.messages.filter(
+      message => !omitted.has(message.sourceKey)
+    );
+    request.source.messageKeys = request.source.messageKeys.filter(
+      key => !omitted.has(key)
+    );
+    const rows = new Set(
+      [...omitted].flatMap(key => [key + ":" + MESSAGE, key + ":" + OFFLINE])
+    );
+    for (const table of request.records.tables) {
+      table.rows = table.rows.filter(key => !rows.has(key));
+    }
+  }
   request.sourceId = source.id;
   request.databaseSourceId = databaseSourceId;
   request.recordsComplete = false;
   request.unhandledRecords = [];
-  request.folderProperties = accountRecords(request, folderFlags, imap, note);
+  request.folderProperties = accountRecords(
+    request,
+    folderFlags,
+    imap,
+    note,
+    omitted.size > 0
+  );
   request.recordsComplete = true;
   return request;
 }
@@ -1166,9 +1193,17 @@ function classifyRecordTables(tables, imap) {
  * @param {boolean} [imap=false] - Account the typed saved IMAP operation section.
  * @param {function(string, string, number): void} [note] - Told what is not
  *   imported.
+ * @param {boolean} [rethread=false] - Headers were left out: thread the
+ *   remaining ones as their own rows say, without the ones left out.
  * @returns {object[]} Exact text properties with explicit known numeric views.
  */
-function accountRecords(request, folderFlags, imap = false, note = null) {
+function accountRecords(
+  request,
+  folderFlags,
+  imap = false,
+  note = null,
+  rethread = false
+) {
   const rows = new Map();
   for (const row of request.records.rows) {
     const key = rowKey(row);
@@ -1250,7 +1285,10 @@ function accountRecords(request, folderFlags, imap = false, note = null) {
   });
   for (const [key, { message }] of messages) {
     const relation = relations.get(key);
-    if (
+    if (rethread) {
+      message.rootSourceKey = relation.root;
+      message.parentSourceKey = relation.parent;
+    } else if (
       message.rootSourceKey !== relation.root ||
       message.parentSourceKey !== relation.parent
     ) {

@@ -31,6 +31,10 @@ import {
 } from "resource:///modules/panorama/MigrationSource.sys.mjs";
 
 import { getMorkThreadRelations } from "resource:///modules/panorama/MigrationMessageMap.sys.mjs";
+import {
+  findStaleMoveResults,
+  getMorkMoveResults,
+} from "resource:///modules/panorama/MorkSummaryReader.sys.mjs";
 
 import { verifyMigrationBackup } from "resource:///modules/panorama/MigrationBackup.sys.mjs";
 
@@ -3456,6 +3460,7 @@ async function finishPanoramaProfileStartup(
         database.validateProfileStartup(operation);
       }
       const sources = [];
+      const moves = new Map();
       for (const source of captured.summaries) {
         const { identity, summary } = await readMorkMigrationSource(
           source.path
@@ -3478,8 +3483,10 @@ async function finishPanoramaProfileStartup(
               }
             : {}),
         });
+        moves.set(sources.at(-1), getMorkMoveResults(summary));
         database.validateProfileStartup(operation);
       }
+      omitStaleMoveResults(sources, moves, note);
       const journalPath = PathUtils.join(captured.workPath, "journal.json");
       journal = await MigrationJournal.create(journalPath, {
         profilePath: selected.profilePath,
@@ -3693,6 +3700,29 @@ async function finishPanoramaProfileStartup(
   } finally {
     journal?.close();
   }
+}
+
+/**
+ * Takes the offline move results whose source operation is gone out of the
+ * plan of the IMAP sources (findStaleMoveResults): neither their pseudo header
+ * nor their operation is migrated.
+ *
+ * @param {object[]} sources - Planned sources; changed in place.
+ * @param {Map<object, object>} moves - getMorkMoveResults of each source.
+ * @param {function(string, string, number): void} note - Told the count left
+ *   out per source.
+ */
+function omitStaleMoveResults(sources, moves, note) {
+  const imap = sources.filter(source => source.protocol === "imap");
+  const stale = findStaleMoveResults(imap.map(source => moves.get(source)));
+  imap.forEach((source, index) => {
+    if (stale[index].length) {
+      const omitted = new Set(stale[index]);
+      source.omittedMessageKeys = stale[index];
+      source.messageKeys = source.messageKeys.filter(key => !omitted.has(key));
+      note("stale-move-results", source.id, stale[index].length);
+    }
+  });
 }
 
 /**

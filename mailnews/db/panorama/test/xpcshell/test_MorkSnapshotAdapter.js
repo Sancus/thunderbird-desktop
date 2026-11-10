@@ -28,6 +28,10 @@ const {
 const { MigrationJournal } = ChromeUtils.importESModule(
   "resource:///modules/panorama/MigrationJournal.sys.mjs"
 );
+const { parseMorkSummary, getMorkMoveResults, findStaleMoveResults } =
+  ChromeUtils.importESModule(
+    "resource:///modules/panorama/MorkSummaryReader.sys.mjs"
+  );
 const { MailStringUtils } = ChromeUtils.importESModule(
   "resource:///modules/MailStringUtils.sys.mjs"
 );
@@ -1142,6 +1146,94 @@ add_task(async function test_imapUnitAccountsUidAndOfflineRecords() {
       await IOUtils.computeHexDigest(member.source.path, "sha256"),
       saved.sha256
     );
+  }
+});
+
+// An offline move or copy leaves a "move result" with a pseudo header in its
+// destination. Once the source folder's operation is gone, old Thunderbird
+// discards the result at its next playback; Panorama cannot hold it. Such a
+// result is left out of the plan, and one that is still pending stays exact.
+add_task(async function test_staleMoveResultsAreLeftOutOfThePlan() {
+  const OPS = "ns:msg:db:row:scope:ops:all";
+  const entries = await genuineImapEntries();
+  const facts = [];
+  for (const entry of entries) {
+    facts.push(
+      getMorkMoveResults(
+        parseMorkSummary(await IOUtils.read(entry.input.source.path))
+      )
+    );
+  }
+  Assert.greater(
+    facts.reduce((count, folder) => count + folder.results.length, 0),
+    0,
+    "The fixture has pending move results"
+  );
+  Assert.deepEqual(
+    findStaleMoveResults(facts),
+    entries.map(() => []),
+    "A result whose source operation is pending is never stale"
+  );
+
+  // The source operations have been played back: their table lets go of them
+  // and the destination results are leftovers.
+  for (const [index, entry] of entries.entries()) {
+    for (const table of entry.input.records.tables) {
+      if (table.scope == OPS) {
+        table.rows = table.rows.filter(
+          key => !facts[index].origins.has(parseInt(key))
+        );
+      }
+    }
+  }
+  const convertUnit = () =>
+    convertMorkProtocolUnit(entries, "snapshot-imap-stale", database.sourceId);
+  Assert.throws(
+    convertUnit,
+    /counterpart|Unresolved/,
+    "A result without its source operation is not importable as it is"
+  );
+  const stale = findStaleMoveResults(
+    facts.map(folder => ({ results: folder.results, origins: new Set() }))
+  );
+  Assert.deepEqual(
+    stale,
+    facts.map(folder =>
+      folder.results.map(result => result.key).sort((a, b) => a - b)
+    )
+  );
+  for (const [index, entry] of entries.entries()) {
+    if (stale[index].length) {
+      entry.source.omittedMessageKeys = stale[index];
+      entry.source.messageKeys = entry.source.messageKeys.filter(
+        key => !stale[index].includes(key)
+      );
+    }
+  }
+  const request = convertUnit();
+  for (const [index, member] of request.folders.entries()) {
+    const omitted = new Set(stale[index]);
+    Assert.ok(member.recordsComplete);
+    Assert.ok(!member.messages.some(message => omitted.has(message.sourceKey)));
+    Assert.ok(!member.source.messageKeys.some(key => omitted.has(key)));
+    Assert.ok(!member.imap.operations.some(op => omitted.has(op.sourceKey)));
+    Assert.equal(
+      member.messages.length,
+      entries[index].input.messages.length -
+        entries[index].input.messages.filter(message =>
+          omitted.has(message.sourceKey)
+        ).length,
+      "Every other message is still imported"
+    );
+    Assert.deepEqual(
+      member.records.rows,
+      entries[index].input.records.rows,
+      "The original rows stay, as rows no table holds"
+    );
+    for (const message of member.messages) {
+      Assert.ok(!omitted.has(message.rootSourceKey));
+      Assert.ok(!omitted.has(message.parentSourceKey));
+    }
   }
 });
 

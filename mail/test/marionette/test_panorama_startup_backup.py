@@ -934,7 +934,11 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         unrelated = outside / "other-profile" / "Mail" / "cache-moved"
         unrelated.mkdir(parents=True)
         entries = {str(root): current, str(absent): current,
-                   str(unrelated): current}
+                   str(unrelated): current,
+                   # Legacy writes a folder without a file path under an empty
+                   # key; a key that is no absolute path reaches no folder.
+                   "": {"folderName": "No path"},
+                   "relative-descriptor": current}
         if sys.platform != "win32":
             # Another spelling of the current root, superseded by its exact entry.
             link = outside / "linked-mail"

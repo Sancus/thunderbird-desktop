@@ -25937,12 +25937,12 @@ TEST_F(DeliveryCoreReferences, StartupInvalidJSONNeverFallsBackToMork) {
   ASSERT_EQ(NS_OK, WriteStartupFile("panacea.dat", "historical bytes"_ns));
   ASSERT_EQ(NS_OK, ArmSelectedStartup());
   nsCString selected;
-  for (const char* raw : {"{", "[]", "null", "{\"relative\":{}}",
-                          "{\"/original.msf\":{\"flags\":true}}",
-                          "{\"/original.msf\":{\"flags\":4294967296}}",
-                          "{\"/original.msf\":{\"unknown\":1}}",
-                          "{\"/original.msf\":{\"custom\":null}}",
-                          "{\"/original.msf\":{\"custom\":{}}}"}) {
+  for (const char* raw :
+       {"{", "[]", "null", "{\"\":[]}", "{\"/original.msf\":{\"flags\":true}}",
+        "{\"/original.msf\":{\"flags\":4294967296}}",
+        "{\"/original.msf\":{\"unknown\":1}}",
+        "{\"/original.msf\":{\"custom\":null}}",
+        "{\"/original.msf\":{\"custom\":{}}}"}) {
     SCOPED_TRACE(raw);
     ASSERT_EQ(NS_OK,
               WriteStartupFile("folderCache.json", nsDependentCString(raw)));

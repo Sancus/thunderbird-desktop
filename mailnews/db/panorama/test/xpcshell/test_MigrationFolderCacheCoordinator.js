@@ -1573,10 +1573,14 @@ add_task(function test_JSONCacheRefusesUnsafeOrAmbiguousCellTypes() {
       /cache text/
     );
   }
-  Assert.throws(
-    () => parseJSONFolderCache(encode({ relative: {} })),
-    /cache row/
+  Assert.throws(() => parseJSONFolderCache(encode({ [key]: [] })), /cache row/);
+  // Thunderbird writes a folder without a file path under an empty key. Such
+  // an entry, like any key that is no absolute path, reaches no folder.
+  const pathless = parseJSONFolderCache(
+    encode({ "": { folderName: "No path" }, relative: {}, [key]: {} })
   );
+  Assert.deepEqual([...pathless.entries.keys()], ["", "relative", key]);
+  Assert.equal(pathless.entries.get("").values.folderName, "No path");
   Assert.throws(
     () => parseJSONFolderCache(encode({ [key]: { key: "replacement" } })),
     /cache property/
@@ -1772,13 +1776,19 @@ add_task(function test_JSONCacheObsoleteKeysAreExplicitAndRetained() {
     [...obsolete].reverse(),
     [obsolete[0], obsolete[0]],
     [key],
-    [""],
+    ["nul\0key"],
   ]) {
     Assert.throws(
       () => createMorkFolderCacheRequest({ ...unit, unboundKeys }),
       /Invalid obsolete folder-cache keys/
     );
   }
+  Assert.deepEqual(
+    createMorkFolderCacheRequest({ ...unit, unboundKeys: ["", ...obsolete] })
+      .unboundKeys,
+    ["", ...obsolete],
+    "The entry Thunderbird wrote under an empty key is accounted as obsolete"
+  );
   Assert.throws(
     () =>
       createMorkFolderCacheRequest({

@@ -7049,7 +7049,7 @@ nsresult CacheRequest(JSContext* cx, JS::Handle<JS::Value> value,
       NS_ENSURE_TRUE(JS_GetElement(cx, array, i, &field), NS_ERROR_FAILURE);
       nsCString key;
       MOZ_TRY(ImportText(cx, field, key));
-      NS_ENSURE_TRUE(!key.IsEmpty() && key.FindChar(0) < 0 &&
+      NS_ENSURE_TRUE(key.FindChar(0) < 0 &&
                          (input.unboundKeys.IsEmpty() ||
                           Compare(input.unboundKeys.LastElement(), key) < 0),
                      NS_ERROR_INVALID_ARG);
@@ -7069,8 +7069,11 @@ nsresult CacheRequest(JSContext* cx, JS::Handle<JS::Value> value,
 // device/inode. A linked leaf or reparse point is refused, never classified.
 nsresult CachePhysicalIdentity(const nsACString& path, nsCString& identity) {
   identity.Truncate();
+  // An empty key, or one that is no absolute path here, names no object.
   nsCOMPtr<nsIFile> file;
-  MOZ_TRY(NewComparableFile(path, getter_AddRefs(file)));
+  if (path.IsEmpty() ||
+      NS_FAILED(NewComparableFile(path, getter_AddRefs(file))))
+    return NS_OK;
   bool exists;
   MOZ_TRY(file->Exists(&exists));
   if (!exists) return NS_OK;

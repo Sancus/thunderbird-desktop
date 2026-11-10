@@ -131,12 +131,11 @@ export function parseJSONFolderCache(bytes) {
   };
   const entries = new Map();
   for (const [key, row] of Object.entries(source)) {
-    if (
-      !PathUtils.isAbsolute(text(key)) ||
-      !row ||
-      Array.isArray(row) ||
-      typeof row !== "object"
-    ) {
+    // Thunderbird writes the entry of a folder without a file path under an
+    // empty key. A key that is no absolute path here reaches no folder; it is
+    // accounted like any other obsolete entry, never refused.
+    text(key);
+    if (!row || Array.isArray(row) || typeof row !== "object") {
       throw new Error("Invalid native JSON cache row");
     }
     const properties = new Map([["key", key]]);
@@ -438,7 +437,6 @@ export function createMorkFolderCacheRequest(unit) {
     unboundKeys.some(
       (key, index) =>
         typeof key != "string" ||
-        !key ||
         key.includes("\0") ||
         (index && unboundKeys[index - 1] >= key) ||
         folders.some(

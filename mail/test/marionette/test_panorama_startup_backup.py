@@ -2450,12 +2450,18 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         work.mkdir(mode=0o700)
         self.created_work.add(work)
         journal = work / "journal.json"
-        journal.write_bytes(b'{"interrupted":"retained journal requires recovery"}\n')
-        self.assert_startup_refuses(
-            [saved_selector, saved_database, journal], absent=[database, selector]
-        )
-        self.assertFalse((work / "backup").exists(),
-                         "An existing journal cannot be hidden behind another backup")
+        leftover = b'{"interrupted":"a journal no migration finished"}\n'
+        journal.write_bytes(leftover)
+        # Work without a selector or a database is an attempt that never
+        # activated. It is never read as progress or resumed: startup sets it
+        # aside whole and proceeds from the unchanged profile.
+        self.start_same_profile(True)
+        fresh = self.selection()
+        self.assertNotEqual(selected["sourceId"], fresh["sourceId"])
+        aside = work / "incomplete-1"
+        self.assertEqual(["journal.json"], [path.name for path in aside.iterdir()])
+        self.assertEqual(leftover, (aside / "journal.json").read_bytes())
+        self.assertFalse((work / "incomplete-2").exists())
 
     def tearDown(self):
         try:
@@ -2895,8 +2901,9 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         return mappings
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "POSIX file-size limit")
-    def test_interruptedStartupBackupIsNeverAccepted(self):
-        """S7-15.1: cut the real opt-in startup copy; restart never accepts it."""
+    def test_interruptedStartupBackupIsSetAsideAndMigrationRetried(self):
+        """S7-15.1: cut the real opt-in startup copy; restart never accepts it
+        and completes a new migration unaided."""
         self.clean_profile(False)
         source = self.create_legacy_message("mbox")
         self.stop_application()
@@ -2929,15 +2936,20 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         for path, contents in originals.items():
             self.assertEqual(contents, path.read_bytes())
 
-        # Partial work without a selector is explicit recovery: restart never
-        # accepts, resumes or replaces the incomplete archive.
-        self.assert_startup_refuses(
-            [backup / "manifest.json", large, *originals],
-            absent=[work / "journal.json", self.profile / "panorama-profile.json",
-                    self.profile / "panorama.sqlite"],
-        )
-        self.assertIs(False, json.loads((backup / "manifest.json").read_bytes())["complete"])
-        self.assertFalse(installed.exists())
+        # Partial work without a selector never activated. Restart never
+        # accepts or resumes the incomplete archive: it sets it aside whole and
+        # migrates again, unaided, from the unchanged original.
+        self.start_same_profile(True)
+        selected = self.selection()
+        self.assertEqual("migrated", selected["record"]["origin"])
+        aside = work / "incomplete-1" / "backup"
+        self.assertEqual(manifest_bytes, (aside / "manifest.json").read_bytes())
+        self.assertFalse(
+            (aside / profile_root["directory"] / large.relative_to(self.profile)).exists())
+        self.assertIs(True, json.loads((backup / "manifest.json").read_bytes())["complete"])
+        self.assertEqual(digest, hashlib.sha256(large.read_bytes()).hexdigest())
+        for path, contents in originals.items():
+            self.assertEqual(contents, path.read_bytes(), path.name)
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux process lifecycle")
     def test_interruptedActivationCutoverNeverExposesActiveState(self):
@@ -2973,17 +2985,78 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         for path, contents in originals.items():
             self.assertEqual(contents, path.read_bytes())
 
-        retained = [selector, journal, database, *summaries]
-        self.assert_startup_refuses(retained)
-        before = {path: path.read_bytes() for path in retained}
-        self.marionette.instance.profile.set_preferences({"mail.panorama.enabled": False})
-        self.marionette.instance.start()
-        code = self.marionette.instance.runner.wait(timeout=self.marionette.startup_timeout)
-        self.assertEqual(5, code, "Legacy default never ignores an unvalidated selection")
-        for path, contents in before.items():
-            self.assertEqual(contents, path.read_bytes())
-        self.assertEqual(mappings, self.native_unit_mappings())
-        self.assertEqual("prepared", json.loads(selector.read_bytes())["state"])
+        # The attempt never activated, so nothing the old application reads
+        # changed. The next start sets it aside whole (candidate database,
+        # selector and journal, byte for byte) and migrates again unaided.
+        attempt = {path: path.read_bytes() for path in (selector, journal, database)}
+        self.start_same_profile(True)
+        selected = self.selection()
+        self.assertEqual("migrated", selected["record"]["origin"])
+        aside = work / "incomplete-1"
+        for path, contents in attempt.items():
+            self.assertEqual(contents, (aside / path.name).read_bytes(), path.name)
+        self.assertEqual(
+            "prepared",
+            json.loads((aside / "panorama-profile.json").read_bytes())["state"])
+        self.assertFalse((work / "incomplete-2").exists())
+        self.assertNotEqual(
+            attempt[selector], selector.read_bytes(), "A new selection, not the old one")
+        for path, contents in originals.items():
+            self.assertEqual(contents, path.read_bytes(), path.name)
+        self.stop_application()
+        again = self.native_unit_mappings()
+        self.assertEqual(sorted(mappings), sorted(again))
+        self.assertEqual(len(summaries), sum(value[1] for value in again.values()))
+        self.start_same_profile(True)
+        self.assertEqual(selected["sourceId"], self.selection()["sourceId"])
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux process lifecycle")
+    def test_neverActivatedAttemptRetriesTwicePerBuildThenStops(self):
+        """One build migrates again twice on its own. Its third attempt stays
+        in place and startup stops; with the backend switched off the attempt
+        is set aside and the old application starts from its unchanged
+        profile. All data is fabricated."""
+        self.clean_profile(False)
+        source = self.create_legacy_folders(3)
+        self.stop_application()
+        summaries = [Path(folder["summary"]) for folder in source["folders"]]
+        originals = {path: path.read_bytes() for path in summaries}
+        work = self.profile.parent / ("panorama-migration-" + self.profile.name)
+        self.created_work.add(work)
+        selector = self.profile / "panorama-profile.json"
+        database = self.profile / "panorama.sqlite"
+        for attempt in (1, 2, 3):
+            self.fail_selector_publication()
+            self.assertEqual("prepared", json.loads(selector.read_bytes())["state"])
+            self.assertEqual(
+                ["incomplete-%d" % number for number in range(1, attempt)],
+                sorted(path.name for path in work.glob("incomplete-*")))
+        journal = work / "journal.json"
+        self.assert_startup_refuses([selector, journal, database, *summaries],
+                                    absent=[work / "incomplete-3"])
+        third = {path: path.read_bytes() for path in (selector, journal, database)}
+
+        self.start_same_profile(False)
+        for path, contents in third.items():
+            self.assertFalse(path.exists(), path.name)
+            self.assertEqual(contents, (work / "incomplete-3" / path.name).read_bytes())
+        folders = self.marionette.execute_script("""
+            const { MailServices } = ChromeUtils.importESModule(
+              'resource:///modules/MailServices.sys.mjs');
+            return MailServices.accounts.getIncomingServer(arguments[0])
+              .rootFolder.subFolders.map(folder => folder.getTotalMessages(false));
+        """, script_args=[source["serverKey"]])
+        self.assertEqual(len(summaries), sum(folders))
+        self.stop_application()
+
+        # Switching the backend on again is the user's own new attempt.
+        self.start_same_profile(True)
+        selected = self.selection()
+        self.assertEqual("migrated", selected["record"]["origin"])
+        self.assertFalse((work / "incomplete-4").exists())
+        self.stop_application()
+        self.assertEqual(len(summaries),
+                         sum(value[1] for value in self.native_unit_mappings().values()))
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "POSIX file-size limit")
     def test_interruptedRestoreCopyClaimsNoCompletion(self):

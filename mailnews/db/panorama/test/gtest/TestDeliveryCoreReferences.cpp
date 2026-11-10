@@ -3422,6 +3422,76 @@ class DeliveryCoreReferences : public testing::Test {
     NS_ENSURE_TRUE(written == bytes.Length(), NS_ERROR_FAILURE);
     return close;
   }
+  // The sibling work directory of this fixture's profile, created on demand
+  // and removed with the fixture.
+  nsresult StartupFixtureWork(nsIFile** output) {
+    nsCOMPtr<nsIFile> work;
+    MOZ_TRY(mProfile->GetParent(getter_AddRefs(work)));
+    nsCString leaf;
+    MOZ_TRY(mProfile->GetNativeLeafName(leaf));
+    MOZ_TRY(work->AppendNative("panorama-migration-"_ns + leaf));
+    bool exists;
+    MOZ_TRY(work->Exists(&exists));
+    if (!exists) MOZ_TRY(work->Create(nsIFile::DIRECTORY_TYPE, 0700));
+    mStartupFixtureWork = work;
+    work.forget(output);
+    return NS_OK;
+  }
+  // The selector a migration writes before it has a target, as |build| wrote
+  // it (this build when null).
+  nsresult PreparedMigrationSelector(nsACString& bytes,
+                                     const char* build = nullptr,
+                                     const char* origin = "migrated") {
+    dom::AutoJSAPI jsapi;
+    NS_ENSURE_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()), NS_ERROR_FAILURE);
+    nsCOMPtr<nsIXULAppInfo> app = do_GetService("@mozilla.org/xre/app-info;1");
+    NS_ENSURE_TRUE(app, NS_ERROR_NOT_AVAILABLE);
+    nsCString current;
+    MOZ_TRY(app->GetAppBuildID(current));
+    nsCString json(
+        "{\"formatVersion\":2,\"backend\":\"panorama\",\"origin\":\"");
+    json.Append(origin);
+    json.AppendLiteral(
+        "\",\"state\":\"prepared\",\"application\":{\"version\":\"1.0\","
+        "\"buildId\":\"");
+    json.Append(build ? build : current.get());
+    json.AppendLiteral("\"},\"identity\":{\"profilePath\":@PROFILE@}}");
+    JS::Rooted<JS::Value> value(jsapi.cx());
+    MOZ_TRY(StartupDocument(jsapi.cx(), json, &value));
+    return StartupJSONValue(jsapi.cx(), value, bytes);
+  }
+  static nsresult WriteStartupChild(nsIFile* directory, const char* leaf,
+                                    const nsACString& bytes) {
+    nsCOMPtr<nsIFile> file;
+    MOZ_TRY(directory->Clone(getter_AddRefs(file)));
+    MOZ_TRY(file->AppendNative(nsDependentCString(leaf)));
+    return StartupWriteControl(file, bytes);
+  }
+  // An attempt of |build| already set aside as incomplete-|number|.
+  nsresult WriteSetAsideAttempt(nsIFile* work, uint32_t number,
+                                const char* build = nullptr) {
+    nsCOMPtr<nsIFile> aside;
+    MOZ_TRY(work->Clone(getter_AddRefs(aside)));
+    MOZ_TRY(aside->AppendNative(nsPrintfCString("incomplete-%u", number)));
+    MOZ_TRY(aside->Create(nsIFile::DIRECTORY_TYPE, 0700));
+    nsCString selector;
+    MOZ_TRY(PreparedMigrationSelector(selector, build));
+    return WriteStartupChild(aside, "panorama-profile.json", selector);
+  }
+  void ExpectStartupChild(nsIFile* directory, const char* path,
+                          const Maybe<nsCString>& expected) {
+    nsCOMPtr<nsIFile> file;
+    ASSERT_EQ(NS_OK, directory->Clone(getter_AddRefs(file)));
+    ASSERT_EQ(NS_OK, file->AppendRelativeNativePath(nsDependentCString(path)));
+    bool exists;
+    ASSERT_EQ(NS_OK, file->Exists(&exists));
+    ASSERT_EQ(expected.isSome(), exists) << path;
+    if (expected) {
+      nsCString actual;
+      ASSERT_EQ(NS_OK, JSONCacheReadFile(file, actual));
+      EXPECT_EQ(*expected, actual) << path;
+    }
+  }
   nsresult DescribeStartup(nsACString& json) {
     dom::AutoJSAPI jsapi;
     NS_ENSURE_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()), NS_ERROR_FAILURE);
@@ -26014,6 +26084,126 @@ TEST_F(DeliveryCoreReferences, StartupLeavesUnreferencedLegacyFilesAlone) {
   ASSERT_EQ(NS_OK, DescribeStartup(selected));
   EXPECT_NE(kNotFound, selected.Find("\"mode\":\"initialize\""));
   ASSERT_EQ(NS_OK, OpenStartup("initialize"));
+}
+
+// A migration that never activated left its selector "prepared" and changed
+// nothing the old application reads. Startup moves everything it left into
+// its work directory, untouched, and selects as if it had never run.
+TEST_F(DeliveryCoreReferences, StartupSetsNeverActivatedAttemptAside) {
+  nsCOMPtr<nsIFile> work;
+  ASSERT_EQ(NS_OK, StartupFixtureWork(getter_AddRefs(work)));
+  nsCString selector;
+  ASSERT_EQ(NS_OK, PreparedMigrationSelector(selector));
+  ASSERT_EQ(NS_OK, WriteStartupFile("panorama-profile.json", selector));
+  ASSERT_EQ(NS_OK, WriteStartupFile("panorama.sqlite", "candidate"_ns));
+  ASSERT_EQ(NS_OK, WriteStartupFile("panorama.sqlite-wal", "candidate log"_ns));
+  ASSERT_EQ(NS_OK, WriteStartupChild(work, "journal.json", "its journal"_ns));
+  nsCOMPtr<nsIFile> backup;
+  ASSERT_EQ(NS_OK, work->Clone(getter_AddRefs(backup)));
+  ASSERT_EQ(NS_OK, backup->AppendNative("backup"_ns));
+  ASSERT_EQ(NS_OK, backup->Create(nsIFile::DIRECTORY_TYPE, 0700));
+  ASSERT_EQ(NS_OK, WriteStartupChild(backup, "manifest.json", "its copy"_ns));
+  ASSERT_EQ(NS_OK, ArmSelectedStartup());
+  nsCString selected;
+  ASSERT_EQ(NS_OK, DescribeStartup(selected));
+  EXPECT_NE(kNotFound, selected.Find("\"mode\":\"initialize\""));
+  for (const char* leaf :
+       {"panorama-profile.json", "panorama.sqlite", "panorama.sqlite-wal"}) {
+    ExpectStartupChild(mProfile, leaf, Nothing());
+  }
+  ExpectStartupChild(work, "journal.json", Nothing());
+  ExpectStartupChild(work, "incomplete-1/panorama-profile.json",
+                     Some(selector));
+  ExpectStartupChild(work, "incomplete-1/panorama.sqlite",
+                     Some("candidate"_ns));
+  ExpectStartupChild(work, "incomplete-1/panorama.sqlite-wal",
+                     Some("candidate log"_ns));
+  ExpectStartupChild(work, "incomplete-1/journal.json", Some("its journal"_ns));
+  ExpectStartupChild(work, "incomplete-1/backup/manifest.json",
+                     Some("its copy"_ns));
+  ASSERT_EQ(NS_OK, OpenStartup("initialize"));
+}
+
+// Work a migration left before it had a selector or a database.
+TEST_F(DeliveryCoreReferences, StartupSetsAsideWorkLeftWithoutSelector) {
+  nsCOMPtr<nsIFile> work;
+  ASSERT_EQ(NS_OK, StartupFixtureWork(getter_AddRefs(work)));
+  ASSERT_EQ(NS_OK, WriteSetAsideAttempt(work, 4, "20000101000000"));
+  ASSERT_EQ(NS_OK, WriteStartupChild(work, "journal.json", "cut short"_ns));
+  ASSERT_EQ(NS_OK, ArmSelectedStartup());
+  nsCString selected;
+  ASSERT_EQ(NS_OK, DescribeStartup(selected));
+  EXPECT_NE(kNotFound, selected.Find("\"mode\":\"initialize\""));
+  ExpectStartupChild(work, "journal.json", Nothing());
+  ExpectStartupChild(work, "incomplete-5/journal.json", Some("cut short"_ns));
+}
+
+// One build migrates again twice. Its third attempt stays where it is, and
+// startup stops on the prepared selector as it always did.
+TEST_F(DeliveryCoreReferences, StartupStopsAfterThisBuildRetriedTwice) {
+  nsCOMPtr<nsIFile> work;
+  ASSERT_EQ(NS_OK, StartupFixtureWork(getter_AddRefs(work)));
+  ASSERT_EQ(NS_OK, WriteSetAsideAttempt(work, 1));
+  ASSERT_EQ(NS_OK, WriteSetAsideAttempt(work, 2));
+  nsCString selector;
+  ASSERT_EQ(NS_OK, PreparedMigrationSelector(selector));
+  ASSERT_EQ(NS_OK, WriteStartupFile("panorama-profile.json", selector));
+  ASSERT_EQ(NS_OK, WriteStartupChild(work, "journal.json", "third"_ns));
+  ASSERT_EQ(NS_OK, ArmSelectedStartup());
+  nsCString selected;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DescribeStartup(selected));
+  ExpectStartupChild(mProfile, "panorama-profile.json", Some(selector));
+  ExpectStartupChild(work, "journal.json", Some("third"_ns));
+  ExpectStartupChild(work, "incomplete-3", Nothing());
+}
+
+// What another build could not finish says nothing about this one.
+TEST_F(DeliveryCoreReferences, StartupRetriesAttemptsOfAnotherBuild) {
+  constexpr auto other = "20000101000000";
+  nsCOMPtr<nsIFile> work;
+  ASSERT_EQ(NS_OK, StartupFixtureWork(getter_AddRefs(work)));
+  for (uint32_t number : {1u, 2u, 3u}) {
+    ASSERT_EQ(NS_OK, WriteSetAsideAttempt(work, number, other));
+  }
+  nsCString selector;
+  ASSERT_EQ(NS_OK, PreparedMigrationSelector(selector, other));
+  ASSERT_EQ(NS_OK, WriteStartupFile("panorama-profile.json", selector));
+  ASSERT_EQ(NS_OK, ArmSelectedStartup());
+  nsCString selected;
+  ASSERT_EQ(NS_OK, DescribeStartup(selected));
+  EXPECT_NE(kNotFound, selected.Find("\"mode\":\"initialize\""));
+  ExpectStartupChild(mProfile, "panorama-profile.json", Nothing());
+  ExpectStartupChild(work, "incomplete-4/panorama-profile.json",
+                     Some(selector));
+}
+
+// Only a migration's own never-activated selector is such an attempt. A
+// prepared selector of any other origin, and work a restore owns, stay.
+TEST_F(DeliveryCoreReferences, StartupNeverSetsAsideOtherPreparedSelectors) {
+  nsCString selector;
+  ASSERT_EQ(NS_OK,
+            PreparedMigrationSelector(selector, nullptr, "initialized-empty"));
+  ASSERT_EQ(NS_OK, WriteStartupFile("panorama-profile.json", selector));
+  ASSERT_EQ(NS_OK, ArmSelectedStartup());
+  nsCString selected;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DescribeStartup(selected));
+  ExpectStartupChild(mProfile, "panorama-profile.json", Some(selector));
+}
+
+TEST_F(DeliveryCoreReferences, StartupNeverSetsAsideWorkOfARestore) {
+  nsCOMPtr<nsIFile> work;
+  ASSERT_EQ(NS_OK, StartupFixtureWork(getter_AddRefs(work)));
+  nsCString selector;
+  ASSERT_EQ(NS_OK, PreparedMigrationSelector(selector));
+  ASSERT_EQ(NS_OK, WriteStartupFile("panorama-profile.json", selector));
+  ASSERT_EQ(NS_OK, WriteStartupChild(work, "journal.json", "retained"_ns));
+  ASSERT_EQ(NS_OK, WriteStartupChild(work, "restore.json", "{}"_ns));
+  ASSERT_EQ(NS_OK, ArmSelectedStartup());
+  nsCString selected;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DescribeStartup(selected));
+  ExpectStartupChild(mProfile, "panorama-profile.json", Some(selector));
+  ExpectStartupChild(work, "journal.json", Some("retained"_ns));
+  ExpectStartupChild(work, "incomplete-1", Nothing());
 }
 
 TEST_F(DeliveryCoreReferences, StartupEmptyJSONRetainsOtherLegacyData) {

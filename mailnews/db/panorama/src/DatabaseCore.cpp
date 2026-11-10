@@ -490,6 +490,7 @@ nsresult RestorePending(nsIFile* profile, bool& pending,
 #endif
   return NS_OK;
 }
+nsresult StartupSetAsideIncomplete(JSContext* cx, nsIFile* profile, bool retry);
 }  // namespace
 
 nsresult DatabaseCore::ArmProfileStartup(nsIFile* profile, nsIFile* local) {
@@ -722,6 +723,17 @@ DatabaseCore::Observe(nsISupports* aSubject, const char* aTopic,
     if (NS_SUCCEEDED(rv)) rv = RestorePending(profile, hasRestore);
     if (NS_SUCCEEDED(rv))
       rv = RestorePending(profile, hasAudit, "restore-current.json");
+    if (NS_SUCCEEDED(rv) && !hasRestore && !hasAudit) {
+      const bool enabled = StaticPrefs::mail_panorama_enabled_AtStartup();
+      dom::AutoJSAPI jsapi;
+      nsresult aside =
+          jsapi.Init(xpc::PrivilegedJunkScope())
+              ? StartupSetAsideIncomplete(jsapi.cx(), profile, enabled)
+              : NS_ERROR_FAILURE;
+      // With the backend off this only clears the way for the old
+      // application; what could not be moved is refused below as before.
+      if (enabled) rv = aside;
+    }
     if (NS_SUCCEEDED(rv))
       rv = StartupChild(profile, "panorama-profile.json",
                         getter_AddRefs(selector));
@@ -9010,6 +9022,132 @@ nsresult StartupSelector(JSContext* cx, ProfileStartupOperation& operation,
   NS_ENSURE_TRUE(profile == operation.profilePath, NS_ERROR_NOT_AVAILABLE);
   return NS_OK;
 }
+// How often one application build migrates again, unaided, after an attempt
+// of its own did not reach activation.
+constexpr uint32_t kStartupRetries = 2;
+// Whether this is the selector of a migration of this profile that never
+// activated, and which application build wrote it. Any other selector, and
+// one that cannot be read, is not.
+bool StartupIncompleteSelector(JSContext* cx, nsIFile* file,
+                               const nsACString& profilePath,
+                               nsACString& build) {
+  // An active selector carries every import receipt and is megabytes; it is
+  // not parsed here a second time just to learn that it is not "prepared".
+  nsCString text;
+  if (NS_FAILED(StartupRead(file, text)) ||
+      text.Find("\"prepared\""_ns) == kNotFound) {
+    return false;
+  }
+  JS::Rooted<JS::Value> value(cx);
+  JS::Rooted<JSObject*> record(cx), identity(cx), application(cx);
+  nsAutoCString backend, state, origin, profile, recorded;
+  int64_t version;
+  if (NS_SUCCEEDED(StartupParse(cx, text, &value))) record = &value.toObject();
+  const bool incomplete =
+      record &&
+      NS_SUCCEEDED(StartupNumber(cx, record, "formatVersion", 2, 2, version)) &&
+      NS_SUCCEEDED(StartupText(cx, record, "backend", backend)) &&
+      NS_SUCCEEDED(StartupText(cx, record, "state", state)) &&
+      NS_SUCCEEDED(StartupText(cx, record, "origin", origin)) &&
+      NS_SUCCEEDED(StartupObject(cx, record, "identity", &identity)) &&
+      NS_SUCCEEDED(StartupText(cx, identity, "profilePath", profile)) &&
+      NS_SUCCEEDED(StartupObject(cx, record, "application", &application)) &&
+      NS_SUCCEEDED(StartupText(cx, application, "buildId", recorded)) &&
+      backend == "panorama"_ns && state == "prepared"_ns &&
+      origin == "migrated"_ns && profile == profilePath;
+  JS_ClearPendingException(cx);
+  if (incomplete) build = recorded;
+  return incomplete;
+}
+// A migration that never activated has changed nothing the old application
+// reads, and its selector still says "prepared". Whatever it left (candidate
+// database, selector, journal, index backup) is moved whole into a numbered
+// directory of its work directory, so that this startup migrates again from
+// the unchanged original. Nothing is deleted. With |retry|, a build that has
+// already retried kStartupRetries times leaves its attempt where it is, and
+// startup stops on it as before. A requested or settled restore owns the work
+// directory and is never touched.
+nsresult StartupSetAsideIncomplete(JSContext* cx, nsIFile* profile,
+                                   bool retry) {
+  nsCOMPtr<nsIFile> selector, database, work;
+  MOZ_TRY(
+      StartupChild(profile, "panorama-profile.json", getter_AddRefs(selector)));
+  MOZ_TRY(StartupChild(profile, "panorama.sqlite", getter_AddRefs(database)));
+  MOZ_TRY(profile->GetParent(getter_AddRefs(work)));
+  if (!work) return NS_OK;
+  nsAutoString leaf;
+  MOZ_TRY(profile->GetLeafName(leaf));
+  MOZ_TRY(work->Append(u"panorama-migration-"_ns + leaf));
+  bool hasSelector, hasDatabase, hasWork;
+  MOZ_TRY(selector->Exists(&hasSelector));
+  MOZ_TRY(database->Exists(&hasDatabase));
+  MOZ_TRY(work->Exists(&hasWork));
+  // Without a selector, only what a migration left in its work directory
+  // before it had a database is such an attempt.
+  if (!hasSelector && (hasDatabase || !hasWork)) return NS_OK;
+  nsAutoCString profilePath, current;
+  MOZ_TRY(StartupDirectory(profile, profilePath));
+  nsCOMPtr<nsIXULAppInfo> app = do_GetService("@mozilla.org/xre/app-info;1");
+  NS_ENSURE_TRUE(app, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(app->GetAppBuildID(current));
+  nsAutoCString build(current);
+  if (hasSelector &&
+      !StartupIncompleteSelector(cx, selector, profilePath, build)) {
+    return NS_OK;
+  }
+  uint32_t attempts = build == current ? 1 : 0;
+  int32_t last = 0;
+  nsTArray<nsCOMPtr<nsIFile>> leftovers;
+  if (hasWork) {
+    nsAutoCString path;
+    MOZ_TRY(StartupDirectory(work, path));
+    nsCOMPtr<nsIDirectoryEnumerator> entries;
+    MOZ_TRY(work->GetDirectoryEntries(getter_AddRefs(entries)));
+    nsCOMPtr<nsIFile> entry;
+    while (NS_SUCCEEDED(entries->GetNextFile(getter_AddRefs(entry))) && entry) {
+      nsAutoString name;
+      MOZ_TRY(entry->GetLeafName(name));
+      if (name == u"restore.json"_ns || name == u"restore-current.json"_ns) {
+        return NS_OK;
+      }
+      if (!StringBeginsWith(name, u"incomplete-"_ns)) {
+        leftovers.AppendElement(entry);
+        continue;
+      }
+      nsresult rv;
+      const int32_t number = nsAutoString(Substring(name, 11)).ToInteger(&rv);
+      if (NS_SUCCEEDED(rv) && number > last) last = number;
+      // An earlier attempt without a readable selector counts as this build's.
+      nsCOMPtr<nsIFile> earlier;
+      MOZ_TRY(StartupChild(entry, "panorama-profile.json",
+                           getter_AddRefs(earlier)));
+      nsAutoCString earlierBuild(current);
+      (void)StartupIncompleteSelector(cx, earlier, profilePath, earlierBuild);
+      if (earlierBuild == current) ++attempts;
+    }
+  }
+  if (!hasSelector && leftovers.IsEmpty()) return NS_OK;
+  if (retry && attempts > kStartupRetries) return NS_OK;
+  NS_ENSURE_TRUE(last < INT32_MAX, NS_ERROR_FILE_TOO_BIG);
+  nsCOMPtr<nsIFile> aside;
+  MOZ_TRY(work->Clone(getter_AddRefs(aside)));
+  MOZ_TRY(aside->AppendNative(nsPrintfCString("incomplete-%d", last + 1)));
+  MOZ_TRY(aside->Create(nsIFile::DIRECTORY_TYPE, 0700));
+  for (const auto& entry : leftovers) {
+    MOZ_TRY(entry->MoveTo(aside, u""_ns));
+  }
+  // The selector goes last: until then this is still the same attempt.
+  for (const char* name :
+       {"panorama.sqlite-journal", "panorama.sqlite-wal", "panorama.sqlite-shm",
+        "panorama.sqlite", "panorama-profile.json"}) {
+    nsCOMPtr<nsIFile> file;
+    MOZ_TRY(StartupChild(profile, name, getter_AddRefs(file)));
+    bool exists;
+    MOZ_TRY(file->Exists(&exists));
+    if (exists) MOZ_TRY(file->MoveTo(aside, u""_ns));
+  }
+  return NS_OK;
+}
 nsresult StartupSchema(mozIStorageConnection* reader, int32_t version) {
   NS_ENSURE_TRUE(version >= 0 && version <= 21, NS_ERROR_NOT_AVAILABLE);
   // These are the original upgrade pre/post layouts at their actual versions.
@@ -13731,6 +13869,9 @@ nsresult DatabaseCore::DescribeProfileStartup(
   if (!operation.selected) {
     AutoRestore<bool> busy(operation.busy);
     operation.busy = true;
+    if (!operation.auditCandidate) {
+      MOZ_TRY(StartupSetAsideIncomplete(cx, operation.profile, true));
+    }
     JS::Rooted<JSObject*> selector(cx);
     MOZ_TRY(StartupSelector(cx, operation, &selector));
     nsCOMPtr<nsIFile> file;

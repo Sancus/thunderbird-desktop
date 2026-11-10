@@ -2536,10 +2536,16 @@ function captureStartupMigration(signal, nativeAudit) {
   const selectorExists = startupEntryExists(selector);
   const audit = work.clone();
   audit.append("restore-current.json");
+  // Attempts that never activated were set aside whole before this capture
+  // (StartupSetAsideIncomplete) and are no obstacle. Anything else left here
+  // is one the native side declined to move.
   if (
     startupEntryExists(work) &&
     !selectorExists &&
-    nativeAudit?.restoreAuditPath !== audit.path
+    nativeAudit?.restoreAuditPath !== audit.path &&
+    [...work.directoryEntries].some(
+      entry => !/^incomplete-\d+$/.test(entry.leafName) || !entry.isDirectory()
+    )
   ) {
     throw new Error("Existing migration work requires explicit recovery");
   }
@@ -3653,13 +3659,18 @@ async function finishPanoramaProfileStartup(
         if (!target && !startupEntryExists(databaseFile)) {
           // This operation alone created the prepared selector. No target was
           // created, so legacy can still use the untouched original profile.
-          // Retained work continues to require explicit recovery on opt-in.
           await IOUtils.remove(
             PathUtils.join(captured.profilePath, "panorama-profile.json")
           );
-        } else {
+        } else if (
+          (await getMigrationProfileState(captured.profilePath)).state !==
+          "prepared"
+        ) {
           await requireStartupProfileRecovery(captured.profilePath);
         }
+        // A selector still "prepared" never activated: the original profile
+        // is unchanged, and the next startup sets this attempt aside whole
+        // and migrates again (StartupSetAsideIncomplete).
       } catch (secondary) {
         console.error(
           "Could not persist startup recovery selection",

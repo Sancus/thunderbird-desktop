@@ -2590,35 +2590,61 @@ function captureStartupMigration(signal, nativeAudit) {
       storeContractID: contract,
     });
   }
-  const files = [];
+  // Discover from the configuration outward: the caches and books at the top
+  // of the profile, then each account server's own root and root summary.
+  // Nothing else in the profile is migration input, so nothing else is read,
+  // and a link or special file elsewhere is none of this migration's business.
+  const found = new Map();
+  const add = file => {
+    if (file.isSymlink()) {
+      throw new Error("Startup inventory contains a link");
+    }
+    if (!file.isFile()) {
+      throw new Error("Startup inventory contains a nonregular file");
+    }
+    found.set(file.path, file.clone());
+  };
   const visit = directory => {
     for (const entry of directory.directoryEntries) {
       const file = entry.QueryInterface(Ci.nsIFile);
-      if (
-        directory.equals(profile) &&
-        ["parent.lock", ".parentlock", "lock"].includes(file.leafName)
-      ) {
-        continue;
-      }
       if (file.isSymlink()) {
         throw new Error("Startup inventory contains a link");
       }
       if (file.isDirectory()) {
         visit(file);
-      } else if (file.isFile()) {
-        files.push(file.clone());
       } else {
-        throw new Error("Startup inventory contains a nonregular file");
+        add(file);
       }
     }
   };
-  visit(profile);
-  for (const root of externalRoots) {
-    visit(root);
+  for (const entry of profile.directoryEntries) {
+    const file = entry.QueryInterface(Ci.nsIFile);
+    if (
+      ["panacea.dat", "folderCache.json"].includes(file.leafName) ||
+      file.leafName.endsWith(".mab")
+    ) {
+      add(file);
+    }
   }
+  const serverRoots = servers.map(server => new FileUtils.File(server.root));
+  for (const root of serverRoots) {
+    if (!startupEntryExists(root)) {
+      continue;
+    }
+    if (!root.isDirectory()) {
+      throw new Error("Server root is not a directory");
+    }
+    visit(root);
+    const rootSummary = new FileUtils.File(root.path + ".msf");
+    if (startupEntryExists(rootSummary)) {
+      add(rootSummary);
+    }
+  }
+  const files = [...found.values()];
   const summaries = [];
   const serverSummaries = [];
   const books = [];
+  const bookFiles = [];
   const caches = [];
   let unreferenced = 0;
   for (const file of files) {
@@ -2686,10 +2712,9 @@ function captureStartupMigration(signal, nativeAudit) {
         ),
       });
     } else if (file.leafName.endsWith(".mab")) {
-      books.push({
-        id: "book:" + file.getRelativePath(profile),
-        path: file.path,
-      });
+      if (file.parent.equals(profile)) {
+        bookFiles.push(file);
+      }
     } else if (
       file.parent.equals(profile) &&
       ["panacea.dat", "folderCache.json"].includes(file.leafName)
@@ -2702,8 +2727,7 @@ function captureStartupMigration(signal, nativeAudit) {
   }
   if (unreferenced) {
     console.warn(
-      "Panorama migration leaves summaries of no current account in place; " +
-        "they stay in the backup",
+      "Panorama migration leaves summaries of no current account in place",
       unreferenced
     );
   }
@@ -2746,7 +2770,7 @@ function captureStartupMigration(signal, nativeAudit) {
       throw new Error("Message-store data has no supported Mork summary");
     }
   }
-  if (books.length) {
+  if (bookFiles.length) {
     const profiles = Cc["@mozilla.org/toolkit/profile-service;1"].getService(
       Ci.nsIToolkitProfileService
     );
@@ -2766,7 +2790,12 @@ function captureStartupMigration(signal, nativeAudit) {
       if (!pref.endsWith(".filename")) {
         continue;
       }
-      const filename = Services.prefs.getStringPref(pref);
+      const filename = Services.prefs.getStringPref(pref, "");
+      // Only a Mork book is migration input; any other directory is not
+      // this migration's business.
+      if (!filename.endsWith(".mab")) {
+        continue;
+      }
       const file = PathUtils.isAbsolute(filename)
         ? startupSourceFile(filename)
         : startupSourceFile(PathUtils.join(profile.path, filename));
@@ -2793,11 +2822,23 @@ function captureStartupMigration(signal, nativeAudit) {
       }
       names.set(file.path, name);
     }
-    for (const book of books) {
-      if (!names.has(book.path)) {
-        throw new Error("Mork address book has no unique persisted directory");
+    // A Mork file no directory names is the leftover of a removed or already
+    // converted book. Thunderbird never opens it; it stays in place.
+    for (const file of bookFiles) {
+      if (names.has(file.path)) {
+        books.push({
+          id: "book:" + file.getRelativePath(profile),
+          path: file.path,
+          dirName: names.get(file.path),
+        });
       }
-      book.dirName = names.get(book.path);
+    }
+    if (books.length != bookFiles.length) {
+      console.warn(
+        "Panorama migration leaves address-book files of no current " +
+          "directory in place",
+        bookFiles.length - books.length
+      );
     }
   }
   if (
@@ -2844,11 +2885,74 @@ function captureStartupMigration(signal, nativeAudit) {
   // Windows the journal7 inventory and backup3 originalRoots use exactly
   // these admitted spellings; in-profile roots are part of the profile.
   const mailPaths = externalRoots.map(root => root.path);
+  // An index migration changes no message store, so none is read or copied:
+  // the backup holds the metadata that is migration input (and the small
+  // account files beside it) and measures each store in place.
+  const key = file => {
+    const normalized = file.clone();
+    normalized.normalize();
+    return normalized.path;
+  };
+  const copied = new Set(
+    [...summaries, ...serverSummaries, ...books, ...caches].map(input =>
+      key(new FileUtils.File(input.path))
+    )
+  );
+  for (const name of [
+    "prefs.js",
+    "user.js",
+    "folderCache.json",
+    "panacea.dat",
+    "virtualFolders.dat",
+  ]) {
+    copied.add(PathUtils.join(profile.path, name));
+  }
+  for (const server of servers) {
+    if (server.protocol !== "nntp") {
+      continue;
+    }
+    // A news server keeps its subscriptions and read state beside its root.
+    const branch = "mail.server." + server.key + ".newsrc.file";
+    let newsrc = null;
+    if (Services.prefs.prefHasUserValue(branch + "-rel")) {
+      newsrc = Services.prefs.getComplexValue(
+        branch + "-rel",
+        Ci.nsIRelativeFilePref
+      ).file;
+    } else if (Services.prefs.prefHasUserValue(branch)) {
+      newsrc = Services.prefs.getComplexValue(branch, Ci.nsIFile);
+    }
+    if (newsrc) {
+      copied.add(key(newsrc));
+    }
+  }
+  const classify = (file, isDirectory) => {
+    const inRoot = serverRoots.some(
+      root => root.equals(file) || root.contains(file)
+    );
+    if (isDirectory) {
+      return inRoot || serverRoots.some(root => file.contains(root))
+        ? "descend"
+        : "skip";
+    }
+    if (copied.has(key(file))) {
+      return "copy";
+    }
+    if (!inRoot) {
+      return "skip";
+    }
+    return file.leafName.endsWith(".msf") ||
+      isLegacyStoreIgnoredFile(file.leafName) ||
+      file.leafName === "hostinfo.dat"
+      ? "copy"
+      : "in-place";
+  };
   const backup = createMigrationBackupAtStartup(
     profile.path,
     windows ? mailPaths : roots.mailPaths,
     backupPath,
-    signal
+    signal,
+    classify
   );
   return {
     profilePath: profile.path,

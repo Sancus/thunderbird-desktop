@@ -1221,6 +1221,18 @@ export class MigrationJournal {
           filesByPath.set(saved.file.path, saved);
           files.set(entry.sha256, matches);
         }
+        if (entry.type == "in-place") {
+          // A message store the index migration never reads: no digest.
+          const file = new FileUtils.File(
+            PathUtils.join(root.source, ...entry.parts)
+          );
+          filesByPath.set(file.path, {
+            file,
+            size: entry.size,
+            physicalIdentity: entry.physicalIdentity,
+            sha256: null,
+          });
+        }
       }
     }
     for (const source of [
@@ -1249,7 +1261,8 @@ export class MigrationJournal {
             if (root.contains(saved.file)) {
               differs =
                 (await IOUtils.stat(saved.file.path)).size !== saved.size ||
-                (await hashMigrationFile(saved.file.path)) !== saved.sha256;
+                (saved.sha256 !== null &&
+                  (await hashMigrationFile(saved.file.path)) !== saved.sha256);
             }
           }
         } else {
@@ -1259,8 +1272,9 @@ export class MigrationJournal {
             stored.physicalIdentity.parentId !== measured.store.parentId ||
             (await IOUtils.stat(measured.store.canonicalPath)).size !==
               stored.size ||
-            (await hashMigrationFile(measured.store.canonicalPath)) !==
-              stored.sha256;
+            (stored.sha256 !== null &&
+              (await hashMigrationFile(measured.store.canonicalPath)) !==
+                stored.sha256);
         }
         if (differs) {
           throw new Error("Migration body store differs from verified backup");

@@ -429,6 +429,7 @@ export async function verifyMigrationBackup(backupPath) {
 export async function stageMigrationRestore(backupPath, parentPath) {
   const receipt = await verifyMigrationBackup(backupPath);
   const manifest = await IOUtils.readJSON(receipt.path);
+  requireWholeProfileBackup(manifest);
   const parent = physicalFile(parentPath);
   const backup = physicalFile(backupPath);
   if (
@@ -785,10 +786,40 @@ async function verifyCopies(path, manifest) {
         }
       } else if (entry.type == "regular") {
         await verifyFile(target, entry);
-      } else {
+      } else if (
+        entry.type != "in-place" ||
+        manifest.scope !== "index" ||
+        !Number.isSafeInteger(entry.size) ||
+        entry.size < 0 ||
+        "sha256" in entry
+      ) {
         throw new Error("Invalid migration backup entry");
       }
+      // An in-place entry is a message store the index migration never
+      // reads or copies. It has no copy to verify; its original is measured
+      // again where it is used.
     }
+  }
+}
+
+/**
+ * An index backup holds only the metadata an index migration could need
+ * again. Its message stores were never copied, so it can never stand in for
+ * the complete copy a whole-profile restore replaces live directories with.
+ *
+ * @param {object} manifest - Verified backup manifest.
+ * @throws {Error} For an index backup.
+ */
+export function requireWholeProfileBackup(manifest) {
+  if (
+    manifest.scope !== undefined ||
+    manifest.roots.some(root =>
+      root.entries.some(entry => entry.type == "in-place")
+    )
+  ) {
+    throw new Error(
+      "An index migration backup holds no message stores and is not a restore point"
+    );
   }
 }
 
@@ -819,6 +850,11 @@ function checkCancellation(signal) {
  * @param {string[]} mailPaths - Persisted external message directories.
  * @param {string} backupPath - Private destination outside every source tree.
  * @param {AbortSignal} [signal] - Cancellation checked between stream reads.
+ * @param {function(nsIFile, boolean): string} [classify] - Index backup: for
+ *   each entry (file, isDirectory) returns "copy" (hashed and copied
+ *   metadata), "in-place" (a message store: measured by size and time, never
+ *   read or copied), "descend" (a directory to enter) or "skip" (no migration
+ *   input: not examined at all). Without it every entry is copied.
  * @returns {{path: string, sha256: string}} Complete manifest path and hash.
  * @throws {Error} For cancellation, changed sources, unsafe paths or copy errors.
  */
@@ -826,7 +862,8 @@ export function createMigrationBackupAtStartup(
   profilePath,
   mailPaths,
   backupPath,
-  signal
+  signal,
+  classify = null
 ) {
   checkCancellation(signal);
   const profile = physicalFile(profilePath);
@@ -864,7 +901,7 @@ export function createMigrationBackupAtStartup(
       directory: "root-" + index,
       permissions: source.permissions,
       lastModified: source.lastModifiedTime,
-      ...startupInventory(source, index == 0, signal),
+      ...startupInventory(source, index == 0, signal, classify),
     };
   });
   const originalRoots =
@@ -877,6 +914,7 @@ export function createMigrationBackupAtStartup(
     manifest = readStartupJSON(manifestFile);
     if (
       manifest.version != BACKUP_VERSION ||
+      manifest.scope !== (classify ? "index" : undefined) ||
       JSON.stringify(manifest.roots) != JSON.stringify(roots) ||
       (originalRoots &&
         JSON.stringify(manifest.originalRoots) !=
@@ -891,7 +929,7 @@ export function createMigrationBackupAtStartup(
     let requiredBytes = 0;
     for (const root of roots) {
       for (const entry of root.entries) {
-        requiredBytes += entry.size ?? 0;
+        requiredBytes += entry.type == "in-place" ? 0 : (entry.size ?? 0);
         if (!Number.isSafeInteger(requiredBytes)) {
           throw new Error("Migration backup byte count exceeds the safe range");
         }
@@ -903,6 +941,7 @@ export function createMigrationBackupAtStartup(
     backup.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
     manifest = {
       version: BACKUP_VERSION,
+      ...(classify ? { scope: "index" } : {}),
       complete: false,
       roots,
       ...(originalRoots ? { originalRoots } : {}),
@@ -927,6 +966,9 @@ export function createMigrationBackupAtStartup(
     physicalFile(destination.path);
     for (const entry of root.entries) {
       checkCancellation(signal);
+      if (entry.type == "in-place") {
+        continue;
+      }
       const target = new FileUtils.File(
         childPath(destination.path, entry.parts)
       );
@@ -988,7 +1030,9 @@ export function createMigrationBackupAtStartup(
   }
   for (const [index, root] of roots.entries()) {
     if (
-      JSON.stringify(startupInventory(sources[index], index == 0, signal)) !=
+      JSON.stringify(
+        startupInventory(sources[index], index == 0, signal, classify)
+      ) !=
       JSON.stringify({
         entries: root.entries,
         excluded: root.excluded,
@@ -1028,10 +1072,12 @@ export function createMigrationBackupAtStartup(
  * @param {nsIFile} root - Canonical selected directory.
  * @param {boolean} profile - Exclude ordinary profile lock files at the root.
  * @param {AbortSignal} [signal] - Cancellation signal.
+ * @param {?function(nsIFile, boolean): string} [classify] - Index backup
+ *   selection (see createMigrationBackupAtStartup).
  * @returns {{entries: object[], excluded: string[], physicalIdentity?: object}}
  *   Ordered source inventory, compatible with ordinary backup verification.
  */
-function startupInventory(root, profile, signal) {
+function startupInventory(root, profile, signal, classify = null) {
   const entries = [];
   const excluded = [];
   const pending = [{ file: root, parts: [] }];
@@ -1056,6 +1102,17 @@ function startupInventory(root, profile, signal) {
         excluded.push(child.leafName);
         continue;
       }
+      // What an index migration does not use is not examined at all: a link
+      // or special file outside the mail data is none of its business.
+      let selection = "copy";
+      if (classify) {
+        selection = child.isSymlink()
+          ? classify(child, false)
+          : classify(child, child.isDirectory());
+        if (selection == "skip") {
+          continue;
+        }
+      }
       physicalFile(child.path);
       const entry = {
         parts: [...parts, child.leafName],
@@ -1068,6 +1125,9 @@ function startupInventory(root, profile, signal) {
       }
       if (child.isDirectory()) {
         pending.push({ file: child, parts: entry.parts });
+      } else if (child.isFile() && selection == "in-place") {
+        entry.type = "in-place";
+        entry.size = child.fileSize;
       } else if (child.isFile()) {
         entry.size = child.fileSize;
         entry.sha256 = hashStartupFile(child, signal);

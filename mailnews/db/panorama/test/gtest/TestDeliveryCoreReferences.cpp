@@ -24707,7 +24707,7 @@ TEST_F(DeliveryCoreReferences, StartupInitializesOnlyGenuinelyEmptyProfile) {
 }
 
 TEST_F(DeliveryCoreReferences, StartupLegacyTargetRequiresVerifiedBackup) {
-  ASSERT_EQ(NS_OK, WriteStartupFile("legacy.msf", "retained legacy bytes"_ns));
+  ASSERT_EQ(NS_OK, WriteStartupFile("panacea.dat", "retained legacy bytes"_ns));
   ASSERT_EQ(NS_OK, ArmSelectedStartup());
   nsCString selected;
   ASSERT_EQ(NS_OK, DescribeStartup(selected));
@@ -25960,9 +25960,28 @@ TEST_F(DeliveryCoreReferences, StartupInvalidJSONNeverFallsBackToMork) {
   EXPECT_NE(kNotFound, selected.Find("\"mode\":\"migrate\""));
 }
 
+// A summary no account server holds and a Mork book no directory names are
+// leftovers Thunderbird never opens: they are left alone and select nothing.
+TEST_F(DeliveryCoreReferences, StartupLeavesUnreferencedLegacyFilesAlone) {
+  ASSERT_EQ(NS_OK, WriteStartupFile("removed-account.msf", "left alone"_ns));
+  ASSERT_EQ(NS_OK, WriteStartupFile("removed-book.mab", "left alone"_ns));
+  ASSERT_EQ(NS_OK, ArmSelectedStartup());
+  nsCString selected;
+  ASSERT_EQ(NS_OK, DescribeStartup(selected));
+  EXPECT_NE(kNotFound, selected.Find("\"mode\":\"initialize\""));
+  ASSERT_EQ(NS_OK, OpenStartup("initialize"));
+}
+
 TEST_F(DeliveryCoreReferences, StartupEmptyJSONRetainsOtherLegacyData) {
+  nsCOMPtr<nsIPrefBranch> prefs =
+      do_GetService("@mozilla.org/preferences-service;1");
+  ASSERT_TRUE(prefs);
+  constexpr auto book = "ldap_2.servers.startupRetained.filename";
+  ASSERT_EQ(NS_OK, prefs->SetCharPref(book, "retained.mab"_ns));
+  auto clearBook =
+      MakeScopeExit([&] { EXPECT_EQ(NS_OK, prefs->ClearUserPref(book)); });
   ASSERT_EQ(NS_OK, WriteStartupFile("folderCache.json", "{}"_ns));
-  ASSERT_EQ(NS_OK, WriteStartupFile("retained.msf", "real summary bytes"_ns));
+  ASSERT_EQ(NS_OK, WriteStartupFile("retained.mab", "real book bytes"_ns));
   ASSERT_EQ(NS_OK, ArmSelectedStartup());
   nsCString selected;
   ASSERT_EQ(NS_OK, DescribeStartup(selected));

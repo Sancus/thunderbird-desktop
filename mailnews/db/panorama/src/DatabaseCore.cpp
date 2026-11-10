@@ -404,6 +404,29 @@ nsresult StartupHash(nsIFile* file, nsACString& hex) {
   }
   return NS_OK;
 }
+// An index migration never reads, copies or changes a message store. The
+// backup manifest lists each one "in-place" and its retained identity is its
+// size and modification time, measured again wherever a digest was compared.
+nsresult StartupInPlaceIdentity(nsIFile* file, nsACString& identity) {
+  MOZ_TRY(StartupRegular(file));
+  int64_t size;
+  PRTime modified;
+  MOZ_TRY(file->GetFileSize(&size));
+  MOZ_TRY(file->GetLastModifiedTime(&modified));
+  identity.AssignLiteral("in-place:");
+  identity.AppendInt(size);
+  identity.Append(':');
+  identity.AppendInt(int64_t(modified));
+  return NS_OK;
+}
+// The current identity of an original in its retained form: the digest of a
+// copied file, or the in-place measure of a message store.
+nsresult StartupRetainedIdentity(const nsACString& retained, nsIFile* file,
+                                 nsACString& actual) {
+  if (StringBeginsWith(retained, "in-place:"_ns))
+    return StartupInPlaceIdentity(file, actual);
+  return StartupHash(file, actual);
+}
 nsresult RestoreWork(nsIFile* profile, nsIFile** output, bool validate = true) {
   nsCOMPtr<nsIFile> work;
   nsString leaf;
@@ -7843,6 +7866,8 @@ nsresult CheckCacheProjectionProof(
         directories.InsertOrUpdate(path, true);
         continue;
       }
+      // A message store measured in place has no copy and is no cache input.
+      if (type == "in-place"_ns) continue;
       NS_ENSURE_TRUE(type == "regular"_ns, NS_ERROR_NOT_IMPLEMENTED);
       CacheInventoryFile file;
       file.original = path;
@@ -9615,6 +9640,12 @@ nsresult StartupInventory(
     if (selectedRoot && (name == "parent.lock"_ns || name == ".parentlock"_ns ||
                          name == "lock"_ns))
       continue;
+    // Migration input is discovered from the configuration outward. At the
+    // top of the selected profile that is the folder caches, Mork books and a
+    // root summary; StartupConfiguredRoots inventories every account root.
+    // Nothing else in the profile is examined: a link, a special file or the
+    // mail of a removed account there is none of this migration's business.
+    if (selectedRoot && !StartupMailDataName(name)) continue;
     bool linked, vanished;
     nsresult rv = file->IsSymlink(&linked);
     MOZ_TRY(
@@ -9785,8 +9816,29 @@ nsresult StartupConfiguredRoots(
     MOZ_TRY(StartupConfiguredPath(prefs, branch, getter_AddRefs(root)));
     MOZ_TRY(StartupAdmitMailRoot(profile, root, external));
     nsTArray<nsCString> files;
-    MOZ_TRY(StartupInventory(root, files, true, false, retired));
-    inventory.AppendElements(files);
+    bool rootExists;
+    MOZ_TRY(root->Exists(&rootExists));
+    if (rootExists)
+      MOZ_TRY(StartupInventory(root, files, true, false, retired));
+    // The root folder's own summary lies beside the root directory.
+    nsCOMPtr<nsIFile> rootSummary;
+    MOZ_TRY(root->Clone(getter_AddRefs(rootSummary)));
+    nsAutoString rootLeaf;
+    MOZ_TRY(rootSummary->GetLeafName(rootLeaf));
+    MOZ_TRY(rootSummary->SetLeafName(rootLeaf + u".msf"_ns));
+    bool summaryExists;
+    MOZ_TRY(rootSummary->Exists(&summaryExists));
+    if (summaryExists) {
+      MOZ_TRY(StartupRegular(rootSummary));
+      nsCString summaryPath;
+      MOZ_TRY(GetComparablePath(rootSummary, summaryPath));
+      if (!inventory.Contains(summaryPath))
+        inventory.AppendElement(summaryPath);
+    }
+    for (auto& path : files) {
+      // Two servers can share or nest their roots; list each file once.
+      if (!inventory.Contains(path)) inventory.AppendElement(path);
+    }
     if (output) {
       StartupServerRoot binding;
       binding.key = Substring(branch, 12, branch.Length() - 13);
@@ -9811,16 +9863,43 @@ nsresult StartupConfiguredRoots(
   if (admitted) *admitted = std::move(external);
   return NS_OK;
 }
-// Mail data no account references: a summary, or any file in a mail tree,
-// outside every account server root and no root summary either. A removed
-// account or a copied profile leaves such files and Thunderbird never opens
-// them. They still select a migration, never an empty initialization, but are
-// no import input: each stays in place and must be unchanged in the complete
-// backup (StartupUnreferencedRetained).
-nsresult StartupSetAsideUnreferenced(nsTArray<nsCString>& inventory,
+// The Mork address books a directory preference names
+// (ldap_2.servers.<name>.filename, relative to the profile or absolute).
+nsresult StartupReferencedBooks(nsIFile* profile,
+                                nsTHashSet<nsCString>& books) {
+  nsCOMPtr<nsIPrefBranch> prefs =
+      do_GetService("@mozilla.org/preferences-service;1");
+  NS_ENSURE_TRUE(prefs, NS_ERROR_NOT_AVAILABLE);
+  nsTArray<nsCString> names;
+  MOZ_TRY(prefs->GetChildList("ldap_2.servers.", names));
+  for (const auto& name : names) {
+    if (!StringEndsWith(name, ".filename"_ns)) continue;
+    nsAutoCString value;
+    Preferences::GetCString(name.get(), value);
+    if (!StringEndsWith(value, ".mab"_ns)) continue;
+    nsCOMPtr<nsIFile> file;
+    if (NS_FAILED(NewComparableFile(value, getter_AddRefs(file)))) {
+      MOZ_TRY(profile->Clone(getter_AddRefs(file)));
+      if (NS_FAILED(file->Append(NS_ConvertUTF8toUTF16(value)))) continue;
+    }
+    nsCString path;
+    MOZ_TRY(GetComparablePath(file, path));
+    books.Insert(path);
+  }
+  return NS_OK;
+}
+// Mail data nothing references: a summary outside every account server root
+// that is no root summary either, or a Mork book no directory names. A
+// removed account, a converted book or a copied profile leaves such files and
+// Thunderbird never opens them. They are no migration input and select
+// nothing: each is left alone, in place.
+nsresult StartupSetAsideUnreferenced(nsIFile* profile,
+                                     nsTArray<nsCString>& inventory,
                                      nsTArray<nsCString>& unreferenced) {
   nsTArray<nsCOMPtr<nsIFile>> roots;
   MOZ_TRY(StartupConfiguredRootFiles(roots));
+  nsTHashSet<nsCString> books;
+  MOZ_TRY(StartupReferencedBooks(profile, books));
   nsTHashSet<nsCString> rootSummaries;
   for (const auto& root : roots) {
     nsCString path;
@@ -9829,11 +9908,12 @@ nsresult StartupSetAsideUnreferenced(nsTArray<nsCString>& inventory,
   }
   nsTArray<nsCString> referenced;
   for (auto& path : inventory) {
-    bool keep = StringEndsWith(path, ".mab"_ns) ||
-                StringEndsWith(path, kCachePanaceaLeaf) ||
-                StringEndsWith(path, kCacheJSONLeaf) ||
-                rootSummaries.Contains(path);
-    if (!keep) {
+    bool keep = StringEndsWith(path, ".mab"_ns)
+                    ? books.Contains(path)
+                    : StringEndsWith(path, kCachePanaceaLeaf) ||
+                          StringEndsWith(path, kCacheJSONLeaf) ||
+                          rootSummaries.Contains(path);
+    if (!keep && !StringEndsWith(path, ".mab"_ns)) {
       nsCOMPtr<nsIFile> file;
       MOZ_TRY(NewComparableFile(path, getter_AddRefs(file)));
       for (const auto& root : roots) {
@@ -9845,19 +9925,6 @@ nsresult StartupSetAsideUnreferenced(nsTArray<nsCString>& inventory,
     (keep ? referenced : unreferenced).AppendElement(std::move(path));
   }
   inventory = std::move(referenced);
-  return NS_OK;
-}
-nsresult StartupUnreferencedRetained(ProfileStartupOperation& operation,
-                                     const nsTArray<nsCString>& unreferenced) {
-  for (const auto& path : unreferenced) {
-    nsCOMPtr<nsIFile> file;
-    MOZ_TRY(StartupContainedMail(operation, path, getter_AddRefs(file)));
-    auto saved = operation.backupFiles.Lookup(path);
-    NS_ENSURE_TRUE(saved, NS_ERROR_NOT_AVAILABLE);
-    nsCString actual;
-    MOZ_TRY(StartupHash(file, actual));
-    NS_ENSURE_TRUE(saved.Data() == actual, NS_ERROR_NOT_AVAILABLE);
-  }
   return NS_OK;
 }
 bool StartupUnknownDelimiter(char delimiter) {
@@ -10052,8 +10119,13 @@ nsresult StartupStores(ProfileStartupOperation& operation,
     NS_ENSURE_TRUE(covered || nativeEmpty, NS_ERROR_NOT_AVAILABLE);
     auto saved = operation.backupFiles.Lookup(path);
     NS_ENSURE_TRUE(saved || nativeEmpty, NS_ERROR_NOT_AVAILABLE);
+    // A message store is measured in place, never read.
     nsCString actual;
-    MOZ_TRY(StartupHash(file, actual));
+    if (saved) {
+      MOZ_TRY(StartupRetainedIdentity(saved.Data(), file, actual));
+    } else {
+      MOZ_TRY(StartupHash(file, actual));
+    }
     NS_ENSURE_TRUE((saved && saved.Data() == actual) ||
                        (nativeEmpty && created.Data() == actual),
                    NS_ERROR_NOT_AVAILABLE);
@@ -10097,6 +10169,15 @@ nsresult StartupBackup(JSContext* cx, ProfileStartupOperation& operation,
                  NS_ERROR_NOT_AVAILABLE);
   int64_t version;
   MOZ_TRY(StartupNumber(cx, record, "version", 1, 3, version));
+  JS::Rooted<JS::Value> scope(cx);
+  MOZ_TRY(ImportMember(cx, record, "scope", &scope, true));
+  bool indexScope = false;
+  if (!scope.isUndefined()) {
+    nsCString text;
+    MOZ_TRY(ImportText(cx, scope, text));
+    NS_ENSURE_TRUE(text == "index"_ns, NS_ERROR_FILE_CORRUPTED);
+    indexScope = true;
+  }
   uint32_t rootCount;
   MOZ_TRY(StartupArray(cx, record, "roots", &roots, rootCount));
   NS_ENSURE_TRUE(rootCount, NS_ERROR_FILE_CORRUPTED);
@@ -10164,6 +10245,26 @@ nsresult StartupBackup(JSContext* cx, ProfileStartupOperation& operation,
       if (type == "directory"_ns) {
         nsAutoCString actualPath;
         MOZ_TRY(StartupDirectory(destination, actualPath));
+      } else if (type == "in-place"_ns) {
+        // Only an index backup lists a message store without copying it.
+        NS_ENSURE_TRUE(indexScope, NS_ERROR_FILE_CORRUPTED);
+        int64_t size, modified;
+        MOZ_TRY(StartupNumber(cx, entry, "size", 0, INT64_C(9007199254740991),
+                              size));
+        MOZ_TRY(StartupNumber(cx, entry, "lastModified",
+                              -INT64_C(9007199254740991),
+                              INT64_C(9007199254740991), modified));
+        nsCString retained("in-place:");
+        retained.AppendInt(size);
+        retained.Append(':');
+        retained.AppendInt(modified);
+        nsCString measured, originalPath;
+        MOZ_TRY(StartupInPlaceIdentity(originalEntry, measured));
+        NS_ENSURE_TRUE(measured == retained, NS_ERROR_NOT_AVAILABLE);
+        MOZ_TRY(GetComparablePath(originalEntry, originalPath));
+        if (auto prior = operation.backupFiles.Lookup(originalPath))
+          NS_ENSURE_TRUE(prior.Data() == retained, NS_ERROR_NOT_AVAILABLE);
+        operation.backupFiles.InsertOrUpdate(originalPath, retained);
       } else {
         NS_ENSURE_TRUE(type == "regular"_ns, NS_ERROR_FILE_CORRUPTED);
         nsCString expectedHash, copyHash;
@@ -13708,6 +13809,9 @@ nsresult DatabaseCore::DescribeProfileStartup(
       MOZ_TRY(StartupConfiguredRoots(operation.profile, inventory, nullptr,
                                      &operation.retiredPaths,
                                      &operation.mailRoots));
+      nsTArray<nsCString> unreferenced;
+      MOZ_TRY(StartupSetAsideUnreferenced(operation.profile, inventory,
+                                          unreferenced));
       operation.mode = inventory.IsEmpty() ? "initialize"_ns : "migrate"_ns;
     }
     operation.selected = true;
@@ -13914,11 +14018,11 @@ nsresult DatabaseCore::OpenProfileStartup(JSContext* cx,
         operation.profile, inventory,
         mode == "migrate"_ns ? &operation.servers : nullptr,
         &operation.retiredPaths));
+    nsTArray<nsCString> unreferenced;
+    MOZ_TRY(StartupSetAsideUnreferenced(operation.profile, inventory,
+                                        unreferenced));
     if (mode == "initialize"_ns) {
       NS_ENSURE_TRUE(inventory.IsEmpty() && !count, NS_ERROR_NOT_AVAILABLE);
-      MOZ_TRY(StartupConfiguredRoots(operation.profile, inventory, nullptr,
-                                     &operation.retiredPaths));
-      NS_ENSURE_TRUE(inventory.IsEmpty(), NS_ERROR_NOT_AVAILABLE);
     } else {
       NS_ENSURE_TRUE(selector, NS_ERROR_NOT_AVAILABLE);
       JS::Rooted<JSObject*> selectorIdentity(cx), backup(cx), journal(cx),
@@ -14113,8 +14217,6 @@ nsresult DatabaseCore::OpenProfileStartup(JSContext* cx,
       // Physical store files are accounted by the source store, never imported
       // as a remote hierarchy or substituted for an original summary.
       // Inventory paths use the platform separator (GetComparablePath).
-      nsTArray<nsCString> unreferenced;
-      MOZ_TRY(StartupSetAsideUnreferenced(inventory, unreferenced));
       for (const auto& path : inventory) {
         if (StringEndsWith(path, ".msf"_ns) ||
             StringEndsWith(path, ".mab"_ns) ||
@@ -14123,7 +14225,6 @@ nsresult DatabaseCore::OpenProfileStartup(JSContext* cx,
           NS_ENSURE_TRUE(paths.Contains(path), NS_ERROR_NOT_AVAILABLE);
         }
       }
-      MOZ_TRY(StartupUnreferencedRetained(operation, unreferenced));
       MOZ_TRY(StartupStores(operation, inventory, paths));
       NS_ENSURE_FALSE(paths.IsEmpty(), NS_ERROR_NOT_AVAILABLE);
     }
@@ -16073,8 +16174,8 @@ nsresult DatabaseCore::CheckProfileActivation(
   MOZ_TRY(StartupConfiguredRoots(operation.profile, finalInventory, nullptr,
                                  &operation.retiredPaths));
   nsTArray<nsCString> unreferenced;
-  MOZ_TRY(StartupSetAsideUnreferenced(finalInventory, unreferenced));
-  MOZ_TRY(StartupUnreferencedRetained(operation, unreferenced));
+  MOZ_TRY(StartupSetAsideUnreferenced(operation.profile, finalInventory,
+                                      unreferenced));
   for (const auto& path : finalInventory) {
     if (StringEndsWith(path, ".msf"_ns) || StringEndsWith(path, ".mab"_ns) ||
         StringEndsWith(path, kCachePanaceaLeaf) ||

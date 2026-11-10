@@ -133,6 +133,110 @@ add_task(async function test_startupHashNeverPassesFileBytesThroughScript() {
   );
 });
 
+add_task(async function test_indexBackupMeasuresStoresInPlace() {
+  // An index migration changes no message store: it copies the metadata it
+  // uses, measures each store by size and time, and examines nothing else.
+  const { root, profile, external, body, backup } = await startupCopyFixture(
+    2 * 1024 * 1024 + 3
+  );
+  const summary = PathUtils.join(external, "Inbox.msf");
+  await IOUtils.writeUTF8(summary, "summary bytes");
+  const bodyBefore = await IOUtils.stat(body);
+  const classify = (file, isDirectory) => {
+    if (isDirectory) {
+      return file.path.startsWith(external) ? "descend" : "skip";
+    }
+    if (file.leafName == "prefs.js" || file.leafName.endsWith(".msf")) {
+      return "copy";
+    }
+    return file.path.startsWith(external) ? "in-place" : "skip";
+  };
+  const moduleGlobal = Cu.getGlobalForObject(createMigrationBackupAtStartup);
+  const originalCc = moduleGlobal.Cc;
+  let streams = 0;
+  let result;
+  moduleGlobal.Cc = new Proxy(originalCc, {
+    get(target, name) {
+      if (name == "@mozilla.org/network/file-input-stream;1") {
+        streams++;
+      }
+      return target[name];
+    },
+  });
+  try {
+    result = createMigrationBackupAtStartup(
+      profile,
+      [external],
+      backup,
+      null,
+      classify
+    );
+  } finally {
+    moduleGlobal.Cc = originalCc;
+  }
+  const manifest = await IOUtils.readJSON(result.path);
+  Assert.equal(manifest.scope, "index");
+  Assert.equal(manifest.complete, true);
+  const entries = manifest.roots.map(
+    item => new Map(item.entries.map(entry => [entry.parts.join("/"), entry]))
+  );
+  Assert.deepEqual([...entries[0].keys()], ["prefs.js"]);
+  Assert.equal(entries[1].get("Inbox.msf").type, "regular");
+  const stored = entries[1].get("Inbox/cur/message");
+  Assert.equal(stored.type, "in-place");
+  Assert.equal(stored.size, 2 * 1024 * 1024 + 3);
+  Assert.ok(!("sha256" in stored), "A store is measured, never hashed");
+  // Two copied files, each read for the inventory, the copy check, the
+  // second inventory and the final check; the store was never opened.
+  Assert.equal(streams, 8, "Only the copied metadata is ever read");
+  Assert.ok(
+    !(await IOUtils.exists(
+      PathUtils.join(backup, "root-1", "Inbox", "cur", "message")
+    )),
+    "A store is never copied"
+  );
+  Assert.equal(
+    await IOUtils.readUTF8(PathUtils.join(backup, "root-1", "Inbox.msf")),
+    "summary bytes"
+  );
+  const bodyAfter = await IOUtils.stat(body);
+  Assert.equal(bodyAfter.size, bodyBefore.size);
+  Assert.equal(bodyAfter.lastModified, bodyBefore.lastModified);
+  Assert.deepEqual(await verifyMigrationBackup(backup), result);
+  await Assert.rejects(
+    stageMigrationRestore(backup, root),
+    /holds no message stores and is not a restore point/,
+    "An index backup can never replace live directories"
+  );
+  // A changed store is a changed source for an unchanged repeat.
+  await IOUtils.write(body, new Uint8Array(7));
+  Assert.throws(
+    () =>
+      createMigrationBackupAtStartup(
+        profile,
+        [external],
+        backup,
+        null,
+        classify
+      ),
+    /Backup source identity changed/
+  );
+  // A whole-profile archive is never continued as an index backup.
+  const whole = PathUtils.join(root, "whole");
+  createMigrationBackupAtStartup(profile, [external], whole);
+  Assert.throws(
+    () =>
+      createMigrationBackupAtStartup(
+        profile,
+        [external],
+        whole,
+        null,
+        classify
+      ),
+    /Backup source identity changed/
+  );
+});
+
 add_task(async function test_unchangedRepeatVerifiesAndChangedSourceRefuses() {
   const { profile, external, body, backup } = await startupCopyFixture();
   const result = createMigrationBackupAtStartup(profile, [external], backup);

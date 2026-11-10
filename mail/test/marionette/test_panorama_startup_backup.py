@@ -8,6 +8,7 @@ import os
 import shutil
 import signal
 import sqlite3
+import stat
 import sys
 import tempfile
 import unittest
@@ -569,10 +570,9 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         manifest = json.loads(backup.read_text())
         self.assertTrue(manifest["complete"])
         self.assertEqual(self.profile, Path(manifest["roots"][0]["source"]))
-        for path, original in before.items():
-            self.assertEqual(original, path.read_bytes())
-            archived = backup.parent / "root-0" / path.relative_to(self.profile)
-            self.assertEqual(original, archived.read_bytes())
+        stores = self.assert_index_backup(manifest, backup.parent, 0, before)
+        self.assertEqual(protocol != "nntp", bool(stores),
+                         "A local store is measured in place; news has none")
         self.stop_application()
         selector = (self.profile / "panorama-profile.json").read_bytes()
         journal_path = Path(record["identity"]["journalPath"])
@@ -610,6 +610,30 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.assertEqual(journal, journal_path.read_bytes())
         self.assertFalse(backup.parent.exists(), "Reuse must not recreate the archive")
         self.assertEqual(manifest_bytes, (moved_archive / "manifest.json").read_bytes())
+
+    def assert_index_backup(self, manifest, archive, index, before):
+        """Index migration copies metadata; a message store is never read or copied."""
+        self.assertEqual("index", manifest["scope"])
+        root = manifest["roots"][index]
+        base = Path(root["source"]).resolve()
+        entries = {tuple(entry["parts"]): entry for entry in root["entries"]}
+        stores = 0
+        for path, original in before.items():
+            self.assertEqual(original, path.read_bytes())
+            entry = entries[path.relative_to(base).parts]
+            archived = archive / root["directory"] / path.relative_to(base)
+            if path.suffix == ".msf":
+                self.assertEqual("regular", entry["type"])
+            if entry["type"] == "in-place":
+                stores += 1
+                self.assertEqual(len(original), entry["size"])
+                self.assertNotIn("sha256", entry)
+                self.assertFalse(archived.exists(), "A message store is never copied")
+            else:
+                self.assertEqual(original, archived.read_bytes())
+        copied = sum(path.stat().st_size for path in archive.rglob("*") if path.is_file())
+        self.assertLess(copied, 16 * 1024 * 1024, "The archive stays near index size")
+        return stores
 
     def register_selected_profile(self):
         """Register the actual current path; XRE resolves it on the next startup."""
@@ -1520,8 +1544,9 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
                          identity["serverSummaries"][0]["sourceId"])
         backup = Path(identity["backup"]["path"])
         self.assertEqual(original, unknown.read_bytes())
-        self.assertEqual(original, (backup.parent / "root-0" /
-                                    unknown.relative_to(self.profile)).read_bytes())
+        self.assertFalse((backup.parent / "root-0" /
+                          unknown.relative_to(self.profile)).exists(),
+                         "What no account references is not examined or copied")
 
     def test_migratesBesideMailOfRemovedAccounts(self):
         """Mail no current account references stays in place and is not imported.
@@ -1593,7 +1618,7 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         for path, data in leftovers.items():
             self.assertEqual(data, path.read_bytes(), "Unreferenced mail stays in place")
             archived = backup.parent / "root-0" / path.relative_to(self.profile)
-            self.assertEqual(data, archived.read_bytes())
+            self.assertFalse(archived.exists(), "It is not examined or copied")
         for _ in range(2):
             self.stop_application()
             selector = (self.profile / "panorama-profile.json").read_bytes()
@@ -1697,6 +1722,53 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.assertEqual(b"{}", cache.read_bytes())
         self.assertFalse(work.exists())
 
+    @unittest.skipIf(sys.platform == "win32", "POSIX permissions and links")
+    def test_indexMigrationNeverReadsMessageStoresOrUnrelatedFiles(self):
+        """Bodies stay in place unread; nothing outside the mail data is examined."""
+        self.clean_profile(False)
+        source = self.create_legacy_message("mbox")
+        self.stop_application()
+        root = Path(source["root"]).resolve()
+        store = root / source["name"]
+        body = store.read_bytes()
+        before = store.stat()
+        # Not even this process may read the store while it migrates.
+        store.chmod(0)
+        self.addCleanup(store.chmod, 0o600)
+        # Ordinary profile content that is no mail data: a linked directory,
+        # a dangling link and a named pipe.
+        outside = self.outside_profile()
+        (outside / "linked").mkdir()
+        (self.profile / "linked-directory").symlink_to(outside / "linked", True)
+        (self.profile / "dangling-link").symlink_to(outside / "absent")
+        os.mkfifo(self.profile / "named-pipe")
+        self.start_same_profile(True)
+        selected = self.selection()
+        self.assertEqual("migrated", selected["record"]["origin"])
+        self.assertEqual(0, stat.S_IMODE(store.stat().st_mode))
+        store.chmod(0o600)
+        after = store.stat()
+        self.assertEqual(body, store.read_bytes())
+        self.assertEqual((before.st_size, before.st_mtime_ns, before.st_ino),
+                         (after.st_size, after.st_mtime_ns, after.st_ino))
+        self.assert_message_after_activation(source)
+        backup = Path(selected["record"]["identity"]["backup"]["path"])
+        manifest = json.loads(backup.read_text())
+        entries = {tuple(entry["parts"]): entry for entry in manifest["roots"][0]["entries"]}
+        self.assertEqual("in-place", entries[store.relative_to(self.profile).parts]["type"])
+        for name in ("linked-directory", "dangling-link", "named-pipe"):
+            self.assertNotIn((name,), entries)
+        work = backup.parent.parent
+        self.assertFalse([path for path in work.rglob("*")
+                          if path.is_file() and path.stat().st_size == len(body)
+                          and path.read_bytes() == body],
+                         "The work directory holds no copy of a message store")
+        for _ in range(2):
+            self.stop_application()
+            self.start_same_profile(True)
+            self.assertEqual(selected["sourceId"], self.selection()["sourceId"])
+            self.assert_message_after_activation(source)
+
     def test_genuine_mork_mbox_migration_and_reuse(self):
         self.assert_mork_migration("mbox")
 
@@ -1789,10 +1861,7 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         manifest = json.loads(backup.read_text())
         sources = [Path(item["source"]).resolve() for item in manifest["roots"]]
         self.assertEqual([self.profile, root], sources)
-        for path, original in before.items():
-            self.assertEqual(original, path.read_bytes())
-            archived = backup.parent / "root-1" / path.relative_to(root)
-            self.assertEqual(original, archived.read_bytes())
+        self.assertTrue(self.assert_index_backup(manifest, backup.parent, 1, before))
         journal = json.loads(Path(record["identity"]["journalPath"]).read_text())
         self.assertEqual([str(root)], [str(Path(p).resolve()) for p in journal["mailPaths"]])
         self.stop_application()
@@ -2404,7 +2473,8 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         source = self.create_legacy_message("mbox")
         self.stop_application()
         limit = self.largest_file_limit([self.profile])
-        large = self.profile / "s715-large-backup-input"
+        # An index backup copies account files beside the stores, never a store.
+        large = Path(source["root"]).resolve() / "filterlog.html"
         digest = self.write_large_file(large, 4 * limit)
         originals = {path: path.read_bytes()
                      for path in Path(source["root"]).rglob("*") if path.is_file()}
@@ -2420,7 +2490,8 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.assertIs(False, manifest["complete"], "An interrupted copy is never complete")
         profile_root = next(root for root in manifest["roots"]
                             if Path(root["source"]).resolve() == self.profile)
-        self.assertFalse((backup / profile_root["directory"] / large.name).exists(),
+        installed = backup / profile_root["directory"] / large.relative_to(self.profile)
+        self.assertFalse(installed.exists(),
                          "The cut file is never installed in the archive")
         self.assert_cut_copy(backup / "scratch", large, limit)
         for absent in (work / "journal.json", self.profile / "panorama-profile.json",
@@ -2438,7 +2509,7 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
                     self.profile / "panorama.sqlite"],
         )
         self.assertIs(False, json.loads((backup / "manifest.json").read_bytes())["complete"])
-        self.assertFalse((backup / profile_root["directory"] / large.name).exists())
+        self.assertFalse(installed.exists())
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux process lifecycle")
     def test_interruptedActivationCutoverNeverExposesActiveState(self):

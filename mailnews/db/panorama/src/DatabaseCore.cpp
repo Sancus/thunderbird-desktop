@@ -7951,9 +7951,12 @@ nsresult CheckCacheProjectionProof(
       MOZ_TRY(receipt->GetUTF8String(1, hash));
       MOZ_TRY(receipt->GetUTF8String(2, database));
       MOZ_TRY(receipt->GetInt64(3, &count));
+      // The receipt is of this very file. It holds fewer messages than the
+      // summary when the import left stale offline move results out, never
+      // more.
       NS_ENSURE_TRUE(NS_ConvertUTF16toUTF8(path) == found->original &&
                          hash == found->sha && database == input.databaseId &&
-                         count == messages,
+                         count >= 0 && count <= int64_t(messages),
                      NS_ERROR_NOT_AVAILABLE);
     }
   }

@@ -3512,10 +3512,15 @@ async function finishPanoramaProfileStartup(
         database.validateProfileStartup(operation);
       }
       const sources = [];
+      let storelessSearches = 0;
       for (const source of captured.summaries) {
         const { identity, summary } = await readMorkMigrationSource(
           source.path
         );
+        if (isStorelessSavedSearch(source, summary)) {
+          storelessSearches++;
+          continue;
+        }
         sources.push({
           ...source,
           ...identity,
@@ -3535,6 +3540,9 @@ async function finishPanoramaProfileStartup(
             : {}),
         });
         database.validateProfileStartup(operation);
+      }
+      if (storelessSearches) {
+        note("saved-searches-without-store", "", storelessSearches);
       }
       phase("readSources");
       const journalPath = PathUtils.join(captured.workPath, "journal.json");
@@ -3786,6 +3794,33 @@ async function finishPanoramaProfileStartup(
   } finally {
     journal?.close();
   }
+}
+
+/**
+ * A saved search is its definition in virtualFolders.dat, which the mail
+ * window loads as before. Current Thunderbird writes no message store for
+ * one, and store discovery then finds no folder its summary could be the
+ * index of: such a summary is no migration source and stays in place. An
+ * older saved search that has a store file is discovered and imported like
+ * any folder.
+ *
+ * @param {object} source - Captured summary of a local account.
+ * @param {object} summary - Its parsed Mork summary.
+ * @returns {boolean} Whether it is a saved search without a store.
+ */
+function isStorelessSavedSearch(source, summary) {
+  if (source.protocol === "imap" || source.protocol === "nntp") {
+    return false;
+  }
+  const info = [...summary.source.rows.values()].find(
+    row => row.scope === "ns:msg:db:row:scope:dbfolderinfo:all" && row.id === 1
+  );
+  return (
+    !!(
+      parseInt(info?.cells.get("flags") ?? "0", 16) &
+      Ci.nsMsgFolderFlags.Virtual
+    ) && !startupEntryExists(new FileUtils.File(source.storePath))
+  );
 }
 
 /**

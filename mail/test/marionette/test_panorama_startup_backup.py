@@ -788,6 +788,14 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         """The flags word of a summary stands: a saved search stays Virtual. A
         folder old discovery marks by its name (SetFlagsOnDefaultMailboxes)
         gets that special use again. All data is fabricated."""
+        self.assert_saved_search_migration(False)
+
+    def test_keepsSavedSearchThatHasAnOldStoreFile(self):
+        """Older Thunderbird wrote an empty store file for a saved search;
+        such a summary is discovered and imported like any folder."""
+        self.assert_saved_search_migration(True)
+
+    def assert_saved_search_migration(self, with_store):
         self.clean_profile(False)
         source = self.marionette.execute_script(r"""
             const { MailServices } = ChromeUtils.importESModule(
@@ -840,6 +848,10 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.assertFalse(source["draftsFlags"] & 0x400)
         summary = Path(source["virtualSummary"])
         original = summary.read_bytes()
+        store = summary.with_suffix("")
+        self.assertFalse(store.exists(), "Current Thunderbird writes no store for one")
+        if with_store:
+            store.touch()
         # The old application's own cache describes the saved search too.
         cache = json.loads((self.profile / "folderCache.json").read_text(encoding="utf-8"))
         self.assertIn(str(summary), cache)
@@ -872,12 +884,14 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.assertEqual("migrated", selected["record"]["origin"])
         self.assertEqual(expected, state())
         self.assertEqual(original, summary.read_bytes())
-        # A search folder's cache entry is a recomputed view: not applied, counted.
+        # With a store its summary is imported and only its cache entry, a
+        # recomputed view, is left out. Without one the summary is no source.
         report = json.loads(
             (Path(selected["record"]["identity"]["journalPath"]).parent /
              "report.json").read_text(encoding="utf-8"))
-        self.assertIn("search-folder-cache-entries",
-                      [entry["code"] for entry in report["notImported"]])
+        self.assertIn(
+            "search-folder-cache-entries" if with_store else "saved-searches-without-store",
+            [entry["code"] for entry in report["notImported"]])
         for _ in range(2):
             self.stop_application()
             self.start_same_profile(True)

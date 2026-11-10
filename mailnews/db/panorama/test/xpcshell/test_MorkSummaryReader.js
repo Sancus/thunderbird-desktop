@@ -153,6 +153,78 @@ add_task(function test_summaryFactsReadFolderInfoOnce() {
   );
 });
 
+add_task(function test_threadRelationsFollowHeadersNotStaleThreadTables() {
+  // Each header's own row names its thread and parent. The per-thread tables
+  // and their cached root are a derived index real summaries leave stale.
+  const { getMorkThreadRelations, getMorkThreadFlags } =
+    ChromeUtils.importESModule(
+      "resource:///modules/panorama/MigrationMessageMap.sys.mjs"
+    );
+  const summary = body =>
+    parseMorkSummary(
+      new TextEncoder().encode(
+        '// <!-- <mdb:mork:z v="1.4"/> -->\n' +
+          "< <(a=c)> (80=ns:msg:db:row:scope:msgs:all)" +
+          "(81=ns:msg:db:table:kind:msgs)(82=ns:msg:db:table:kind:thread)" +
+          "(83=msgThreadId)(84=threadParent)(85=threadRoot)(86=threadFlags)" +
+          "(87=threadId)(88=children)>\n" +
+          body
+      )
+    );
+  const relations = body =>
+    Object.fromEntries(
+      [...getMorkThreadRelations(summary(body))].map(([key, value]) => [
+        key,
+        [value.root, value.parent],
+      ])
+    );
+  // A consistent thread: root 2, child 3 below it, grandchild 4 below 3.
+  const clean =
+    "{1:^80 {(k^81:c)(s=9)} [2(^83=2)] [3(^83=2)(^84=2)] [4(^83=2)(^84=3)]}\n" +
+    "{2:^80 {(k^82:c)(s=9) [2:m(^87=2)(^85=2)(^86=0)(^88=3)]} 2 3 4}\n";
+  Assert.deepEqual(relations(clean), {
+    2: [2, null],
+    3: [2, 2],
+    4: [2, 3],
+  });
+  Assert.deepEqual(
+    relations(
+      // The cached root (2) left the thread and was the parent of 3; the
+      // parent of 5 was deleted; 6 names itself; 7 names a header of another
+      // thread; 8 and 9 form a cycle; thread 14 has no table at all; header
+      // 20 has no thread.
+      "{1:^80 {(k^81:c)(s=9)} [3(^83=2)(^84=2)] [4(^83=2)(^84=3)]" +
+        " [5(^83=2)(^84=63)] [6(^83=2)(^84=6)] [7(^83=2)(^84=14)]" +
+        " [8(^83=2)(^84=9)] [9(^83=2)(^84=8)]" +
+        " [14(^83=14)] [15(^83=14)(^84=14)] [20]}\n" +
+        "{2:^80 {(k^82:c)(s=9) [2:m(^87=2)(^85=2)(^86=0)(^88=63)]} 3 4 9}\n"
+    ),
+    {
+      3: [3, null],
+      4: [3, 3],
+      5: [3, 3],
+      6: [3, 3],
+      7: [3, 3],
+      8: [3, 3],
+      9: [3, 8],
+      20: [20, null],
+      21: [20, 20],
+      32: [32, null],
+    },
+    "A header whose parent is not in its thread hangs below the root"
+  );
+  // The watch/ignore word is user data, read from the thread's own table.
+  const watched = summary(
+    "{1:^80 {(k^81:c)(s=9)} [2(^83=2)] [3(^83=2)(^84=2)] [9(^83=9)]}\n" +
+      "{2:^80 {(k^82:c)(s=9) [2:m(^87=2)(^85=2)(^86=100)(^88=2)]} 2 3}\n" +
+      "{9:^80 {(k^82:c)(s=9) [9:m(^87=9)(^85=9)(^86=not-hex)]} 9}\n"
+  );
+  Assert.deepEqual(
+    getMorkThreadFlags(watched, getMorkThreadRelations(watched)),
+    [[2, 0x100]]
+  );
+});
+
 add_task(async function test_invalidStructuralTextRejectsSnapshot() {
   const bytes = await IOUtils.read(do_get_file("data/migration.msf").path);
   const source = String.fromCharCode(...bytes);

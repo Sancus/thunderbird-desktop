@@ -2477,6 +2477,29 @@ nsresult DatabaseCore::ReadFolderImportReceipt(
   return NS_OK;
 }
 
+// Legacy keeps a thread's watch/ignore word in its thread table. The word of
+// each imported thread goes where the native thread reads it.
+nsresult DatabaseCore::WriteImportedThreadFlags(
+    uint64_t folderId, const nsTArray<std::pair<nsMsgKey, uint32_t>>& words,
+    const nsTHashMap<nsMsgKey, nsMsgKey>& keys) {
+  for (const auto& entry : words) {
+    nsMsgKey thread;
+    NS_ENSURE_TRUE(keys.Get(entry.first, &thread) && entry.second,
+                   NS_ERROR_INVALID_ARG);
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(GetStatement("ImportSnapshotThreadFlags"_ns,
+                         "INSERT INTO thread_flags(folderId,threadId,flags) "
+                         "VALUES(:folder,:thread,:flags)"_ns,
+                         getter_AddRefs(stmt)));
+    mozStorageStatementScoper scoper(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("folder"_ns, folderId));
+    MOZ_TRY(stmt->BindInt64ByName("thread"_ns, thread));
+    MOZ_TRY(stmt->BindInt64ByName("flags"_ns, entry.second));
+    MOZ_TRY(stmt->Execute());
+  }
+  return NS_OK;
+}
+
 nsresult DatabaseCore::WriteImportedMessage(uint64_t folderId, nsMsgKey key,
                                             nsMsgKey root, nsMsgKey parent,
                                             const RawHdr& header) {
@@ -2659,6 +2682,8 @@ nsresult DatabaseCore::ImportFolderSnapshotFromFile(
       prepared.AppendElement(std::move(cached));
       live.AppendElement(new Message(key));
     }
+    MOZ_TRY(
+        WriteImportedThreadFlags(identity.folderId, input.threadFlags, keys));
     for (const auto& property : input.folderProperties) {
       NS_ENSURE_TRUE(!property.name.EqualsLiteral("morkMigrationSource"),
                      NS_ERROR_INVALID_ARG);
@@ -3500,6 +3525,8 @@ nsresult DatabaseCore::ImportImapUnit(
                                      parent, row.header));
         live.AppendElement(new Message(key));
       }
+      MOZ_TRY(WriteImportedThreadFlags(snapshot.identity.folderId,
+                                       snapshot.threadFlags, map));
       for (const auto& property : snapshot.folderProperties) {
         NS_ENSURE_TRUE(property.name != "morkMigrationSource"_ns,
                        NS_ERROR_INVALID_ARG);
@@ -5280,18 +5307,13 @@ nsresult ImportFolderProperties(JSContext* cx, JS::Handle<JSObject*> request,
         allowed |= flags & ~uint32_t(expected) & nsMsgFolderFlags::SpecialUse;
         NS_ENSURE_TRUE(((uint32_t(expected) ^ flags) & ~allowed) == 0,
                        NS_ERROR_NOT_IMPLEMENTED);
-      } else if (value.name == "numMsgs"_ns || value.name == "numNewMsgs"_ns) {
-        NS_ENSURE_TRUE(
-            expected == (value.name == "numMsgs"_ns ? total : unread),
-            NS_ERROR_INVALID_ARG);
       } else if (value.name == "version"_ns) {
         NS_ENSURE_TRUE(expected == 1, NS_ERROR_NOT_IMPLEMENTED);
-      } else if (value.name == "totPendingMsgs"_ns ||
-                 value.name == "unreadPendingMsgs"_ns ||
-                 value.name == "forceReparse"_ns) {
-        NS_ENSURE_TRUE(
-            (imap && value.name != "forceReparse"_ns) || expected == 0,
-            NS_ERROR_NOT_IMPLEMENTED);
+      } else if (value.name == "forceReparse"_ns) {
+        // A summary old Thunderbird itself marked for rebuilding from its
+        // store is not a usable index. The message and pending counters are
+        // a cache it recounts and are not compared.
+        NS_ENSURE_TRUE(expected == 0, NS_ERROR_NOT_IMPLEMENTED);
       }
     }
     output.AppendElement(std::move(value));
@@ -5586,13 +5608,17 @@ nsresult CheckFullImportRecords(JSContext* cx, JS::Handle<JSObject*> request,
     return rowIndexes.Get(key, &index) ? rows[index].get() : nullptr;
   };
   constexpr auto messageScope = "ns:msg:db:row:scope:msgs:all"_ns;
-  constexpr auto threadScope = "ns:msg:db:row:scope:threads:all"_ns;
   constexpr auto infoScope = "ns:msg:db:row:scope:dbfolderinfo:all"_ns;
+  // The all-headers table, the folder-info row and (IMAP) the pending server
+  // operations are the index. The per-thread tables with their cached counts
+  // and roots, the all-threads subject index, the folder-info counts and
+  // cached unified-folder hits are derived from the headers: old Thunderbird
+  // repairs or recounts them and real summaries leave them stale, so they are
+  // neither imported nor compared. Only a thread's watch/ignore word, which
+  // lives in its table's metadata row, is user data.
   ImportSourceRecord *messageTable = nullptr, *infoTable = nullptr,
-                     *allThreads = nullptr, *offlineTable = nullptr,
-                     *pendingTable = nullptr;
+                     *offlineTable = nullptr;
   nsTHashMap<uint32_t, uint32_t> threadTables;
-  nsTArray<const ImportSourceRecord*> unifiedHits;
   for (uint32_t i = 0; i < tables.Length(); ++i) {
     auto& table = *tables[i];
     for (auto cell = table.cells.ConstIter(); !cell.Done(); cell.Next()) {
@@ -5606,243 +5632,93 @@ nsresult CheckFullImportRecords(JSContext* cx, JS::Handle<JSObject*> request,
       messageTable = &table;
     } else if (table.scope == messageScope &&
                kind == "ns:msg:db:table:kind:thread"_ns) {
-      threadTables.InsertOrUpdate(table.id, i);
+      if (!threadTables.Contains(table.id))
+        threadTables.InsertOrUpdate(table.id, i);
     } else if (table.scope == infoScope &&
                kind == "ns:msg:db:table:kind:dbfolderinfo"_ns && !infoTable &&
                table.meta.IsEmpty()) {
       infoTable = &table;
-    } else if (table.scope == threadScope &&
-               kind == "ns:msg:db:table:kind:allthreads"_ns && !allThreads &&
-               table.meta.IsEmpty()) {
-      allThreads = &table;
     } else if (imap && table.scope == "ns:msg:db:row:scope:ops:all"_ns &&
                kind == "ns:msg:db:table:kind:ops"_ns && !offlineTable &&
                table.meta.IsEmpty()) {
       offlineTable = &table;
     } else if (imap && table.scope == "ns:msg:db:row:scope:pending:all"_ns &&
                table.id == 1 && kind == "ns:msg:db:table:kind:pending"_ns &&
-               !pendingTable && table.meta.IsEmpty() &&
-               table.members.IsEmpty()) {
-      pendingTable = &table;
-    } else if (table.scope == messageScope &&
-               StringBeginsWith(kind,
-                                "mailbox://nobody@smart%20mailboxes/"_ns) &&
-               table.meta.IsEmpty()) {
-      // nsMsgDatabase caches a unified folder's hits in a message-scope
-      // table named by that folder's URI. Panorama does not migrate unified
-      // folders; the cache is accounted against live headers below.
-      unifiedHits.AppendElement(&table);
-    } else {
+               table.meta.IsEmpty() && table.members.IsEmpty()) {
+      // Adding an IMAP header creates this pending-attributes table even when
+      // no pending attributes exist. Nonempty pending state stays unsupported.
+    } else if ((table.scope == "ns:msg:db:row:scope:ops:all"_ns ||
+                table.scope == "ns:msg:db:row:scope:pending:all"_ns) &&
+               (imap || !table.members.IsEmpty())) {
+      // Pending server work is user data this reader must understand.
       return NS_ERROR_NOT_IMPLEMENTED;
     }
+    // Any other table is a derived index or cache old Thunderbird rebuilds.
   }
-  // Only an empty folder's summary may lack both the all-headers and the
-  // all-threads table; nsMsgDatabase recreates them when it opens one.
-  const bool infoOnly = !messageTable && !allThreads &&
-                        input.messages.IsEmpty() && threadTables.IsEmpty();
-  // Native empty local folders have no per-thread table. Only the exact
-  // empty message/allthreads shape with a lone folder-info row can omit it;
-  // every record, info cell and live count is still checked below.
-  NS_ENSURE_TRUE(
-      infoTable && (infoOnly ? imap || rows.Length() == 1
-                             : messageTable && allThreads &&
-                                   (imap || !threadTables.IsEmpty() ||
-                                    (input.messages.IsEmpty() &&
-                                     messageTable->members.IsEmpty() &&
-                                     allThreads->members.IsEmpty() &&
-                                     rows.Length() == 1))),
-      NS_ERROR_NOT_IMPLEMENTED);
-  NS_ENSURE_TRUE(
-      (infoOnly || messageTable->members.Length() == input.messages.Length()) &&
-          infoTable->members.Length() == 1,
-      NS_ERROR_INVALID_ARG);
-  for (const auto* hits : unifiedHits) {
-    for (const auto& key : hits->members) {
-      NS_ENSURE_TRUE(messageTable && messageTable->memberSet.Contains(key),
-                     NS_ERROR_NOT_IMPLEMENTED);
+  // Only an empty folder's summary may lack the all-headers table;
+  // nsMsgDatabase recreates it when it opens one.
+  NS_ENSURE_TRUE(infoTable && (messageTable || input.messages.IsEmpty()),
+                 NS_ERROR_NOT_IMPLEMENTED);
+  NS_ENSURE_TRUE((!messageTable ||
+                  messageTable->members.Length() == input.messages.Length()) &&
+                     infoTable->members.Length() == 1,
+                 NS_ERROR_INVALID_ARG);
+  // The watch/ignore word of the thread a header's own row names, read from
+  // that thread table's metadata row; zero when there is none.
+  auto threadWord = [&](const ImportSourceRecord& row) -> uint32_t {
+    nsCString text;
+    uint32_t index;
+    uint64_t value;
+    if (!row.cells.Get("msgThreadId"_ns, &text) ||
+        NS_FAILED(ImportHex(text, 8, value)) || value == nsMsgKey_None ||
+        !threadTables.Get(uint32_t(value), &index)) {
+      return 0;
     }
-  }
-  nsTHashMap<nsMsgKey, uint32_t> messages;
+    auto* meta = find(tables[index]->meta);
+    if (!meta || !meta->cells.Get("threadFlags"_ns, &text) ||
+        NS_FAILED(ImportHex(text, 8, value))) {
+      return 0;
+    }
+    return uint32_t(value);
+  };
   nsCOMPtr<nsIMimeConverter> converter =
       mozilla::components::MimeConverter::Service();
   NS_ENSURE_TRUE(converter, NS_ERROR_NOT_AVAILABLE);
   uint32_t unread = 0;
-  for (uint32_t i = 0; i < input.messages.Length(); ++i) {
-    const auto& message = input.messages[i];
+  nsTHashMap<nsMsgKey, uint32_t> words;
+  for (const auto& message : input.messages) {
     nsCString key = ImportSourceKey(message.sourceKey, messageScope);
     auto* row = find(key);
     NS_ENSURE_TRUE(row && messageTable->memberSet.Contains(key),
                    NS_ERROR_INVALID_ARG);
     MOZ_TRY(CheckImportHeader(*row, message.header, converter));
-    row->accounted = true;
-    messages.InsertOrUpdate(message.sourceKey, i);
     unread += !(message.header.flags & nsMsgMessageFlags::Read);
+    // A thread's word is that of its first header in table order, as the JS
+    // reader takes it (getMorkThreadFlags).
+    if (!words.Contains(message.rootSourceKey))
+      words.InsertOrUpdate(message.rootSourceKey, threadWord(*row));
   }
-  nsTHashMap<nsMsgKey, bool> assigned;
-  auto checkMeta = [&](ImportSourceRecord* meta, uint32_t id, uint32_t children,
-                       uint32_t unreadChildren, uint32_t newest,
-                       uint32_t& root) -> nsresult {
-    NS_ENSURE_TRUE(meta && !meta->accounted && meta->scope == "m"_ns,
-                   NS_ERROR_NOT_IMPLEMENTED);
-    // The legacy unread cache defaults to zero when absent. Only IMAP admits
-    // that exact representation, and the computed live unread count must agree.
-    bool absentUnread = imap && !meta->cells.Contains("unreadChildren"_ns);
-    // nsMsgThread defaults an absent newest-date cache to zero and computes
-    // the live maximum on read. Preserve absence just like an explicit zero;
-    // no original row/cell is rewritten or newly marked as accounted here.
-    bool absentNewest = !meta->cells.Contains("threadNewestMsgDate"_ns);
-    NS_ENSURE_TRUE(meta->cells.Count() ==
-                       6u - uint32_t(absentUnread) - uint32_t(absentNewest),
-                   NS_ERROR_NOT_IMPLEMENTED);
-    uint32_t values[6] = {};
-    const char* names[] = {"threadRoot",     "threadId",
-                           "threadFlags",    "children",
-                           "unreadChildren", "threadNewestMsgDate"};
-    for (uint32_t i = 0; i < 6; ++i) {
-      nsDependentCString name(names[i]);
-      if ((i == 4 && absentUnread) || (i == 5 && absentNewest)) continue;
-      NS_ENSURE_TRUE(meta->cells.Contains(name), NS_ERROR_NOT_IMPLEMENTED);
-      MOZ_TRY(ImportCellNumber(*meta, name, values[i]));
-    }
-    NS_ENSURE_TRUE(values[1] == id && !values[2] && values[3] == children &&
-                       values[4] == unreadChildren &&
-                       (!values[5] || values[5] == newest),
-                   NS_ERROR_NOT_IMPLEMENTED);
-    root = values[0];
-    meta->accounted = true;
-    return NS_OK;
-  };
-  nsTHashMap<uint32_t, bool> retiredThreads;
-  uint32_t indexedThreads = 0;
-  constexpr uint32_t retiring = nsIMsgOfflineImapOperation::kMsgMoved |
-                                nsIMsgOfflineImapOperation::kDeletedMsg |
-                                nsIMsgOfflineImapOperation::kMsgMarkedDeleted;
-  for (auto entry = threadTables.ConstIter(); !entry.Done(); entry.Next()) {
-    const auto& table = *tables[entry.Data()];
-    if (table.members.IsEmpty()) {
-      auto operationKey =
-          ImportSourceKey(table.id, "ns:msg:db:row:scope:ops:all"_ns);
-      auto* operation = find(operationKey);
-      NS_ENSURE_TRUE(imap && !messages.Contains(table.id) && offlineTable &&
-                         offlineTable->memberSet.Contains(operationKey) &&
-                         operation,
-                     NS_ERROR_NOT_IMPLEMENTED);
-      uint32_t word, key, root;
-      MOZ_TRY(ImportCellNumber(*operation, "op"_ns, word));
-      MOZ_TRY(ImportCellNumber(*operation, "msgKey"_ns, key));
-      NS_ENSURE_TRUE((word & retiring) && key == table.id,
-                     NS_ERROR_NOT_IMPLEMENTED);
-      MOZ_TRY(checkMeta(find(table.meta), table.id, 0, 0, 0, root));
-      NS_ENSURE_TRUE(
-          root == table.id && !allThreads->memberSet.Contains(
-                                  ImportSourceKey(table.id, threadScope)),
-          NS_ERROR_NOT_IMPLEMENTED);
-      retiredThreads.InsertOrUpdate(table.id, true);
-      continue;
-    }
-    uint32_t childrenUnread = 0, newest = 0;
-    for (const auto& key : table.members) {
-      auto* row = find(key);
-      uint32_t index;
-      NS_ENSURE_TRUE(row && row->scope == messageScope &&
-                         messages.Get(row->id, &index) &&
-                         !assigned.Contains(row->id),
-                     NS_ERROR_INVALID_ARG);
-      uint32_t id, parent;
-      MOZ_TRY(ImportCellNumber(*row, "msgThreadId"_ns, id));
-      MOZ_TRY(ImportCellNumber(*row, "threadParent"_ns, parent, nsMsgKey_None));
-      const auto& message = input.messages[index];
-      Maybe<nsMsgKey> expectedParent;
-      if (parent != nsMsgKey_None) {
-        expectedParent = Some(nsMsgKey(parent));
-      }
-      NS_ENSURE_TRUE(
-          id == table.id && message.parentSourceKey == expectedParent,
-          NS_ERROR_INVALID_ARG);
-      assigned.InsertOrUpdate(row->id, true);
-      childrenUnread += !(message.header.flags & nsMsgMessageFlags::Read);
-      newest =
-          std::max(newest, uint32_t(message.header.date / PR_USEC_PER_SEC));
-    }
-    uint32_t root, rootIndex;
-    MOZ_TRY(checkMeta(find(table.meta), table.id, table.members.Length(),
-                      childrenUnread, newest, root));
-    NS_ENSURE_TRUE(
-        messages.Get(root, &rootIndex) &&
-            table.memberSet.Contains(ImportSourceKey(root, messageScope)),
-        NS_ERROR_INVALID_ARG);
-    for (const auto& key : table.members) {
-      uint32_t index;
-      NS_ENSURE_TRUE(messages.Get(find(key)->id, &index) &&
-                         input.messages[index].rootSourceKey == root,
-                     NS_ERROR_INVALID_ARG);
-    }
-    nsCString subjectKey = ImportSourceKey(table.id, threadScope);
-    auto* subject = find(subjectKey);
-    auto* rootRow = find(ImportSourceKey(root, messageScope));
-    nsCString rawSubject, threadSubject;
-    if (!rootRow->cells.Get("subject"_ns, &rawSubject)) {
-      rawSubject.Truncate();
-    }
-    // The all-threads table is legacy's derived subject index. nsMsgDatabase
-    // can leave a live thread out of it, e.g. after a header is removed and
-    // added again; the thread table and headers above stay authoritative. A
-    // present subject row must still be exact, indexed or not.
-    const bool indexed = allThreads->memberSet.Contains(subjectKey);
-    if (subject || indexed) {
-      NS_ENSURE_TRUE(
-          subject && !subject->accounted && subject->cells.Count() == 1 &&
-              subject->cells.Get("threadSubject"_ns, &threadSubject) &&
-              threadSubject == rawSubject,
-          NS_ERROR_NOT_IMPLEMENTED);
-      subject->accounted = true;
-      indexedThreads += indexed;
-    }
+  // Every word of the source is declared, exactly, and nothing else is.
+  uint32_t declared = 0;
+  for (const auto& entry : input.threadFlags) {
+    uint32_t word;
+    NS_ENSURE_TRUE(words.Get(entry.first, &word) && word == entry.second,
+                   NS_ERROR_INVALID_ARG);
+    ++declared;
   }
-  // Every index member must be the subject of a distinct live thread.
-  NS_ENSURE_TRUE(
-      assigned.Count() == input.messages.Length() &&
-          (infoOnly || allThreads->members.Length() == indexedThreads),
-      NS_ERROR_INVALID_ARG);
+  uint32_t present = 0;
+  for (auto entry = words.ConstIter(); !entry.Done(); entry.Next())
+    present += entry.Data() != 0;
+  NS_ENSURE_TRUE(present == declared, NS_ERROR_INVALID_ARG);
   auto* info = find(infoTable->members[0]);
   NS_ENSURE_TRUE(info && info->id == 1 && info->scope == infoScope,
                  NS_ERROR_NOT_IMPLEMENTED);
   MOZ_TRY(ImportFolderProperties(
       cx, request, *info, folderFlags, input.messages.Length(), unread,
       input.folderProperties, bool(imap), StartupLocalProtocol(protocol)));
-  info->accounted = true;
   if (imap) {
     MOZ_TRY(
         CheckImapImportRecords(cx, request, rows, offlineTable, *info, *imap));
-  }
-  // CheckImapImportRecords above independently validates the entire raw op
-  // payload and exact typed projection before inactive remnants are accounted.
-  for (const auto& row : rows) {
-    if (imap && !row->accounted && retiredThreads.Contains(row->id)) {
-      if (row->scope == threadScope && row->cells.Count() == 1 &&
-          row->cells.Contains("threadSubject"_ns)) {
-        row->accounted = true;
-      } else if (row->scope == messageScope && row->cells.IsEmpty() &&
-                 !messageTable->memberSet.Contains(
-                     ImportSourceKey(row->id, messageScope))) {
-        row->accounted = true;
-      }
-    }
-    // nsMsgDatabase deletes a played-back offline operation or pending
-    // attribute row by cutting it from its table and cutting all its cells.
-    // Such a detached cell-less row has no state left to import.
-    if (imap && !row->accounted && row->cells.IsEmpty() &&
-        (row->scope == "ns:msg:db:row:scope:ops:all"_ns ||
-         row->scope == "ns:msg:db:row:scope:pending:all"_ns) &&
-        !(offlineTable && offlineTable->memberSet.Contains(
-                              ImportSourceKey(row->id, row->scope)))) {
-      row->accounted = true;
-    }
-    if (!row->accounted) {
-      uint32_t root;
-      MOZ_TRY(checkMeta(row.get(), row->id, 0, 0, 0, root));
-      NS_ENSURE_TRUE(root == row->id, NS_ERROR_NOT_IMPLEMENTED);
-    }
   }
   return NS_OK;
 }
@@ -6091,6 +5967,34 @@ nsresult ImportMessages(JSContext* cx, JS::Handle<JSObject*> request,
     }
     for (uint32_t member : chain) {
       visited[member] = 2;
+    }
+  }
+  // A thread's watch/ignore word is user data: it names a thread root of
+  // this import once.
+  MOZ_TRY(ImportMember(cx, request, "threadFlags", &field, true));
+  if (!field.isUndefined()) {
+    JS::Rooted<JSObject*> words(cx), pair(cx);
+    uint32_t wordCount, pairLength;
+    MOZ_TRY(ImportArray(cx, field, &words, wordCount));
+    nsTHashSet<nsMsgKey> flagged;
+    for (uint32_t i = 0; i < wordCount; ++i) {
+      NS_ENSURE_TRUE(JS_GetElement(cx, words, i, &field), NS_ERROR_FAILURE);
+      MOZ_TRY(ImportArray(cx, field, &pair, pairLength));
+      NS_ENSURE_TRUE(pairLength == 2, NS_ERROR_INVALID_ARG);
+      int64_t root, word;
+      NS_ENSURE_TRUE(JS_GetElement(cx, pair, 0, &field), NS_ERROR_FAILURE);
+      MOZ_TRY(ImportNumber(field, 0, nsMsgKey_None - 1, root));
+      NS_ENSURE_TRUE(JS_GetElement(cx, pair, 1, &field), NS_ERROR_FAILURE);
+      MOZ_TRY(ImportNumber(field, 1, UINT32_MAX, word));
+      uint32_t index;
+      NS_ENSURE_TRUE(
+          indexes.Get(nsMsgKey(root), &index) &&
+              input.messages[index].rootSourceKey == nsMsgKey(root) &&
+              !flagged.Contains(nsMsgKey(root)),
+          NS_ERROR_INVALID_ARG);
+      flagged.Insert(nsMsgKey(root));
+      input.threadFlags.AppendElement(
+          std::pair{nsMsgKey(root), uint32_t(word)});
     }
   }
   if (full) {

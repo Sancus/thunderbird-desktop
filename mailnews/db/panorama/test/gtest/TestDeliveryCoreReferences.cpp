@@ -26666,12 +26666,22 @@ TEST_F(DeliveryCoreReferences, StartupImapRootCacheCompletesWithNativeReceipt) {
                              nullptr, NS_OK, nullptr, false, true);
 }
 
-TEST_F(DeliveryCoreReferences, StartupBeginPreservesSettledParserFailure) {
-  ASSERT_EQ(NS_OK, WriteStartupFile("folderCache.json", "{corrupt JSON"_ns));
+// A cache that does not parse is an empty cache now and fails nothing
+// (StartupUnusableJSONIsAnEmptyCacheNeverMork). A cache with an entry is
+// legacy input this observed startup cannot migrate; that failure settles and
+// stays the first one.
+TEST_F(DeliveryCoreReferences, StartupBeginPreservesSettledLegacyInputFailure) {
+  dom::AutoJSAPI jsapi;
+  ASSERT_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()));
+  nsCString descriptor, quoted;
+  ASSERT_EQ(NS_OK, mProfile->GetPersistentDescriptor(descriptor));
+  ASSERT_EQ(NS_OK, JSONCacheQuote(jsapi.cx(), descriptor, quoted));
+  ASSERT_EQ(NS_OK, WriteStartupFile("folderCache.json",
+                                    "{"_ns + quoted + ":{\"flags\":4}}"_ns));
   CheckObservedStartupFailure();
 }
 
-TEST_F(DeliveryCoreReferences, StartupUnknownNumericCacheCellStillRefuses) {
+TEST_F(DeliveryCoreReferences, StartupUnknownCacheCellKeepsOriginalBytes) {
   dom::AutoJSAPI jsapi;
   ASSERT_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()));
   nsCString descriptor, quoted;

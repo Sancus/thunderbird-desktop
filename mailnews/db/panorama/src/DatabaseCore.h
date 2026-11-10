@@ -171,6 +171,9 @@ struct FolderImportSnapshot {
   uint64_t sourceSize{0};
   nsTArray<FolderImportMessage> messages;
   nsTArray<FolderImportProperty> folderProperties;
+  // Each thread's watch/ignore word (legacy nsMsgThread flags), by the
+  // physical source key of the thread's root message. Only nonzero words.
+  nsTArray<std::pair<nsMsgKey, uint32_t>> threadFlags;
   // Set only after accounting for every required source row/table.
   bool recordsComplete{false};
   nsTArray<nsCString> unhandledRecords;
@@ -392,6 +395,9 @@ class DatabaseCore : public nsIDatabaseCore,
   nsresult CheckFolderImportIdentity(const FolderImportIdentity& identity);
   nsresult ReadFolderImportReceipt(const FolderImportIdentity& identity,
                                    Maybe<FolderImportReceipt>& output);
+  nsresult WriteImportedThreadFlags(
+      uint64_t folderId, const nsTArray<std::pair<nsMsgKey, uint32_t>>& words,
+      const nsTHashMap<nsMsgKey, nsMsgKey>& keys);
   nsresult WriteImportedMessage(uint64_t folderId, nsMsgKey key, nsMsgKey root,
                                 nsMsgKey parent, const RawHdr& header);
 

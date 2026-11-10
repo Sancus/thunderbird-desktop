@@ -561,35 +561,47 @@ add_task(async function test_rejectsUnknownStructuralRow() {
     scope: "unknown-required-scope",
     cells: [],
   });
-  Assert.throws(() => convert(input, source), /unaccounted/);
+  // A row no table old Thunderbird reads holds is not data.
+  Assert.ok(convert(input, source).recordsComplete);
 });
 
 add_task(async function test_rejectsOfflineOperationsBeforeImport() {
   const { input, source } = await snapshotInput();
-  input.records.tables.push({
+  const table = {
     id: 1,
     scope: "ns:msg:db:row:scope:ops:all",
     cells: [{ k: "k", v: "ns:msg:db:table:kind:ops" }],
     rows: [],
     metaRow: null,
+  };
+  input.records.tables.push(table);
+  Assert.ok(
+    convert(input, source).recordsComplete,
+    "An empty operations table holds no pending work"
+  );
+  input.records.rows.push({
+    id: 1,
+    scope: "ns:msg:db:row:scope:ops:all",
+    cells: [{ k: "op", v: "1" }],
   });
+  table.rows.push("1:ns:msg:db:row:scope:ops:all");
   Assert.throws(
     () => convert(input, source),
     error =>
-      error.message.startsWith("Unsupported Mork structural/offline table:")
+      error.message.startsWith("Unsupported Mork structural/offline table:"),
+    "Pending server work is never dropped"
   );
   Assert.equal(originalFolder.getTotalMessages(false), 0);
 });
 
-add_task(async function test_rejectsUnrepresentableThreadFlags() {
+add_task(async function test_importsThreadWatchIgnoreWord() {
+  // The word of a thread's metadata row is user data (watch, ignore).
   const { input, source } = await snapshotInput();
-  input.records.rows
-    .find(row => row.id == 1 && row.scope == "m")
-    .cells.find(cell => cell.k == "threadFlags").v = "100";
-  Assert.throws(
-    () => convert(input, source),
-    error => error.message == "Unsupported Mork thread metadata/state"
-  );
+  Assert.deepEqual(convert(input, source).threadFlags, []);
+  const meta = input.records.rows.find(row => row.id == 1 && row.scope == "m");
+  meta.cells.find(cell => cell.k == "threadFlags").v = "40000";
+  const root = parseInt(meta.cells.find(cell => cell.k == "threadRoot").v, 16);
+  Assert.deepEqual(convert(input, source).threadFlags, [[root, 0x40000]]);
 });
 
 add_task(async function test_rejectsUnsafeInt64FolderProjection() {
@@ -600,11 +612,23 @@ add_task(async function test_rejectsUnsafeInt64FolderProjection() {
   Assert.throws(() => convert(input, source), /exact int64/);
 });
 
-add_task(async function test_rejectsNonzeroPendingFolderState() {
+add_task(async function test_rejectsSummaryMarkedForRebuilding() {
   const { input, source } = await snapshotInput();
-  input.records.rows
-    .find(row => row.scope == INFO_SCOPE)
-    .cells.push({ k: "totPendingMsgs", v: "1" });
+  const info = input.records.rows.find(row => row.scope == INFO_SCOPE);
+  // The pending and message counters are a cache old Thunderbird recounts.
+  info.cells.push({ k: "totPendingMsgs", v: "1" });
+  info.cells.push({ k: "unreadPendingMsgs", v: "2" });
+  for (const name of ["numMsgs", "numNewMsgs"]) {
+    const cell = info.cells.find(item => item.k == name);
+    if (cell) {
+      cell.v = "7f";
+    } else {
+      info.cells.push({ k: name, v: "7f" });
+    }
+  }
+  Assert.ok(convert(input, source).recordsComplete);
+  // A summary old Thunderbird marked for rebuilding is no usable index.
+  info.cells.push({ k: "forceReparse", v: "1" });
   Assert.throws(() => convert(input, source), /required Mork folder state/);
 });
 
@@ -1150,9 +1174,10 @@ add_task(async function test_imapUnitRejectsUnknownOrAmbiguousBinding() {
   const readMeta = append.input.records.rows.find(row => row.scope == "m");
   Assert.ok(!readMeta.cells.some(cell => cell.k == "unreadChildren"));
   readMeta.cells.push({ k: "unreadChildren", v: "1" });
-  Assert.throws(
-    () => convertUnit(unread),
-    /Unsupported Mork thread metadata\/state/
+  Assert.equal(
+    convertUnit(unread).folders.length,
+    entries.length,
+    "A thread's cached unread count is recounted, never compared"
   );
   const retired = structuredClone(entries);
   const classic = retired.find(entry => entry.source.id == "MigrationClassic");
@@ -1169,9 +1194,9 @@ add_task(async function test_imapUnitRejectsUnknownOrAmbiguousBinding() {
     row => row.id + ":" + row.scope == emptyThread.metaRow
   );
   retiredMeta.cells.find(cell => cell.k == "threadFlags").v = "1";
-  Assert.throws(
-    () => convertUnit(retired),
-    /Unsupported Mork thread metadata\/state/
+  Assert.ok(
+    convertUnit(retired).folders.every(folder => !folder.threadFlags.length),
+    "A thread without headers has no word to import"
   );
   const alias = structuredClone(entries);
   alias[1].source.originalFolderURI = alias[0].source.originalFolderURI;
@@ -1334,56 +1359,54 @@ add_task(async function test_convertsOriginalImapNoNewestDateCache() {
   );
 });
 
-add_task(async function test_rejectsInvalidMetadataWithNoNewestDateCache() {
+add_task(async function test_threadCachesAreHintsAndWordIsImported() {
   const entry = await missingNewestImapEntry();
   const convertEntry = value =>
-    convertMorkProtocolUnit(
-      [value],
-      "missing-newest-refusal",
-      database.sourceId
-    );
+    convertMorkProtocolUnit([value], "thread-cache-hints", database.sourceId);
   Assert.equal(convertEntry(entry).folders.length, 1);
-  for (const [name, value, expected] of [
-    ["threadNewestMsgDate", "1", /Unsupported Mork newest-date cache/],
-    ["threadNewestMsgDate", "ffffffff", /Unsupported Mork newest-date cache/],
-    ["threadNewestMsgDate", "g", /Invalid structural Mork uint32/],
-    ["unknownThreadCell", "0", /Unsupported Mork thread metadata\/state/],
-    ["threadFlags", "1", /Unsupported Mork thread metadata\/state/],
-    ["children", "2", /Unsupported Mork thread metadata\/state/],
-    ["unreadChildren", "0", /Unsupported Mork thread metadata\/state/],
-    ["threadRoot", "2b", /Source thread root is not an imported member/],
-  ]) {
+  // The per-thread metadata row caches counts, a newest date and the root.
+  // Old Thunderbird recounts and reroots; stale or absent cells refuse nothing.
+  const variants = [
+    ["threadNewestMsgDate", "1"],
+    ["threadNewestMsgDate", "ffffffff"],
+    ["threadNewestMsgDate", "g"],
+    ["unknownThreadCell", "0"],
+    ["children", "2"],
+    ["unreadChildren", "0"],
+    ["threadRoot", "2b"],
+    ["threadRoot", "not hex"],
+    ["threadRoot", null],
+    ["threadId", null],
+    ["children", null],
+    ["unreadChildren", null],
+    ["threadFlags", null],
+    ["threadFlags", "not hex"],
+  ];
+  for (const [name, value] of variants) {
     const changed = structuredClone(entry);
     const row = changed.input.records.rows.find(record => record.scope == "m");
     const cell = row.cells.find(item => item.k == name);
-    if (cell) {
+    if (value === null) {
+      row.cells = row.cells.filter(item => item.k != name);
+    } else if (cell) {
       cell.v = value;
     } else {
       row.cells.push({ k: name, v: value });
     }
-    Assert.throws(() => convertEntry(changed), expected, name + ": " + value);
+    const [member] = convertEntry(changed).folders;
+    Assert.equal(member.messages[0].rootSourceKey, 42, name + ": " + value);
+    Assert.equal(member.messages[0].parentSourceKey, null, name);
+    Assert.deepEqual(member.threadFlags, [], name);
   }
-  // Original source-key relations reject missing roots before metadata checks.
-  for (const [name, expected] of [
-    ["threadRoot", /Invalid source thread root/],
-    ["threadId", /Unsupported Mork thread metadata\/state/],
-    ["threadFlags", /Unsupported Mork thread metadata\/state/],
-    ["children", /Unsupported Mork thread metadata\/state/],
-    ["unreadChildren", /Unsupported Mork thread metadata\/state/],
-  ]) {
-    const changed = structuredClone(entry);
-    const row = changed.input.records.rows.find(record => record.scope == "m");
-    row.cells = row.cells.filter(cell => cell.k != name);
-    Assert.throws(
-      () => convertEntry(changed),
-      expected,
-      name + " stays required for this original unread message"
-    );
-  }
+  // The watch/ignore word is user data.
+  const watched = structuredClone(entry);
+  const meta = watched.input.records.rows.find(record => record.scope == "m");
+  meta.cells.find(item => item.k == "threadFlags").v = "100";
+  Assert.deepEqual(convertEntry(watched).folders[0].threadFlags, [[42, 0x100]]);
   Assert.equal(
     await IOUtils.computeHexDigest(entry.source.path, "sha256"),
     MISSING_NEWEST_IMAP_SHA256,
-    "Refusal variants change only owned parsed models"
+    "Variants change only owned parsed models"
   );
 });
 
@@ -1430,24 +1453,19 @@ add_task(async function test_imapUnitAccountsLegacyDerivedAndDeletedRecords() {
     converted.folders.every(folder => folder.recordsComplete),
     "Cached unified folder hits are accounted"
   );
-  Assert.throws(
-    () =>
-      convertUnit(
-        withTable("mailbox://nobody@smart%20mailboxes/Inbox", records => [
-          ...liveHeaders(records),
-          "999999:" + MESSAGES,
-        ])
-      ),
-    /Unsupported Mork unified folder hit/
-  );
-  Assert.throws(
-    () =>
-      convertUnit(
-        withTable("mailbox://nobody@Local%20Folders/Saved", liveHeaders)
-      ),
-    /Unsupported Mork structural\/offline table/,
-    "Other search folder caches stay unsupported"
-  );
+  // A stale hit and the cache of any other search folder are derived too.
+  for (const stale of [
+    withTable("mailbox://nobody@smart%20mailboxes/Inbox", records => [
+      ...liveHeaders(records),
+      "999999:" + MESSAGES,
+    ]),
+    withTable("mailbox://nobody@Local%20Folders/Saved", liveHeaders),
+  ]) {
+    Assert.ok(
+      convertUnit(stale).folders.every(folder => folder.recordsComplete),
+      "A search cache is rebuilt, never imported or compared"
+    );
+  }
 
   // A live thread may be missing from the derived all-threads subject index.
   const unindexed = structuredClone(entries);
@@ -1461,11 +1479,7 @@ add_task(async function test_imapUnitAccountsLegacyDerivedAndDeletedRecords() {
     row => row.id + ":" + row.scope == subjectKey
   );
   subject.cells.find(cell => cell.k == "threadSubject").v += " changed";
-  Assert.throws(
-    () => convertUnit(unindexed),
-    /Unsupported Mork thread subject index/,
-    "A detached subject row must still be exact"
-  );
+  convertUnit(unindexed);
 
   // A played-back offline operation or pending attribute is deleted by
   // cutting it from its table and cutting all its cells.
@@ -1478,10 +1492,8 @@ add_task(async function test_imapUnitAccountsLegacyDerivedAndDeletedRecords() {
     deletedRecords.rows.push({ id: 777, scope, cells: [] });
   }
   convertUnit(deleted);
+  // Old Thunderbird reads pending operations through their table only: a
+  // row cut from it is no pending work, with or without leftover cells.
   deletedRecords.rows.at(-2).cells.push({ k: "op", v: "1" });
-  Assert.throws(
-    () => convertUnit(deleted),
-    /Unsupported unaccounted Mork row/,
-    "A detached operation with state is never dropped"
-  );
+  convertUnit(deleted);
 });

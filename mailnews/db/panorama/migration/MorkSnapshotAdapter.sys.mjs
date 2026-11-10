@@ -10,7 +10,10 @@ import {
   validateMorkFolderWindowsInventory,
   validateMorkFolderWindowsReceipt,
 } from "resource:///modules/panorama/MorkFolderImport.sys.mjs";
-import { getMorkThreadRelations } from "resource:///modules/panorama/MigrationMessageMap.sys.mjs";
+import {
+  getMorkThreadFlags,
+  getMorkThreadRelations,
+} from "resource:///modules/panorama/MigrationMessageMap.sys.mjs";
 
 const MESSAGE = "ns:msg:db:row:scope:msgs:all";
 const THREAD = "ns:msg:db:row:scope:threads:all";
@@ -49,14 +52,6 @@ const UINT32_PROPERTIES = new Set([
   "fixedBadRefThreading",
 ]);
 const INT64_PROPERTIES = new Set(["folderSize", "expungedBytes"]);
-const META_FIELDS = new Set([
-  "threadRoot",
-  "threadId",
-  "threadFlags",
-  "children",
-  "unreadChildren",
-  "threadNewestMsgDate",
-]);
 
 /**
  * Converts folder-reader input to Unix version1 or Windows version2 native input.
@@ -1131,9 +1126,14 @@ function classifyRecordTables(tables, imap) {
       table.metaRow === null
     ) {
       unifiedHits.push(table);
-    } else {
+    } else if (
+      (table.scope == OFFLINE || table.scope == PENDING) &&
+      (imap || table.rows.length)
+    ) {
+      // Pending server work is user data this reader must understand.
       throw new Error("Unsupported Mork structural/offline table: " + key);
     }
+    // Any other table is a derived index or cache old Thunderbird rebuilds.
   }
   return {
     messageTable,
@@ -1164,7 +1164,6 @@ function accountRecords(request, folderFlags, imap = false) {
     }
     rows.set(key, { ...row, cells: cells(row) });
   }
-  const remaining = new Set(rows.keys());
   const tables = new Map();
   for (const table of request.records.tables) {
     const key = rowKey(table);
@@ -1198,57 +1197,44 @@ function accountRecords(request, folderFlags, imap = false) {
       throw new Error("Unsupported deleted/pending thread state");
     }
     messages.set(message.sourceKey, { message, row });
-    remaining.delete(key);
   }
   if (!sameKeys([...messages.keys()], request.source.messageKeys)) {
     throw new Error("Incomplete Mork physical source key set");
   }
-  const {
-    messageTable,
-    infoTable,
-    allThreads,
-    offlineTable,
-    threadTables,
-    unifiedHits,
-  } = classifyRecordTables(tables, imap);
-  // Only an empty folder's summary may lack both the all-headers and the
-  // all-threads table; nsMsgDatabase recreates them when it opens one.
-  const infoOnly =
-    !messageTable && !allThreads && !messages.size && !threadTables.size;
+  const { messageTable, infoTable, offlineTable } = classifyRecordTables(
+    tables,
+    imap
+  );
+  // The all-headers table and the folder-info row are the index. Only an
+  // empty folder's summary may lack the all-headers table; nsMsgDatabase
+  // recreates it when it opens one.
   if (
     !infoTable ||
-    (!infoOnly &&
-      (!messageTable ||
-        !allThreads ||
-        !sameKeys(
+    (messageTable
+      ? !sameKeys(
           messageTable.rows,
           [...messages.keys()].map(key => key + ":" + MESSAGE)
-        )))
+        )
+      : messages.size)
   ) {
-    throw new Error("Incomplete Mork message/folder/thread tables");
+    throw new Error("Incomplete Mork message/folder tables");
   }
-  // A cached unified folder hit is derived from live headers of this folder.
-  // It is accounted, not imported, and never stands in for a missing header.
-  for (const table of unifiedHits) {
-    if (!table.rows.every(key => messageTable?.rows.includes(key))) {
-      throw new Error("Unsupported Mork unified folder hit");
-    }
-  }
+  // The per-thread tables with their cached counts and roots, the all-threads
+  // subject index, the folder-info counts and cached unified-folder hits are
+  // derived from the headers. Old Thunderbird repairs or recounts them and
+  // real summaries leave them stale; they are neither imported nor compared.
+  // Each header's own row names its thread and parent.
   const relations = getMorkThreadRelations({
     source: { rows, tables },
     messages: [...messages].map(([sourceKey, { row }]) => ({
       sourceKey,
-      threadId: hex(row.cells.get("msgThreadId")),
+      threadId: row.cells.has("msgThreadId")
+        ? hex(row.cells.get("msgThreadId"))
+        : null,
       threadParent: hex(row.cells.get("threadParent") ?? "ffffffff"),
     })),
   });
-  const grouped = new Map();
-  for (const [key, { row, message }] of messages) {
-    const id = hex(row.cells.get("msgThreadId"));
-    if (!grouped.has(id)) {
-      grouped.set(id, []);
-    }
-    grouped.get(id).push(key);
+  for (const [key, { message }] of messages) {
     const relation = relations.get(key);
     if (
       message.rootSourceKey !== relation.root ||
@@ -1257,70 +1243,19 @@ function accountRecords(request, folderFlags, imap = false) {
       throw new Error("Mork semantic thread map differs from source");
     }
   }
-  const retiredThreads = new Set();
-  for (const [id, table] of threadTables) {
-    const members = grouped.get(id) ?? [];
-    if (!members.length) {
-      const operationKey = id + ":" + OFFLINE;
-      const operation = rows.get(operationKey);
-      const retired =
-        imap &&
-        offlineTable?.rows.includes(operationKey) &&
-        operation &&
-        hex(operation.cells.get("op")) &
-          (Ci.nsIMsgOfflineImapOperation.kMsgMoved |
-            Ci.nsIMsgOfflineImapOperation.kDeletedMsg |
-            Ci.nsIMsgOfflineImapOperation.kMsgMarkedDeleted);
-      if (!retired) {
-        throw new Error("Unsupported empty or inconsistent Mork thread table");
-      }
-      retiredThreads.add(id);
-    }
-    if (
-      !sameKeys(
-        table.rows,
-        members.map(key => key + ":" + MESSAGE)
-      )
-    ) {
-      throw new Error("Unsupported empty or inconsistent Mork thread table");
-    }
-    const meta = rows.get(table.metaRow);
-    checkMeta(meta, id, members, messages, imap);
-    remaining.delete(table.metaRow);
-    grouped.delete(id);
-  }
-  if (grouped.size) {
-    throw new Error("Missing Mork thread membership/index");
-  }
-  const checkSubject = (key, row) => {
-    const table = row && threadTables.get(row.id);
-    const root = table && hex(rows.get(table.metaRow).cells.get("threadRoot"));
-    const subject = messages.get(root)?.row.cells.get("subject") ?? "";
-    if (
-      !row ||
-      row.scope != THREAD ||
-      !table ||
-      retiredThreads.has(row.id) ||
-      row.cells.size != 1 ||
-      row.cells.get("threadSubject") != subject
-    ) {
-      throw new Error("Unsupported Mork thread subject index");
-    }
-    remaining.delete(key);
-  };
-  for (const key of allThreads?.rows ?? []) {
-    checkSubject(key, rows.get(key));
-  }
-  // The all-threads table is legacy's derived subject index. nsMsgDatabase
-  // can leave a live thread out of it, e.g. after a header is removed and
-  // added again; the thread table and headers above stay authoritative. A
-  // present subject row must still be exact, indexed or not.
-  for (const id of threadTables.keys()) {
-    const key = id + ":" + THREAD;
-    if (!retiredThreads.has(id) && remaining.has(key)) {
-      checkSubject(key, rows.get(key));
-    }
-  }
+  // A thread's watch/ignore word is user data and is imported.
+  request.threadFlags = getMorkThreadFlags(
+    {
+      source: { rows, tables },
+      messages: [...messages].map(([sourceKey, { row }]) => ({
+        sourceKey,
+        threadId: row.cells.has("msgThreadId")
+          ? hex(row.cells.get("msgThreadId"))
+          : null,
+      })),
+    },
+    relations
+  );
   if (infoTable.rows.length != 1) {
     throw new Error("Unsupported Mork folder-info membership");
   }
@@ -1335,118 +1270,10 @@ function accountRecords(request, folderFlags, imap = false) {
     imap,
     LOCAL_STORE_PROTOCOLS.includes(request.folder.protocol)
   );
-  for (const [name, expected] of [
-    ["numMsgs", messages.size],
-    [
-      "numNewMsgs",
-      [...messages.values()].filter(
-        ({ message }) => !(message.header.flags & Ci.nsMsgMessageFlags.Read)
-      ).length,
-    ],
-  ]) {
-    if (info.cells.has(name) && hex(info.cells.get(name)) != expected) {
-      throw new Error("Mork folder count differs from imported rows");
-    }
-  }
-  remaining.delete(infoKey);
   if (imap) {
     request.imap = accountImapRecords(request, info.cells, offlineTable, rows);
-    for (const operation of request.imap.operations) {
-      remaining.delete(operation.sourceKey + ":" + OFFLINE);
-      const retired = operation.sourceKey + ":" + MESSAGE;
-      if (
-        !messages.has(operation.sourceKey) &&
-        operation.payload.operation &
-          (Ci.nsIMsgOfflineImapOperation.kMsgMoved |
-            Ci.nsIMsgOfflineImapOperation.kDeletedMsg |
-            Ci.nsIMsgOfflineImapOperation.kMsgMarkedDeleted)
-      ) {
-        remaining.delete(retired);
-      }
-    }
-  }
-  // Detached empty metadata has no live thread membership. Reject any state.
-  for (const key of remaining) {
-    const row = rows.get(key);
-    if (
-      imap &&
-      row.scope == THREAD &&
-      retiredThreads.has(row.id) &&
-      row.cells.size === 1 &&
-      row.cells.has("threadSubject")
-    ) {
-      // A removed source can leave its inactive subject index outside the live
-      // all-threads table. Its zero-member metadata was checked above.
-      continue;
-    }
-    if (
-      imap &&
-      (row.scope == OFFLINE || row.scope == PENDING) &&
-      !row.cells.size &&
-      !offlineTable?.rows.includes(key)
-    ) {
-      // nsMsgDatabase deletes a played-back offline operation or pending
-      // attribute row by cutting it from its table and cutting all its cells.
-      // Such a detached cell-less row has no state left to import.
-      continue;
-    }
-    if (
-      row.scope != "m" ||
-      hex(row.cells.get("threadId")) != row.id ||
-      hex(row.cells.get("threadRoot")) != row.id
-    ) {
-      throw new Error("Unsupported unaccounted Mork row: " + key);
-    }
-    checkMeta(row, row.id, [], messages, imap);
   }
   return properties;
-}
-
-/**
- * Checks the known legacy thread metadata without changing original cells.
- * Reads an omitted newest-date cache as zero, as the native thread reader does.
- *
- * @param {object} row - Original metadata row.
- * @param {number} id - Original thread table ID.
- * @param {number[]} members - Exact physical message keys.
- * @param {Map<number, object>} messages - Source messages by physical key.
- * @param {boolean} [imap=false] - Honor the legacy omitted zero unread count.
- * @returns {number} Explicit original semantic root.
- */
-function checkMeta(row, id, members, messages, imap = false) {
-  if (
-    !row ||
-    row.scope != "m" ||
-    row.cells.size !=
-      META_FIELDS.size -
-        Number(imap && !row.cells.has("unreadChildren")) -
-        Number(!row.cells.has("threadNewestMsgDate")) ||
-    [...row.cells.keys()].some(name => !META_FIELDS.has(name)) ||
-    hex(row.cells.get("threadId")) != id ||
-    hex(row.cells.get("threadFlags")) != 0 ||
-    hex(row.cells.get("children")) != members.length ||
-    hex(row.cells.get("unreadChildren") ?? (imap ? "0" : undefined)) !=
-      members.filter(
-        key =>
-          !(messages.get(key).message.header.flags & Ci.nsMsgMessageFlags.Read)
-      ).length
-  ) {
-    throw new Error("Unsupported Mork thread metadata/state");
-  }
-  const root = hex(row.cells.get("threadRoot"));
-  if (members.length ? !members.includes(root) : imap && root !== id) {
-    throw new Error("Missing Mork semantic root");
-  }
-  const newest = hex(row.cells.get("threadNewestMsgDate") ?? "0");
-  const expected = members.reduce(
-    (latest, key) =>
-      Math.max(latest, messages.get(key).message.header.date / 1000000),
-    0
-  );
-  if (newest != 0 && newest != expected) {
-    throw new Error("Unsupported Mork newest-date cache");
-  }
-  return root;
 }
 
 /**
@@ -1503,12 +1330,9 @@ function folderProperties(original, flags, imap = false, localStore = false) {
             ? (property.integer ^ flags) &
               ~(Ci.nsMsgFolderFlags.OfflineEvents | derived)
             : (property.integer ^ flags) & ~(mail | derived))) ||
-        ((imap
-          ? name == "forceReparse"
-          : ["totPendingMsgs", "unreadPendingMsgs", "forceReparse"].includes(
-              name
-            )) &&
-          property.integer != 0) ||
+        // A summary old Thunderbird itself marked for rebuilding from its
+        // store is not a usable index; the pending counters are a cache.
+        (name == "forceReparse" && property.integer != 0) ||
         (name == "version" && property.integer != 1)
       ) {
         throw new Error("Unsupported required Mork folder state: " + name);

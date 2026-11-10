@@ -875,6 +875,93 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             self.assertEqual(selected["sourceId"], self.selection()["sourceId"])
             self.assertEqual(expected, state())
 
+    def test_migratesWatchedThreadAndStaleDerivedThreadData(self):
+        """Counts and per-thread caches are derived data real summaries leave
+        stale; a thread's watch word is user data. All data is fabricated."""
+        self.clean_profile(False)
+        source = self.marionette.execute_script(r"""
+            const { MailServices } = ChromeUtils.importESModule(
+              'resource:///modules/MailServices.sys.mjs');
+            const { FileUtils } = ChromeUtils.importESModule(
+              'resource://gre/modules/FileUtils.sys.mjs');
+            const root = new FileUtils.File(PathUtils.join(PathUtils.profileDir,
+              'Mail', 's526-derived'));
+            root.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+            const server = MailServices.accounts.createIncomingServer(
+              's526derived', 'localhost', 'none');
+            server.localPath = root;
+            MailServices.accounts.createAccount().incomingServer = server;
+            server.rootFolder.createSubfolder('Threads', null);
+            const folder = server.rootFolder.getChildNamed('Threads')
+              .QueryInterface(Ci.nsIMsgLocalMailFolder);
+            const add = (id, subject, references) => folder.addMessage(
+              'From - Thu Nov 05 00:00:00 2026\r\n' +
+              'Message-ID: <' + id + '@invalid>\r\n' +
+              (references ? 'References: <' + references + '@invalid>\r\n' : '') +
+              'From: source@example.invalid\r\n' +
+              'Subject: ' + subject + '\r\n' +
+              'Date: Thu, 5 Nov 2026 00:00:00 +0000\r\n\r\n' +
+              'Body.\r\n');
+            const first = add('derived-root', 'Watched thread', null);
+            const reply = add('derived-reply', 'Re: Watched thread', 'derived-root');
+            add('derived-other', 'Another thread', null);
+            const database = folder.msgDatabase;
+            database.markThreadWatched(
+              database.getThreadContainingMsgHdr(first), first.messageKey, true, null);
+            // What real summaries leave stale: a parent that no longer exists
+            // and cached counts that no longer match.
+            reply.threadParent = 0x7fff0001;
+            database.dBFolderInfo.changeNumMessages(40);
+            database.commit(Ci.nsMsgDBCommitType.kLargeCommit);
+            Services.prefs.savePrefFile(null);
+            return {serverKey: server.key, summary: folder.summaryFile.path,
+              watched: database.isWatched(first.messageKey),
+              count: database.dBFolderInfo.numMessages};
+        """)
+        self.stop_application()
+        self.assertTrue(source["watched"])
+        self.assertEqual(43, source["count"], "The fixture's cached count is stale")
+        original = Path(source["summary"]).read_bytes()
+
+        def state():
+            return self.marionette.execute_script("""
+                const { MailServices } = ChromeUtils.importESModule(
+                  'resource:///modules/MailServices.sys.mjs');
+                const folder = MailServices.accounts.getIncomingServer(arguments[0])
+                  .rootFolder.getChildNamed('Threads');
+                const database = folder.msgDatabase;
+                const headers = Object.fromEntries(
+                  [...database.enumerateMessages()].map(h => [h.messageId, h]));
+                const first = headers['derived-root@invalid'];
+                const reply = headers['derived-reply@invalid'];
+                const other = headers['derived-other@invalid'];
+                return {
+                  subjects: Object.values(headers).map(h => h.subject).sort(),
+                  total: folder.getTotalMessages(false),
+                  watched: database.isWatched(first.messageKey),
+                  otherWatched: database.isWatched(other.messageKey),
+                  sameThread: reply.threadId === first.threadId,
+                  below: reply.threadParent === first.messageKey,
+                  otherThread: other.threadId !== first.threadId,
+                };
+            """, script_args=[source["serverKey"]])
+
+        expected = {
+            "subjects": ["Another thread", "Re: Watched thread", "Watched thread"],
+            "total": 3, "watched": True, "otherWatched": False,
+            "sameThread": True, "below": True, "otherThread": True,
+        }
+        self.start_same_profile(True)
+        selected = self.selection()
+        self.assertEqual("migrated", selected["record"]["origin"])
+        self.assertEqual(expected, state())
+        self.assertEqual(original, Path(source["summary"]).read_bytes())
+        for _ in range(2):
+            self.stop_application()
+            self.start_same_profile(True)
+            self.assertEqual(selected["sourceId"], self.selection()["sourceId"])
+            self.assertEqual(expected, state())
+
     def test_namedAndUnnamedActualSelection(self):
         self.clean_profile(True)
         first = self.selection()

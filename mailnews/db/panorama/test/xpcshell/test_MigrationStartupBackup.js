@@ -93,6 +93,46 @@ add_task(async function test_realBytesMatchExistingVerifierAndRestore() {
   );
 });
 
+add_task(async function test_startupHashNeverPassesFileBytesThroughScript() {
+  // Every file is hashed four times. Reading each byte into a script array
+  // made an ordinary multi-gigabyte profile take hours to start.
+  const { profile, external, body, backup } = await startupCopyFixture(
+    3 * 1024 * 1024 + 5
+  );
+  const originalHash = await IOUtils.computeHexDigest(body, "sha256");
+  const moduleGlobal = Cu.getGlobalForObject(createMigrationBackupAtStartup);
+  const originalCc = moduleGlobal.Cc;
+  let result;
+  moduleGlobal.Cc = new Proxy(originalCc, {
+    get(target, name) {
+      if (name == "@mozilla.org/binaryinputstream;1") {
+        throw new Error("Startup hashing must not read bytes into script");
+      }
+      return target[name];
+    },
+  });
+  try {
+    result = createMigrationBackupAtStartup(profile, [external], backup);
+  } finally {
+    moduleGlobal.Cc = originalCc;
+  }
+  Assert.strictEqual(moduleGlobal.Cc, originalCc);
+  Assert.deepEqual(await verifyMigrationBackup(backup), result);
+  const manifest = await IOUtils.readJSON(result.path);
+  const entry = manifest.roots[1].entries.find(
+    item => item.parts.join("/") == "Inbox/cur/message"
+  );
+  Assert.equal(entry.size, 3 * 1024 * 1024 + 5);
+  Assert.equal(entry.sha256, originalHash);
+  Assert.equal(
+    await IOUtils.computeHexDigest(
+      PathUtils.join(backup, "root-1", "Inbox", "cur", "message"),
+      "sha256"
+    ),
+    originalHash
+  );
+});
+
 add_task(async function test_unchangedRepeatVerifiesAndChangedSourceRefuses() {
   const { profile, external, body, backup } = await startupCopyFixture();
   const result = createMigrationBackupAtStartup(profile, [external], backup);

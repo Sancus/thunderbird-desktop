@@ -1113,7 +1113,10 @@ function startupPhysicalIdentity(file) {
 }
 
 /**
- * Hashes a regular file with bounded synchronous stream reads.
+ * Hashes a regular file with bounded synchronous stream reads. The hash
+ * service consumes the stream itself: a backup hashes every file four times,
+ * and passing each byte through a script array took hours for an ordinary
+ * multi-gigabyte profile.
  *
  * @param {nsIFile} file - Canonical regular file.
  * @param {AbortSignal} [signal] - Cancellation checked between reads.
@@ -1137,10 +1140,6 @@ function hashStartupFile(file, signal) {
   let firstError;
   let digest;
   try {
-    const binary = Cc["@mozilla.org/binaryinputstream;1"].createInstance(
-      Ci.nsIBinaryInputStream
-    );
-    binary.setInputStream(input);
     const hash = Cc["@mozilla.org/security/hash;1"].createInstance(
       Ci.nsICryptoHash
     );
@@ -1148,11 +1147,18 @@ function hashStartupFile(file, signal) {
     for (let remaining = size; remaining > 0; ) {
       checkCancellation(signal);
       const count = Math.min(1024 * 1024, remaining);
-      const bytes = binary.readByteArray(count);
-      if (bytes.length != count) {
-        throw new Error("Migration file changed while hashing");
+      try {
+        hash.updateFromStream(input, count);
+      } catch (error) {
+        // The stream no longer holds the bytes its measured size promised.
+        if (
+          error.result == Cr.NS_ERROR_NOT_AVAILABLE ||
+          error.result == Cr.NS_BASE_STREAM_CLOSED
+        ) {
+          throw new Error("Migration file changed while hashing");
+        }
+        throw error;
       }
-      hash.update(bytes, bytes.length);
       remaining -= count;
     }
     if (io.fileSize != size || io.lastModifiedTime != modified) {

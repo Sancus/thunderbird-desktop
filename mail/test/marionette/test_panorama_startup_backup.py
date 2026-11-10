@@ -784,6 +784,97 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             self.assertEqual(selected["sourceId"], self.selection()["sourceId"])
             self.assertEqual(expected, subjects())
 
+    def test_keepsSavedSearchAndAddsDerivedSpecialUse(self):
+        """The flags word of a summary stands: a saved search stays Virtual. A
+        folder old discovery marks by its name (SetFlagsOnDefaultMailboxes)
+        gets that special use again. All data is fabricated."""
+        self.clean_profile(False)
+        source = self.marionette.execute_script(r"""
+            const { MailServices } = ChromeUtils.importESModule(
+              'resource:///modules/MailServices.sys.mjs');
+            const { FileUtils } = ChromeUtils.importESModule(
+              'resource://gre/modules/FileUtils.sys.mjs');
+            const { VirtualFolderHelper } = ChromeUtils.importESModule(
+              'resource:///modules/VirtualFolderWrapper.sys.mjs');
+            const root = new FileUtils.File(PathUtils.join(PathUtils.profileDir,
+              'Mail', 's526-saved-search'));
+            root.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+            const server = MailServices.accounts.createIncomingServer(
+              's526search', 'localhost', 'none');
+            server.localPath = root;
+            MailServices.accounts.createAccount().incomingServer = server;
+            const add = name => {
+              server.rootFolder.createSubfolder(name, null);
+              const folder = server.rootFolder.getChildNamed(name)
+                .QueryInterface(Ci.nsIMsgLocalMailFolder);
+              folder.addMessage(
+                'From - Thu Nov 05 00:00:00 2026\r\n' +
+                'Message-ID: <' + name.toLowerCase() + '-search@invalid>\r\n' +
+                'From: source@example.invalid\r\n' +
+                'Subject: In ' + name + '\r\n' +
+                'Date: Thu, 5 Nov 2026 00:00:00 +0000\r\n\r\n' +
+                'Body.\r\n');
+              folder.msgDatabase.commit(Ci.nsMsgDBCommitType.kLargeCommit);
+              return folder;
+            };
+            const searched = add('Searched');
+            // A folder with a default name whose word lost its special use.
+            const drafts = add('Drafts');
+            drafts.clearFlag(Ci.nsMsgFolderFlags.Drafts);
+            drafts.msgDatabase.dBFolderInfo.flags = drafts.flags;
+            drafts.msgDatabase.commit(Ci.nsMsgDBCommitType.kLargeCommit);
+            const wrapper = VirtualFolderHelper.createNewVirtualFolder(
+              'Saved search', server.rootFolder, [searched],
+              [{matchAll: true}], false);
+            const virtual = wrapper.virtualFolder;
+            virtual.msgDatabase.commit(Ci.nsMsgDBCommitType.kLargeCommit);
+            MailServices.accounts.saveVirtualFolders();
+            Services.prefs.savePrefFile(null);
+            return {serverKey: server.key,
+              virtualSummary: virtual.summaryFile.path,
+              virtualFlags: virtual.flags >>> 0,
+              draftsFlags: drafts.flags >>> 0};
+        """)
+        self.stop_application()
+        self.assertTrue(source["virtualFlags"] & 0x20, "The fixture is a saved search")
+        self.assertFalse(source["draftsFlags"] & 0x400)
+        summary = Path(source["virtualSummary"])
+        original = summary.read_bytes()
+
+        def state():
+            return self.marionette.execute_script("""
+                const { MailServices } = ChromeUtils.importESModule(
+                  'resource:///modules/MailServices.sys.mjs');
+                const root = MailServices.accounts.getIncomingServer(arguments[0])
+                  .rootFolder;
+                const read = name => {
+                  const folder = root.getChildNamed(name);
+                  return folder && {
+                    virtual: !!(folder.flags & Ci.nsMsgFolderFlags.Virtual),
+                    drafts: !!(folder.flags & Ci.nsMsgFolderFlags.Drafts),
+                    subjects: folder.flags & Ci.nsMsgFolderFlags.Virtual ? [] :
+                      [...folder.msgDatabase.enumerateMessages()].map(h => h.subject)};
+                };
+                return {search: read('Saved search'), searched: read('Searched'),
+                        drafts: read('Drafts')};
+            """, script_args=[source["serverKey"]])
+
+        expected = {
+            "search": {"virtual": True, "drafts": False, "subjects": []},
+            "searched": {"virtual": False, "drafts": False, "subjects": ["In Searched"]},
+            "drafts": {"virtual": False, "drafts": True, "subjects": ["In Drafts"]},
+        }
+        self.start_same_profile(True)
+        selected = self.selection()
+        self.assertEqual("migrated", selected["record"]["origin"])
+        self.assertEqual(expected, state())
+        self.assertEqual(original, summary.read_bytes())
+        for _ in range(2):
+            self.stop_application()
+            self.start_same_profile(True)
+            self.assertEqual(selected["sourceId"], self.selection()["sourceId"])
+            self.assertEqual(expected, state())
+
     def test_namedAndUnnamedActualSelection(self):
         self.clean_profile(True)
         first = self.selection()
@@ -1524,6 +1615,13 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
                   Ci.nsMsgFolderFlags.ImapPersonal);
                 database.dBFolderInfo.flags = folder.flags;
               }
+              if (path == 'user' || path == 'user/team') {
+                // A namespace placeholder: its summary word says so, while
+                // the box flags kept in the folder cache say nothing.
+                folder.setFlag(Ci.nsMsgFolderFlags.ImapNoselect |
+                  Ci.nsMsgFolderFlags.ImapOtherUser);
+                database.dBFolderInfo.flags = folder.flags;
+              }
               database.summaryValid = true;
               database.commit(Ci.nsMsgDBCommitType.kLargeCommit);
               database.forceClosed();
@@ -1564,6 +1662,9 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
                 for (const folder of root.descendants) {
                   const imap = folder.QueryInterface(Ci.nsIMsgImapMailFolder);
                   state[decodeURIComponent(folder.URI.slice(root.URI.length + 1))] = {
+                    placeholder: !!(folder.flags & Ci.nsMsgFolderFlags.ImapNoselect) &&
+                      !!(folder.flags & Ci.nsMsgFolderFlags.ImapOtherUser),
+                    box: !!(folder.flags & Ci.nsMsgFolderFlags.ImapBox),
                     onlineName: imap.onlineName,
                     delimiter: imap.hierarchyDelimiter,
                     messages: [...folder.msgDatabase.enumerateMessages()].map(
@@ -1573,6 +1674,8 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             """, script_args=[source["serverKey"]])
 
         expected = {path: {
+            "placeholder": path in ("user", "user/team"),
+            "box": path != "INBOX/Looked: up",
             "onlineName": folder["onlineName"], "delimiter": folder["delimiter"],
             "messages": [folder["onlineName"] + " " + str(key)
                          for key in range(1, folder["messages"] + 1)]}

@@ -5276,6 +5276,8 @@ nsresult ImportFolderProperties(JSContext* cx, JS::Handle<JSObject*> request,
         // legacy discovery setting it; never the reverse.
         if (localStore && (flags & nsMsgFolderFlags::Mail))
           allowed |= nsMsgFolderFlags::Mail;
+        // Discovery adds the special use it derives, as the old one does.
+        allowed |= flags & ~uint32_t(expected) & nsMsgFolderFlags::SpecialUse;
         NS_ENSURE_TRUE(((uint32_t(expected) ^ flags) & ~allowed) == 0,
                        NS_ERROR_NOT_IMPLEMENTED);
       } else if (value.name == "numMsgs"_ns || value.name == "numNewMsgs"_ns) {
@@ -14715,31 +14717,16 @@ nsresult DatabaseCore::BuildStartupFolders() {
               ? (retained & ~nsMsgFolderFlags::OfflineEvents) |
                     (before & nsMsgFolderFlags::OfflineEvents)
               : retained | (localStore ? nsMsgFolderFlags::Mail : 0);
-      const uint32_t protocolMask =
-          nsMsgFolderFlags::Newsgroup | nsMsgFolderFlags::Virtual |
-          nsMsgFolderFlags::ImapBox | nsMsgFolderFlags::ImapPersonal |
-          nsMsgFolderFlags::ImapPublic | nsMsgFolderFlags::ImapOtherUser |
-          nsMsgFolderFlags::ImapNoselect | nsMsgFolderFlags::ImapNoinferiors;
-      // Thunderbird's junk/client folder lookup leaves a never-listed folder
-      // without any box state; native discovery necessarily created a box,
-      // which the exact retained word replaces.
-      const bool boxless = source.protocol == "imap"_ns && !source.boxFlags &&
-                           !(wanted & protocolMask);
-      // Only a server LIST reports a mailbox namespace. Box flags restored
-      // offline carry none, while Thunderbird keeps the namespace flag in the
-      // summary's word; when discovery derived no namespace, the exact
-      // retained word supplies it. A derived namespace must still match.
-      const uint32_t namespaceMask = nsMsgFolderFlags::ImapPersonal |
-                                     nsMsgFolderFlags::ImapPublic |
-                                     nsMsgFolderFlags::ImapOtherUser;
-      const uint32_t comparedMask =
-          source.protocol == "imap"_ns && !(before & namespaceMask)
-              ? protocolMask & ~namespaceMask
-              : protocolMask;
-      NS_ENSURE_TRUE((boxless || !((wanted ^ before) & comparedMask)) &&
-                         !(before & nsMsgFolderFlags::SpecialUse & ~wanted),
-                     NS_ERROR_NOT_AVAILABLE);
-      if (wanted != before) {
+      // The flags word of the summary is index data and stands: a saved
+      // search is Virtual, a namespace placeholder is not selectable, a folder
+      // the server never listed has no box state. Old Thunderbird restores
+      // that word and keeps the box flags of the folder cache beside it; they
+      // are a hint that never replaces it, so a difference from what native
+      // discovery derived from them refuses nothing. Like the old discovery
+      // (SetFlagsOnDefaultMailboxes, the IMAP trash name), native discovery
+      // adds the special use it derives.
+      const uint32_t settled = wanted | (before & nsMsgFolderFlags::SpecialUse);
+      if (settled != before) {
         auto connection = sConnection;
         NS_ENSURE_TRUE(connection && !mShuttingDown, NS_ERROR_NOT_AVAILABLE);
         bool active;
@@ -14756,7 +14743,7 @@ nsresult DatabaseCore::BuildStartupFolders() {
           nsCString measured;
           MOZ_TRY(StartupHash(summary, measured));
           NS_ENSURE_TRUE(measured == source.hash, NS_ERROR_NOT_AVAILABLE);
-          MOZ_TRY(mFolderDatabase->WriteCacheFolderFlags(id, wanted));
+          MOZ_TRY(mFolderDatabase->WriteCacheFolderFlags(id, settled));
           NS_ENSURE_TRUE(origin.revision < INT64_MAX - 1,
                          NS_ERROR_ILLEGAL_VALUE);
           ++origin.revision;
@@ -14772,7 +14759,7 @@ nsresult DatabaseCore::BuildStartupFolders() {
           return rv;
         }
         static_cast<nsMsgDBFolder*>(folder.get())
-            ->PublishCacheImportFlags(wanted);
+            ->PublishCacheImportFlags(settled);
       }
     }
     operation.sourceIds.AppendElement(source.id);

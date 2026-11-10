@@ -1492,11 +1492,17 @@ function folderProperties(original, flags, imap = false, localStore = false) {
         );
       }
       property.integer = Number(integer);
+      // Discovery adds the special use it derives, as the old one does.
+      const derived =
+        name == "flags"
+          ? flags & ~property.integer & Ci.nsMsgFolderFlags.SpecialUse
+          : 0;
       if (
         (name == "flags" &&
           (imap
-            ? (property.integer ^ flags) & ~Ci.nsMsgFolderFlags.OfflineEvents
-            : (property.integer ^ flags) & ~mail)) ||
+            ? (property.integer ^ flags) &
+              ~(Ci.nsMsgFolderFlags.OfflineEvents | derived)
+            : (property.integer ^ flags) & ~(mail | derived))) ||
         ((imap
           ? name == "forceReparse"
           : ["totPendingMsgs", "unreadPendingMsgs", "forceReparse"].includes(

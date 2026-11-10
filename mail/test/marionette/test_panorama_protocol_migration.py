@@ -343,12 +343,15 @@ class TestPanoramaProtocolMigration(MarionetteTestCase):
                     stream, stream.available(), {charset: 'UTF-8'});
                   stream.close();
                 }
-                messages.push({key: header.messageKey, messageId: header.messageId,
+                // Native physical keys are independent of article numbers.
+                messages.push({key: header.messageKey,
+                  article: header.getUint32Property('newsArticleNumber'),
+                  messageId: header.messageId,
                   subject: header.subject, read: header.isRead,
                   offline: !!(header.flags & Ci.nsMsgMessageFlags.Offline),
                   custom: header.getStringProperty('s526-custom'), body});
               }
-              messages.sort((a, b) => a.key - b.key);
+              messages.sort((a, b) => a.article - b.article);
               return {flags: folder.flags, messages,
                 knownArts: folder.msgDatabase.dBFolderInfo.knownArtsSet};
             })().then(done, error => done({error: String(error)}));
@@ -451,7 +454,7 @@ class TestPanoramaProtocolMigration(MarionetteTestCase):
             self.assertEqual(source["flags"], result["flags"])
             self.assertEqual(NEWS_KNOWN, result["knownArts"])
             self.assertEqual([a["key"] for a in NEWS_ARTICLES],
-                             [m["key"] for m in result["messages"]])
+                             [m["article"] for m in result["messages"]])
             for article, message in zip(NEWS_ARTICLES, result["messages"]):
                 self.assertEqual(article["messageId"], message["messageId"])
                 self.assertEqual(article["subject"], message["subject"])

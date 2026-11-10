@@ -2632,6 +2632,20 @@ nsresult DatabaseCore::ImportFolderSnapshotFromFile(
                                              property.text));
       }
     }
+    if (MOZ_TRY(FolderDB().GetFolderFlags(identity.folderId)) &
+        nsMsgFolderFlags::Newsgroup) {
+      // A legacy news key is the article number; keep that identity.
+      nsTArray<ImportedNewsArticle> articles;
+      for (const auto& row : input.messages) {
+        ImportedNewsArticle article;
+        NS_ENSURE_TRUE(keys.Get(row.sourceKey, &article.physicalKey),
+                       NS_ERROR_INVALID_ARG);
+        article.articleNumber = row.sourceKey;
+        articles.AppendElement(article);
+      }
+      MOZ_TRY(messages->BindImportedNewsArticlesInTransaction(identity.folderId,
+                                                              articles));
+    }
     MOZ_TRY(FolderDB().SetFolderProperty(
         identity.folderId, "morkMigrationSource"_ns, legacyMarker));
     {
@@ -14314,6 +14328,11 @@ nsresult DatabaseCore::BuildStartupFolders() {
           source.protocol == "imap"_ns
               ? (*source.originalFlags & ~nsMsgFolderFlags::OfflineEvents) |
                     (before & nsMsgFolderFlags::OfflineEvents)
+          // Legacy discovery marks every local store folder Mail each
+          // time it loads it; the copy of the word in the summary can
+          // predate that. Never drop it.
+          : StartupLocalProtocol(source.protocol)
+              ? *source.originalFlags | (before & nsMsgFolderFlags::Mail)
               : *source.originalFlags;
       const uint32_t protocolMask =
           nsMsgFolderFlags::Newsgroup | nsMsgFolderFlags::Virtual |

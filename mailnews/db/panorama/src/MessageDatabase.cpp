@@ -940,6 +940,51 @@ nsresult MessageDatabase::SetNewsReadSet(
   return NS_OK;
 }
 
+nsresult MessageDatabase::BindImportedNewsArticlesInTransaction(
+    uint64_t folderId, const nsTArray<ImportedNewsArticle>& articles) {
+  nsCString sourceId;
+  MOZ_TRY(DatabaseCore::sInstance->ReadSourceIdForFolderAdmission(sourceId));
+  // The provider may already have given this group its incarnation; otherwise
+  // this import is its birth. The provider then keeps it when it initializes
+  // the read set from newsrc and reconciles each bound article.
+  NewsGroupIdentity group;
+  MOZ_TRY(ReadNewsGroupIdentity(sourceId, folderId, group, true));
+  {
+    // An incarnation requires a read set row. A retained legacy readSet keeps
+    // its text; without the typed companion it stays unknown to the provider.
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "BindImportedNewsGroup"_ns,
+        "INSERT OR IGNORE INTO folder_properties(id,name,value) VALUES "
+        "(:folder,'readSet',''),(:folder,'newsGroupIncarnation',:group)"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scope(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("folder"_ns, folderId));
+    MOZ_TRY(stmt->BindUTF8StringByName("group"_ns, group.incarnation));
+    MOZ_TRY(stmt->Execute());
+  }
+  NewsGroupIdentity stored;
+  MOZ_TRY(ReadNewsGroupIdentity(sourceId, folderId, stored, false));
+  NS_ENSURE_TRUE(SameNewsGroup(stored, group), NS_ERROR_NOT_AVAILABLE);
+  for (const auto& article : articles) {
+    NS_ENSURE_TRUE(article.physicalKey != nsMsgKey_None &&
+                       article.articleNumber <= INT32_MAX,
+                   NS_ERROR_INVALID_ARG);
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "BindNewsArticle"_ns,
+        "INSERT INTO message_properties(id,name,value) VALUES "
+        "(:id,'newsArticleNumber',:article),(:id,'newsGroupIncarnation',:group)"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scope(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("id"_ns, article.physicalKey));
+    MOZ_TRY(stmt->BindInt64ByName("article"_ns, article.articleNumber));
+    MOZ_TRY(stmt->BindUTF8StringByName("group"_ns, stored.incarnation));
+    MOZ_TRY(stmt->Execute());
+  }
+  return NS_OK;
+}
+
 nsresult MessageDatabase::AddNewsArticle(const NewsArticleIdentity& expected,
                                          const ::RawHdr& parsed,
                                          bool notifyLegacy,

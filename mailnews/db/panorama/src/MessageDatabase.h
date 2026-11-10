@@ -42,6 +42,12 @@ struct NewsArticleIdentity {
   uint32_t articleNumber{0};
 };
 
+// One imported header of a migrated news group and its retained article.
+struct ImportedNewsArticle {
+  nsMsgKey physicalKey{nsMsgKey_None};
+  uint32_t articleNumber{0};
+};
+
 struct NewsArticleResult {
   bool inserted{false};
   nsMsgKey physicalKey{nsMsgKey_None};
@@ -499,6 +505,11 @@ class MessageDatabase : public nsIMessageDatabase {
                              nsMsgKey& physicalKey);
   // Optional public owning output must be initially null. It is filled with
   // the result before native callbacks; errors preserve both output slots.
+  // Migration only, inside the import transaction that inserted these
+  // headers: a legacy news key is the article number, while native physical
+  // keys are independent. Binds each header to its article in this group.
+  nsresult BindImportedNewsArticlesInTransaction(
+      uint64_t folderId, const nsTArray<ImportedNewsArticle>& articles);
   nsresult AddNewsArticle(const NewsArticleIdentity& expected,
                           const ::RawHdr& parsed, bool notifyLegacy,
                           NewsArticleResult& output,

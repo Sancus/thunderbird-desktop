@@ -697,6 +697,93 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             self.assertEqual(selected["sourceId"], self.selection()["sourceId"])
             self.assertEqual(headers, self.assert_message_after_activation(source))
 
+    def test_preservesSeveralRenamedLocalSiblingsAndTheirChildren(self):
+        """Several folders of one parent whose file names differ from their names
+        (Thunderbird hashes a name that cannot be a file name), beside ordinary
+        siblings and with children of their own. All data is fabricated."""
+        self.clean_profile(False)
+        names = ["100% Real", "Colon: name", "Question? mark", "Plain",
+                 "Original logical name " + "long" * 12]
+        source = self.marionette.execute_script(r"""
+            const { MailServices } = ChromeUtils.importESModule(
+              'resource:///modules/MailServices.sys.mjs');
+            const { FileUtils } = ChromeUtils.importESModule(
+              'resource://gre/modules/FileUtils.sys.mjs');
+            const root = new FileUtils.File(PathUtils.join(PathUtils.profileDir,
+              'Mail', 's526-renamed-siblings'));
+            root.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+            const server = MailServices.accounts.createIncomingServer(
+              's526siblings', 'localhost', 'none');
+            server.localPath = root;
+            MailServices.accounts.createAccount().incomingServer = server;
+            const folders = {};
+            const add = (parent, name, path) => {
+              parent.createSubfolder(name, null);
+              const folder = parent.getChildNamed(name)
+                .QueryInterface(Ci.nsIMsgLocalMailFolder);
+              folder.addMessage(
+                'From - Thu Nov 05 00:00:00 2026\r\n' +
+                'Message-ID: <' + Object.keys(folders).length + '-siblings@invalid>\r\n' +
+                'From: source@example.invalid\r\n' +
+                'Subject: In ' + path + '\r\n' +
+                'Date: Thu, 5 Nov 2026 00:00:00 +0000\r\n\r\n' +
+                'Body.\r\n');
+              folder.msgDatabase.commit(Ci.nsMsgDBCommitType.kLargeCommit);
+              folders[path] = {summary: folder.summaryFile.path,
+                               leaf: folder.filePath.leafName};
+              return folder;
+            };
+            for (const name of arguments[0]) {
+              const folder = add(server.rootFolder, name, name);
+              add(folder, 'Child: of ' + name.slice(0, 8), name + '/child');
+              add(folder, 'Second', name + '/second');
+            }
+            Services.prefs.savePrefFile(null);
+            return {serverKey: server.key, folders};
+        """, script_args=[names])
+        self.stop_application()
+        renamed = [path for path, folder in source["folders"].items()
+                   if "/" not in path and folder["leaf"] != path]
+        self.assertGreaterEqual(len(renamed), 3, "Several siblings have another file name")
+        originals = {path: Path(folder["summary"]).read_bytes()
+                     for path, folder in source["folders"].items()}
+
+        def subjects():
+            return self.marionette.execute_script("""
+                const { MailServices } = ChromeUtils.importESModule(
+                  'resource:///modules/MailServices.sys.mjs');
+                const root = MailServices.accounts.getIncomingServer(arguments[0])
+                  .rootFolder;
+                const state = {};
+                for (const name of arguments[1]) {
+                  const folder = root.getChildNamed(name);
+                  const read = item => [...item.msgDatabase.enumerateMessages()]
+                    .map(header => header.subject);
+                  state[name] = read(folder);
+                  for (const child of folder.subFolders) {
+                    state[name + '/' + child.name] = read(child);
+                  }
+                }
+                return state;
+            """, script_args=[source["serverKey"], names])
+
+        expected = {}
+        for name in names:
+            expected[name] = ["In " + name]
+            expected[name + "/Child: of " + name[:8]] = ["In " + name + "/child"]
+            expected[name + "/Second"] = ["In " + name + "/second"]
+        self.start_same_profile(True)
+        selected = self.selection()
+        self.assertEqual("migrated", selected["record"]["origin"])
+        self.assertEqual(expected, subjects())
+        for path, folder in source["folders"].items():
+            self.assertEqual(originals[path], Path(folder["summary"]).read_bytes())
+        for _ in range(2):
+            self.stop_application()
+            self.start_same_profile(True)
+            self.assertEqual(selected["sourceId"], self.selection()["sourceId"])
+            self.assertEqual(expected, subjects())
+
     def test_namedAndUnnamedActualSelection(self):
         self.clean_profile(True)
         first = self.selection()
@@ -1812,35 +1899,20 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
               .QueryInterface(Ci.nsIMsgLocalMailFolder);
             // Each character below 256 is written as that one byte.
             folder.addMessage(
-              'From - Thu Nov 05 00:00:00 2026
-' +
-              'Message-ID: <raw-cells-s526@invalid>
-' +
-              'From: André Source <source@example.invalid>
-' +
-              'To: destination@example.invalid
-' +
-              'Subject: café raw üñ
-' +
-              'Date: Thu, 5 Nov 2026 00:00:00 +0000
-
-' +
-              'Body.
-');
+              'From - Thu Nov 05 00:00:00 2026\r\n' +
+              'Message-ID: <raw-cells-s526@invalid>\r\n' +
+              'From: Andr\u00e9 Source <source@example.invalid>\r\n' +
+              'To: destination@example.invalid\r\n' +
+              'Subject: caf\u00e9 raw \u00fc\u00f1\r\n' +
+              'Date: Thu, 5 Nov 2026 00:00:00 +0000\r\n\r\n' +
+              'Body.\r\n');
             folder.addMessage(
-              'From - Thu Nov 05 00:00:01 2026
-' +
-              'Message-ID: <plain-s526@invalid>
-' +
-              'From: source@example.invalid
-' +
-              'Subject: Plain neighbour
-' +
-              'Date: Thu, 5 Nov 2026 00:00:01 +0000
-
-' +
-              'Body.
-');
+              'From - Thu Nov 05 00:00:01 2026\r\n' +
+              'Message-ID: <plain-s526@invalid>\r\n' +
+              'From: source@example.invalid\r\n' +
+              'Subject: Plain neighbour\r\n' +
+              'Date: Thu, 5 Nov 2026 00:00:01 +0000\r\n\r\n' +
+              'Body.\r\n');
             folder.msgDatabase.commit(Ci.nsMsgDBCommitType.kLargeCommit);
             Services.prefs.savePrefFile(null);
             return {serverKey: server.key, summary: folder.summaryFile.path};

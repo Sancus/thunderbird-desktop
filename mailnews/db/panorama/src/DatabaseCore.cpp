@@ -14392,6 +14392,10 @@ nsresult DatabaseCore::BuildStartupFolders() {
   });
   // Map actual legacy store discovery through retained summary/cache names.
   // A shortened physical leaf is not a public AddSubfolder row birth.
+  // One parent is reconciled once: its logical names depend only on the
+  // parent, and every renamed child but the one being attached then has its
+  // new row and no wrapper yet.
+  nsTHashSet<uint64_t> reconciledParents;
   auto reconcileLocal = [&](nsIMsgFolder* parent,
                             const StartupMailSource& source, uint32_t depth,
                             const nsTArray<nsCString>& discovered) -> nsresult {
@@ -14447,6 +14451,7 @@ nsresult DatabaseCore::BuildStartupFolders() {
     if (!changed) return NS_OK;
     uint64_t parentId;
     MOZ_TRY(parent->GetId(&parentId));
+    if (reconciledParents.Contains(parentId)) return NS_OK;
     FolderDatabase::CacheOrigin parentOrigin;
     MOZ_TRY(
         mFolderDatabase->CheckCacheProjectionOrigin(parentId, parentOrigin));
@@ -14527,6 +14532,7 @@ nsresult DatabaseCore::BuildStartupFolders() {
     nsMsgDBFolder::RollbackFolderInitialization(lookup, retired);
     for (const auto& child : detached)
       nativeParent->mSubFolders.RemoveObject(child);
+    reconciledParents.Insert(parentId);
     return CheckProfileStartup(ProfileStartupToken(), true);
   };
   nsTHashMap<uint64_t, nsCString> physical;

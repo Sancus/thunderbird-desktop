@@ -105,7 +105,7 @@ function convertMorkSnapshot(
   imap,
   note
 ) {
-  // Offline move results the plan found stale (findStaleMoveResults).
+  // Stale offline move results (staleMoveResults), left out of this source.
   const omitted = new Set(source.omittedMessageKeys ?? []);
   if (
     (input.version !== 1 &&
@@ -194,6 +194,8 @@ function convertMorkSnapshot(
     for (const table of request.records.tables) {
       table.rows = table.rows.filter(key => !rows.has(key));
     }
+    request.source.omittedMessageKeys = [...omitted].sort((a, b) => a - b);
+    note?.("stale-move-results", source.id, omitted.size);
   }
   request.sourceId = source.id;
   request.databaseSourceId = databaseSourceId;
@@ -208,6 +210,83 @@ function convertMorkSnapshot(
   );
   request.recordsComplete = true;
   return request;
+}
+
+/**
+ * An offline move or copy shows its message in the destination folder at
+ * once: a pseudo header with a "move result" operation that names the source
+ * folder and key. The server work itself is the source folder's operation.
+ * When that is gone (played back, or lost with a rebuilt summary or a deleted
+ * folder) the result is a leftover. Old Thunderbird discards every move
+ * result with its pseudo header the next time it plays the folder's
+ * operations back (nsImapOfflineSync::ProcessNextOperation), and the real
+ * message arrives with the next sync. Panorama resolves each result through
+ * its source operation and cannot hold one without it, so such a result is
+ * not migrated. One whose source operation is still pending stays exact.
+ *
+ * @param {{input: object, source: object}[]} entries - The unit's members.
+ * @returns {number[][]} For each member, the keys of its move results that
+ *   are not already left out and that no member has a pending move or copy
+ *   for.
+ */
+function staleMoveResults(entries) {
+  const folders = entries.map(({ input, source }) => {
+    const rows = new Map(
+      input.records.rows.map(row => [row.id + ":" + row.scope, row])
+    );
+    const operations = [];
+    for (const table of input.records.tables) {
+      for (const key of table.scope == OFFLINE ? table.rows : []) {
+        const row = rows.get(key);
+        if (row?.scope != OFFLINE) {
+          continue;
+        }
+        const cell = name => row.cells.find(item => item.k == name)?.v;
+        const text = name =>
+          cell(name) === undefined ? undefined : decode(cell(name));
+        operations.push({
+          key: row.id,
+          operation: parseInt(cell("op") ?? "0", 16),
+          sourceFolderURI: text("srcFolderURI"),
+          sourceMessageKey: parseInt(cell("srcMsgKey") ?? "", 16),
+          destinations: [
+            text("moveDest"),
+            ...(text("copyDests") ?? "").split("\u0001"),
+          ],
+        });
+      }
+    }
+    return {
+      uri: source.originalFolderURI ?? input.folder.uri,
+      omitted: source.omittedMessageKeys ?? [],
+      operations,
+    };
+  });
+  const moved =
+    Ci.nsIMsgOfflineImapOperation.kMsgMoved |
+    Ci.nsIMsgOfflineImapOperation.kMsgCopy;
+  return folders.map(folder =>
+    folder.operations
+      .filter(
+        result =>
+          // Alone, as old playback tests it.
+          result.operation === Ci.nsIMsgOfflineImapOperation.kMoveResult &&
+          result.sourceFolderURI !== undefined &&
+          !folder.omitted.includes(result.key) &&
+          !folders.some(
+            origin =>
+              origin.uri === result.sourceFolderURI &&
+              origin.operations.some(
+                operation =>
+                  operation.key === result.sourceMessageKey &&
+                  operation.operation & moved &&
+                  operation.destinations.includes(folder.uri)
+              )
+          )
+      )
+      .map(result => result.key)
+      .sort((a, b) => a - b)
+  );
 }
 
 /**
@@ -239,10 +318,25 @@ export function convertMorkProtocolUnit(
   ) {
     throw new Error("Invalid Mork protocol import unit");
   }
-  const folders = entries.map(({ input, source, folderFlags }) => {
-    if (source.protocol !== "imap") {
+  const stale = staleMoveResults(entries);
+  const folders = entries.map(({ input, source: planned, folderFlags }, at) => {
+    if (planned.protocol !== "imap") {
       throw new Error("Mork protocol source is not in the retained IMAP plan");
     }
+    // What the first conversion leaves out, the journal records with the
+    // unit's intent (bindImportUnit); later conversions find it in the plan.
+    const source = stale[at].length
+      ? {
+          ...planned,
+          messageKeys: planned.messageKeys.filter(
+            key => !stale[at].includes(key)
+          ),
+          omittedMessageKeys: [
+            ...(planned.omittedMessageKeys ?? []),
+            ...stale[at],
+          ],
+        }
+      : planned;
     const request = convertMorkSnapshot(
       input,
       source,

@@ -451,6 +451,15 @@ export class MigrationJournal {
         throw new Error("Migration protocol import intent is already settled");
       }
       unit.input = input;
+      for (const member of input.folders) {
+        if (member.source.omittedMessageKeys) {
+          const source = state.sources.find(
+            value => value.id === member.sourceId
+          );
+          source.messageKeys = [...member.source.messageKeys];
+          source.omittedMessageKeys = [...member.source.omittedMessageKeys];
+        }
+      }
       return true;
     });
   }
@@ -561,8 +570,19 @@ export class MigrationJournal {
         member.source.path !== source.path ||
         member.source.sha256 !== source.sha256 ||
         member.source.size !== source.size ||
-        JSON.stringify([...member.source.messageKeys].sort((a, b) => a - b)) !==
-          JSON.stringify([...source.messageKeys].sort((a, b) => a - b)) ||
+        // The unit's conversion may leave stale offline move results out
+        // (staleMoveResults); together they are still the planned keys.
+        JSON.stringify(
+          [
+            ...member.source.messageKeys,
+            ...(member.source.omittedMessageKeys ?? []),
+          ].sort((a, b) => a - b)
+        ) !==
+          JSON.stringify(
+            [...source.messageKeys, ...(source.omittedMessageKeys ?? [])].sort(
+              (a, b) => a - b
+            )
+          ) ||
         member.imap?.version !== 1 ||
         (source.originalFolderURI !== undefined &&
           member.imap.originalFolderURI !== source.originalFolderURI) ||
@@ -1773,10 +1793,19 @@ export class MigrationJournal {
     for (let index = 0; index < state.sources.length; index++) {
       const source = state.sources[index];
       const original = startup.inventory.sources[index];
+      // The unit's conversion may have left stale offline move results out
+      // of the planned keys (bindImportUnit).
+      const omitted = new Set(source.omittedMessageKeys ?? []);
       if (
         source.databaseSourceId !== startup.databaseSourceId ||
         Object.keys(original).some(
-          key => JSON.stringify(source[key]) !== JSON.stringify(original[key])
+          key =>
+            JSON.stringify(source[key]) !==
+            JSON.stringify(
+              key == "messageKeys"
+                ? original[key].filter(value => !omitted.has(value))
+                : original[key]
+            )
         )
       ) {
         throw new Error("Startup migration inventory or incarnation changed");
@@ -1906,8 +1935,8 @@ export class MigrationJournal {
         !Array.isArray(source.messageKeys) ||
         new Set(source.messageKeys).size != source.messageKeys.length ||
         source.messageKeys.some(key => !isKey(key, true)) ||
-        // Stale offline move results left out of the plan
-        // (findStaleMoveResults): never also a message of it.
+        // Stale offline move results the unit's conversion left out
+        // (staleMoveResults): never also a message of the plan.
         (source.omittedMessageKeys !== undefined &&
           (!Array.isArray(source.omittedMessageKeys) ||
             !source.omittedMessageKeys.length ||

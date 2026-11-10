@@ -615,20 +615,22 @@ add_task(async function test_rejectsUnsafeInt64FolderProjection() {
 add_task(async function test_rejectsSummaryMarkedForRebuilding() {
   const { input, source } = await snapshotInput();
   const info = input.records.rows.find(row => row.scope == INFO_SCOPE);
-  // The pending and message counters are a cache old Thunderbird recounts.
-  info.cells.push({ k: "totPendingMsgs", v: "1" });
-  info.cells.push({ k: "unreadPendingMsgs", v: "2" });
-  for (const name of ["numMsgs", "numNewMsgs"]) {
+  const set = (name, value) => {
     const cell = info.cells.find(item => item.k == name);
     if (cell) {
-      cell.v = "7f";
+      cell.v = value;
     } else {
-      info.cells.push({ k: name, v: "7f" });
+      info.cells.push({ k: name, v: value });
     }
-  }
+  };
+  // The pending and message counters are a cache old Thunderbird recounts.
+  set("totPendingMsgs", "1");
+  set("unreadPendingMsgs", "2");
+  set("numMsgs", "7f");
+  set("numNewMsgs", "7f");
   Assert.ok(convert(input, source).recordsComplete);
   // A summary old Thunderbird marked for rebuilding is no usable index.
-  info.cells.push({ k: "forceReparse", v: "1" });
+  set("forceReparse", "1");
   Assert.throws(() => convert(input, source), /required Mork folder state/);
 });
 

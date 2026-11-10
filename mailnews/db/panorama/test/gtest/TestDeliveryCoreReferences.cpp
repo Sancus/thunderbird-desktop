@@ -4431,18 +4431,21 @@ class DeliveryCoreReferences : public testing::Test {
     });
   }
 
-  void CheckJSONUserOrderInvalidSource(const nsACString& cell) {
+  // A cell of the wrong type is read as the old cache reads it: no value, or
+  // the number a boolean or a fraction converts to. It never fails the folder.
+  void CheckJSONUserOrderDirtySource(const nsACString& cell,
+                                     Maybe<uint32_t> expected) {
     WithNativeJSONCache("none"_ns, "mbox"_ns, [&](nsIMsgFolder* folder) {
       nsCString request, raw, output;
       ASSERT_EQ(NS_OK, PrepareJSONCacheRequest(folder, cell, request, raw));
-      EXPECT_EQ(NS_ERROR_FAILURE, JSONCacheCall(request, false, output));
-      CheckJSONUserOrderProperty(Nothing());
+      EXPECT_EQ(NS_OK, JSONCacheCall(request, false, output));
+      CheckJSONUserOrderProperty(expected);
       int64_t count = -1;
       ASSERT_EQ(NS_OK, JSONCacheImportCount(count));
-      EXPECT_EQ(0, count);
+      EXPECT_EQ(1, count);
       uint32_t order;
       ASSERT_EQ(NS_OK, folder->GetUserSortOrder(&order));
-      EXPECT_EQ(UINT32_MAX, order);
+      EXPECT_EQ(expected.valueOr(UINT32_MAX), order);
     });
   }
 
@@ -5856,15 +5859,15 @@ class DeliveryCoreReferences : public testing::Test {
     }
   }
 
-  void CheckObservedStartupFailure() {
+  void CheckObservedStartupFailure(nsresult failure) {
     (void)StaticPrefs::mail_panorama_enabled_AtStartup();
     AutoRestore<bool> restoreNative(
         StaticPrefs::sMirror_mail_panorama_enabled_AtStartup);
     StaticPrefs::sMirror_mail_panorama_enabled_AtStartup = true;
-    ASSERT_EQ(NS_ERROR_FAILURE, ArmSelectedStartup(true));
+    ASSERT_EQ(failure, ArmSelectedStartup(true));
     ASSERT_TRUE(mCore);
     EXPECT_TRUE(mCore->mShuttingDown);
-    EXPECT_EQ(NS_ERROR_FAILURE, mCore->mStartupFailure);
+    EXPECT_EQ(failure, mCore->mStartupFailure);
     EXPECT_FALSE(mConnection);
     dom::AutoJSAPI jsapi;
     ASSERT_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()));
@@ -5874,18 +5877,18 @@ class DeliveryCoreReferences : public testing::Test {
     ASSERT_TRUE(promise);
     EXPECT_EQ(dom::Promise::PromiseState::Rejected, promise->State());
     ASSERT_TRUE(promise->SetAnyPromiseIsHandled());
-    EXPECT_EQ(NS_ERROR_FAILURE, mCore->mStartupFailure);
+    EXPECT_EQ(failure, mCore->mStartupFailure);
     RefPtr<dom::Promise> duplicate;
     EXPECT_EQ(
         NS_ERROR_NOT_AVAILABLE,
         mCore->BeginProfileStartup(jsapi.cx(), getter_AddRefs(duplicate)));
     EXPECT_FALSE(duplicate);
-    EXPECT_EQ(NS_ERROR_FAILURE, DatabaseCore::CheckAccountStartup());
-    EXPECT_EQ(NS_ERROR_FAILURE, DatabaseCore::CheckAccountStartup(true));
+    EXPECT_EQ(failure, DatabaseCore::CheckAccountStartup());
+    EXPECT_EQ(failure, DatabaseCore::CheckAccountStartup(true));
     EXPECT_TRUE(mCore->mShuttingDown);
-    EXPECT_EQ(NS_ERROR_FAILURE, mCore->mStartupFailure);
+    EXPECT_EQ(failure, mCore->mStartupFailure);
     EXPECT_FALSE(Connection());
-    EXPECT_EQ(NS_ERROR_FAILURE, StartupContextCheck());
+    EXPECT_EQ(failure, StartupContextCheck());
   }
 
   void CheckStartupServerSummaryRefusal(const char* mode,
@@ -10074,7 +10077,10 @@ TEST_F(DeliveryCoreReferences, ImapRawRecordsRejectOtherFlagDifferences) {
     if (bit == nsMsgFolderFlags::OfflineEvents) {
       continue;
     }
-    EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED,
+    // Discovery adds the special use it derives, as the old one does; every
+    // other difference from the retained word is still refused.
+    const bool derived = (bit & nsMsgFolderFlags::SpecialUse) && !(base & bit);
+    EXPECT_EQ(derived ? NS_OK : NS_ERROR_NOT_IMPLEMENTED,
               CheckRawImport(data, true, false, Some(base ^ bit)));
   }
   EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED,
@@ -10088,40 +10094,47 @@ TEST_F(DeliveryCoreReferences, ImapRawRecordsRejectOtherFlagDifferences) {
 TEST_F(DeliveryCoreReferences, ImapRawRecordsRefusePendingState) {
   ASSERT_EQ(NS_OK, Start());
   const auto source = RawImportRecords(false, true, false);
-  for (auto pair : {std::pair{u"pending\"}],\"metaRow\":null,\"rows\":[]",
-                              u"pending\"}],\"metaRow\":null,\"rows\":[\"5001:"
-                              u"ns:msg:db:row:scope:msgs:all\"]"},
-                    std::pair{u"pending\"}],\"metaRow\":null",
-                              u"pending\"}],\"metaRow\":\"1:m\""},
-                    std::pair{u"pending\"}]",
-                              u"pending\"},{\"k\":\"unknown\",\"v\":\"0\"}]"},
-                    std::pair{u"scope:pending:all", u"scope:foreign:all"}}) {
+  for (auto pair :
+       {std::pair{u"pending\"}],\"metaRow\":null,\"rows\":[]",
+                  u"pending\"}],\"metaRow\":null,\"rows\":[\"5001:"
+                  u"ns:msg:db:row:scope:msgs:all\"]"},
+        std::pair{u"pending\"}],\"metaRow\":null",
+                  u"pending\"}],\"metaRow\":\"1:m\""},
+        std::pair{u"pending\"}]",
+                  u"pending\"},{\"k\":\"unknown\",\"v\":\"0\"}]"}}) {
     auto changed = source;
     ASSERT_NE(kNotFound, changed.Find(pair.first));
     changed.ReplaceSubstring(pair.first, pair.second);
     EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED, CheckRawImport(changed));
   }
+  // A table in a scope no reader knows holds no pending state.
+  auto foreign = source;
+  foreign.ReplaceSubstring(u"scope:pending:all", u"scope:foreign:all");
+  EXPECT_EQ(NS_OK, CheckRawImport(foreign));
 }
 
-TEST_F(DeliveryCoreReferences, ImapRawRecordsRequireExactUnreadCache) {
+// A thread's metadata row caches counts and a newest date. Old Thunderbird
+// recounts them; a stale, absent or unknown cache cell refuses nothing.
+TEST_F(DeliveryCoreReferences, ImapRawRecordsTreatThreadCachesAsHints) {
   ASSERT_EQ(NS_OK, Start());
   EXPECT_EQ(NS_OK, CheckRawImport(RawImportRecords(false, true, true)));
   EXPECT_EQ(NS_OK, CheckRawImport(RawImportRecords(false, true, false, true),
                                   true, true));
-  EXPECT_EQ(
-      NS_ERROR_NOT_IMPLEMENTED,
-      CheckRawImport(RawImportRecords(false, true, true, true), true, true));
+  EXPECT_EQ(NS_OK, CheckRawImport(RawImportRecords(false, true, true, true),
+                                  true, true));
   auto changed = RawImportRecords(false, true, false);
   changed.ReplaceSubstring(u"unreadChildren\",\"v\":\"0",
                            u"unreadChildren\",\"v\":\"1");
-  EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED, CheckRawImport(changed));
+  EXPECT_EQ(NS_OK, CheckRawImport(changed));
   changed = RawImportRecords(false, true, true);
   changed.ReplaceSubstring(u"threadNewestMsgDate", u"unknownMetaCell");
-  EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED, CheckRawImport(changed));
+  EXPECT_EQ(NS_OK, CheckRawImport(changed));
 }
 
+// A thread table without headers is a leftover of the derived index: its
+// cached cells refuse nothing. The pending operation beside it stays exact.
 TEST_F(DeliveryCoreReferences,
-       ImapRawRecordsRefuseActiveOrUnboundRetiredThread) {
+       ImapRawRecordsIgnoreEmptyThreadTableButKeepOperationsExact) {
   ASSERT_EQ(NS_OK, Start());
   const auto source = RawImportRecords(true, true, false);
   for (auto pair :
@@ -10131,29 +10144,37 @@ TEST_F(DeliveryCoreReferences,
         std::pair{u"children\",\"v\":\"0\"},{\"k\":\"unreadChildren\",\"v\":"
                   u"\"0\"},{\"k\":\"threadNewestMsgDate\",\"v\":\"0",
                   u"children\",\"v\":\"0\"},{\"k\":\"unreadChildren\",\"v\":"
-                  u"\"0\"},{\"k\":\"threadNewestMsgDate\",\"v\":\"1"},
-        std::pair{u"\"op\",\"v\":\"2", u"\"op\",\"v\":\"4"},
+                  u"\"0\"},{\"k\":\"threadNewestMsgDate\",\"v\":\"1"}}) {
+    auto changed = source;
+    ASSERT_NE(kNotFound, changed.Find(pair.first));
+    changed.ReplaceSubstring(pair.first, pair.second);
+    EXPECT_EQ(NS_OK, CheckRawImport(changed));
+  }
+  for (auto pair :
+       {std::pair{u"\"op\",\"v\":\"2", u"\"op\",\"v\":\"4"},
         std::pair{u"msgKey\",\"v\":\"1388", u"msgKey\",\"v\":\"1389"}}) {
     auto changed = source;
     ASSERT_NE(kNotFound, changed.Find(pair.first));
     changed.ReplaceSubstring(pair.first, pair.second);
-    EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED, CheckRawImport(changed));
+    EXPECT_EQ(NS_ERROR_INVALID_ARG, CheckRawImport(changed));
   }
 }
 
-TEST_F(DeliveryCoreReferences, ImapRawRecordsPreserveMembershipAndUnknownRows) {
+// Old Thunderbird reads headers through the all-headers table. A row that
+// table does not hold, and a stale member of the subject index, are not data.
+TEST_F(DeliveryCoreReferences, ImapRawRecordsIgnoreRowsNoTableHolds) {
   ASSERT_EQ(NS_OK, Start());
   auto changed = RawImportRecords(true, true, false);
   changed.ReplaceSubstring(
       u"scope:msgs:all\",\"cells\":[]",
       u"scope:msgs:all\",\"cells\":[{\"k\":\"unknown\",\"v\":\"retained\"}]");
-  EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED, CheckRawImport(changed));
+  EXPECT_EQ(NS_OK, CheckRawImport(changed));
   changed = RawImportRecords(true, true, false);
   changed.ReplaceSubstring(
       u"\"rows\":[\"5001:ns:msg:db:row:scope:threads:all\"]",
       u"\"rows\":[\"5001:ns:msg:db:row:scope:threads:all\",\"5000:ns:msg:db:"
       u"row:scope:threads:all\"]");
-  EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED, CheckRawImport(changed));
+  EXPECT_EQ(NS_OK, CheckRawImport(changed));
 }
 
 TEST_F(DeliveryCoreReferences, ImapRawRecordsAcceptUnindexedLiveThread) {
@@ -10195,12 +10216,11 @@ TEST_F(DeliveryCoreReferences, RawRecordsAccountUnifiedFolderHits) {
   const auto unified = u"mailbox://nobody@smart%20mailboxes/Inbox"_ns;
   EXPECT_EQ(NS_OK, CheckRawImport(withHits(unified, u"5001"_ns, true)));
   EXPECT_EQ(NS_OK, CheckRawImport(withHits(unified, u"5001"_ns, false), false));
-  EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED,
-            CheckRawImport(withHits(unified, u"5002"_ns, true)));
-  EXPECT_EQ(
-      NS_ERROR_NOT_IMPLEMENTED,
-      CheckRawImport(withHits(u"mailbox://nobody@Local%20Folders/Saved"_ns,
-                              u"5001"_ns, true)));
+  // A stale hit and the cache of any other search folder are derived too.
+  EXPECT_EQ(NS_OK, CheckRawImport(withHits(unified, u"5002"_ns, true)));
+  EXPECT_EQ(NS_OK, CheckRawImport(
+                       withHits(u"mailbox://nobody@Local%20Folders/Saved"_ns,
+                                u"5001"_ns, true)));
 }
 
 TEST_F(DeliveryCoreReferences, ImapRawRecordsAccountDeletedOperationRows) {
@@ -10221,10 +10241,11 @@ TEST_F(DeliveryCoreReferences, ImapRawRecordsAccountDeletedOperationRows) {
     return data;
   };
   EXPECT_EQ(NS_OK, CheckRawImport(withRows(true, u""_ns)));
-  EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED,
+  // Old Thunderbird reads pending operations through their table only: a row
+  // cut from it is no pending work, with or without leftover cells.
+  EXPECT_EQ(NS_OK,
             CheckRawImport(withRows(true, u"{\"k\":\"op\",\"v\":\"1\"}"_ns)));
-  EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED,
-            CheckRawImport(withRows(false, u""_ns), false));
+  EXPECT_EQ(NS_OK, CheckRawImport(withRows(false, u""_ns), false));
 }
 
 // A fabricated profile directory: only an entry that its directory no longer
@@ -10328,7 +10349,7 @@ TEST_F(DeliveryCoreReferences, RawRecordsAcceptInfoOnlyEmptySummary) {
   exact.ReplaceSubstring(u"@EXTRA@", u"");
   EXPECT_EQ(NS_OK, CheckRawImport(exact, true, false, Nothing(), true));
   EXPECT_EQ(NS_OK, CheckRawImport(exact, false, false, Nothing(), true));
-  // A summary with messages, or with any thread state, needs its tables.
+  // A summary with messages needs its all-headers table.
   EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED, CheckRawImport(exact));
   auto threaded = info;
   threaded.ReplaceSubstring(
@@ -10336,18 +10357,17 @@ TEST_F(DeliveryCoreReferences, RawRecordsAcceptInfoOnlyEmptySummary) {
       u",{\"id\":4294967293,\"scope\":\"ns:msg:db:row:scope:threads:all\","
       u"\"cells\":[{\"k\":\"k\",\"v\":\"ns:msg:db:table:kind:allthreads\"}],"
       u"\"metaRow\":null,\"rows\":[]}");
-  EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED,
-            CheckRawImport(threaded, true, false, Nothing(), true));
+  // An empty subject index beside it is derived and refuses nothing.
+  EXPECT_EQ(NS_OK, CheckRawImport(threaded, true, false, Nothing(), true));
 }
 
-TEST_F(DeliveryCoreReferences, LocalRawRecordsKeepExplicitUnreadAndNoPending) {
+TEST_F(DeliveryCoreReferences, LocalRawRecordsTreatUnreadCacheAsHint) {
   ASSERT_EQ(NS_OK, Start());
   EXPECT_EQ(NS_OK,
             CheckRawImport(RawImportRecords(false, false, false), false));
-  EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED,
-            CheckRawImport(RawImportRecords(false, false, true), false));
-  EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED,
-            CheckRawImport(RawImportRecords(false, true, false), false));
+  // An absent unread cache and an empty pending table refuse nothing.
+  EXPECT_EQ(NS_OK, CheckRawImport(RawImportRecords(false, false, true), false));
+  EXPECT_EQ(NS_OK, CheckRawImport(RawImportRecords(false, true, false), false));
   EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED,
             CheckRawImport(RawImportRecords(true, false, false), false));
 }
@@ -25475,36 +25495,38 @@ TEST_F(DeliveryCoreReferences, NativeJSONUserOrderImapColdReopen) {
                            "mbox"_ns);
 }
 
-TEST_F(DeliveryCoreReferences, NativeJSONUserOrderRefusesString) {
-  CheckJSONUserOrderInvalidSource("{\"userSortOrder\":\"0\"}"_ns);
+TEST_F(DeliveryCoreReferences, NativeJSONUserOrderStringIsNoValue) {
+  CheckJSONUserOrderDirtySource("{\"userSortOrder\":\"0\"}"_ns, Nothing());
 }
 
-TEST_F(DeliveryCoreReferences, NativeJSONUserOrderRefusesBoolean) {
-  CheckJSONUserOrderInvalidSource("{\"userSortOrder\":false}"_ns);
+TEST_F(DeliveryCoreReferences, NativeJSONUserOrderBooleanIsItsNumber) {
+  CheckJSONUserOrderDirtySource("{\"userSortOrder\":false}"_ns,
+                                Some(uint32_t{0}));
 }
 
-TEST_F(DeliveryCoreReferences, NativeJSONUserOrderRefusesNull) {
-  CheckJSONUserOrderInvalidSource("{\"userSortOrder\":null}"_ns);
+TEST_F(DeliveryCoreReferences, NativeJSONUserOrderNullIsNoValue) {
+  CheckJSONUserOrderDirtySource("{\"userSortOrder\":null}"_ns, Nothing());
 }
 
-TEST_F(DeliveryCoreReferences, NativeJSONUserOrderRefusesFraction) {
-  CheckJSONUserOrderInvalidSource("{\"userSortOrder\":0.5}"_ns);
+TEST_F(DeliveryCoreReferences, NativeJSONUserOrderFractionIsTruncated) {
+  CheckJSONUserOrderDirtySource("{\"userSortOrder\":0.5}"_ns,
+                                Some(uint32_t{0}));
 }
 
-TEST_F(DeliveryCoreReferences, NativeJSONUserOrderRefusesNegative) {
-  CheckJSONUserOrderInvalidSource("{\"userSortOrder\":-1}"_ns);
+TEST_F(DeliveryCoreReferences, NativeJSONUserOrderNegativeIsNoValue) {
+  CheckJSONUserOrderDirtySource("{\"userSortOrder\":-1}"_ns, Nothing());
 }
 
-TEST_F(DeliveryCoreReferences, NativeJSONUserOrderRefusesOverflow) {
-  CheckJSONUserOrderInvalidSource("{\"userSortOrder\":4294967296}"_ns);
+TEST_F(DeliveryCoreReferences, NativeJSONUserOrderOverflowIsNoValue) {
+  CheckJSONUserOrderDirtySource("{\"userSortOrder\":4294967296}"_ns, Nothing());
 }
 
-TEST_F(DeliveryCoreReferences, NativeJSONUserOrderRefusesObject) {
-  CheckJSONUserOrderInvalidSource("{\"userSortOrder\":{}}"_ns);
+TEST_F(DeliveryCoreReferences, NativeJSONUserOrderObjectIsNoValue) {
+  CheckJSONUserOrderDirtySource("{\"userSortOrder\":{}}"_ns, Nothing());
 }
 
-TEST_F(DeliveryCoreReferences, NativeJSONUserOrderRefusesArray) {
-  CheckJSONUserOrderInvalidSource("{\"userSortOrder\":[]}"_ns);
+TEST_F(DeliveryCoreReferences, NativeJSONUserOrderArrayIsNoValue) {
+  CheckJSONUserOrderDirtySource("{\"userSortOrder\":[]}"_ns, Nothing());
 }
 
 TEST_F(DeliveryCoreReferences, NativeJSONUserOrderRefusesInvalidNativeTypes) {
@@ -25723,35 +25745,38 @@ TEST_F(DeliveryCoreReferences, NativeEffectiveExpungedRefusesMalformedNative) {
   });
 }
 
-TEST_F(DeliveryCoreReferences, NativeEffectiveExpungedRefusesStringSourceCell) {
+// The old cache reads a text cell as no number and truncates a fraction.
+// Neither fails the folder or touches its committed message.
+TEST_F(DeliveryCoreReferences,
+       NativeEffectiveExpungedStringSourceCellIsNoValue) {
   WithNativeJSONCache("none"_ns, "mbox"_ns, [&](nsIMsgFolder* folder) {
     nsCString token, body, request, raw, output;
     nsMsgKey key;
     ASSERT_EQ(NS_OK, PrepareNonemptyCacheFolder(folder, token, body, key));
     ASSERT_EQ(NS_OK, PrepareJSONCacheRequest(
                          folder, "{\"expungedBytes\":\"0\"}"_ns, request, raw));
-    EXPECT_EQ(NS_ERROR_FAILURE, JSONCacheCall(request, false, output));
+    EXPECT_EQ(NS_OK, JSONCacheCall(request, false, output));
     CheckCacheExpungedProperty(Nothing());
     int64_t count = -1;
     ASSERT_EQ(NS_OK, JSONCacheImportCount(count));
-    EXPECT_EQ(0, count);
+    EXPECT_EQ(1, count);
     CheckNonemptyCacheFolder(folder, token, body, key);
   });
 }
 
 TEST_F(DeliveryCoreReferences,
-       NativeEffectiveExpungedRefusesFractionSourceCell) {
+       NativeEffectiveExpungedFractionSourceCellIsTruncated) {
   WithNativeJSONCache("none"_ns, "mbox"_ns, [&](nsIMsgFolder* folder) {
     nsCString token, body, request, raw, output;
     nsMsgKey key;
     ASSERT_EQ(NS_OK, PrepareNonemptyCacheFolder(folder, token, body, key));
     ASSERT_EQ(NS_OK, PrepareJSONCacheRequest(
                          folder, "{\"expungedBytes\":0.5}"_ns, request, raw));
-    EXPECT_EQ(NS_ERROR_FAILURE, JSONCacheCall(request, false, output));
-    CheckCacheExpungedProperty(Nothing());
+    EXPECT_EQ(NS_OK, JSONCacheCall(request, false, output));
+    CheckCacheExpungedProperty(Some(int64_t{0}));
     int64_t count = -1;
     ASSERT_EQ(NS_OK, JSONCacheImportCount(count));
-    EXPECT_EQ(0, count);
+    EXPECT_EQ(1, count);
     CheckNonemptyCacheFolder(folder, token, body, key);
   });
 }
@@ -26209,13 +26234,18 @@ TEST_F(DeliveryCoreReferences, NativeEmptyLocalSourceHasNoPerThreadTable) {
   uint64_t count = 1;
   ASSERT_EQ(NS_OK, mCore->MessageDB().GetTotalCount(&count));
   EXPECT_EQ(0u, count);
-  // A nonempty typed projection may not omit the original per-thread table.
-  EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED,
+  // A nonempty typed projection may not omit the original header rows.
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
             CheckRawImport(records, false, false, Some(260u), false));
 }
 
-TEST_F(DeliveryCoreReferences, NativeEmptyLocalSourceRetainsEveryRawRecord) {
+// Derived records of an empty folder (a leftover thread metadata row, an
+// unknown index table) refuse nothing. A header row without its typed
+// projection and a record the adapter did not handle still do.
+TEST_F(DeliveryCoreReferences, NativeEmptyLocalSourceIgnoresDerivedRecords) {
   ASSERT_EQ(NS_OK, Start());
+  const nsresult expected[] = {NS_OK, NS_OK, NS_ERROR_INVALID_ARG,
+                               NS_ERROR_NOT_IMPLEMENTED};
   nsTArray<nsString> invalid;
   auto changed = EmptyLocalImportRecords();
   changed.ReplaceSubstring(
@@ -26233,15 +26263,17 @@ TEST_F(DeliveryCoreReferences, NativeEmptyLocalSourceRetainsEveryRawRecord) {
   changed.ReplaceSubstring(u"\"unhandledRecords\": []",
                            u"\"unhandledRecords\": [\"unaccounted-row\"]");
   invalid.AppendElement(changed);
-  for (const auto& data : invalid) {
-    ASSERT_NE(EmptyLocalImportRecords(), data);
-    EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED,
-              CheckRawImport(data, false, false, Some(260u), true));
+  for (uint32_t i = 0; i < invalid.Length(); ++i) {
+    ASSERT_NE(EmptyLocalImportRecords(), invalid[i]);
+    EXPECT_EQ(expected[i],
+              CheckRawImport(invalid[i], false, false, Some(260u), true));
   }
 }
 
+// The folder-info message count is a cache old Thunderbird recounts; the
+// folder flags word is index data.
 TEST_F(DeliveryCoreReferences,
-       NativeEmptyLocalSourceKeepsCountsAndFlagsStrict) {
+       NativeEmptyLocalSourceRecountsButKeepsFlagsStrict) {
   ASSERT_EQ(NS_OK, Start());
   for (uint32_t count : {0u, 1u}) {
     auto records = EmptyLocalImportRecords();
@@ -26253,8 +26285,7 @@ TEST_F(DeliveryCoreReferences,
                         u"\"},{\"k\":\"version\""_ns);
     records.ReplaceSubstring(u"{\"name\":\"version\"", property.get());
     records.ReplaceSubstring(u"{\"k\":\"version\"", cell.get());
-    EXPECT_EQ(count ? NS_ERROR_INVALID_ARG : NS_OK,
-              CheckRawImport(records, false, false, Some(260u), true));
+    EXPECT_EQ(NS_OK, CheckRawImport(records, false, false, Some(260u), true));
   }
   EXPECT_EQ(
       NS_ERROR_NOT_IMPLEMENTED,
@@ -26371,9 +26402,8 @@ TEST_F(DeliveryCoreReferences, ThreadNewestCacheAbsenceUsesNativeZero) {
         data.ReplaceSubstring(u",{\"k\":\"threadNewestMsgDate\",\"v\":\"0\"}",
                               u"");
         const auto original = data;
-        const bool wrongUnread = absentUnread && (!imap || unread);
-        EXPECT_EQ(wrongUnread ? NS_ERROR_NOT_IMPLEMENTED : NS_OK,
-                  CheckRawImport(data, imap, unread));
+        // The unread count of the row is a cache as well.
+        EXPECT_EQ(NS_OK, CheckRawImport(data, imap, unread));
         EXPECT_EQ(original, data);
       }
     }
@@ -26403,13 +26433,13 @@ TEST_F(DeliveryCoreReferences,
     auto wrong = original;
     wrong.ReplaceSubstring(u"\"threadNewestMsgDate\",\"v\":\"0\"",
                            u"\"threadNewestMsgDate\",\"v\":\"c\"");
-    EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED,
-              CheckRawImport(wrong, imap, false, Nothing(), false, 11));
+    // A stale newest date is recomputed, never compared.
+    EXPECT_EQ(NS_OK, CheckRawImport(wrong, imap, false, Nothing(), false, 11));
   }
 }
 
 TEST_F(DeliveryCoreReferences,
-       ThreadNewestCacheStillRefusesMalformedAndUnknownCells) {
+       ThreadNewestCacheMalformedAndUnknownCellsAreIgnored) {
   ASSERT_EQ(NS_OK, Start());
   for (bool imap : {false, true}) {
     for (const char16_t* invalid : {u"", u"not-hex"}) {
@@ -26418,16 +26448,16 @@ TEST_F(DeliveryCoreReferences,
                                  nsDependentString(invalid) + u"\""_ns);
       data.ReplaceSubstring(u"\"threadNewestMsgDate\",\"v\":\"0\"",
                             replacement.get());
-      EXPECT_EQ(NS_ERROR_INVALID_ARG, CheckRawImport(data, imap));
+      EXPECT_EQ(NS_OK, CheckRawImport(data, imap));
     }
     auto unknown = RawImportRecords(false, false, false);
     unknown.ReplaceSubstring(u"threadNewestMsgDate", u"unknownNewestCache");
-    EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED, CheckRawImport(unknown, imap));
+    EXPECT_EQ(NS_OK, CheckRawImport(unknown, imap));
     auto missingRoot = RawImportRecords(false, false, false);
     missingRoot.ReplaceSubstring(
         u",{\"k\":\"threadNewestMsgDate\",\"v\":\"0\"}", u"");
     missingRoot.ReplaceSubstring(u"threadRoot", u"unrecognizedRoot");
-    EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED, CheckRawImport(missingRoot, imap));
+    EXPECT_EQ(NS_OK, CheckRawImport(missingRoot, imap));
   }
 }
 
@@ -26441,7 +26471,7 @@ TEST_F(DeliveryCoreReferences,
   EXPECT_EQ(original, data);
   data.ReplaceSubstring(u"\"children\",\"v\":\"0\"",
                         u"\"children\",\"v\":\"1\"");
-  EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED, CheckRawImport(data));
+  EXPECT_EQ(NS_OK, CheckRawImport(data));
 }
 
 // Stock mach gtest runs suites in separate processes. This native fixture uses
@@ -26666,19 +26696,11 @@ TEST_F(DeliveryCoreReferences, StartupImapRootCacheCompletesWithNativeReceipt) {
                              nullptr, NS_OK, nullptr, false, true);
 }
 
-// A cache that does not parse is an empty cache now and fails nothing
-// (StartupUnusableJSONIsAnEmptyCacheNeverMork). A cache with an entry is
-// legacy input this observed startup cannot migrate; that failure settles and
-// stays the first one.
-TEST_F(DeliveryCoreReferences, StartupBeginPreservesSettledLegacyInputFailure) {
-  dom::AutoJSAPI jsapi;
-  ASSERT_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()));
-  nsCString descriptor, quoted;
-  ASSERT_EQ(NS_OK, mProfile->GetPersistentDescriptor(descriptor));
-  ASSERT_EQ(NS_OK, JSONCacheQuote(jsapi.cx(), descriptor, quoted));
-  ASSERT_EQ(NS_OK, WriteStartupFile("folderCache.json",
-                                    "{"_ns + quoted + ":{\"flags\":4}}"_ns));
-  CheckObservedStartupFailure();
+// No folder cache content fails startup any more. A selector that cannot be
+// read still does; that failure settles and stays the first one.
+TEST_F(DeliveryCoreReferences, StartupBeginPreservesSettledSelectorFailure) {
+  ASSERT_EQ(NS_OK, WriteStartupFile("panorama-profile.json", "{"_ns));
+  CheckObservedStartupFailure(NS_ERROR_FILE_CORRUPTED);
 }
 
 TEST_F(DeliveryCoreReferences, StartupUnknownCacheCellKeepsOriginalBytes) {
@@ -26690,7 +26712,10 @@ TEST_F(DeliveryCoreReferences, StartupUnknownCacheCellKeepsOriginalBytes) {
   const nsCString raw("{"_ns + quoted +
                       ":{\"notANativeNumericProperty\":0}}"_ns);
   ASSERT_EQ(NS_OK, WriteStartupFile("folderCache.json", raw));
-  CheckObservedStartupFailure();
+  ASSERT_EQ(NS_OK, ArmSelectedStartup());
+  nsCString selected;
+  ASSERT_EQ(NS_OK, DescribeStartup(selected));
+  EXPECT_NE(kNotFound, selected.Find("\"mode\":\"migrate\""));
   nsCOMPtr<nsIFile> file;
   ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(file)));
   ASSERT_EQ(NS_OK, file->AppendNative("folderCache.json"_ns));

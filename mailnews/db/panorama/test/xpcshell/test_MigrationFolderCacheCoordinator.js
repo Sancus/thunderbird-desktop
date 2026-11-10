@@ -33,6 +33,7 @@ const { prepareMorkFolderCacheImport, resumeMorkCacheImports } =
 
 const {
   parseJSONFolderCache,
+  parseMorkFolderCache,
   createMorkFolderCacheRequest,
   validateMorkFolderCacheReceipt,
 } = ChromeUtils.importESModule(
@@ -1527,78 +1528,202 @@ add_task(function test_JSONCacheRetainsDescriptorIdentityAndTypedPresence() {
   Assert.deepEqual(empty.source, {});
 });
 
-add_task(function test_JSONCacheRefusesUnsafeOrAmbiguousCellTypes() {
+add_task(function test_JSONCacheReadsDirtyDataAsTheOldReaderDoes() {
+  // A folder cache is a rebuildable hint. nsMsgFolderCache starts with an
+  // empty cache when the file does not parse and reports "no value" for a
+  // cell its typed getter cannot return. Nothing here refuses a profile.
   const key = PathUtils.join(PathUtils.profileDir, "Original.msf");
   const encode = value => new TextEncoder().encode(JSON.stringify(value));
-  for (const value of [null, [], 0, "rows"]) {
-    Assert.throws(
-      () => parseJSONFolderCache(encode(value)),
-      /requires an object/
-    );
-  }
-  for (const row of [null, [], true]) {
-    Assert.throws(
-      () => parseJSONFolderCache(encode({ [key]: row })),
-      /cache row/
-    );
-  }
-  for (const row of [
-    { flags: -1 },
-    { userSortOrder: -1 },
-    { userSortOrder: 0x100000000 },
-    { userSortOrder: "0" },
-    { flags: 0x100000000 },
-    { totalMsgs: 0x80000000 },
-    { totalMsgs: -0x80000001 },
-    { folderSize: 9007199254740992 },
-    { flags: "0" },
-    { flags: 0.5 },
+  const raw = text => new TextEncoder().encode(text);
+  for (const bytes of [
+    raw(""),
+    raw("{broken"),
+    raw("﻿{broken"),
+    new Uint8Array([0xff, 0xfe, 0x00]),
+    encode(null),
+    encode([]),
+    encode(0),
+    encode("rows"),
   ]) {
-    Assert.throws(
-      () => parseJSONFolderCache(encode({ [key]: row })),
-      /cache number/
+    const unusable = parseJSONFolderCache(bytes);
+    Assert.equal(unusable.entries.size, 0, "An unusable cache is empty");
+    Assert.equal(unusable.format, "json");
+    Assert.ok(unusable.unusable, "The reason is retained for the report");
+    Assert.deepEqual(unusable.source, {});
+  }
+  // A row that is no object has no entry; its neighbours are unaffected.
+  const rows = parseJSONFolderCache(
+    encode({
+      "": { folderName: "No path" },
+      relative: {},
+      [key]: {},
+      "/null-row": null,
+      "/array-row": [],
+      "/true-row": true,
+      "/text-row": "text",
+      "/nul\0key": {},
+    })
+  );
+  Assert.deepEqual([...rows.entries.keys()], ["", "relative", key]);
+  Assert.equal(rows.entries.get("").values.folderName, "No path");
+  Assert.equal(rows.skipped.entries, 5);
+  Assert.ok(rows.source["/null-row"] === null, "The original keeps every row");
+  // Each cell alone: what the old typed getter returns, or no value.
+  const cell = (name, value) => {
+    const parsed = parseJSONFolderCache(encode({ [key]: { [name]: value } }));
+    const entry = parsed.entries.get(key);
+    Assert.ok(entry, "A dirty cell never removes its row");
+    Assert.deepEqual(parsed.source[key][name], value);
+    return entry.properties.has(name)
+      ? [entry.values[name], entry.properties.get(name)]
+      : null;
+  };
+  for (const [name, value] of [
+    // Null: the getter's zero or empty default, the same as an absent cell.
+    ["flags", null],
+    ["nextUID", null],
+    ["folderSize", null],
+    ["folderName", null],
+    ["MRUTime", null],
+    // Text is not convertible to a number.
+    ["flags", "0"],
+    ["flags", "1c"],
+    ["userSortOrder", "0"],
+    ["totalMsgs", ""],
+    // Out of the getter's range.
+    ["flags", -1],
+    ["flags", 0x100000000],
+    ["userSortOrder", -1],
+    ["userSortOrder", 0x100000000],
+    ["totalMsgs", 0x80000000],
+    ["totalMsgs", -0x80000001],
+    ["folderSize", 9007199254740992],
+    // No scalar at all.
+    ["flags", []],
+    ["flags", {}],
+    ["folderName", []],
+    ["folderName", {}],
+    ["folderName", 1.5],
+    // Text no later stage can carry exactly.
+    ["folderName", "nul\0value"],
+    ["folderName", "\ud800"],
+  ]) {
+    Assert.equal(
+      cell(name, value),
+      null,
+      name + " " + JSON.stringify(value) + " has no value"
     );
   }
-  // Thunderbird writes null for a cell without a value and reads it as empty.
-  const valueless = parseJSONFolderCache(
-    encode({ [key]: { folderName: null, nextUID: null, flags: 4 } })
+  for (const [name, value, expected] of [
+    ["flags", 0, [0, "0"]],
+    ["flags", 0xffffffff, [0xffffffff, "ffffffff"]],
+    ["flags", true, [1, "1"]],
+    ["flags", 4.75, [4, "4"]],
+    ["totalMsgs", -1, [-1, "ffffffff"]],
+    ["totalMsgs", false, [0, "0"]],
+    ["hierDelim", 47.0, [47, "2f"]],
+    ["folderSize", -2, [-2, "fffffffffffffffe"]],
+    ["folderName", "Name", ["Name", "Name"]],
+    ["folderName", "", ["", ""]],
+    ["folderName", 12, ["12", "12"]],
+    ["folderName", true, ["true", "true"]],
+    ["unknownText", "kept", ["kept", "kept"]],
+    ["folderName", "Replaced �", ["Replaced �", "Replaced �"]],
+  ]) {
+    Assert.deepEqual(
+      cell(name, value),
+      expected,
+      name + " " + JSON.stringify(value)
+    );
+  }
+  // A property named like the row key is no cell.
+  const reserved = parseJSONFolderCache(
+    encode({ [key]: { key: "replacement", flags: 4 } })
   );
   Assert.deepEqual(
-    [...valueless.entries.get(key).properties.keys()],
-    ["key", "flags"]
+    [...reserved.entries.get(key).properties],
+    [
+      ["key", key],
+      ["flags", "4"],
+    ]
   );
-  Assert.deepEqual({ ...valueless.entries.get(key).values }, { flags: 4 });
-  Assert.strictEqual(valueless.source[key].nextUID, null);
-  for (const row of [
-    { folderName: true },
-    { folderName: [] },
-    { folderName: {} },
-    { unknownNumber: 1 },
-    { folderName: "nul\0value" },
-    { folderName: "\ud800" },
-  ]) {
-    Assert.throws(
-      () => parseJSONFolderCache(encode({ [key]: row })),
-      /cache text/
+  Assert.equal(reserved.skipped.cells, 1);
+  // Bytes that are not UTF-8 inside one value do not lose the document.
+  const latin = new Uint8Array([
+    ...raw('{"/a.msf":{"folderName":"caf'),
+    0xe9,
+    ...raw('","flags":4}}'),
+  ]);
+  const replaced = parseJSONFolderCache(latin).entries.get("/a.msf");
+  Assert.equal(replaced.values.flags, 4);
+  Assert.equal(replaced.values.folderName, "caf�");
+});
+
+add_task(function test_MorkCacheReadsDirtyDataAsTheOldReaderDoes() {
+  // importFromMork/applyEntry: a file that does not open is an empty cache,
+  // a row without a key is skipped, a later row replaces an earlier one and
+  // a numeric cell without leading hexadecimal digits is dropped.
+  const encode = text =>
+    Uint8Array.from(text, character => character.charCodeAt(0));
+  const document = rows =>
+    encode(
+      '// <!-- <mdb:mork:z v="1.4"/> -->\n' +
+        "< <(a=c)> (80=ns:msg:db:row:scope:folders:all)" +
+        "(81=ns:msg:db:table:kind:folders)(82=key)(83=flags)(84=folderName)" +
+        "(85=totalMsgs)(86=folderSize)(87=custom)>\n" +
+        "{1:^80 {(k^81:c)(s=9)}\n" +
+        rows +
+        "}\n"
     );
+  for (const bytes of [
+    encode(""),
+    encode("not Mork at all"),
+    encode('// <!-- <mdb:mork:z v="1.4"/> -->\n{1:^80 {(k^81:c)(s=9)} [1(^82'),
+    encode(
+      '// <!-- <mdb:mork:z v="1.4"/> -->\n' +
+        "< <(a=c)> (80=ns:other:scope)(81=ns:other:kind)>\n" +
+        "{1:^80 {(k^81:c)(s=9)}}\n"
+    ),
+  ]) {
+    const unusable = parseMorkFolderCache(bytes);
+    Assert.equal(unusable.entries.size, 0, "An unusable cache is empty");
+    Assert.ok(unusable.unusable);
   }
-  Assert.throws(() => parseJSONFolderCache(encode({ [key]: [] })), /cache row/);
-  // Thunderbird writes a folder without a file path under an empty key. Such
-  // an entry, like any key that is no absolute path, reaches no folder.
-  const pathless = parseJSONFolderCache(
-    encode({ "": { folderName: "No path" }, relative: {}, [key]: {} })
+  const parsed = parseMorkFolderCache(
+    document(
+      "[1(^82=/first.msf)(^83=1c)(^84=First)(^85=)(^86=zz)(^87=)]\n" +
+        "[2(^83=4)(^84=No key)]\n" +
+        "[3(^82=)(^83=4)]\n" +
+        "[4(^82=/dup.msf)(^84=Earlier)]\n" +
+        "[5(^82=/dup.msf)(^84=Later)(^83=1cz)(^85=123456789)]\n" +
+        "[6(^82=/bytes.msf)(^84=caf$E9)(^83=8)]\n"
+    )
   );
-  Assert.deepEqual([...pathless.entries.keys()], ["", "relative", key]);
-  Assert.equal(pathless.entries.get("").values.folderName, "No path");
-  Assert.throws(
-    () => parseJSONFolderCache(encode({ [key]: { key: "replacement" } })),
-    /cache property/
+  Assert.deepEqual(
+    [...parsed.entries.keys()],
+    ["/first.msf", "/dup.msf", "/bytes.msf"]
   );
-  Assert.throws(() => parseJSONFolderCache(new Uint8Array([0xff])), /./);
-  Assert.throws(
-    () => parseJSONFolderCache(new TextEncoder().encode("{broken")),
-    /./
+  const first = parsed.entries.get("/first.msf");
+  Assert.equal(first.sourceKey, 1);
+  Assert.deepEqual(
+    { ...first.values },
+    { flags: 0x1c, folderName: "First", custom: "" },
+    "An empty or unreadable number has no value; empty text is text"
   );
+  const duplicate = parsed.entries.get("/dup.msf");
+  Assert.equal(duplicate.sourceKey, 5, "A later row replaces an earlier one");
+  Assert.deepEqual(
+    { ...duplicate.values },
+    { folderName: "Later", flags: 0x1c },
+    "Leading hexadecimal digits are read; an over-long number is dropped"
+  );
+  Assert.deepEqual(
+    { ...parsed.entries.get("/bytes.msf").values },
+    { flags: 8 },
+    "Text that is not UTF-8 has no projection; its row stays"
+  );
+  Assert.equal(parsed.skipped.entries, 3);
+  Assert.equal(parsed.source.rows.size, 6, "The original keeps every row");
 });
 
 add_task(

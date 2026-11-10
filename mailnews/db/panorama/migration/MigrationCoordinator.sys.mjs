@@ -774,17 +774,23 @@ function startupJSONCacheIsEmpty(path) {
   if (!file.isFile() || size < 0 || size > 64 * 1024 * 1024) {
     throw new Error("Unsupported startup JSON cache file");
   }
+  if (!size) {
+    // A zero-length cache is as empty as one that does not parse.
+    return true;
+  }
   const stream = Cc["@mozilla.org/network/file-input-stream;1"].createInstance(
     Ci.nsIFileInputStream
   );
   stream.init(file, 0x01, 0, 0);
   try {
-    const binary = Cc["@mozilla.org/binaryinputstream;1"].createInstance(
-      Ci.nsIBinaryInputStream
+    // One native read into a byte string; never a script array per byte.
+    const scriptable = Cc[
+      "@mozilla.org/scriptableinputstream;1"
+    ].createInstance(Ci.nsIScriptableInputStream);
+    scriptable.init(stream);
+    const parsed = parseJSONFolderCache(
+      MailStringUtils.byteStringToUint8Array(scriptable.readBytes(size))
     );
-    binary.setInputStream(stream);
-    const bytes = new Uint8Array(binary.readByteArray(size));
-    const parsed = parseJSONFolderCache(bytes);
     if (
       startupSourceFile(path).path !== file.path ||
       file.fileSize !== size ||
@@ -2590,57 +2596,8 @@ function captureStartupMigration(signal, nativeAudit) {
       storeContractID: contract,
     });
   }
-  // Discover from the configuration outward: the caches and books at the top
-  // of the profile, then each account server's own root and root summary.
-  // Nothing else in the profile is migration input, so nothing else is read,
-  // and a link or special file elsewhere is none of this migration's business.
-  const found = new Map();
-  const add = file => {
-    if (file.isSymlink()) {
-      throw new Error("Startup inventory contains a link");
-    }
-    if (!file.isFile()) {
-      throw new Error("Startup inventory contains a nonregular file");
-    }
-    found.set(file.path, file.clone());
-  };
-  const visit = directory => {
-    for (const entry of directory.directoryEntries) {
-      const file = entry.QueryInterface(Ci.nsIFile);
-      if (file.isSymlink()) {
-        throw new Error("Startup inventory contains a link");
-      }
-      if (file.isDirectory()) {
-        visit(file);
-      } else {
-        add(file);
-      }
-    }
-  };
-  for (const entry of profile.directoryEntries) {
-    const file = entry.QueryInterface(Ci.nsIFile);
-    if (
-      ["panacea.dat", "folderCache.json"].includes(file.leafName) ||
-      file.leafName.endsWith(".mab")
-    ) {
-      add(file);
-    }
-  }
   const serverRoots = servers.map(server => new FileUtils.File(server.root));
-  for (const root of serverRoots) {
-    if (!startupEntryExists(root)) {
-      continue;
-    }
-    if (!root.isDirectory()) {
-      throw new Error("Server root is not a directory");
-    }
-    visit(root);
-    const rootSummary = new FileUtils.File(root.path + ".msf");
-    if (startupEntryExists(rootSummary)) {
-      add(rootSummary);
-    }
-  }
-  const files = [...found.values()];
+  const files = startupMailFiles(profile, serverRoots);
   const summaries = [];
   const serverSummaries = [];
   const books = [];
@@ -2885,18 +2842,115 @@ function captureStartupMigration(signal, nativeAudit) {
   // Windows the journal7 inventory and backup3 originalRoots use exactly
   // these admitted spellings; in-profile roots are part of the profile.
   const mailPaths = externalRoots.map(root => root.path);
-  // An index migration changes no message store, so none is read or copied:
-  // the backup holds the metadata that is migration input (and the small
-  // account files beside it) and measures each store in place.
+  const classify = startupIndexSelection(profile, servers, serverRoots, [
+    ...summaries,
+    ...serverSummaries,
+    ...books,
+    ...caches,
+  ]);
+  const backup = createMigrationBackupAtStartup(
+    profile.path,
+    windows ? mailPaths : roots.mailPaths,
+    backupPath,
+    signal,
+    classify
+  );
+  return {
+    profilePath: profile.path,
+    mailPaths,
+    servers,
+    summaries,
+    serverSummaries,
+    books,
+    caches,
+    workPath: work.path,
+    backupPath,
+    backup,
+  };
+}
+
+/**
+ * Discovers migration input from the configuration outward: the caches and
+ * books at the top of the profile, then each account server's own root and
+ * root summary. Nothing else in the profile is migration input, so nothing
+ * else is read, and a link or special file elsewhere is none of this
+ * migration's business.
+ *
+ * @param {nsIFile} profile - Selected profile directory.
+ * @param {nsIFile[]} serverRoots - Each account server's root directory.
+ * @returns {nsIFile[]} Every regular file found, once.
+ * @throws {Error} For a link or special file inside the mail data.
+ */
+function startupMailFiles(profile, serverRoots) {
+  const found = new Map();
+  const add = file => {
+    if (file.isSymlink()) {
+      throw new Error("Startup inventory contains a link");
+    }
+    if (!file.isFile()) {
+      throw new Error("Startup inventory contains a nonregular file");
+    }
+    found.set(file.path, file.clone());
+  };
+  const visit = directory => {
+    for (const entry of directory.directoryEntries) {
+      const file = entry.QueryInterface(Ci.nsIFile);
+      if (file.isSymlink()) {
+        throw new Error("Startup inventory contains a link");
+      }
+      if (file.isDirectory()) {
+        visit(file);
+      } else {
+        add(file);
+      }
+    }
+  };
+  for (const entry of profile.directoryEntries) {
+    const file = entry.QueryInterface(Ci.nsIFile);
+    if (
+      ["panacea.dat", "folderCache.json"].includes(file.leafName) ||
+      file.leafName.endsWith(".mab")
+    ) {
+      add(file);
+    }
+  }
+  for (const root of serverRoots) {
+    if (!startupEntryExists(root)) {
+      continue;
+    }
+    if (!root.isDirectory()) {
+      throw new Error("Server root is not a directory");
+    }
+    visit(root);
+    const rootSummary = new FileUtils.File(root.path + ".msf");
+    if (startupEntryExists(rootSummary)) {
+      add(rootSummary);
+    }
+  }
+  return [...found.values()];
+}
+
+/**
+ * Selects what an index migration backs up. It changes no message store, so
+ * none is read or copied: the backup holds the metadata that is migration
+ * input (and the small account files beside it) and measures each store in
+ * place.
+ *
+ * @param {nsIFile} profile - Selected profile directory.
+ * @param {object[]} servers - Captured account servers.
+ * @param {nsIFile[]} serverRoots - Their root directories.
+ * @param {{path: string}[]} inputs - Captured summaries, books and caches.
+ * @returns {function(nsIFile, boolean): string} Backup selection
+ *   (createMigrationBackupAtStartup).
+ */
+function startupIndexSelection(profile, servers, serverRoots, inputs) {
   const key = file => {
     const normalized = file.clone();
     normalized.normalize();
     return normalized.path;
   };
   const copied = new Set(
-    [...summaries, ...serverSummaries, ...books, ...caches].map(input =>
-      key(new FileUtils.File(input.path))
-    )
+    inputs.map(input => key(new FileUtils.File(input.path)))
   );
   for (const name of [
     "prefs.js",
@@ -2926,7 +2980,7 @@ function captureStartupMigration(signal, nativeAudit) {
       copied.add(key(newsrc));
     }
   }
-  const classify = (file, isDirectory) => {
+  return (file, isDirectory) => {
     const inRoot = serverRoots.some(
       root => root.equals(file) || root.contains(file)
     );
@@ -2946,25 +3000,6 @@ function captureStartupMigration(signal, nativeAudit) {
       file.leafName === "hostinfo.dat"
       ? "copy"
       : "in-place";
-  };
-  const backup = createMigrationBackupAtStartup(
-    profile.path,
-    windows ? mailPaths : roots.mailPaths,
-    backupPath,
-    signal,
-    classify
-  );
-  return {
-    profilePath: profile.path,
-    mailPaths,
-    servers,
-    summaries,
-    serverSummaries,
-    books,
-    caches,
-    workPath: work.path,
-    backupPath,
-    backup,
   };
 }
 

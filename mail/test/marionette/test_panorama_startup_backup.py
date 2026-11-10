@@ -1630,26 +1630,47 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             for path, data in leftovers.items():
                 self.assertEqual(data, path.read_bytes())
 
-    def test_invalidActiveJsonCacheNeverFallsBackToMork(self):
-        for case in ["malformed", "array", "negativeFlags", "objectName"]:
+    def test_unusableOrDirtyJsonCacheNeverRefusesNorFallsBackToMork(self):
+        """A folder cache is a hint: old Thunderbird starts with an empty cache
+        when the file does not parse and never consults the Mork cache beside
+        it; a cell it cannot read simply has no value."""
+        for case in ["malformed", "array", "empty", "negativeFlags", "objectName"]:
             self.clean_profile(False)
             source = self.create_legacy_message("mbox")
             self.stop_application()
             summary = Path(source["summary"])
             legacy = self.write_legacy_cache([{"key": str(summary),
                 "flags": format(source["flags"] & 0xffffffff, "x"),
-                "folderName": source["name"]}])
+                "folderName": "Stale Mork name"}])
+            legacy_bytes = legacy.read_bytes()
             cache = self.profile / "folderCache.json"
             raw = {
                 "malformed": b'{corrupt JSON',
                 "array": b'[]',
+                "empty": b'',
                 "negativeFlags": json.dumps({str(summary): {"flags": -1}}).encode(),
                 "objectName": json.dumps({str(summary): {"folderName": {}}}).encode(),
             }[case]
             cache.write_bytes(raw)
-            self.assert_startup_refuses([cache, legacy, summary], absent=[
-                self.profile / "panorama.sqlite",
-                self.profile / "panorama-profile.json"])
+            self.start_same_profile(True)
+            selected = self.selection()
+            self.assertEqual("migrated", selected["record"]["origin"], case)
+            self.assert_message_after_activation(source)
+            dirty_cell = case in ("negativeFlags", "objectName")
+            self.assertEqual(1 if dirty_cell else 0,
+                             len(selected["record"]["identity"]["caches"]), case)
+            name = self.marionette.execute_script("""
+                const { MailServices } = ChromeUtils.importESModule(
+                  'resource:///modules/MailServices.sys.mjs');
+                return MailServices.accounts.getIncomingServer(arguments[0])
+                  .rootFolder.getChildNamed(arguments[1]).name;
+            """, script_args=[source["serverKey"], source["name"]])
+            self.assertEqual(source["name"], name, "The Mork cache is never consulted")
+            self.assertEqual(raw, cache.read_bytes())
+            self.assertEqual(legacy_bytes, legacy.read_bytes())
+            self.stop_application()
+            self.start_same_profile(True)
+            self.assertEqual(selected["sourceId"], self.selection()["sourceId"])
 
     def test_activeMigrationRequiresUnchangedCompleteJournal(self):
         self.clean_profile(False)

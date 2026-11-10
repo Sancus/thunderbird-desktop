@@ -25933,35 +25933,51 @@ TEST_F(DeliveryCoreReferences, StartupNonemptyJSONCannotInitialize) {
   EXPECT_FALSE(exists);
 }
 
-TEST_F(DeliveryCoreReferences, StartupInvalidJSONNeverFallsBackToMork) {
+// nsMsgFolderCache starts with an empty cache when its JSON file does not
+// parse, and never consults the Mork cache beside it. An unusable JSON cache
+// is therefore an empty one: it selects nothing and refuses nothing.
+TEST_F(DeliveryCoreReferences, StartupUnusableJSONIsAnEmptyCacheNeverMork) {
   ASSERT_EQ(NS_OK, WriteStartupFile("panacea.dat", "historical bytes"_ns));
+  ASSERT_EQ(NS_OK, WriteStartupFile("folderCache.json", "{corrupt JSON"_ns));
   ASSERT_EQ(NS_OK, ArmSelectedStartup());
   nsCString selected;
-  for (const char* raw :
-       {"{", "[]", "null", "{\"\":[]}", "{\"/original.msf\":{\"flags\":true}}",
-        "{\"/original.msf\":{\"flags\":4294967296}}",
-        "{\"/original.msf\":{\"unknown\":1}}",
-        "{\"/original.msf\":{\"custom\":{}}}"}) {
-    SCOPED_TRACE(raw);
-    ASSERT_EQ(NS_OK,
-              WriteStartupFile("folderCache.json", nsDependentCString(raw)));
-    EXPECT_TRUE(NS_FAILED(DescribeStartup(selected)));
-    EXPECT_TRUE(NS_FAILED(OpenStartup("initialize")));
-    bool exists;
-    ASSERT_EQ(NS_OK, mFile->Exists(&exists));
-    EXPECT_FALSE(exists);
-  }
-  // Only genuinely removing the malformed source restores Mork selection.
-  nsCOMPtr<nsIFile> file;
-  ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(file)));
-  ASSERT_EQ(NS_OK, file->AppendNative("folderCache.json"_ns));
-  ASSERT_EQ(NS_OK, file->Remove(false));
+  ASSERT_EQ(NS_OK, DescribeStartup(selected));
+  EXPECT_NE(kNotFound, selected.Find("\"mode\":\"initialize\""));
+  ASSERT_EQ(NS_OK, OpenStartup("initialize"));
+}
+
+TEST_F(DeliveryCoreReferences, StartupZeroLengthJSONIsAnEmptyCache) {
+  ASSERT_EQ(NS_OK, WriteStartupFile("folderCache.json", ""_ns));
+  ASSERT_EQ(NS_OK, ArmSelectedStartup());
+  nsCString selected;
+  ASSERT_EQ(NS_OK, DescribeStartup(selected));
+  EXPECT_NE(kNotFound, selected.Find("\"mode\":\"initialize\""));
+}
+
+// A row the old reader skips has no entry; a cache of only such rows is empty.
+TEST_F(DeliveryCoreReferences, StartupSkippedJSONRowsLeaveAnEmptyCache) {
+  ASSERT_EQ(NS_OK, WriteStartupFile("folderCache.json",
+                                    "{\"\":[],\"/original.msf\":null}"_ns));
+  ASSERT_EQ(NS_OK, ArmSelectedStartup());
+  nsCString selected;
+  ASSERT_EQ(NS_OK, DescribeStartup(selected));
+  EXPECT_NE(kNotFound, selected.Find("\"mode\":\"initialize\""));
+}
+
+// A cell without a usable value never removes its row: the cache still has
+// an entry and is migration input.
+TEST_F(DeliveryCoreReferences, StartupDirtyJSONCellsKeepTheirRow) {
+  ASSERT_EQ(NS_OK,
+            WriteStartupFile(
+                "folderCache.json",
+                "{\"/original.msf\":{\"flags\":true,\"totalMsgs\":4294967296,"
+                "\"custom\":null,\"other\":{},\"folderName\":7}}"_ns));
+  ASSERT_EQ(NS_OK, ArmSelectedStartup());
+  nsCString selected;
   ASSERT_EQ(NS_OK, DescribeStartup(selected));
   EXPECT_NE(kNotFound, selected.Find("\"mode\":\"migrate\""));
 }
 
-// A summary no account server holds and a Mork book no directory names are
-// leftovers Thunderbird never opens: they are left alone and select nothing.
 TEST_F(DeliveryCoreReferences, StartupLeavesUnreferencedLegacyFilesAlone) {
   ASSERT_EQ(NS_OK, WriteStartupFile("removed-account.msf", "left alone"_ns));
   ASSERT_EQ(NS_OK, WriteStartupFile("removed-book.mab", "left alone"_ns));

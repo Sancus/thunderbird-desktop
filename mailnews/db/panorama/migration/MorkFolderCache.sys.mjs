@@ -29,14 +29,47 @@ const UNSIGNED32 = new Set(["aclFlags", "boxFlags", "flags"]);
 const SIGNED64 = new Set(["expungedBytes", "folderSize"]);
 
 /**
+ * A folder cache is a rebuildable hint. Old Thunderbird reads it leniently
+ * (nsMsgFolderCache.cpp): a file it cannot parse is an empty cache, a row
+ * without a key is skipped, a later row replaces an earlier one with its key,
+ * and a cell whose value the typed getter cannot return simply has no value.
+ * Both readers below apply those rules and never refuse a profile for its
+ * cache. The complete original stays in the backup (and in `source` when it
+ * parsed); `skipped` counts the rows and cells that have no projection.
+ *
+ * @param {string} format - "mork" or "json".
+ * @param {string} reason - Why no row could be read.
+ * @returns {object} An empty cache.
+ */
+function unusableCache(format, reason) {
+  return {
+    ...(format == "json" ? { format } : {}),
+    entries: new Map(),
+    source: format == "json" ? {} : { rows: new Map(), tables: new Map() },
+    skipped: { entries: 0, cells: 0 },
+    unusable: reason,
+  };
+}
+
+/**
+ * @param {*} value - Candidate key, name or text cell.
+ * @returns {boolean} Whether it is text every later stage can carry exactly.
+ */
+function carriedText(value) {
+  return (
+    typeof value == "string" && !value.includes("\0") && value.isWellFormed()
+  );
+}
+
+/**
  * Reads active legacy folder-cache rows without starting the cache service.
- * Retains exact text, presence and the complete byte-string snapshot.
- * Known numeric fields have a separate cache projection.
+ * Retains exact text and presence of every cell it can project. Known numeric
+ * fields have a separate cache projection.
  *
  * @param {Uint8Array} bytes - Complete panacea.dat bytes.
  * @returns {{entries: Map<string, {sourceKey: number, properties: Map<string, string>,
- *   values: Record<string, string|number>}>, source: object}} Original path keys.
- * @throws {MorkImportError} For malformed/unsupported rows or unsafe numbers.
+ *   values: Record<string, string|number>}>, source: object, skipped: object,
+ *   unusable?: string}} Original path keys.
  */
 export function parseMorkFolderCache(bytes) {
   if (
@@ -45,59 +78,70 @@ export function parseMorkFolderCache(bytes) {
   ) {
     throw new TypeError("Expected Uint8Array");
   }
-  const source = new MorkParser().parseForImport(
-    MailStringUtils.uint8ArrayToByteString(bytes)
-  );
-  const table = source.tables.get("1:" + SCOPE);
-  if (source.tables.size != 1 || table?.cells.get("k") != KIND) {
-    throw new MorkImportError(
-      "UNSUPPORTED_MORK",
-      0,
-      "Expected one folder-cache table"
+  let source;
+  try {
+    source = new MorkParser().parseForImport(
+      MailStringUtils.uint8ArrayToByteString(bytes)
     );
+  } catch (error) {
+    if (!(error instanceof MorkImportError)) {
+      throw error;
+    }
+    // importFromMork fails and Thunderbird starts with an empty cache.
+    return unusableCache("mork", error.code);
+  }
+  const table = source.tables.get("1:" + SCOPE);
+  if (table?.cells.get("k") != KIND) {
+    return unusableCache("mork", "NO_FOLDER_TABLE");
   }
   const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
   const text = raw => {
     try {
-      return decoder.decode(MailStringUtils.byteStringToUint8Array(raw));
+      const value = decoder.decode(MailStringUtils.byteStringToUint8Array(raw));
+      return carriedText(value) ? value : null;
     } catch {
-      throw new MorkImportError(
-        "UNSUPPORTED_MORK",
-        0,
-        "Non-UTF-8 folder-cache cell"
-      );
+      return null;
     }
   };
+  const skipped = { entries: 0, cells: 0 };
   const entries = new Map();
   for (const key of table.rows) {
     const row = source.rows.get(key);
-    if (row.scope != SCOPE) {
-      throw new MorkImportError(
-        "UNSUPPORTED_MORK",
-        0,
-        "Unsupported folder-cache row scope"
-      );
-    }
-    const properties = new Map(
-      [...row.cells].map(([name, value]) => [text(name), text(value)])
-    );
-    const path = properties.get("key");
-    if (!path || path.includes("\0") || entries.has(path)) {
-      throw new MorkImportError(
-        "MALFORMED_MORK",
-        0,
-        "Missing or duplicate folder-cache key"
-      );
-    }
+    const properties = new Map();
     const values = Object.create(null);
-    for (const [name, value] of properties) {
-      if (name != "key") {
-        values[name] = cacheValue(name, value);
+    let path = null;
+    for (const [rawName, rawValue] of row?.scope == SCOPE ? row.cells : []) {
+      const name = text(rawName);
+      const value = text(rawValue);
+      if (name == "key") {
+        path = value;
+        continue;
       }
+      const projected =
+        name === null || value === null ? undefined : cacheValue(name, value);
+      if (projected === undefined) {
+        skipped.cells++;
+        continue;
+      }
+      properties.set(name, value);
+      values[name] = projected;
     }
-    entries.set(path, { sourceKey: row.id, properties, values });
+    // convertTable skips a row without a key; a later row replaces an
+    // earlier one.
+    if (!path) {
+      skipped.entries++;
+      continue;
+    }
+    if (entries.has(path)) {
+      skipped.entries++;
+    }
+    entries.set(path, {
+      sourceKey: row.id,
+      properties: new Map([["key", path], ...properties]),
+      values,
+    });
   }
-  return { entries, source };
+  return { entries, source, skipped };
 }
 
 /**
@@ -107,79 +151,105 @@ export function parseMorkFolderCache(bytes) {
  *
  * @param {Uint8Array} bytes - Complete original folderCache.json bytes.
  * @returns {{format: string, entries: Map<string, {properties: Map<string, string>,
- *   values: Record<string, string|number>}>, source: object}} Complete original rows.
- * @throws {Error} For malformed JSON, unsupported types or unsafe cell values.
+ *   values: Record<string, string|number>}>, source: object, skipped: object,
+ *   unusable?: string}} Every row that has a projection.
  */
 export function parseJSONFolderCache(bytes) {
   if (Object.prototype.toString.call(bytes) !== "[object Uint8Array]") {
     throw new TypeError("Expected Uint8Array");
   }
-  const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
-  const source = JSON.parse(decoder.decode(bytes));
-  if (!source || Array.isArray(source) || typeof source !== "object") {
-    throw new Error("Native JSON cache requires an object");
+  let source;
+  try {
+    // The old reader parses bytes; text that is not UTF-8 is carried with
+    // replacement characters and can then name no current folder.
+    source = JSON.parse(new TextDecoder("utf-8").decode(bytes));
+  } catch {
+    // LoadFolderCache fails and Thunderbird starts with an empty cache.
+    return unusableCache("json", "NOT_JSON");
   }
-  const text = value => {
-    if (
-      typeof value !== "string" ||
-      value.includes("\0") ||
-      decoder.decode(new TextEncoder().encode(value)) !== value
-    ) {
-      throw new Error("Invalid native JSON cache text");
-    }
-    return value;
-  };
+  if (!source || Array.isArray(source) || typeof source !== "object") {
+    return unusableCache("json", "NOT_AN_OBJECT");
+  }
+  const skipped = { entries: 0, cells: 0 };
   const entries = new Map();
   for (const [key, row] of Object.entries(source)) {
     // Thunderbird writes the entry of a folder without a file path under an
     // empty key. A key that is no absolute path here reaches no folder; it is
-    // accounted like any other obsolete entry, never refused.
-    text(key);
-    if (!row || Array.isArray(row) || typeof row !== "object") {
-      throw new Error("Invalid native JSON cache row");
+    // accounted like any other obsolete entry.
+    if (
+      !carriedText(key) ||
+      !row ||
+      Array.isArray(row) ||
+      typeof row !== "object"
+    ) {
+      skipped.entries++;
+      continue;
     }
     const properties = new Map([["key", key]]);
     const values = Object.create(null);
-    for (const [name, value] of Object.entries(row)) {
-      if (!text(name) || name === "key") {
-        throw new Error("Invalid native JSON cache property");
-      }
-      if (value === null) {
-        // Thunderbird wrote no value and reads this cell as empty
-        // (nsMsgFolderCacheElement). It has no projection; the complete
-        // original keeps it.
+    for (const [name, original] of Object.entries(row)) {
+      const projected =
+        carriedText(name) && name !== "key"
+          ? jsonCacheValue(name, original)
+          : null;
+      if (!projected) {
+        skipped.cells++;
         continue;
       }
-      // The current JSON producer writes userSortOrder as uint32. Historical
-      // Mork conversion retains its original text projection for this property.
-      const unsigned = UNSIGNED32.has(name) || name === "userSortOrder";
-      let width = 0;
-      if (SIGNED64.has(name)) {
-        width = 64;
-      } else if (SIGNED32.has(name) || unsigned) {
-        width = 32;
-      }
-      let cell;
-      if (width) {
-        const minimum = unsigned ? 0 : -(2 ** (width - 1));
-        const maximum = unsigned ? 0xffffffff : 2 ** (width - 1) - 1;
-        if (
-          !Number.isSafeInteger(value) ||
-          value < minimum ||
-          value > maximum
-        ) {
-          throw new Error("Unsupported native JSON cache number");
-        }
-        cell = BigInt.asUintN(width, BigInt(value)).toString(16);
-      } else {
-        cell = text(value);
-      }
-      properties.set(name, cell);
-      values[name] = value;
+      properties.set(name, projected.cell);
+      values[name] = projected.value;
     }
     entries.set(key, { properties, values });
   }
-  return { format: "json", entries, source };
+  return { format: "json", entries, source, skipped };
+}
+
+/**
+ * Projects one JSON cache cell as nsMsgFolderCacheElement's typed getter
+ * returns it (Json::Value::isConvertibleTo): a number or boolean converts
+ * between the numeric and text forms; a value the getter reports as not
+ * available, or returns only as its zero or empty default (null), has no
+ * projection.
+ *
+ * @param {string} name - Cache property name.
+ * @param {*} original - Parsed JSON value.
+ * @returns {?{cell: string, value: string|number}} Typed value and canonical
+ *   cell text, or null.
+ */
+function jsonCacheValue(name, original) {
+  // The current JSON producer writes userSortOrder as uint32. Historical
+  // Mork conversion retains its original text projection for this property.
+  const unsigned = UNSIGNED32.has(name) || name === "userSortOrder";
+  let width = 0;
+  if (SIGNED64.has(name)) {
+    width = 64;
+  } else if (SIGNED32.has(name) || unsigned) {
+    width = 32;
+  }
+  if (!width) {
+    if (typeof original == "string") {
+      return carriedText(original) ? { cell: original, value: original } : null;
+    }
+    if (typeof original == "boolean" || Number.isSafeInteger(original)) {
+      return { cell: String(original), value: String(original) };
+    }
+    return null;
+  }
+  let value = original;
+  if (typeof value == "boolean") {
+    value = Number(value);
+  } else if (typeof value == "number" && Number.isFinite(value)) {
+    value = Math.trunc(value);
+  }
+  const minimum = unsigned ? 0 : -(2 ** (width - 1));
+  const maximum = unsigned ? 0xffffffff : 2 ** (width - 1) - 1;
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    return null;
+  }
+  return {
+    cell: BigInt.asUintN(width, BigInt(value)).toString(16),
+    value,
+  };
 }
 
 /**
@@ -264,38 +334,29 @@ export async function importMorkFolderCacheForFolders(
 }
 
 /**
- * Projects only fields typed by the existing cache converter.
+ * Projects one Mork cache cell as nsMsgFolderCache.cpp applyEntry converts it:
+ * a numeric property reads its leading hexadecimal digits and is dropped when
+ * it has none; any other property is text.
  *
- * @param {string} name - Exact cache property name.
- * @param {string} value - Exact original text.
- * @returns {string|number} Cache-compatible value.
- * @throws {MorkImportError} For invalid or nonrepresentable typed values.
+ * @param {string} name - Cache property name.
+ * @param {string} value - Original cell text.
+ * @returns {string|number|undefined} Typed value; undefined for no value.
  */
 function cacheValue(name, value) {
   const width = SIGNED64.has(name) ? 64 : 32;
   if (!SIGNED32.has(name) && !UNSIGNED32.has(name) && !SIGNED64.has(name)) {
     return value;
   }
-  if (!new RegExp("^[0-9a-f]{1," + width / 4 + "}$", "i").test(value)) {
-    throw new MorkImportError(
-      "MALFORMED_MORK",
-      0,
-      "Invalid cache number: " + name
-    );
+  const digits = /^[0-9a-f]+/i.exec(value)?.[0];
+  if (!digits || digits.length > width / 4) {
+    return undefined;
   }
-  let number = BigInt("0x" + value);
+  let number = BigInt("0x" + digits);
   if (!UNSIGNED32.has(name)) {
     number = BigInt.asIntN(width, number);
   }
   const converted = Number(number);
-  if (!Number.isSafeInteger(converted)) {
-    throw new MorkImportError(
-      "UNSUPPORTED_MORK",
-      0,
-      "Cache number exceeds exact JSON range"
-    );
-  }
-  return converted;
+  return Number.isSafeInteger(converted) ? converted : undefined;
 }
 
 const CACHE_BINDING_FIELDS = [

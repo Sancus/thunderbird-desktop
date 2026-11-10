@@ -585,6 +585,18 @@ export class MorkParser {
       rowScope: "r",
     };
     let group = null;
+    // Sticky and global matchers read in place: no copy of the remaining
+    // document per marker.
+    const markerAt = /@\$\$([{}])([0-9a-f]+|~~)([{}])@/iy;
+    const endAfter = /@\$\$\}([0-9a-f]+|~~)\}@/gi;
+    const groupMarker = from => {
+      markerAt.lastIndex = from;
+      return markerAt.exec(body);
+    };
+    const groupEnd = from => {
+      endAfter.lastIndex = from;
+      return endAfter.exec(body);
+    };
     const cache = new Map();
     const skip = () => {
       while (pos < body.length) {
@@ -983,36 +995,47 @@ export class MorkParser {
           break;
         case "@": {
           token();
-          const marker = /^@\$\$([{}])([0-9a-f]+|~~)([{}])@/i.exec(
-            body.slice(pos)
-          );
+          const marker = groupMarker(pos);
           if (!marker || marker[1] != marker[3]) {
             fail("MALFORMED_MORK", "Invalid group marker");
           }
-          const opening = marker[1] == "{";
           const aborted = marker[2] == "~~";
-          const id = aborted ? null : parseInt(marker[2], 16);
-          if (opening) {
+          if (marker[1] == "{") {
             if (group || aborted || marker[2].length > 8) {
               fail("MALFORMED_MORK", "Invalid or nested group");
             }
-            group = { id, before: state };
-            state = structuredClone(state);
+            const id = parseInt(marker[2], 16);
+            pos += marker[0].length;
+            // morkParser::ReadGroup first finds the end of the group
+            // (FindGroupEnd) and reads its content only when it commits.
+            let end = groupEnd(pos);
+            if (end?.[1] == "~~") {
+              // An aborted transaction is ignored. The old reader then scans
+              // on for an end and ignores whatever follows; a later group
+              // end makes it fail ("end group id mismatch").
+              const after = end.index + end[0].length;
+              if (groupEnd(after)) {
+                pos = after;
+                skip();
+                fail("UNSUPPORTED_MORK", "Content after aborted group");
+              }
+              end = null;
+            }
+            if (!end) {
+              // A group that never ends (a crash while saving) is not read,
+              // nor anything after it. Everything committed before stays.
+              pos = body.length;
+            } else if (parseInt(end[1], 16) != id) {
+              fail("MALFORMED_MORK", "Unmatched group end", end.index);
+            } else {
+              group = { id };
+            }
           } else {
-            if (!group || (!aborted && group.id != id)) {
+            if (!group || aborted || group.id != parseInt(marker[2], 16)) {
               fail("MALFORMED_MORK", "Unmatched group end");
             }
-            if (aborted) {
-              state = group.before;
-            }
             group = null;
-          }
-          pos += marker[0].length;
-          if (aborted) {
-            skip();
-            if (pos != body.length) {
-              fail("UNSUPPORTED_MORK", "Content after aborted group");
-            }
+            pos += marker[0].length;
           }
           break;
         }

@@ -372,11 +372,14 @@ nsresult StartupRead(nsIFile* file, nsACString& bytes) {
   MOZ_TRY(StartupRegular(file));
   int64_t size;
   MOZ_TRY(file->GetFileSize(&size));
-  NS_ENSURE_TRUE(size > 0 && size <= 64 * 1024 * 1024, NS_ERROR_FILE_CORRUPTED);
+  // A zero-length file is read as no bytes; its reader decides what that is.
+  NS_ENSURE_TRUE(size >= 0 && size <= 64 * 1024 * 1024,
+                 NS_ERROR_FILE_CORRUPTED);
   nsCOMPtr<nsIInputStream> stream;
   MOZ_TRY(NS_NewLocalFileInputStream(getter_AddRefs(stream), file));
   auto close = MakeScopeExit([&] { stream->Close(); });
-  MOZ_TRY(NS_ReadInputStreamToString(stream, bytes, size));
+  bytes.Truncate();
+  if (size) MOZ_TRY(NS_ReadInputStreamToString(stream, bytes, size));
   NS_ENSURE_TRUE(bytes.Length() == uint64_t(size), NS_ERROR_FILE_CORRUPTED);
   MOZ_TRY(stream->Close());
   close.release();
@@ -7446,18 +7449,15 @@ nsresult ParseCacheBytes(JSContext* cx, const nsACString& bytes,
   MOZ_TRY(ImportMember(cx, object, "source", &field));
   NS_ENSURE_TRUE(field.isObject(), NS_ERROR_FAILURE);
   source = &field.toObject();
-  // Every original entry is either bound to a current folder or an explicit
-  // obsolete key; none is silently dropped.
+  // Every entry the cache reader projects is either bound to a current folder
+  // or an explicit obsolete key; none is silently dropped. A row the old
+  // reader itself skips (no key, not an object) has no entry and stays only
+  // in the complete original.
   const size_t expected = input.folders.Length() + input.unboundKeys.Length();
-  if (input.version == 3) {
-    JS::Rooted<JS::IdVector> keys(cx, JS::IdVector(cx));
-    NS_ENSURE_TRUE(JS_Enumerate(cx, source, &keys), NS_ERROR_FAILURE);
-    NS_ENSURE_TRUE(keys.length() == expected, NS_ERROR_NOT_IMPLEMENTED);
-  } else {
+  if (input.version != 3) {
     MOZ_TRY(ImportMember(cx, source, "rows", &field));
     NS_ENSURE_TRUE(field.isObject(), NS_ERROR_FAILURE);
     rows = &field.toObject();
-    NS_ENSURE_TRUE(JS::MapSize(cx, rows) == expected, NS_ERROR_NOT_IMPLEMENTED);
   }
   NS_ENSURE_TRUE(JS::MapSize(cx, entries) == expected,
                  NS_ERROR_NOT_IMPLEMENTED);
@@ -9478,12 +9478,20 @@ nsresult StartupContainedMail(ProfileStartupOperation& operation,
 // Independent on-disk inventory. Only selected-profile roots are admitted here;
 // a path or digest does not prove an external writer has been excluded.
 nsresult StartupJSONCache(nsIFile* file, bool& empty) {
+  // A zero-length cache is as empty as one that does not parse.
+  MOZ_TRY(StartupRegular(file));
+  int64_t length;
+  MOZ_TRY(file->GetFileSize(&length));
+  if (!length) {
+    empty = true;
+    return NS_OK;
+  }
   nsCString bytes;
   MOZ_TRY(StartupRead(file, bytes));
   dom::AutoJSAPI jsapi;
   NS_ENSURE_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()), NS_ERROR_FAILURE);
   JSContext* cx = jsapi.cx();
-  JS::Rooted<JSObject*> parsed(cx), entries(cx), source(cx);
+  JS::Rooted<JSObject*> parsed(cx), entries(cx);
   nsresult rv = ParseCacheDocument(cx, bytes, true, &parsed);
   if (NS_FAILED(rv)) {
     // Preserve the actual decoder diagnostic before the isolated JSAPI scope
@@ -9491,17 +9499,14 @@ nsresult StartupJSONCache(nsIFile* file, bool& empty) {
     if (jsapi.HasException()) jsapi.ReportException();
     return rv;
   }
+  // The reader is as lenient as nsMsgFolderCache: a document it cannot parse
+  // and a row it skips yield no entry. A cache without any entry is an empty
+  // cache, which is no migration input.
   JS::Rooted<JS::Value> value(cx);
   MOZ_TRY(ImportMember(cx, parsed, "entries", &value));
   NS_ENSURE_TRUE(value.isObject(), NS_ERROR_FILE_CORRUPTED);
   entries = &value.toObject();
-  MOZ_TRY(ImportMember(cx, parsed, "source", &value));
-  NS_ENSURE_TRUE(value.isObject(), NS_ERROR_FILE_CORRUPTED);
-  source = &value.toObject();
-  JS::Rooted<JS::IdVector> keys(cx, JS::IdVector(cx));
-  NS_ENSURE_TRUE(JS_Enumerate(cx, source, &keys), NS_ERROR_FAILURE);
   uint32_t count = JS::MapSize(cx, entries);
-  NS_ENSURE_TRUE(keys.length() == count, NS_ERROR_FILE_CORRUPTED);
   nsCString after;
   MOZ_TRY(StartupRead(file, after));
   NS_ENSURE_TRUE(after == bytes, NS_ERROR_NOT_AVAILABLE);

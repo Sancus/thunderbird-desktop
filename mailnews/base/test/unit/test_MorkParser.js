@@ -572,7 +572,6 @@ add_task(function test_strictFailuresDoNotRecover() {
   const header = '// <!-- <mdb:mork:z v="1.4"/> -->\n';
   for (const [body, code] of [
     ["[1:r(a=value)", "TRUNCATED_MORK"],
-    ["@$${A{@\n[1:r(a=value)]", "TRUNCATED_MORK"],
     ["@$${A{@\n@$$}B}@", "MALFORMED_MORK"],
     ["[1:r(a^FF)]", "MALFORMED_MORK"],
     ["{1:r {(k=kind)(f=1)}}", "UNSUPPORTED_MORK"],
@@ -643,20 +642,36 @@ add_task(function test_strictMembershipUpdatesKeepNativeOrder() {
   Assert.equal(snapshot.rows.size, 64);
 });
 
-add_task(function test_strictRejectsRowsAfterAbort() {
-  const before =
-    '// <!-- <mdb:mork:z v="1.4"/> -->\n' +
-    ["[1:r(a=before)]", "@$${A{@", "[1:r(a=aborted)]", "@$$}~~}@", ""].join(
-      "\n"
+add_task(function test_strictReadsGroupsAsTheOldReaderDoes() {
+  // morkParser::ReadGroup finds the end of a group before reading it. A group
+  // that never ends (a crash while saving) is not read, nor anything after
+  // it; an aborted group is ignored, and so is whatever follows it.
+  const header = '// <!-- <mdb:mork:z v="1.4"/> -->\n';
+  const committed = ["[1:r(a=before)]", "@$${A{@", "[2:r(a=two)]", "@$$}A}@"];
+  for (const [tail, label] of [
+    [["@$${B{@", "[1:r(a=uncommitted)]", "[3:r(a=three)]"], "uncommitted"],
+    [["@$${B{@", "[1:r(a=uncommitted)", ""], "cut inside a row"],
+    [["@$${B{@", "[1:r(a=unc"], "cut inside a value"],
+    [["@$${B{@"], "cut after the group start"],
+    [["@$${B{@", "[1:r(a=aborted)]", "@$$}~~}@", "[3:r(a=later)]"], "aborted"],
+  ]) {
+    const snapshot = new MorkParser().parseForImport(
+      header + [...committed, ...tail].join("\n")
     );
-  Assert.throws(
-    () => new MorkParser().parseForImport(before + "[2:r(a=later)]"),
-    error =>
-      error.name == "MorkImportError" &&
-      error.code == "UNSUPPORTED_MORK" &&
-      error.offset == before.length,
-    "Later rows cannot produce a successful stale snapshot"
-  );
+    Assert.deepEqual([...snapshot.rows.keys()], ["1:r", "2:r"], label);
+    Assert.equal(snapshot.rows.get("1:r").cells.get("a"), "before", label);
+    Assert.equal(snapshot.rows.get("2:r").cells.get("a"), "two", label);
+  }
+  // Many committed groups are read in place.
+  const groups = [];
+  for (let id = 1; id <= 300; id++) {
+    const hex = id.toString(16).toUpperCase();
+    groups.push("@$${" + hex + "{@", "[" + hex + ":r(a=v" + id + ")]");
+    groups.push("@$$}" + hex + "}@");
+  }
+  const many = new MorkParser().parseForImport(header + groups.join("\n"));
+  Assert.equal(many.rows.size, 300);
+  Assert.equal(many.rows.get("300:r").cells.get("a"), "v300");
 });
 
 add_task(function test_strictRejectsGroupsAfterAbort() {

@@ -3566,7 +3566,33 @@ nsresult DatabaseCore::ImportImapUnit(
                          ? NS_SUCCEEDED(epochRv) && epoch == *member.uidValidity
                          : epochRv == NS_ERROR_NOT_AVAILABLE,
                      NS_ERROR_INVALID_ARG);
+      // BindMessageToServerUidInTransaction looks every bound message of the
+      // folder up for each binding, which is quadratic in a large folder. In
+      // a folder that holds nothing but this import, one message's UID can
+      // only collide with another UID of this unit, so that is all that is
+      // checked there. A folder that already held messages keeps the lookup.
+      nsTHashSet<nsMsgKey> live;
+      for (const auto& row : snapshot.messages) live.Insert(row.sourceKey);
+      bool onlyThisImport = false;
+      {
+        nsCOMPtr<mozIStorageStatement> stmt;
+        MOZ_TRY(GetStatement(
+            "ImportFolderOccupancy"_ns,
+            "SELECT (SELECT COUNT(*) FROM messages WHERE folderId = :folder) + "
+            "(SELECT COUNT(*) FROM staged_messages WHERE folderId = :folder)"_ns,
+            getter_AddRefs(stmt)));
+        mozStorageStatementScoper scope(stmt);
+        MOZ_TRY(stmt->BindInt64ByName("folder"_ns, snapshot.identity.folderId));
+        bool more;
+        MOZ_TRY(stmt->ExecuteStep(&more));
+        NS_ENSURE_TRUE(more, NS_ERROR_UNEXPECTED);
+        // Its headers, and the keys kept for operations whose header is gone.
+        const int64_t held = stmt->AsInt64(0);
+        onlyThisImport = held == int64_t(snapshot.messages.Length()) ||
+                         held == int64_t(map.Count());
+      }
       nsTHashMap<nsMsgKey, bool> bound;
+      nsTHashSet<uint32_t> boundUids;
       for (const auto& uid : member.serverUids) {
         NS_ENSURE_TRUE(member.uidValidity && *member.uidValidity && uid.uid &&
                            !bound.Contains(uid.sourceKey),
@@ -3574,10 +3600,12 @@ nsresult DatabaseCore::ImportImapUnit(
         bound.InsertOrUpdate(uid.sourceKey, true);
         nsMsgKey key;
         NS_ENSURE_TRUE(map.Get(uid.sourceKey, &key), NS_ERROR_INVALID_ARG);
-        bool liveHeader = false;
-        for (const auto& row : snapshot.messages)
-          liveHeader |= row.sourceKey == uid.sourceKey;
-        if (liveHeader) {
+        if (!live.Contains(uid.sourceKey)) continue;
+        if (onlyThisImport) {
+          NS_ENSURE_TRUE(boundUids.EnsureInserted(uid.uid),
+                         NS_ERROR_FILE_CORRUPTED);
+          MOZ_TRY(messages->SetMessageUidOnServer(key, uid.uid));
+        } else {
           MOZ_TRY(messages->BindMessageToServerUidInTransaction(
               key, snapshot.identity.folderId, *member.uidValidity, uid.uid,
               false));

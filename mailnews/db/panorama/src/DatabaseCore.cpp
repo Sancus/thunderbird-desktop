@@ -152,6 +152,8 @@ struct StartupMailSource {
   uint32_t boxFlags = 0;
   Maybe<uint32_t> originalFlags;
   char delimiter = 0;
+  // An IMAP name of several levels whose delimiter was never learned.
+  bool unlisted = false;
 };
 
 struct StartupServerSummary {
@@ -9853,6 +9855,61 @@ nsresult StartupUnreferencedRetained(ProfileStartupOperation& operation,
   }
   return NS_OK;
 }
+bool StartupUnknownDelimiter(char delimiter) {
+  return delimiter == kOnlineHierarchySeparatorUnknown ||
+         delimiter == kOnlineHierarchySeparatorNil;
+}
+// An IMAP folder whose delimiter Thunderbird never learned keeps the sentinel
+// in the folder cache while its summary keeps the whole online name (a copied
+// profile, a namespace placeholder, a folder never listed again). Thunderbird
+// shows it below the folder whose directory holds it, so that parent summary
+// places it: the name is the parent's online name, one separator character
+// and a single level, stored exactly where that level belongs. Anything else
+// stays refused.
+nsresult StartupPlaceUnlistedImap(nsTArray<StartupMailSource>& sources) {
+  for (bool progress = true; progress;) {
+    progress = false;
+    for (auto& source : sources) {
+      if (!source.unlisted || !source.canonicalPath.IsEmpty()) continue;
+      for (const auto& parent : sources) {
+        const uint32_t prefix = parent.onlineName.Length();
+        if (parent.protocol != "imap"_ns ||
+            parent.serverKey != source.serverKey ||
+            parent.canonicalPath.IsEmpty() ||
+            source.onlineName.Length() < prefix + 2 ||
+            !StringBeginsWith(source.onlineName, parent.onlineName))
+          continue;
+        const char separator = source.onlineName[prefix];
+        nsCString leaf(Substring(source.onlineName, prefix + 1));
+        if ((separator != '/' && separator != '.' &&
+             separator != parent.delimiter && separator != source.delimiter) ||
+            leaf.FindChar('/') != kNotFound ||
+            leaf.FindChar(separator) != kNotFound ||
+            leaf.FindChar(kOnlineHierarchySeparatorUnknown) != kNotFound ||
+            leaf.FindChar(kOnlineHierarchySeparatorNil) != kNotFound ||
+            leaf == "."_ns || leaf == ".."_ns)
+          continue;
+        nsCOMPtr<nsIFile> physical;
+        MOZ_TRY(NewComparableFile(parent.storePath, getter_AddRefs(physical)));
+        nsAutoString directory;
+        MOZ_TRY(physical->GetLeafName(directory));
+        directory.AppendLiteral(".sbd");
+        MOZ_TRY(physical->SetLeafName(directory));
+        MOZ_TRY(physical->Append(EncodeFilename(leaf)));
+        nsCString expected;
+        MOZ_TRY(GetComparablePath(physical, expected));
+        if (expected != source.storePath) continue;
+        source.canonicalPath = parent.canonicalPath + "/"_ns + leaf;
+        progress = true;
+        break;
+      }
+    }
+  }
+  for (const auto& source : sources)
+    NS_ENSURE_TRUE(!source.unlisted || !source.canonicalPath.IsEmpty(),
+                   NS_ERROR_NOT_AVAILABLE);
+  return NS_OK;
+}
 nsresult StartupStores(ProfileStartupOperation& operation,
                        const nsTArray<nsCString>& inventory,
                        const nsTHashSet<nsCString>& declared,
@@ -12218,16 +12275,16 @@ nsresult DatabaseCore::ReadStartupMailSource(JSContext* cx,
     return NS_OK;
   }
   NS_ENSURE_TRUE(provider == "imap-client-discovery"_ns, NS_ERROR_INVALID_ARG);
-  // Non-default server-directory/namespace layout needs a separate original
-  // canonical-path contract. Refuse it before target creation, never guess.
-  for (const char* pref : {"server_sub_directory", "namespace.personal",
-                           "namespace.public", "namespace.other_users"}) {
-    nsCString value;
-    Preferences::GetCString(nsCString(branch + nsDependentCString(pref)).get(),
-                            value);
-    NS_ENSURE_TRUE(value.IsEmpty() || value == "\"\""_ns,
-                   NS_ERROR_NOT_IMPLEMENTED);
-  }
+  // A server directory strips its prefix from every canonical path; that
+  // layout needs a separate original contract. Refuse it before target
+  // creation, never guess. The namespaces a server reported ("INBOX.",
+  // "user.") leave the canonical path alone: it is the online name with its
+  // delimiter, and each summary must lie exactly where that path puts it.
+  nsCString subDirectory;
+  Preferences::GetCString(nsCString(branch + "server_sub_directory"_ns).get(),
+                          subDirectory);
+  NS_ENSURE_TRUE(subDirectory.IsEmpty() || subDirectory == "\"\""_ns,
+                 NS_ERROR_NOT_IMPLEMENTED);
   JS::Rooted<JSObject*> cache(cx), parsed(cx), row(cx), properties(cx),
       values(cx), original(cx);
   MOZ_TRY(StartupObject(cx, origin, "cache", &cache));
@@ -12327,21 +12384,23 @@ nsresult DatabaseCore::ReadStartupMailSource(JSContext* cx,
                      output.onlineName == retainedName &&
                      delimiter == retainedDelimiter && flags == retainedFlags,
                  NS_ERROR_NOT_AVAILABLE);
-  // Thunderbird keeps the unknown '^' or NIL '|' sentinel for a client folder
-  // the server never listed; only one slash-free level is then exact.
-  NS_ENSURE_TRUE((delimiter != kOnlineHierarchySeparatorUnknown &&
-                  delimiter != kOnlineHierarchySeparatorNil) ||
-                     (output.onlineName.FindChar('/') == kNotFound &&
-                      output.onlineName.FindChar(char(delimiter)) == kNotFound),
-                 NS_ERROR_NOT_AVAILABLE);
+  // Thunderbird keeps the unknown '^' or NIL '|' sentinel for a folder whose
+  // delimiter it never learned. One slash-free level is exact by itself; a
+  // deeper name is placed by its parent summary (StartupPlaceUnlistedImap).
   output.delimiter = char(delimiter);
   output.boxFlags = uint32_t(flags);
-  output.canonicalPath =
-      nsImapUrl::ConvertToCanonicalFormat(output.onlineName, output.delimiter);
-  NS_ENSURE_TRUE(!output.canonicalPath.IsEmpty() &&
-                     output.canonicalPath.First() != '/' &&
-                     output.canonicalPath.Last() != '/',
-                 NS_ERROR_NOT_IMPLEMENTED);
+  output.unlisted = (delimiter == kOnlineHierarchySeparatorUnknown ||
+                     delimiter == kOnlineHierarchySeparatorNil) &&
+                    (output.onlineName.FindChar('/') != kNotFound ||
+                     output.onlineName.FindChar(char(delimiter)) != kNotFound);
+  if (!output.unlisted) {
+    output.canonicalPath = nsImapUrl::ConvertToCanonicalFormat(
+        output.onlineName, output.delimiter);
+    NS_ENSURE_TRUE(!output.canonicalPath.IsEmpty() &&
+                       output.canonicalPath.First() != '/' &&
+                       output.canonicalPath.Last() != '/',
+                   NS_ERROR_NOT_IMPLEMENTED);
+  }
   // Cross-check retained summary metadata from original bytes when present.
   MOZ_TRY(StartupParseFile(
       cx, file, u"resource:///modules/panorama/MorkSummaryReader.sys.mjs"_ns,
@@ -12382,6 +12441,7 @@ nsresult DatabaseCore::ReadStartupMailSource(JSContext* cx,
       NS_ENSURE_TRUE(bytes == output.onlineName, NS_ERROR_NOT_AVAILABLE);
     }
   }
+  if (output.unlisted) return NS_OK;
   nsCOMPtr<nsIFile> physical;
   MOZ_TRY(root->Clone(getter_AddRefs(physical)));
   nsCCharSeparatedTokenizer parts(output.canonicalPath, '/');
@@ -13912,19 +13972,31 @@ nsresult DatabaseCore::OpenProfileStartup(JSContext* cx,
         nsCString measured;
         MOZ_TRY(StartupHash(summary, measured));
         NS_ENSURE_TRUE(measured == native.hash, NS_ERROR_NOT_AVAILABLE);
+        // An unlisted IMAP folder has its destination once it is placed.
         NS_ENSURE_TRUE(!ids.Contains(native.id) &&
                            !paths.Contains(native.path) &&
-                           !destinations.Contains(native.serverKey + "/"_ns +
-                                                  (native.protocol == "imap"_ns
-                                                       ? native.canonicalPath
-                                                       : native.storePath)),
+                           (native.unlisted ||
+                            !destinations.Contains(native.serverKey + "/"_ns +
+                                                   (native.protocol == "imap"_ns
+                                                        ? native.canonicalPath
+                                                        : native.storePath))),
                        NS_ERROR_INVALID_ARG);
         ids.Insert(native.id);
         paths.Insert(native.path);
-        destinations.Insert(native.serverKey + "/"_ns +
-                            (native.protocol == "imap"_ns ? native.canonicalPath
-                                                          : native.storePath));
+        if (!native.unlisted)
+          destinations.Insert(native.serverKey + "/"_ns +
+                              (native.protocol == "imap"_ns
+                                   ? native.canonicalPath
+                                   : native.storePath));
         operation.sources.AppendElement(std::move(native));
+      }
+      MOZ_TRY(StartupPlaceUnlistedImap(operation.sources));
+      for (const auto& source : operation.sources) {
+        if (!source.unlisted) continue;
+        nsCString destination(source.serverKey + "/"_ns + source.canonicalPath);
+        NS_ENSURE_FALSE(destinations.Contains(destination),
+                        NS_ERROR_INVALID_ARG);
+        destinations.Insert(destination);
       }
       JS::Rooted<JSObject*> savedSummaries(cx);
       uint32_t savedSummaryCount;
@@ -13957,9 +14029,13 @@ nsresult DatabaseCore::OpenProfileStartup(JSContext* cx,
         nsCString parent(Substring(source.canonicalPath, 0, slash));
         bool present = false;
         for (const auto& other : operation.sources) {
+          // A parent or child whose delimiter was never learned contradicts
+          // nothing; two different known delimiters do.
           if (other.serverKey == source.serverKey &&
               other.protocol == "imap"_ns && other.canonicalPath == parent &&
-              other.delimiter == source.delimiter)
+              (other.delimiter == source.delimiter ||
+               StartupUnknownDelimiter(other.delimiter) ||
+               StartupUnknownDelimiter(source.delimiter)))
             present = true;
         }
         NS_ENSURE_TRUE(present, NS_ERROR_NOT_AVAILABLE);
@@ -14333,6 +14409,20 @@ nsresult DatabaseCore::BuildStartupFolders() {
     MOZ_TRY(provider->CreateClientSubfolderInfo(
         source->canonicalPath, source->delimiter, int32_t(source->boxFlags),
         true));
+    if (source->unlisted) {
+      // The provider joined the name with the sentinel. The retained name
+      // keeps the separator the server used; children are created after it.
+      nsCOMPtr<nsIMsgFolder> folder = root.Data();
+      for (const auto& part : source->canonicalPath.Split('/')) {
+        nsCOMPtr<nsIMsgFolder> child;
+        MOZ_TRY(folder->GetChildNamed(part, getter_AddRefs(child)));
+        NS_ENSURE_TRUE(child, NS_ERROR_NOT_AVAILABLE);
+        folder = child;
+      }
+      nsCOMPtr<nsIMsgImapMailFolder> placed = do_QueryInterface(folder);
+      NS_ENSURE_TRUE(placed, NS_ERROR_NOT_AVAILABLE);
+      MOZ_TRY(placed->SetOnlineName(source->onlineName));
+    }
   }
   nsTHashSet<uint64_t> ids;
   for (const auto& source : operation.sources) {

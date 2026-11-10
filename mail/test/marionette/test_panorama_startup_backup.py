@@ -1344,6 +1344,127 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             "Sent": {"personal": False, "messages": self.SENT_MESSAGES},
             "Drafts": {"personal": False, "messages": []}})
 
+    def test_migratesImapNamespacesAndNeverLearnedDelimiters(self):
+        """A server with namespaces, and folders whose delimiter was never learned.
+
+        All data is fabricated. A copied profile misses its folder-cache entries
+        once: the cache then keeps the unknown delimiter while each summary keeps
+        its whole online name. A namespace placeholder is never listed at all.
+        Thunderbird shows each such folder below the one whose directory holds it.
+        """
+        self.clean_profile(False)
+        source = self.marionette.execute_script("""
+            const { MailServices } = ChromeUtils.importESModule(
+              'resource:///modules/MailServices.sys.mjs');
+            Services.io.offline = true;
+            Services.prefs.setBoolPref('network.manage-offline-status', false);
+            Services.prefs.setIntPref('offline.startup_state', 2);
+            const server = MailServices.accounts.createIncomingServer(
+              's526unlisted', 'imap.invalid', 'imap');
+            server.setBoolValue('login_at_startup', false);
+            server.setBoolValue('download_on_biff', false);
+            // What a server with an INBOX prefix and shared mailboxes reports.
+            server.setStringValue('namespace.personal', '"INBOX."');
+            server.setStringValue('namespace.other_users', '"user."');
+            const account = MailServices.accounts.createAccount();
+            account.incomingServer = server;
+            const root = server.rootFolder.QueryInterface(Ci.nsIMsgImapMailFolder);
+            const folders = {};
+            // [path below the root, cached delimiter, messages]
+            for (const [path, cached, count] of [
+              ['INBOX', '.', 2],
+              ['INBOX/Sent', '.', 1],
+              ['INBOX/Kept', '^', 1],
+              ['user', '^', 0],
+              ['user/team', '^', 0],
+              ['user/team/INBOX', '.', 1],
+            ]) {
+              let folder = server.rootFolder;
+              for (const part of path.split('/')) {
+                if (!folder.containsChildNamed(part)) {
+                  root.createClientSubfolderInfo(path, '.', 0, true);
+                }
+                folder = folder.getChildNamed(part);
+              }
+              const onlineName = path.replaceAll('/', '.');
+              const imap = folder.QueryInterface(Ci.nsIMsgImapMailFolder);
+              imap.onlineName = onlineName;
+              imap.hierarchyDelimiter = '.';
+              const database = folder.msgDatabase;
+              database.dBFolderInfo.setCharProperty('onlineName', onlineName);
+              database.dBFolderInfo.setUint32Property('UIDValidity', 526);
+              for (let key = 1; key <= count; key++) {
+                const header = database.createNewHdrWithSpecificMsgKey(key);
+                header.messageId = 'unlisted-' + key + '-' + onlineName + '@invalid';
+                header.subject = onlineName + ' ' + key;
+                header.setUint32Property('uidOnServer', key);
+                database.addNewHdrToDB(header, false);
+              }
+              database.summaryValid = true;
+              database.commit(Ci.nsMsgDBCommitType.kLargeCommit);
+              database.forceClosed();
+              folders[path] = {
+                summary: folder.summaryFile.path, onlineName, delimiter: cached,
+                flags: (folder.flags >>> 0).toString(16), folderName: folder.name,
+                hierDelim: cached.charCodeAt(0).toString(16), boxFlags: '0',
+                messages: count};
+            }
+            Services.prefs.savePrefFile(null);
+            return {serverKey: server.key, root: server.localPath.path, folders};
+        """)
+        self.stop_application()
+        folders = source["folders"]
+        root = Path(source["root"])
+        self.assertEqual(root / "INBOX.sbd" / "Kept.msf", Path(folders["INBOX/Kept"]["summary"]))
+        self.assertEqual(root / "user.sbd" / "team.sbd" / "INBOX.msf",
+                         Path(folders["user/team/INBOX"]["summary"]))
+        originals = {path: Path(folder["summary"]).read_bytes()
+                     for path, folder in folders.items()}
+        self.write_legacy_cache([{"key": folder["summary"], **{
+            field: folder[field] for field in
+            ["flags", "folderName", "onlineName", "hierDelim", "boxFlags"]}}
+            for folder in folders.values()])
+
+        def imported():
+            return self.marionette.execute_script("""
+                const { MailServices } = ChromeUtils.importESModule(
+                  'resource:///modules/MailServices.sys.mjs');
+                const root = MailServices.accounts.getIncomingServer(arguments[0])
+                  .rootFolder;
+                const state = {};
+                for (const folder of root.descendants) {
+                  const imap = folder.QueryInterface(Ci.nsIMsgImapMailFolder);
+                  state[folder.URI.slice(root.URI.length + 1)] = {
+                    onlineName: imap.onlineName,
+                    delimiter: imap.hierarchyDelimiter,
+                    messages: [...folder.msgDatabase.enumerateMessages()].map(
+                      header => header.subject).sort()};
+                }
+                return state;
+            """, script_args=[source["serverKey"]])
+
+        expected = {path: {
+            "onlineName": folder["onlineName"], "delimiter": folder["delimiter"],
+            "messages": [folder["onlineName"] + " " + str(key)
+                         for key in range(1, folder["messages"] + 1)]}
+            for path, folder in folders.items()}
+        self.start_same_profile(True)
+        selected = self.selection()
+        self.assertEqual("migrated", selected["record"]["origin"])
+        self.assertEqual(len(folders), len(selected["record"]["identity"]["imports"]))
+        state = imported()
+        self.assertEqual(expected, {path: state.get(path) for path in expected})
+        for path, folder in folders.items():
+            self.assertEqual(originals[path], Path(folder["summary"]).read_bytes())
+        for _ in range(2):
+            self.stop_application()
+            self.start_same_profile(True)
+            repeated = self.selection()
+            self.assertEqual(selected["sourceId"], repeated["sourceId"])
+            self.assertEqual(selected["record"]["identity"],
+                             repeated["record"]["identity"])
+            self.assertEqual(state, imported())
+
     def test_nativeImapRootSummaryRefusesMessageData(self):
         source = self.create_legacy_imap_source()
         self.stop_application()

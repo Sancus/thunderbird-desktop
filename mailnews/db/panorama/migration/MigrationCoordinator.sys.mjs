@@ -2931,14 +2931,16 @@ function startupFolderOrigin(source, summary, caches) {
     hierDelim <= 0 ||
     hierDelim > 127 ||
     ([94, 124].includes(hierDelim) &&
+      !source.physicalRelativePath.includes("/") &&
       (onlineName.includes("/") ||
         onlineName.includes(String.fromCharCode(hierDelim)))) ||
     !Number.isInteger(boxFlags) ||
     boxFlags < 0 ||
     boxFlags > 0xffffffff
   ) {
-    // Thunderbird keeps the unknown '^' or NIL '|' sentinel for a client
-    // folder the server never listed. Only one slash-free level is exact.
+    // Thunderbird keeps the unknown '^' or NIL '|' sentinel for a folder whose
+    // delimiter it never learned. One slash-free level is exact by itself;
+    // native startup places a deeper name by the parent summary holding it.
     throw new Error(
       "IMAP discovery requires retained name, delimiter and flags"
     );

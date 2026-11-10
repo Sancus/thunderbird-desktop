@@ -2342,6 +2342,7 @@ function validateStartupFolderOrigin(source, caches) {
     origin.hierarchyDelimiter <= 0 ||
     origin.hierarchyDelimiter > 127 ||
     ([94, 124].includes(origin.hierarchyDelimiter) &&
+      !source.physicalRelativePath?.includes("/") &&
       (origin.onlineName.includes("/") ||
         origin.onlineName.includes(
           String.fromCharCode(origin.hierarchyDelimiter)

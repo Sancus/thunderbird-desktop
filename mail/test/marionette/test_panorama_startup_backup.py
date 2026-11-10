@@ -849,8 +849,10 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         summary = Path(source["virtualSummary"])
         original = summary.read_bytes()
         store = summary.with_suffix("")
-        self.assertFalse(store.exists(), "Current Thunderbird writes no store for one")
+        self.assertFalse(store.is_file(), "Current Thunderbird writes no mbox for one")
         if with_store:
+            if store.is_dir():
+                shutil.rmtree(store)
             store.touch()
         # The old application's own cache describes the saved search too.
         cache = json.loads((self.profile / "folderCache.json").read_text(encoding="utf-8"))

@@ -3798,11 +3798,12 @@ async function finishPanoramaProfileStartup(
 
 /**
  * A saved search is its definition in virtualFolders.dat, which the mail
- * window loads as before. Current Thunderbird writes no message store for
- * one, and store discovery then finds no folder its summary could be the
- * index of: such a summary is no migration source and stays in place. An
- * older saved search that has a store file is discovered and imported like
- * any folder.
+ * window loads as before. Beside its summary current Thunderbird leaves
+ * nothing the account's store would list as a folder (at most a plain
+ * directory in an mbox account), so store discovery finds no folder its
+ * summary could be the index of: such a summary is no migration source and
+ * stays in place. An older saved search that has a store of the account's
+ * kind is discovered and imported like any folder.
  *
  * @param {object} source - Captured summary of a local account.
  * @param {object} summary - Its parsed Mork summary.
@@ -3819,8 +3820,21 @@ function isStorelessSavedSearch(source, summary) {
     !!(
       parseInt(info?.cells.get("flags") ?? "0", 16) &
       Ci.nsMsgFolderFlags.Virtual
-    ) && !startupEntryExists(new FileUtils.File(source.storePath))
+    ) && !startupStoreExists(source)
   );
+}
+
+/**
+ * @param {object} source - Captured summary with its store path and type.
+ * @returns {boolean} Whether a store of the account's kind lies beside it: a
+ *   file for mbox, a directory for maildir.
+ */
+function startupStoreExists(source) {
+  const store = new FileUtils.File(source.storePath);
+  if (!startupEntryExists(store)) {
+    return false;
+  }
+  return source.storeType === "maildir" ? store.isDirectory() : store.isFile();
 }
 
 /**

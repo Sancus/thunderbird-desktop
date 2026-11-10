@@ -12786,6 +12786,16 @@ nsresult DatabaseCore::ReadStartupMailSource(JSContext* cx,
   if (expectedStore != output.storePath) {
     // The caller reads the retained folder word and requires it boxless.
     MOZ_TRY(StartupLegacyNamedImapLeaf(physical, output, output.legacyLeaf));
+    if (!output.legacyLeaf && StartupUnknownDelimiter(output.delimiter) &&
+        output.onlineName.FindChar('.') != kNotFound) {
+      // The name is not one level after all: it holds the separator
+      // Thunderbird never learned, and the folder lies below its parent. Its
+      // parent's directory places it (StartupPlaceUnlistedImap), as it does a
+      // name with a slash or the sentinel.
+      output.unlisted = true;
+      output.canonicalPath.Truncate();
+      return NS_OK;
+    }
     NS_ENSURE_TRUE(output.legacyLeaf, NS_ERROR_NOT_IMPLEMENTED);
   }
   return NS_OK;

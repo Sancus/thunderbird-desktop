@@ -1740,10 +1740,14 @@ function bindPanoramaMigrationTarget(
       throw new Error("Mork snapshot conflicts with journal/database identity");
     }
   };
+  // Tokens whose committed import this target has read back from the
+  // database: the source was read, converted and compared message by message.
+  const verified = new Set();
   const checkedReceipt = (folder, request, receipt) => {
     const result = validateMorkFolderReceipt(request, receipt);
     if (journal.view.stage == "import" || journal.view.version === 7) {
       verifyNativeMessageProjection(database, folder, request, result);
+      verified.add(request.token);
     }
     checkIdentity();
     checkLock();
@@ -1753,6 +1757,7 @@ function bindPanoramaMigrationTarget(
   checkLock();
   let prepared = null;
   return {
+    verified,
     async findProtocolUnitReceipt(token, ids) {
       prepared = null;
       checkIdentity();
@@ -1833,6 +1838,7 @@ function bindPanoramaMigrationTarget(
               checked.folders[index]
             );
           }
+          verified.add(token);
         }
         // Only checkpointed receipts survive legitimate queue/header changes.
         return checked;
@@ -1891,6 +1897,7 @@ function bindPanoramaMigrationTarget(
           checked.folders[index]
         );
       }
+      verified.add(token);
       return checked;
     },
     async findReceipt(token, identity) {
@@ -3833,7 +3840,15 @@ async function validateStartupMigration(journal, native, database, operation) {
   if (journal.view.stage !== "validate" || journal.view.cancelled) {
     throw new Error("Startup migration imports have not completed");
   }
+  // What this process imported it has already read back, message by message,
+  // against the source it had just read and converted; the profile is locked
+  // and nothing has written since. Reading, converting and comparing every
+  // summary a second time found nothing new and doubled the work. Only what
+  // an earlier process imported is read back here.
   for (const unit of journal.view.protocolUnits ?? []) {
+    if (native.verified.has(unit.token)) {
+      continue;
+    }
     const receipt = await native.findProtocolUnitReceipt(
       unit.token,
       unit.sourceIds
@@ -3844,7 +3859,7 @@ async function validateStartupMigration(journal, native, database, operation) {
     startupMigrationDirectory(journal, database, operation);
   }
   for (const source of journal.view.sources) {
-    if (source.protocol === "imap") {
+    if (source.protocol === "imap" || native.verified.has(source.token)) {
       continue;
     }
     const receipt = await native.findReceipt(source.token, {

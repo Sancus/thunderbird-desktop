@@ -665,7 +665,8 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         def cell(value):
             return "".join("$%02X" % byte for byte in str(value).encode("utf-8"))
         columns = {"key": "82", "flags": "83", "folderName": "84",
-                   "onlineName": "85", "hierDelim": "86", "boxFlags": "87"}
+                   "onlineName": "85", "hierDelim": "86", "boxFlags": "87",
+                   "pendingMsgs": "88"}
         text = ('// <!-- <mdb:mork:z v="1.4"/> -->\n'
                 '< <(a=c)> (80=ns:msg:db:row:scope:folders:all)'
                 '(81=ns:msg:db:table:kind:folders)' +
@@ -1410,7 +1411,9 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.assertTrue(root_summary.is_file())
         self.assertFalse(root_summary.is_symlink())
         root_original = root_summary.read_bytes()
-        cache = self.write_legacy_cache([{"key": str(summary), **{
+        # The cache also knows of five messages the server has and the
+        # summary does not yet.
+        cache = self.write_legacy_cache([{"key": str(summary), "pendingMsgs": "5", **{
             name: source[name] for name in
             ["flags", "folderName", "onlineName", "hierDelim", "boxFlags"]}}])
         cache_bytes = cache.read_bytes()
@@ -1419,6 +1422,16 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.assertEqual("migrated", selected["record"]["origin"])
         self.assertEqual(1, len(selected["record"]["identity"]["imports"]))
         self.assertEqual(1, len(selected["record"]["identity"]["caches"]))
+
+        def shown_total():
+            return self.marionette.execute_script("""
+                const { MailServices } = ChromeUtils.importESModule(
+                  'resource:///modules/MailServices.sys.mjs');
+                return MailServices.accounts.getIncomingServer(arguments[0])
+                  .rootFolder.getChildNamed('INBOX').getTotalMessages(false);
+            """, script_args=[source["serverKey"]])
+        # The session that migrated shows what every later session shows.
+        self.assertEqual(6, shown_total())
         root_bindings = selected["record"]["identity"]["serverSummaries"]
         self.assertEqual(1, len(root_bindings))
         self.assertEqual("server-summary:" + root_summary.relative_to(self.profile).as_posix(),
@@ -1459,6 +1472,7 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.assertEqual(selected["sourceId"], repeated["sourceId"])
         self.assertEqual(root_bindings, repeated["record"]["identity"]["serverSummaries"])
         self.assertEqual(messages, imported())
+        self.assertEqual(6, shown_total())
         self.assertEqual(original, summary.read_bytes())
         self.assertEqual(cache_bytes, cache.read_bytes())
         self.assertEqual(root_original, root_summary.read_bytes())

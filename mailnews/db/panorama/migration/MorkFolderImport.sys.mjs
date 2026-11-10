@@ -477,10 +477,12 @@ export function createMorkImportData(summary) {
   const messages = summary.messages.map(message => {
     const properties = message.properties;
     const charset = properties.get("msgCharSet") ?? "";
+    // The displayed fields are decoded from the cell's original bytes.
     const decode = name =>
       converter
         .decodeMimeHeaderToUTF8(
-          MailStringUtils.stringToByteString(properties.get(name) ?? ""),
+          message.rawCells?.get(name) ??
+            MailStringUtils.stringToByteString(properties.get(name) ?? ""),
           charset,
           true,
           true

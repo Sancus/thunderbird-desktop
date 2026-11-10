@@ -1567,7 +1567,11 @@ add_task(function test_JSONCacheReadsDirtyDataAsTheOldReaderDoes() {
   Assert.deepEqual([...rows.entries.keys()], ["", "relative", key]);
   Assert.equal(rows.entries.get("").values.folderName, "No path");
   Assert.equal(rows.skipped.entries, 5);
-  Assert.ok(rows.source["/null-row"] === null, "The original keeps every row");
+  Assert.strictEqual(
+    rows.source["/null-row"],
+    null,
+    "The original keeps every row"
+  );
   // Each cell alone: what the old typed getter returns, or no value.
   const cell = (name, value) => {
     const parsed = parseJSONFolderCache(encode({ [key]: { [name]: value } }));

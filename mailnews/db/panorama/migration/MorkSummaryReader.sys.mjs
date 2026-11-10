@@ -64,16 +64,18 @@ export function parseMorkSummary(bytes) {
       "Expected one message table"
     );
   }
+  // Old Thunderbird keeps a header cell as bytes (nsMsgHdr) and decodes the
+  // displayed fields from them with the message's character set. A cell that
+  // is not UTF-8 (raw 8-bit headers of old mail) is therefore data, never a
+  // reason to refuse: its text is its bytes read as ISO-8859-1, the one
+  // reading that keeps every byte, and the bytes stay beside it in rawCells
+  // for the character-set aware decoding.
   const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
   const text = raw => {
     try {
       return decoder.decode(MailStringUtils.byteStringToUint8Array(raw));
     } catch (error) {
-      throw new MorkImportError(
-        "UNSUPPORTED_MORK",
-        0,
-        "Non-UTF-8 header property"
-      );
+      return null;
     }
   };
   const messages = (tables[0]?.rows ?? []).map(key => {
@@ -85,9 +87,16 @@ export function parseMorkSummary(bytes) {
         "Message row scope mismatch"
       );
     }
-    const properties = new Map(
-      [...row.cells].map(([name, value]) => [text(name), text(value)])
-    );
+    const properties = new Map();
+    const rawCells = new Map();
+    for (const [rawName, rawValue] of row.cells) {
+      const name = text(rawName) ?? rawName;
+      const value = text(rawValue);
+      if (value === null) {
+        rawCells.set(name, rawValue);
+      }
+      properties.set(name, value ?? rawValue);
+    }
     const number = (name, fallback = 0) => {
       if (!properties.has(name)) {
         return fallback;
@@ -124,9 +133,42 @@ export function parseMorkSummary(bytes) {
       threadId: number("msgThreadId"),
       threadParent: number("threadParent", 0xffffffff),
       storeToken,
+      ...(rawCells.size ? { rawCells } : {}),
     };
   });
   return { messages, source };
+}
+
+/**
+ * Reads only the folder-info cells native startup needs to place a summary:
+ * one parse, no message conversion. Cells are original byte strings.
+ *
+ * @param {Uint8Array} bytes - Complete original summary bytes.
+ * @returns {{infoRows: number, flags?: string, onlineName?: string,
+ *   folderName?: string}} Folder-info row count and its first row's cells.
+ * @throws {MorkImportError} For Mork this migration cannot read.
+ */
+export function readMorkSummaryFacts(bytes) {
+  if (
+    !ArrayBuffer.isView(bytes) ||
+    Object.prototype.toString.call(bytes) != "[object Uint8Array]"
+  ) {
+    throw new TypeError("Expected Uint8Array");
+  }
+  const source = new MorkParser().parseForImport(
+    MailStringUtils.uint8ArrayToByteString(bytes)
+  );
+  const info = [...source.rows.values()].filter(
+    row => row.scope == "ns:msg:db:row:scope:dbfolderinfo:all"
+  );
+  const facts = { infoRows: info.length };
+  for (const name of ["flags", "onlineName", "folderName"]) {
+    const value = info[0]?.cells.get(name);
+    if (value !== undefined) {
+      facts[name] = value;
+    }
+  }
+  return facts;
 }
 
 /**

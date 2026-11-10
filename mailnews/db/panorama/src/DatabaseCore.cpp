@@ -167,6 +167,14 @@ struct StartupServerRoot {
   nsCString key, path, protocol, contract;
 };
 
+// The folder-info cells of one summary that place it at startup, read once.
+// Each text is the cell's original bytes; hash is the file it was read from.
+struct StartupSummaryFacts {
+  nsCString hash;
+  uint32_t infoRows = 0;
+  Maybe<nsCString> flags, onlineName, folderName;
+};
+
 class ProfileStartupOperation final : public nsIAsyncShutdownBlocker {
  public:
   NS_DECL_ISUPPORTS
@@ -202,6 +210,11 @@ class ProfileStartupOperation final : public nsIAsyncShutdownBlocker {
   nsTArray<nsCString> mailRoots;
   nsTHashMap<nsCString, nsCString> backupFiles;
   nsTHashMap<nsCString, nsCOMPtr<nsIFile>> backupCopies;
+  // Read once per target opening: each summary's placing cells by path, and
+  // the parsed folder cache (rooted by OpenProfileStartup while it is set).
+  nsTHashMap<nsCString, StartupSummaryFacts> summaryFacts;
+  JS::Rooted<JSObject*>* parsedCache = nullptr;
+  nsCString parsedCacheKey;
   nsTHashMap<nsCString, nsCString> createdEmptyStores;
   nsTArray<nsCString> sourceIds;
   nsTArray<nsCOMPtr<nsIMsgFolder>> folders;
@@ -4687,6 +4700,8 @@ NS_IMPL_ISUPPORTS(FolderMigrator, nsIRunnable, mozIStorageStatementCallback)
 
 namespace {
 
+nsresult ImportByteText(JSContext* cx, JS::Handle<JS::Value> value,
+                        nsACString& output, Maybe<nsCString>* raw = nullptr);
 nsresult ImportMember(JSContext* cx, JS::Handle<JSObject*> object,
                       const char* name, JS::MutableHandle<JS::Value> value,
                       bool optional = false) {
@@ -4914,15 +4929,9 @@ nsresult CheckProjectedImportRecords(JSContext* cx,
       JS::Rooted<JSObject*> cell(cx, &field.toObject());
       for (auto pair : {std::pair{"k", &extras[j].k}, {"v", &extras[j].v}}) {
         MOZ_TRY(ImportMember(cx, cell, pair.first, &field));
-        NS_ENSURE_TRUE(field.isString(), NS_ERROR_INVALID_ARG);
-        nsAutoJSString bytes;
-        NS_ENSURE_TRUE(bytes.init(cx, field), NS_ERROR_OUT_OF_MEMORY);
-        nsCString raw;
-        for (char16_t c : bytes.View()) {
-          NS_ENSURE_TRUE(c <= 255, NS_ERROR_INVALID_ARG);
-          raw.Append(static_cast<char>(c));
-        }
-        NS_ENSURE_TRUE(raw == *pair.second, NS_ERROR_INVALID_ARG);
+        nsCString text;
+        MOZ_TRY(ImportByteText(cx, field, text));
+        NS_ENSURE_TRUE(text == *pair.second, NS_ERROR_INVALID_ARG);
       }
     }
   }
@@ -4932,7 +4941,10 @@ nsresult CheckProjectedImportRecords(JSContext* cx,
 struct ImportSourceRecord {
   uint32_t id{0};
   nsCString scope;
+  // Each cell's text. A cell that is not UTF-8 is its bytes read as
+  // ISO-8859-1 (ImportByteText) and its original bytes are in rawCells.
   nsTHashMap<nsCString, nsCString> cells;
+  nsTHashMap<nsCString, nsCString> rawCells;
   nsTArray<nsCString> members;
   nsTHashMap<nsCString, bool> memberSet;
   nsCString meta;
@@ -4947,18 +4959,27 @@ nsCString ImportSourceKey(uint32_t id, const nsACString& scope) {
   return key;
 }
 
+// The text of one original Mork cell passed as a byte string. Old Thunderbird
+// keeps a cell as bytes; one that is not UTF-8 (raw 8-bit headers of old
+// mail) is data, never a refusal. Its text is its bytes read as ISO-8859-1,
+// the one reading that keeps every byte, exactly as the JS reader carries it
+// (parseMorkSummary); *raw then receives the original bytes.
 nsresult ImportByteText(JSContext* cx, JS::Handle<JS::Value> value,
-                        nsACString& output) {
+                        nsACString& output, Maybe<nsCString>* raw) {
   NS_ENSURE_TRUE(value.isString(), NS_ERROR_INVALID_ARG);
   nsAutoJSString bytes;
   NS_ENSURE_TRUE(bytes.init(cx, value), NS_ERROR_OUT_OF_MEMORY);
-  output.Truncate();
+  nsCString original;
   for (char16_t c : bytes.View()) {
     NS_ENSURE_TRUE(c <= 255, NS_ERROR_INVALID_ARG);
-    output.Append(char(c));
+    original.Append(char(c));
   }
-  nsCString roundtrip = NS_ConvertUTF16toUTF8(NS_ConvertUTF8toUTF16(output));
-  NS_ENSURE_TRUE(roundtrip == output, NS_ERROR_INVALID_ARG);
+  if (IsUtf8(original)) {
+    output = original;
+    return NS_OK;
+  }
+  CopyLatin1toUTF8(original, output);
+  if (raw) *raw = Some(std::move(original));
   return NS_OK;
 }
 
@@ -4991,11 +5012,13 @@ nsresult ImportSourceRecords(JSContext* cx, JS::Handle<JS::Value> value,
       NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
       JS::Rooted<JSObject*> cell(cx, &field.toObject());
       nsCString name, text;
+      Maybe<nsCString> raw;
       MOZ_TRY(ImportMember(cx, cell, "k", &field));
       MOZ_TRY(ImportByteText(cx, field, name));
       MOZ_TRY(ImportMember(cx, cell, "v", &field));
-      MOZ_TRY(ImportByteText(cx, field, text));
+      MOZ_TRY(ImportByteText(cx, field, text, &raw));
       NS_ENSURE_FALSE(record->cells.Contains(name), NS_ERROR_INVALID_ARG);
+      if (raw) record->rawCells.InsertOrUpdate(name, std::move(*raw));
       record->cells.InsertOrUpdate(name, std::move(text));
     }
     if (tables) {
@@ -5087,10 +5110,12 @@ nsresult CheckImportHeader(const ImportSourceRecord& row, const RawHdr& header,
                     {"ccList", &header.ccList},
                     {"bccList", &header.bccList},
                     {"subject", &header.subject}}) {
-    nsCString decoded;
-    MOZ_TRY(converter->DecodeMimeHeaderToUTF8(
-        text(nsDependentCString(pair.first)), header.charset.get(), true, true,
-        decoded));
+    // The displayed fields are decoded from the cell's original bytes.
+    nsCString decoded, original;
+    if (!row.rawCells.Get(nsDependentCString(pair.first), &original))
+      original = text(nsDependentCString(pair.first));
+    MOZ_TRY(converter->DecodeMimeHeaderToUTF8(original, header.charset.get(),
+                                              true, true, decoded));
     normalized = MOZ_TRY(DatabaseUtils::Normalize(decoded));
     NS_ENSURE_TRUE(*pair.second == normalized, NS_ERROR_INVALID_ARG);
   }
@@ -12109,6 +12134,75 @@ nsresult StartupCheckHash(nsIFile* file, const nsACString& expected,
   MOZ_TRY(StartupHash(file, actual));
   return actual == expected ? NS_OK : NS_ERROR_NOT_AVAILABLE;
 }
+// One parse of the folder cache per target opening. The caller has checked
+// that the file has this digest.
+nsresult StartupCacheDocument(JSContext* cx, ProfileStartupOperation& operation,
+                              nsIFile* file, const nsACString& hash, bool json,
+                              JS::MutableHandle<JSObject*> parsed) {
+  nsCString key(hash + (json ? ":json"_ns : ":mork"_ns));
+  if (operation.parsedCache && operation.parsedCache->get() &&
+      operation.parsedCacheKey == key) {
+    parsed.set(operation.parsedCache->get());
+    return NS_OK;
+  }
+  MOZ_TRY(StartupParseFile(
+      cx, file, u"resource:///modules/panorama/MorkFolderCache.sys.mjs"_ns,
+      json ? "parseJSONFolderCache" : "parseMorkFolderCache", parsed));
+  if (operation.parsedCache) {
+    *operation.parsedCache = parsed.get();
+    operation.parsedCacheKey = key;
+  }
+  return NS_OK;
+}
+// The original bytes of a Mork cell the JS reader returned as a byte string.
+nsresult StartupCellBytes(JSContext* cx, JS::Handle<JSObject*> object,
+                          const char* name, Maybe<nsCString>& output) {
+  JS::Rooted<JS::Value> value(cx);
+  MOZ_TRY(ImportMember(cx, object, name, &value, true));
+  if (value.isUndefined()) return NS_OK;
+  nsAutoJSString raw;
+  NS_ENSURE_TRUE(value.isString() && raw.init(cx, value),
+                 NS_ERROR_FILE_CORRUPTED);
+  nsCString bytes;
+  for (uint32_t i = 0; i < raw.Length(); ++i) {
+    char16_t c = raw[i];
+    NS_ENSURE_TRUE(c <= 255, NS_ERROR_FILE_CORRUPTED);
+    bytes.Append(char(c));
+  }
+  output = Some(std::move(bytes));
+  return NS_OK;
+}
+// One parse of a summary per target opening: placing it needs its folder-info
+// cells three times (IMAP name, folder flags, local folder name).
+nsresult StartupSummaryFactsFor(JSContext* cx,
+                                ProfileStartupOperation& operation,
+                                nsIFile* file, const nsACString& path,
+                                StartupSummaryFacts& output) {
+  nsCString hash;
+  MOZ_TRY(StartupHash(file, hash));
+  if (auto cached = operation.summaryFacts.Lookup(path)) {
+    if (cached.Data().hash == hash) {
+      output = cached.Data();
+      return NS_OK;
+    }
+  }
+  JS::Rooted<JSObject*> parsed(cx);
+  MOZ_TRY(StartupParseFile(
+      cx, file, u"resource:///modules/panorama/MorkSummaryReader.sys.mjs"_ns,
+      "readMorkSummaryFacts", &parsed));
+  StartupSummaryFacts facts;
+  int64_t rows;
+  MOZ_TRY(StartupNumber(cx, parsed, "infoRows", 0, UINT32_MAX, rows));
+  facts.infoRows = uint32_t(rows);
+  MOZ_TRY(StartupCellBytes(cx, parsed, "flags", facts.flags));
+  MOZ_TRY(StartupCellBytes(cx, parsed, "onlineName", facts.onlineName));
+  MOZ_TRY(StartupCellBytes(cx, parsed, "folderName", facts.folderName));
+  MOZ_TRY(StartupHash(file, facts.hash));
+  NS_ENSURE_TRUE(facts.hash == hash, NS_ERROR_NOT_AVAILABLE);
+  operation.summaryFacts.InsertOrUpdate(path, facts);
+  output = std::move(facts);
+  return NS_OK;
+}
 // A server's sibling summary is metadata, never a synthetic message folder.
 // Its entire original document remains in the verified backup and inventory.
 nsresult StartupServerSummaryInput(JSContext* cx, JS::Handle<JSObject*> source,
@@ -12482,9 +12576,8 @@ nsresult DatabaseCore::ReadStartupMailSource(JSContext* cx,
     NS_ENSURE_FALSE(hasJSON, NS_ERROR_NOT_AVAILABLE);
   }
   MOZ_TRY(StartupCheckHash(cacheFile, cacheHash, cacheSize));
-  MOZ_TRY(StartupParseFile(
-      cx, cacheFile, u"resource:///modules/panorama/MorkFolderCache.sys.mjs"_ns,
-      jsonCache ? "parseJSONFolderCache" : "parseMorkFolderCache", &parsed));
+  MOZ_TRY(StartupCacheDocument(cx, operation, cacheFile, cacheHash, jsonCache,
+                               &parsed));
   JS::Rooted<JS::Value> field(cx);
   MOZ_TRY(StartupMapEntry(cx, parsed, "entries", key, &field));
   NS_ENSURE_TRUE(field.isObject(), NS_ERROR_FILE_CORRUPTED);
@@ -12544,45 +12637,12 @@ nsresult DatabaseCore::ReadStartupMailSource(JSContext* cx,
                    NS_ERROR_NOT_IMPLEMENTED);
   }
   // Cross-check retained summary metadata from original bytes when present.
-  MOZ_TRY(StartupParseFile(
-      cx, file, u"resource:///modules/panorama/MorkSummaryReader.sys.mjs"_ns,
-      "parseMorkSummary", &parsed));
-  JS::Rooted<JSObject*> sourceObject(cx), rows(cx);
-  MOZ_TRY(StartupObject(cx, parsed, "source", &sourceObject));
-  MOZ_TRY(StartupObject(cx, sourceObject, "rows", &rows));
-  NS_ENSURE_TRUE(JS::MapValues(cx, rows, &field), NS_ERROR_FAILURE);
-  JS::ForOfIterator iterator(cx);
-  NS_ENSURE_TRUE(iterator.init(field), NS_ERROR_FAILURE);
-  bool done, seenInfo = false;
-  while (true) {
-    NS_ENSURE_TRUE(iterator.next(&field, &done), NS_ERROR_FAILURE);
-    if (done) break;
-    NS_ENSURE_TRUE(field.isObject(), NS_ERROR_FILE_CORRUPTED);
-    row = &field.toObject();
-    nsCString scope;
-    MOZ_TRY(StartupText(cx, row, "scope", scope));
-    if (scope != "ns:msg:db:row:scope:dbfolderinfo:all"_ns) continue;
-    NS_ENSURE_FALSE(seenInfo, NS_ERROR_NOT_AVAILABLE);
-    seenInfo = true;
-    MOZ_TRY(StartupObject(cx, row, "cells", &properties));
-    JS::Rooted<JSString*> name(cx, JS_NewStringCopyZ(cx, "onlineName"));
-    NS_ENSURE_TRUE(name, NS_ERROR_OUT_OF_MEMORY);
-    JS::Rooted<JS::Value> mapKey(cx, JS::StringValue(name));
-    NS_ENSURE_TRUE(JS::MapGet(cx, properties, mapKey, &field),
-                   NS_ERROR_FAILURE);
-    if (!field.isUndefined()) {
-      nsAutoJSString raw;
-      NS_ENSURE_TRUE(field.isString() && raw.init(cx, field),
-                     NS_ERROR_FILE_CORRUPTED);
-      nsCString bytes;
-      for (uint32_t i = 0; i < raw.Length(); ++i) {
-        char16_t c = raw[i];
-        NS_ENSURE_TRUE(c <= 255, NS_ERROR_FILE_CORRUPTED);
-        bytes.Append(char(c));
-      }
-      NS_ENSURE_TRUE(bytes == output.onlineName, NS_ERROR_NOT_AVAILABLE);
-    }
-  }
+  StartupSummaryFacts facts;
+  MOZ_TRY(StartupSummaryFactsFor(cx, operation, file, output.path, facts));
+  NS_ENSURE_TRUE(facts.infoRows <= 1, NS_ERROR_NOT_AVAILABLE);
+  if (facts.onlineName)
+    NS_ENSURE_TRUE(*facts.onlineName == output.onlineName,
+                   NS_ERROR_NOT_AVAILABLE);
   if (output.unlisted) return NS_OK;
   nsCOMPtr<nsIFile> physical;
   MOZ_TRY(root->Clone(getter_AddRefs(physical)));
@@ -12674,8 +12734,20 @@ nsresult DatabaseCore::BindStartupLocalNames(JSContext* cx,
     nsCString path;
     MOZ_TRY(GetComparablePath(summary, path));
     Maybe<nsCString> name;
-    if (auto archived = operation.backupFiles.Lookup(path))
-      MOZ_TRY(ReadStartupSummaryName(cx, summary, archived.Data(), name));
+    if (auto archived = operation.backupFiles.Lookup(path)) {
+      StartupSummaryFacts facts;
+      MOZ_TRY(StartupSummaryFactsFor(cx, operation, summary, path, facts));
+      NS_ENSURE_TRUE(facts.hash == archived.Data() && facts.infoRows <= 1,
+                     NS_ERROR_NOT_AVAILABLE);
+      if (facts.folderName && !facts.folderName->IsEmpty()) {
+        // The same acceptance as ReadStartupSummaryName.
+        NS_ENSURE_TRUE(NS_ConvertUTF16toUTF8(NS_ConvertUTF8toUTF16(
+                           *facts.folderName)) == *facts.folderName &&
+                           facts.folderName->FindChar(0) < 0,
+                       NS_ERROR_FILE_CORRUPTED);
+        name = facts.folderName;
+      }
+    }
     nsCOMPtr<nsIFile> cache;
     MOZ_TRY(operation.profile->Clone(getter_AddRefs(cache)));
     MOZ_TRY(cache->AppendNative("folderCache.json"_ns));
@@ -12692,10 +12764,8 @@ nsresult DatabaseCore::BindStartupLocalNames(JSContext* cx,
       MOZ_TRY(StartupHash(cache, cacheHash));
       NS_ENSURE_TRUE(cacheHash == archived.Data(), NS_ERROR_NOT_AVAILABLE);
       JS::Rooted<JSObject*> parsed(cx), row(cx), values(cx);
-      MOZ_TRY(StartupParseFile(
-          cx, cache, u"resource:///modules/panorama/MorkFolderCache.sys.mjs"_ns,
-          jsonCache ? "parseJSONFolderCache" : "parseMorkFolderCache",
-          &parsed));
+      MOZ_TRY(StartupCacheDocument(cx, operation, cache, cacheHash, jsonCache,
+                                   &parsed));
       nsCString descriptor;
       MOZ_TRY(summary->GetPersistentDescriptor(descriptor));
       JS::Rooted<JS::Value> value(cx);
@@ -14072,6 +14142,15 @@ nsresult DatabaseCore::OpenProfileStartup(JSContext* cx,
       MOZ_TRY(StartupJSON(cx, actual, operation.retainedSources));
       nsTHashSet<nsCString> paths, ids, destinations;
       operation.sources.Clear();
+      // One parse of the folder cache and of each summary for this opening.
+      JS::Rooted<JSObject*> parsedCache(cx);
+      operation.parsedCache = &parsedCache;
+      operation.summaryFacts.Clear();
+      auto forgetParsed = MakeScopeExit([&] {
+        operation.parsedCache = nullptr;
+        operation.parsedCacheKey.Truncate();
+        operation.summaryFacts.Clear();
+      });
       for (uint32_t i = 0; i < count; ++i) {
         JS::Rooted<JSObject*> source(cx);
         MOZ_TRY(StartupItem(cx, sources, i, &source));
@@ -14085,39 +14164,15 @@ nsresult DatabaseCore::OpenProfileStartup(JSContext* cx,
         nsCOMPtr<nsIFile> summary;
         MOZ_TRY(StartupContainedMail(operation, native.path,
                                      getter_AddRefs(summary)));
-        JS::Rooted<JSObject*> parsed(cx), original(cx), rows(cx);
-        MOZ_TRY(StartupParseFile(
-            cx, summary,
-            u"resource:///modules/panorama/MorkSummaryReader.sys.mjs"_ns,
-            "parseMorkSummary", &parsed));
-        MOZ_TRY(StartupObject(cx, parsed, "source", &original));
-        MOZ_TRY(StartupObject(cx, original, "rows", &rows));
-        JS::Rooted<JS::Value> rowValue(cx);
-        NS_ENSURE_TRUE(JS::MapValues(cx, rows, &rowValue), NS_ERROR_FAILURE);
-        JS::ForOfIterator rowsIterator(cx);
-        NS_ENSURE_TRUE(rowsIterator.init(rowValue), NS_ERROR_FAILURE);
-        bool done, seenInfo = false;
-        while (true) {
-          NS_ENSURE_TRUE(rowsIterator.next(&rowValue, &done), NS_ERROR_FAILURE);
-          if (done) break;
-          NS_ENSURE_TRUE(rowValue.isObject(), NS_ERROR_FILE_CORRUPTED);
-          JS::Rooted<JSObject*> row(cx, &rowValue.toObject());
-          nsCString scope;
-          MOZ_TRY(StartupText(cx, row, "scope", scope));
-          if (scope != "ns:msg:db:row:scope:dbfolderinfo:all"_ns) continue;
-          NS_ENSURE_FALSE(seenInfo, NS_ERROR_NOT_IMPLEMENTED);
-          seenInfo = true;
-          MOZ_TRY(
-              StartupMapEntry(cx, row, "cells", "flags"_ns, &rowValue, true));
-          if (!rowValue.isUndefined()) {
-            nsCString text;
-            MOZ_TRY(ImportText(cx, rowValue, text));
-            uint64_t flags;
-            MOZ_TRY(ImportHex(text, 8, flags));
-            native.originalFlags = Some(uint32_t(flags));
-          }
+        StartupSummaryFacts facts;
+        MOZ_TRY(
+            StartupSummaryFactsFor(cx, operation, summary, native.path, facts));
+        NS_ENSURE_TRUE(facts.infoRows == 1, NS_ERROR_NOT_IMPLEMENTED);
+        if (facts.flags) {
+          uint64_t flags;
+          MOZ_TRY(ImportHex(*facts.flags, 8, flags));
+          native.originalFlags = Some(uint32_t(flags));
         }
-        NS_ENSURE_TRUE(seenInfo, NS_ERROR_NOT_IMPLEMENTED);
         NS_ENSURE_TRUE(!native.legacyLeaf || !(native.originalFlags.valueOr(0) &
                                                nsMsgFolderFlags::ImapBox),
                        NS_ERROR_NOT_IMPLEMENTED);

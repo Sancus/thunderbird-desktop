@@ -577,7 +577,7 @@ export class MorkParser {
     if (!body.startsWith('// <!-- <mdb:mork:z v="1.4"/> -->')) {
       fail("UNSUPPORTED_MORK", "Expected Mork 1.4 header");
     }
-    let state = {
+    const state = {
       columns: new Map(),
       values: new Map(),
       rows: new Map(),

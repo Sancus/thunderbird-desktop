@@ -1555,14 +1555,32 @@ function cells(record) {
  * @returns {boolean} Exact UTF-8 correspondence.
  */
 function sameCells(raw, extras) {
+  // A cell that is not UTF-8 is carried as its bytes read as ISO-8859-1
+  // (parseMorkSummary): its text then is the byte string itself.
+  const same = (text, bytes) =>
+    MailStringUtils.stringToByteString(text) == bytes ||
+    (text == bytes && !isUTF8(bytes));
   return (
     raw.size == extras.length &&
     [...raw].every(
-      ([k, v], index) =>
-        MailStringUtils.stringToByteString(extras[index].k) == k &&
-        MailStringUtils.stringToByteString(extras[index].v) == v
+      ([k, v], index) => same(extras[index].k, k) && same(extras[index].v, v)
     )
   );
+}
+
+/**
+ * @param {string} bytes - Byte string.
+ * @returns {boolean} Whether the bytes are well-formed UTF-8.
+ */
+function isUTF8(bytes) {
+  try {
+    new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
+      MailStringUtils.byteStringToUint8Array(bytes)
+    );
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**

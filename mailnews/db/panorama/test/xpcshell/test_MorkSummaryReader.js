@@ -85,6 +85,74 @@ add_task(function test_exactPropertiesAndOrderedAncestors() {
   Assert.deepEqual(messages[1].references, ["legacy undelimited"]);
 });
 
+add_task(function test_cellsThatAreNotUTF8AreCarriedAsBytes() {
+  // Old mail has raw 8-bit header bytes. nsMsgHdr keeps a cell as bytes and
+  // decodes the displayed fields with the message's character set, so such a
+  // cell is data: its text is its bytes read as ISO-8859-1, which keeps every
+  // byte, and the bytes stay beside it for that decoding.
+  const input = String.raw`// <!-- <mdb:mork:z v="1.4"/> -->
+< <(a=c)> (80=ns:msg:db:row:scope:msgs:all)(81=ns:msg:db:table:kind:msgs)
+(82=message-id)(83=subject)(84=sender)(85=custom)>
+{1:^80 {(k^81:c)(s=9)}
+[1(^82=raw)(^83=caf$E9 $FC$F1)(^84=Andr$C3$A9)(^85=$FF$FE)]
+[2(^82=plain)(^83=Plain)]}
+`;
+  const { messages, source } = parseMorkSummary(
+    Uint8Array.from(input, character => character.charCodeAt(0))
+  );
+  const [raw, plain] = messages;
+  Assert.equal(raw.properties.get("subject"), "café üñ");
+  Assert.equal(raw.properties.get("custom"), "ÿþ");
+  Assert.equal(raw.properties.get("sender"), "André", "UTF-8 is decoded");
+  Assert.deepEqual(
+    [...raw.rawCells],
+    [
+      ["subject", "caf\xe9 \xfc\xf1"],
+      ["custom", "\xff\xfe"],
+    ],
+    "Only the cells that are not UTF-8 keep their bytes beside the text"
+  );
+  Assert.ok(!("rawCells" in plain), "A UTF-8 header has no such cells");
+  Assert.equal(
+    source.rows.get("1:ns:msg:db:row:scope:msgs:all").cells.get("subject"),
+    "caf\xe9 \xfc\xf1",
+    "The original snapshot keeps the exact bytes"
+  );
+});
+
+add_task(function test_summaryFactsReadFolderInfoOnce() {
+  const { readMorkSummaryFacts } = ChromeUtils.importESModule(
+    "resource:///modules/panorama/MorkSummaryReader.sys.mjs"
+  );
+  const document = info =>
+    Uint8Array.from(
+      '// <!-- <mdb:mork:z v="1.4"/> -->\n' +
+        "< <(a=c)> (80=ns:msg:db:row:scope:msgs:all)" +
+        "(81=ns:msg:db:table:kind:msgs)" +
+        "(82=ns:msg:db:row:scope:dbfolderinfo:all)" +
+        "(83=ns:msg:db:table:kind:dbfolderinfo)" +
+        "(84=flags)(85=onlineName)(86=folderName)(87=subject)>\n" +
+        "{1:^80 {(k^81:c)(s=9)} [1(^87=not$FFutf8)]}\n" +
+        info,
+      character => character.charCodeAt(0)
+    );
+  Assert.deepEqual(
+    readMorkSummaryFacts(
+      document("{1:^82 {(k^83:c)(s=9)} [1(^84=1c)(^85=INBOX/caf$C3$A9)]}\n")
+    ),
+    { infoRows: 1, flags: "1c", onlineName: "INBOX/caf\xc3\xa9" },
+    "Cells are original bytes; an absent cell is absent"
+  );
+  Assert.deepEqual(readMorkSummaryFacts(document("")), { infoRows: 0 });
+  Assert.equal(
+    readMorkSummaryFacts(
+      document("{1:^82 {(k^83:c)(s=9)} [1(^86=First)] [2(^86=Second)]}\n")
+    ).infoRows,
+    2,
+    "The caller decides what more than one folder-info row means"
+  );
+});
+
 add_task(async function test_invalidStructuralTextRejectsSnapshot() {
   const bytes = await IOUtils.read(do_get_file("data/migration.msf").path);
   const source = String.fromCharCode(...bytes);

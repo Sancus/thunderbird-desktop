@@ -1790,6 +1790,96 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             self.assertEqual(selected["sourceId"], self.selection()["sourceId"])
             self.assert_message_after_activation(source)
 
+    def test_migratesRawEightBitHeaderCells(self):
+        """Old mail has raw 8-bit header bytes that are not UTF-8. Old Thunderbird
+        keeps such a cell as bytes; the migration carries it and never refuses.
+        All data is fabricated."""
+        self.clean_profile(False)
+        source = self.marionette.execute_script(r"""
+            const { MailServices } = ChromeUtils.importESModule(
+              'resource:///modules/MailServices.sys.mjs');
+            const { FileUtils } = ChromeUtils.importESModule(
+              'resource://gre/modules/FileUtils.sys.mjs');
+            const root = new FileUtils.File(PathUtils.join(PathUtils.profileDir,
+              'Mail', 's526-raw-cells'));
+            root.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+            const server = MailServices.accounts.createIncomingServer(
+              's526raw', 'localhost', 'none');
+            server.localPath = root;
+            MailServices.accounts.createAccount().incomingServer = server;
+            server.rootFolder.createSubfolder('Old', null);
+            const folder = server.rootFolder.getChildNamed('Old')
+              .QueryInterface(Ci.nsIMsgLocalMailFolder);
+            // Each character below 256 is written as that one byte.
+            folder.addMessage(
+              'From - Thu Nov 05 00:00:00 2026
+' +
+              'Message-ID: <raw-cells-s526@invalid>
+' +
+              'From: André Source <source@example.invalid>
+' +
+              'To: destination@example.invalid
+' +
+              'Subject: café raw üñ
+' +
+              'Date: Thu, 5 Nov 2026 00:00:00 +0000
+
+' +
+              'Body.
+');
+            folder.addMessage(
+              'From - Thu Nov 05 00:00:01 2026
+' +
+              'Message-ID: <plain-s526@invalid>
+' +
+              'From: source@example.invalid
+' +
+              'Subject: Plain neighbour
+' +
+              'Date: Thu, 5 Nov 2026 00:00:01 +0000
+
+' +
+              'Body.
+');
+            folder.msgDatabase.commit(Ci.nsMsgDBCommitType.kLargeCommit);
+            Services.prefs.savePrefFile(null);
+            return {serverKey: server.key, summary: folder.summaryFile.path};
+        """)
+        self.stop_application()
+        summary = Path(source["summary"])
+        original = summary.read_bytes()
+        self.assertTrue(b"caf$E9" in original or b"caf\xe9" in original,
+                        "The fixture summary holds a cell that is not UTF-8")
+
+        def messages():
+            return self.marionette.execute_script("""
+                const { MailServices } = ChromeUtils.importESModule(
+                  'resource:///modules/MailServices.sys.mjs');
+                const folder = MailServices.accounts.getIncomingServer(arguments[0])
+                  .rootFolder.getChildNamed('Old');
+                return [...folder.msgDatabase.enumerateMessages()].map(header => ({
+                  messageId: header.messageId, subject: header.subject,
+                  author: header.author})).sort(
+                    (a, b) => a.messageId < b.messageId ? -1 : 1);
+            """, script_args=[source["serverKey"]])
+
+        self.start_same_profile(True)
+        selected = self.selection()
+        self.assertEqual("migrated", selected["record"]["origin"])
+        state = messages()
+        self.assertEqual(["plain-s526@invalid", "raw-cells-s526@invalid"],
+                         [message["messageId"] for message in state])
+        self.assertEqual("Plain neighbour", state[0]["subject"])
+        self.assertTrue(state[1]["subject"].startswith("caf"))
+        self.assertIn(" raw ", state[1]["subject"])
+        self.assertIn("Source", state[1]["author"])
+        self.assertEqual(original, summary.read_bytes())
+        for _ in range(2):
+            self.stop_application()
+            self.start_same_profile(True)
+            self.assertEqual(selected["sourceId"], self.selection()["sourceId"])
+            self.assertEqual(state, messages())
+
     def test_genuine_mork_mbox_migration_and_reuse(self):
         self.assert_mork_migration("mbox")
 

@@ -3797,9 +3797,10 @@ async function finishPanoramaProfileStartup(
 }
 
 /**
- * A saved search is its definition in virtualFolders.dat, which the mail
- * window loads as before. Beside its summary current Thunderbird leaves
- * nothing the account's store would list as a folder (at most a plain
+ * A saved search is its definition in virtualFolders.dat, which a new
+ * database takes over when the accounts load (MigrateVirtualFolders), creating
+ * a search that has no folder yet. Beside its summary current Thunderbird
+ * leaves nothing the account's store would list as a folder (at most a plain
  * directory in an mbox account), so store discovery finds no folder its
  * summary could be the index of: such a summary is no migration source and
  * stays in place. An older saved search that has a store of the account's

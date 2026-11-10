@@ -1888,10 +1888,14 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.assertFalse(looked_up.with_suffix("").exists())
         originals = {path: Path(folder["summary"]).read_bytes()
                      for path, folder in folders.items()}
-        self.write_legacy_cache([{"key": folder["summary"], **{
-            field: folder[field] for field in
-            ["flags", "folderName", "onlineName", "hierDelim", "boxFlags"]}}
-            for folder in folders.values()])
+        # The old application's own JSON cache is the one that is read. In it,
+        # the folders named so keep the delimiter that was never learned.
+        cache = self.profile / "folderCache.json"
+        cached = json.loads(cache.read_text(encoding="utf-8"))
+        for folder in folders.values():
+            self.assertEqual(ord("."), cached[folder["summary"]]["hierDelim"])
+            cached[folder["summary"]]["hierDelim"] = ord(folder["delimiter"])
+        cache.write_text(json.dumps(cached), encoding="utf-8")
 
         def imported():
             return self.marionette.execute_script("""

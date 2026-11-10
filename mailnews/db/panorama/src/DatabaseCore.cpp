@@ -14428,6 +14428,23 @@ nsresult DatabaseCore::OpenProfileStartup(JSContext* cx,
             StringEndsWith(path, ".mab"_ns) ||
             StringEndsWith(path, kCachePanaceaLeaf) ||
             StringEndsWith(path, kCacheJSONLeaf)) {
+          if (!paths.Contains(path) && StringEndsWith(path, ".msf"_ns)) {
+            // A saved search is its definition in virtualFolders.dat, which
+            // MigrateVirtualFolders takes over for a new database. When
+            // nothing its account's store lists as a folder lies beside its
+            // summary, the caller declares no source for it and it stays in
+            // place. A store beside an undeclared one is refused below.
+            nsCOMPtr<nsIFile> undeclared;
+            MOZ_TRY(NS_NewNativeLocalFile(path, getter_AddRefs(undeclared)));
+            StartupSummaryFacts facts;
+            MOZ_TRY(
+                StartupSummaryFactsFor(cx, operation, undeclared, path, facts));
+            uint64_t word = 0;
+            if (facts.flags && NS_SUCCEEDED(ImportHex(*facts.flags, 8, word)) &&
+                (word & nsMsgFolderFlags::Virtual)) {
+              continue;
+            }
+          }
           NS_ENSURE_TRUE(paths.Contains(path), NS_ERROR_NOT_AVAILABLE);
         }
       }

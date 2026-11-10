@@ -2524,6 +2524,50 @@ nsresult DatabaseCore::WriteImportedThreadFlags(
 nsresult DatabaseCore::WriteImportedMessage(uint64_t folderId, nsMsgKey key,
                                             nsMsgKey root, nsMsgKey parent,
                                             const RawHdr& header) {
+  // The properties go in before the message row: the change log then records
+  // the new message once, with its row, instead of once more per property.
+  auto& messages = MessageDB();
+  if (!header.replyTo.IsEmpty()) {
+    MOZ_TRY(messages.WriteImportedMessageProperty(key, "replyTo"_ns,
+                                                  header.replyTo));
+  }
+  if (!header.charset.IsEmpty()) {
+    MOZ_TRY(messages.WriteImportedMessageProperty(key, "msgCharSet"_ns,
+                                                  header.charset));
+  }
+  if (!header.accountKey.IsEmpty()) {
+    MOZ_TRY(messages.WriteImportedMessageProperty(key, "account"_ns,
+                                                  header.accountKey));
+  }
+  if (header.dateReceived) {
+    uint32_t seconds;
+    PRTime2Seconds(header.dateReceived, &seconds);
+    nsAutoCString value;
+    value.AppendInt(seconds, 16);
+    MOZ_TRY(
+        messages.WriteImportedMessageProperty(key, "dateReceived"_ns, value));
+  }
+  for (const auto& extra : header.extras) {
+    if (!extra.k.EqualsLiteral("keywords")) {
+      MOZ_TRY(messages.WriteImportedMessageProperty(key, extra.k, extra.v));
+    }
+  }
+  if (header.storeToken) {
+    MOZ_TRY(messages.WriteImportedMessageProperty(key, "storeToken"_ns,
+                                                  *header.storeToken));
+  }
+  if (header.messageSize) {
+    MOZ_TRY(messages.WriteImportedMessageProperty(key, "messageSize"_ns,
+                                                  *header.messageSize));
+  }
+  if (header.offlineMessageSize) {
+    MOZ_TRY(messages.WriteImportedMessageProperty(key, "offlineMessageSize"_ns,
+                                                  *header.offlineMessageSize));
+  }
+  if (header.lineCount) {
+    MOZ_TRY(messages.WriteImportedMessageProperty(key, "lineCount"_ns,
+                                                  *header.lineCount));
+  }
   {
     nsCOMPtr<mozIStorageStatement> stmt;
     MOZ_TRY(GetStatement("ImportSnapshotMessage"_ns,
@@ -2561,45 +2605,7 @@ nsresult DatabaseCore::WriteImportedMessage(uint64_t folderId, nsMsgKey key,
     MOZ_TRY(stmt->BindUTF8StringByName("tags"_ns, tags));
     MOZ_TRY(stmt->Execute());
   }
-  auto& messages = MessageDB();
   MOZ_TRY(messages.WriteMessageReferencesInTransaction(key, header.references));
-  if (!header.replyTo.IsEmpty()) {
-    MOZ_TRY(messages.SetMessageProperty(key, "replyTo"_ns, header.replyTo));
-  }
-  if (!header.charset.IsEmpty()) {
-    MOZ_TRY(messages.SetMessageProperty(key, "msgCharSet"_ns, header.charset));
-  }
-  if (!header.accountKey.IsEmpty()) {
-    MOZ_TRY(messages.SetMessageProperty(key, "account"_ns, header.accountKey));
-  }
-  if (header.dateReceived) {
-    uint32_t seconds;
-    PRTime2Seconds(header.dateReceived, &seconds);
-    nsAutoCString value;
-    value.AppendInt(seconds, 16);
-    MOZ_TRY(messages.SetMessageProperty(key, "dateReceived"_ns, value));
-  }
-  for (const auto& extra : header.extras) {
-    if (!extra.k.EqualsLiteral("keywords")) {
-      MOZ_TRY(messages.SetMessageProperty(key, extra.k, extra.v));
-    }
-  }
-  if (header.storeToken) {
-    MOZ_TRY(
-        messages.SetMessageProperty(key, "storeToken"_ns, *header.storeToken));
-  }
-  if (header.messageSize) {
-    MOZ_TRY(messages.SetMessageProperty(key, "messageSize"_ns,
-                                        *header.messageSize));
-  }
-  if (header.offlineMessageSize) {
-    MOZ_TRY(messages.SetMessageProperty(key, "offlineMessageSize"_ns,
-                                        *header.offlineMessageSize));
-  }
-  if (header.lineCount) {
-    MOZ_TRY(
-        messages.SetMessageProperty(key, "lineCount"_ns, *header.lineCount));
-  }
   return NS_OK;
 }
 

@@ -8900,6 +8900,46 @@ nsresult MessageDatabase::SetMessageProperty(nsMsgKey aKey,
   return NS_OK;
 }
 
+namespace {
+template <typename Bind>
+nsresult WriteImportedProperty(nsMsgKey key, const nsACString& name,
+                               Bind&& bind) {
+  NS_ENSURE_TRUE(!name.EqualsLiteral("keywords") &&
+                     !IsNewsBindingProperty(name) &&
+                     !name.EqualsLiteral(kAcceptedAppendObservationProperty),
+                 NS_ERROR_INVALID_ARG);
+  bool active;
+  MOZ_TRY(DatabaseCore::sConnection->GetTransactionInProgress(&active));
+  NS_ENSURE_TRUE(active, NS_ERROR_UNEXPECTED);
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "WriteImportedMessageProperty"_ns,
+      "REPLACE INTO message_properties (id, name, value) "
+      "VALUES (:id, :name, :value)"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+  MOZ_TRY(stmt->BindUTF8StringByName("name"_ns, name));
+  MOZ_TRY(bind(stmt));
+  return stmt->Execute();
+}
+}  // namespace
+
+nsresult MessageDatabase::WriteImportedMessageProperty(
+    nsMsgKey key, const nsACString& name, const nsACString& value) {
+  return WriteImportedProperty(key, name, [&](mozIStorageStatement* stmt) {
+    return stmt->BindUTF8StringByName("value"_ns, value);
+  });
+}
+
+nsresult MessageDatabase::WriteImportedMessageProperty(nsMsgKey key,
+                                                       const nsACString& name,
+                                                       uint32_t value) {
+  return WriteImportedProperty(key, name, [&](mozIStorageStatement* stmt) {
+    return stmt->BindInt64ByName("value"_ns, value);
+  });
+}
+
 NS_IMETHODIMP_(void)
 MessageDatabase::AddMessageListener(MessageListener* aListener) {
   if (aListener) {

@@ -1771,6 +1771,7 @@ function bindPanoramaMigrationTarget(
         );
       }
       await checkBackup();
+      let since = Date.now();
       const entries = [];
       const members = [];
       for (const id of ids) {
@@ -1803,13 +1804,18 @@ function bindPanoramaMigrationTarget(
         });
         members.push({ folder, source });
       }
+      note?.time?.("unitRead", since);
+      since = Date.now();
       const request = convertMorkProtocolUnit(
         entries,
         token,
         databaseSourceId,
         note
       );
+      note?.time?.("unitConvert", since);
+      since = Date.now();
       await journal.bindImportUnit(request);
+      note?.time?.("unitBind", since);
       checkIdentity();
       checkLock();
       for (let index = 0; index < members.length; index++) {
@@ -1880,10 +1886,13 @@ function bindPanoramaMigrationTarget(
         }
         checkPaths(folder, source, pending.request.folders[index]);
       }
+      let since = Date.now();
       const receipt = await database.importFolderSnapshot(
         pending.members[0].folder,
         pending.request
       );
+      note?.time?.("unitNativeImport", since);
+      since = Date.now();
       checkIdentity();
       checkLock();
       const checked = validateMorkProtocolUnitReceipt(pending.request, receipt);
@@ -1897,6 +1906,7 @@ function bindPanoramaMigrationTarget(
           checked.folders[index]
         );
       }
+      note?.time?.("unitReadback", since);
       verified.add(token);
       return checked;
     },
@@ -2009,16 +2019,16 @@ function persistedAccountKeyForServer(serverKey) {
  *   Native getter failures propagate unchanged after the already committed import.
  */
 function verifyNativeMessageProjection(database, folder, request, receipt) {
+  // One lookup table per folder. Nothing else is built per message: a large
+  // folder is tens of thousands of messages, and a Map, a Set and an array of
+  // pairs for each of them, with every wrapped header kept alive, cost more
+  // than the comparisons themselves.
   const keys = new Map(receipt.keys);
-  const remaining = new Set(keys.values());
-  const headers = new Map();
-  for (const header of folder.messages) {
-    if (!remaining.delete(header.messageKey)) {
-      throw new Error("Native migration message set differs from its receipt");
-    }
-    headers.set(header.messageKey, header);
+  const pending = new Map();
+  for (const message of request.messages) {
+    pending.set(keys.get(message.sourceKey), message);
   }
-  if (remaining.size) {
+  if (pending.size !== request.messages.length) {
     throw new Error("Native migration message set differs from its receipt");
   }
   const newKeys = new Set(folder.msgDatabase.getNewList());
@@ -2032,7 +2042,6 @@ function verifyNativeMessageProjection(database, folder, request, receipt) {
   const news = request.folder.protocol === "nntp";
   const readMask = news ? Ci.nsMsgMessageFlags.Read : 0;
   let incarnation = null;
-  // Looked up once per folder: a large folder has one binding per message.
   const uids = new Map(
     (request.imap?.serverUids ?? []).map(binding => [
       binding.sourceKey,
@@ -2040,9 +2049,31 @@ function verifyNativeMessageProjection(database, folder, request, receipt) {
     ])
   );
   let folderAccount = null;
-  for (const message of request.messages) {
-    const key = keys.get(message.sourceKey);
-    const actual = headers.get(key);
+  // Reused for every message: the expected property names and values.
+  const names = [];
+  const values = [];
+  const expect = (name, value) => {
+    const at = names.indexOf(name);
+    if (at < 0) {
+      names.push(name);
+      values.push(value);
+    } else {
+      values[at] = value;
+    }
+  };
+  const TYPED = [
+    "storeToken",
+    "messageSize",
+    "offlineMessageSize",
+    "lineCount",
+  ];
+  for (const actual of folder.messages) {
+    const key = actual.messageKey;
+    const message = pending.get(key);
+    if (!message) {
+      throw new Error("Native migration message set differs from its receipt");
+    }
+    pending.delete(key);
     const expected = message.header;
     // Public flags include transient NewList status; the imported word must
     // still match exactly, including a persisted New bit added after import.
@@ -2055,28 +2086,22 @@ function verifyNativeMessageProjection(database, folder, request, receipt) {
       (expected.flags & ~readMask) >>> 0,
       "stored flags"
     );
-    equal(actual.messageKey, key, "messageKey");
     equal(actual.folder.id, request.folder.id, "folder");
-    for (const [name, value] of [
-      ["messageId", expected.messageId],
-      ["date", expected.date],
-      ["author", expected.sender],
-      ["recipients", expected.recipients],
-      ["ccList", expected.ccList],
-      ["bccList", expected.bccList],
-      ["subject", expected.subject],
-      ["priority", expected.priority],
-      ["charset", expected.charset],
-      ["threadId", keys.get(message.rootSourceKey)],
-      [
-        "threadParent",
-        message.parentSourceKey === null
-          ? 0
-          : keys.get(message.parentSourceKey),
-      ],
-    ]) {
-      equal(actual[name], value, name);
-    }
+    equal(actual.messageId, expected.messageId, "messageId");
+    equal(actual.date, expected.date, "date");
+    equal(actual.author, expected.sender, "author");
+    equal(actual.recipients, expected.recipients, "recipients");
+    equal(actual.ccList, expected.ccList, "ccList");
+    equal(actual.bccList, expected.bccList, "bccList");
+    equal(actual.subject, expected.subject, "subject");
+    equal(actual.priority, expected.priority, "priority");
+    equal(actual.charset, expected.charset, "charset");
+    equal(actual.threadId, keys.get(message.rootSourceKey), "threadId");
+    equal(
+      actual.threadParent,
+      message.parentSourceKey === null ? 0 : keys.get(message.parentSourceKey),
+      "threadParent"
+    );
     equal(
       (actual.flags & ~readMask) >>> 0,
       ((expected.flags | (newKeys.has(key) ? Ci.nsMsgMessageFlags.New : 0)) &
@@ -2085,44 +2110,46 @@ function verifyNativeMessageProjection(database, folder, request, receipt) {
       "flags"
     );
     equal(actual.numReferences, expected.references.length, "References count");
-    expected.references.forEach((reference, ordinal) => {
+    for (let ordinal = 0; ordinal < expected.references.length; ordinal++) {
       equal(
         actual.getStringReference(ordinal),
-        reference,
+        expected.references[ordinal],
         "References ordinal " + ordinal
       );
-    });
+    }
     equal(
       actual.getUint32Property("dateReceived"),
       expected.dateReceived / 1000000,
       "dateReceived"
     );
-    const properties = new Map(expected.extras.map(({ k, v }) => [k, v]));
-    equal(
-      actual.getStringProperty("keywords"),
-      properties.get("keywords") ?? expected.keywords,
-      "keywords"
-    );
-    properties.delete("keywords"); // Native tags are a field, not a property row.
-    if (!properties.has("account")) {
+    names.length = 0;
+    values.length = 0;
+    let keywords = expected.keywords;
+    let ownAccount = false;
+    for (const extra of expected.extras) {
+      if (extra.k === "keywords") {
+        // Native tags are a field, not a property row.
+        keywords = extra.v;
+      } else {
+        ownAccount ||= extra.k === "account";
+        expect(extra.k, extra.v);
+      }
+    }
+    equal(actual.getStringProperty("keywords"), keywords, "keywords");
+    if (!ownAccount) {
       folderAccount ??= persistedAccountKeyForServer(folder.server.key);
     }
     equal(
       actual.accountKey,
-      properties.has("account") ? expected.accountKey : folderAccount,
+      ownAccount ? expected.accountKey : folderAccount,
       "accountKey"
     );
-    for (const name of [
-      "storeToken",
-      "messageSize",
-      "offlineMessageSize",
-      "lineCount",
-    ]) {
+    for (const name of TYPED) {
       if (Object.hasOwn(expected, name)) {
         equal(actual[name], expected[name], name);
         // These canonical getters are projections of the legacy body fields.
         // Original size/offlineMsgSize/numLines cells remain separate properties.
-        properties.set(name, String(expected[name]));
+        expect(name, String(expected[name]));
       }
     }
     const uid = uids.get(message.sourceKey);
@@ -2130,10 +2157,10 @@ function verifyNativeMessageProjection(database, folder, request, receipt) {
       // A classic source uses its old key as UID without a raw property cell.
       // The explicit native binding materializes the canonical hex property.
       equal(actual.getUint32Property("uidOnServer"), uid, "uidOnServer");
-      properties.set("uidOnServer", uid.toString(16));
+      expect("uidOnServer", uid.toString(16));
     }
     if (news) {
-      properties.set("newsArticleNumber", String(message.sourceKey));
+      expect("newsArticleNumber", String(message.sourceKey));
       const group = database.messageDB.getMessageProperty(
         key,
         "newsGroupIncarnation"
@@ -2142,22 +2169,26 @@ function verifyNativeMessageProjection(database, folder, request, receipt) {
         throw new Error("Native migration news article binding differs");
       }
       incarnation = group;
-      properties.set("newsGroupIncarnation", group);
+      expect("newsGroupIncarnation", group);
     }
-    const present = new Set(actual.properties);
-    if (
-      present.size !== properties.size ||
-      [...present].some(name => !properties.has(name))
-    ) {
+    const present = actual.properties;
+    let known = present.length === names.length;
+    for (let index = 0; known && index < present.length; index++) {
+      known = names.includes(present[index]);
+    }
+    if (!known) {
       throw new Error("Native migration message property presence differs");
     }
-    for (const [name, value] of properties) {
+    for (let index = 0; index < names.length; index++) {
       equal(
-        database.messageDB.getMessageProperty(key, name),
-        value,
-        "property " + name
+        database.messageDB.getMessageProperty(key, names[index]),
+        values[index],
+        "property " + names[index]
       );
     }
+  }
+  if (pending.size) {
+    throw new Error("Native migration message set differs from its receipt");
   }
 }
 
@@ -3385,6 +3416,16 @@ async function finishPanoramaProfileStartup(
     }
     notes.get(code).set(id, count);
   };
+  // Where the time goes, in milliseconds per phase, for the report.
+  const timings = {};
+  note.time = (phase, since) => {
+    timings[phase] = (timings[phase] ?? 0) + (Date.now() - since);
+  };
+  let lap = Date.now();
+  const phase = name => {
+    note.time(name, lap);
+    lap = Date.now();
+  };
   try {
     operation = await pending;
     if (captureError) {
@@ -3487,6 +3528,7 @@ async function finishPanoramaProfileStartup(
         });
         database.validateProfileStartup(operation);
       }
+      phase("readSources");
       const journalPath = PathUtils.join(captured.workPath, "journal.json");
       journal = await MigrationJournal.create(journalPath, {
         profilePath: selected.profilePath,
@@ -3519,6 +3561,7 @@ async function finishPanoramaProfileStartup(
       });
       await journal.bindStartupTarget(database, operation, target.folders);
       await journal.recordBackup(captured.backup);
+      phase("openTarget");
       const folders = new Map(
         target.folders.map(binding => [binding.sourceId, binding.folder])
       );
@@ -3567,7 +3610,9 @@ async function finishPanoramaProfileStartup(
         operation,
         note
       );
+      phase("planCaches");
       await resumeMorkImports(journal, native, signal);
+      phase("importFolders");
       if (books.length) {
         const profiles = Cc[
           "@mozilla.org/toolkit/profile-service;1"
@@ -3593,8 +3638,10 @@ async function finishPanoramaProfileStartup(
           operation
         );
       }
+      phase("importBooksAndCaches");
       await validateStartupMigration(journal, native, database, operation);
       await journal.finishStage("validate");
+      phase("validate");
       origin = "migrated";
     } else {
       if (!["reuse", "initialize"].includes(selected.mode)) {
@@ -3639,7 +3686,13 @@ async function finishPanoramaProfileStartup(
         : (initial.record?.identity.journalPath ?? null),
     });
     if (journal) {
-      await writeStartupMigrationReport(captured.workPath, "migrated", notes);
+      phase("activate");
+      await writeStartupMigrationReport(
+        captured.workPath,
+        "migrated",
+        notes,
+        timings
+      );
     }
     return {
       profilePath: selected.profilePath,
@@ -3656,7 +3709,13 @@ async function finishPanoramaProfileStartup(
           secondary
         );
       }
-      await writeStartupMigrationReport(captured.workPath, "stopped", notes);
+      phase("stopped");
+      await writeStartupMigrationReport(
+        captured.workPath,
+        "stopped",
+        notes,
+        timings
+      );
     }
     if (createdSelection) {
       try {
@@ -3711,8 +3770,9 @@ async function finishPanoramaProfileStartup(
  * @param {"migrated"|"stopped"} outcome - How the migration ended.
  * @param {Map<string, Map<string, number>>} notes - Count per reason code and
  *   source.
+ * @param {object} timings - Milliseconds per phase.
  */
-async function writeStartupMigrationReport(workPath, outcome, notes) {
+async function writeStartupMigrationReport(workPath, outcome, notes, timings) {
   const path = PathUtils.join(workPath, "report.json");
   try {
     await IOUtils.writeJSON(
@@ -3720,6 +3780,7 @@ async function writeStartupMigrationReport(workPath, outcome, notes) {
       {
         version: 1,
         outcome,
+        timings,
         notImported: [...notes].map(([code, sources]) => ({
           code,
           sources: sources.size,

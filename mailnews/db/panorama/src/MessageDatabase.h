@@ -823,6 +823,13 @@ class MessageDatabase : public nsIMessageDatabase {
                               const nsACString& value);
   nsresult SetMessageProperty(nsMsgKey key, const nsACString& name,
                               uint32_t value);
+  // A property of a message whose row the running import transaction inserts
+  // afterwards. Written first, it needs no header lookup and the change log
+  // records the new message once, with its row, not again for each property.
+  nsresult WriteImportedMessageProperty(nsMsgKey key, const nsACString& name,
+                                        const nsACString& value);
+  nsresult WriteImportedMessageProperty(nsMsgKey key, const nsACString& name,
+                                        uint32_t value);
 
   // Stored published membership; never opens a stopped/replaced core.
   // Reads a caller transaction without owning it; errors leave exists

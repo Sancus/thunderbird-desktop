@@ -144,6 +144,12 @@ export function parseJSONFolderCache(bytes) {
       if (!text(name) || name === "key") {
         throw new Error("Invalid native JSON cache property");
       }
+      if (value === null) {
+        // Thunderbird wrote no value and reads this cell as empty
+        // (nsMsgFolderCacheElement). It has no projection; the complete
+        // original keeps it.
+        continue;
+      }
       // The current JSON producer writes userSortOrder as uint32. Historical
       // Mork conversion retains its original text projection for this property.
       const unsigned = UNSIGNED32.has(name) || name === "userSortOrder";

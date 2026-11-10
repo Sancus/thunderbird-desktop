@@ -1559,9 +1559,18 @@ add_task(function test_JSONCacheRefusesUnsafeOrAmbiguousCellTypes() {
       /cache number/
     );
   }
+  // Thunderbird writes null for a cell without a value and reads it as empty.
+  const valueless = parseJSONFolderCache(
+    encode({ [key]: { folderName: null, nextUID: null, flags: 4 } })
+  );
+  Assert.deepEqual(
+    [...valueless.entries.get(key).properties.keys()],
+    ["key", "flags"]
+  );
+  Assert.deepEqual({ ...valueless.entries.get(key).values }, { flags: 4 });
+  Assert.strictEqual(valueless.source[key].nextUID, null);
   for (const row of [
     { folderName: true },
-    { folderName: null },
     { folderName: [] },
     { folderName: {} },
     { unknownNumber: 1 },

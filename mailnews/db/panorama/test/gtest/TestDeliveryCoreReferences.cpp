@@ -25941,7 +25941,6 @@ TEST_F(DeliveryCoreReferences, StartupInvalidJSONNeverFallsBackToMork) {
        {"{", "[]", "null", "{\"\":[]}", "{\"/original.msf\":{\"flags\":true}}",
         "{\"/original.msf\":{\"flags\":4294967296}}",
         "{\"/original.msf\":{\"unknown\":1}}",
-        "{\"/original.msf\":{\"custom\":null}}",
         "{\"/original.msf\":{\"custom\":{}}}"}) {
     SCOPED_TRACE(raw);
     ASSERT_EQ(NS_OK,

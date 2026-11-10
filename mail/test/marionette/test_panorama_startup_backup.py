@@ -927,7 +927,8 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
 
     def test_movedProfileJsonCacheSkipsObsoleteEntries(self):
         root = self.create_cache_only_root("cache-moved")
-        current = {"folderName": "Cache only"}
+        # Legacy writes null for a cell without a value and reads it as empty.
+        current = {"folderName": "Cache only", "MRMTime": None, "nextUID": None}
         outside = self.outside_profile()
         # Legacy never prunes entries of an earlier profile location.
         absent = outside / "old-location" / "Mail" / "cache-moved"

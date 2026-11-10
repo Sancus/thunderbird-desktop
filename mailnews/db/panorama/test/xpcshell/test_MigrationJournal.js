@@ -962,6 +962,41 @@ add_task(async function test_journalResumesCommittedImport() {
   Assert.deepEqual(await verifyMigrationBackup(plan.backupPath), backup);
 });
 
+// The coordinator reads progress many times per folder. Reading it must not
+// copy the whole journal each time, and must never let a reader change it.
+add_task(async function test_viewIsOneFrozenSnapshotPerRevision() {
+  const { plan, path } = await migrationFiles();
+  const journal = await MigrationJournal.create(path, plan);
+  registerCleanupFunction(() => journal.close());
+  const first = journal.view;
+  Assert.strictEqual(journal.view, first, "Reads share one snapshot");
+  Assert.deepEqual(first, journal.state);
+  Assert.notStrictEqual(journal.state, journal.state, "state stays a copy");
+  for (const value of [first, first.sources, first.sources[0]]) {
+    Assert.ok(Object.isFrozen(value));
+  }
+  Assert.throws(() => {
+    first.sources[0].state = "imported";
+  }, TypeError);
+  Assert.throws(() => first.sources.push({}), TypeError);
+  const backup = await createMigrationBackup(
+    plan.profilePath,
+    plan.mailPaths,
+    plan.backupPath
+  );
+  await journal.recordBackup(backup);
+  const second = journal.view;
+  Assert.notStrictEqual(second, first, "A committed change is a new snapshot");
+  Assert.equal(first.stage, "backup", "A held snapshot never changes");
+  Assert.equal(second.stage, "import");
+  Assert.equal(second.revision, first.revision + 1);
+  Assert.deepEqual(second, journal.state);
+  const revision = second.revision;
+  await journal.recordBackup(backup);
+  Assert.equal(journal.view.revision, revision);
+  Assert.strictEqual(journal.view, second, "No change keeps the snapshot");
+});
+
 add_task(async function test_cancellationAndIncompleteMappings() {
   const { plan, path } = await migrationFiles();
   const journal = await MigrationJournal.create(path, plan);

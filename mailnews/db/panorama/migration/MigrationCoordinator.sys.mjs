@@ -74,22 +74,22 @@ ChromeUtils.defineESModuleGetters(lazy, {
  */
 export async function resumeMorkImports(journal, core, signal) {
   const checkCancelled = async () => {
-    if (signal?.aborted && !journal.state.cancelled) {
+    if (signal?.aborted && !journal.view.cancelled) {
       await journal.setCancelled(true);
     }
-    if (journal.state.cancelled) {
+    if (journal.view.cancelled) {
       throw new DOMException("Migration cancelled", "AbortError");
     }
   };
-  if (["validate", "activate", "complete"].includes(journal.state.stage)) {
+  if (["validate", "activate", "complete"].includes(journal.view.stage)) {
     return;
   }
-  if (journal.state.stage != "import") {
+  if (journal.view.stage != "import") {
     throw new Error("Migration is not at the mail-import stage");
   }
   try {
     const settledUnits = new Set();
-    for (const source of journal.state.sources) {
+    for (const source of journal.view.sources) {
       await checkCancelled();
       if (source.protocol === "imap") {
         const group = source.protocolUnitId ?? "imap";
@@ -104,7 +104,7 @@ export async function resumeMorkImports(journal, core, signal) {
             "Native complete protocol-unit migration is required"
           );
         }
-        const ids = journal.state.sources
+        const ids = journal.view.sources
           .filter(
             member =>
               member.protocol === "imap" &&
@@ -116,7 +116,7 @@ export async function resumeMorkImports(journal, core, signal) {
         let receipt = await core.findProtocolUnitReceipt(token, ids);
         if (!receipt) {
           if (
-            journal.state.sources.some(
+            journal.view.sources.some(
               member => ids.includes(member.id) && member.state === "imported"
             )
           ) {
@@ -168,7 +168,7 @@ export async function resumeMorkImports(journal, core, signal) {
       await checkCancelled();
     }
     if (
-      [...(journal.state.books ?? []), ...(journal.state.caches ?? [])].every(
+      [...(journal.view.books ?? []), ...(journal.view.caches ?? [])].every(
         unit => unit.state == "imported"
       )
     ) {
@@ -208,7 +208,7 @@ export async function resumeMorkBookImports(journal, profileLock, signal) {
       throw new Error("Migration profile lock directory is a link");
     }
     directory.normalize();
-    if (!directory.equals(new FileUtils.File(journal.state.profilePath))) {
+    if (!directory.equals(new FileUtils.File(journal.view.profilePath))) {
       throw new Error("Migration profile lock selects another profile");
     }
   };
@@ -226,26 +226,26 @@ export async function resumeMorkBookImports(journal, profileLock, signal) {
  */
 async function resumeMorkBooksWithProfile(journal, checkLock, signal) {
   const checkCancelled = async () => {
-    if (signal?.aborted && !journal.state.cancelled) {
+    if (signal?.aborted && !journal.view.cancelled) {
       await journal.setCancelled(true);
     }
-    if (journal.state.cancelled) {
+    if (journal.view.cancelled) {
       throw new DOMException("Migration cancelled", "AbortError");
     }
   };
   checkLock();
-  if (!journal.state.books?.length) {
+  if (!journal.view.books?.length) {
     return;
   }
-  if (!["import", "validate"].includes(journal.state.stage)) {
+  if (!["import", "validate"].includes(journal.view.stage)) {
     throw new Error("Migration is not at the book-import stage");
   }
   try {
-    for (const book of journal.state.books) {
+    for (const book of journal.view.books) {
       await checkCancelled();
       checkLock();
       const token = await journal.beginBookImport(book.id);
-      const roots = [journal.state.profilePath, ...journal.state.mailPaths].map(
+      const roots = [journal.view.profilePath, ...journal.view.mailPaths].map(
         path => new FileUtils.File(path)
       );
       const sourceFile = new FileUtils.File(book.path);
@@ -342,8 +342,8 @@ async function resumeMorkBooksWithProfile(journal, checkLock, signal) {
       await checkCancelled();
     }
     if (
-      journal.state.stage == "import" &&
-      [...journal.state.sources, ...(journal.state.caches ?? [])].every(
+      journal.view.stage == "import" &&
+      [...journal.view.sources, ...(journal.view.caches ?? [])].every(
         source => source.state == "imported"
       )
     ) {
@@ -393,7 +393,7 @@ export async function resumeMorkBookImportsAndPublish(
   // Only the selected-startup version7 journal is admitted on Windows. It is
   // a physical journal: every book checkpoint re-admits the source and stage
   // through native leases and compares their retained file IDs.
-  if (AppConstants.platform == "win" && journal.state.version !== 7) {
+  if (AppConstants.platform == "win" && journal.view.version !== 7) {
     throw new Error("Windows book migration requires native reparse admission");
   }
   return lazy.withMigrationAddressBookPublication(
@@ -411,13 +411,13 @@ export async function resumeMorkBookImportsAndPublish(
         }
         if (
           !selected.equals(current) ||
-          !selected.equals(new FileUtils.File(journal.state.profilePath))
+          !selected.equals(new FileUtils.File(journal.view.profilePath))
         ) {
           throw new Error("Book publication requires the held current profile");
         }
       };
       checkLock();
-      const initial = journal.state;
+      const initial = journal.view;
       if (
         !["import", "validate"].includes(initial.stage) ||
         !initial.books?.length ||
@@ -439,10 +439,10 @@ export async function resumeMorkBookImportsAndPublish(
         throw new Error("Book publication names differ from the exact plan");
       }
       const checkCancelled = async () => {
-        if (signal?.aborted && !journal.state.cancelled) {
+        if (signal?.aborted && !journal.view.cancelled) {
           await journal.setCancelled(true);
         }
-        if (journal.state.cancelled) {
+        if (journal.view.cancelled) {
           throw new DOMException("Migration cancelled", "AbortError");
         }
       };
@@ -454,12 +454,12 @@ export async function resumeMorkBookImportsAndPublish(
         }
         await resumeMorkBooksWithProfile(journal, checkLock, signal);
         const publications = [];
-        for (const book of journal.state.books) {
+        for (const book of journal.view.books) {
           await checkCancelled();
           checkLock();
           const roots = [
-            journal.state.profilePath,
-            ...journal.state.mailPaths,
+            journal.view.profilePath,
+            ...journal.view.mailPaths,
           ].map(path => new FileUtils.File(path));
           const source = new FileUtils.File(book.path);
           if (admittedFolderPath(source, roots) !== book.path) {
@@ -835,13 +835,13 @@ async function readBoundMorkFolderCacheInput(
   const lock = startupOperation
     ? null
     : profileLock.QueryInterface(Ci.nsIProfileLock);
-  const state = journal.state;
+  const state = journal.view;
   const databaseSourceId = database.sourceId;
   const roots = [state.profilePath, ...state.mailPaths].map(
     root => new FileUtils.File(root)
   );
   const checkTarget = () => {
-    const current = journal.state;
+    const current = journal.view;
     const selected = new FileUtils.File(PathUtils.profileDir);
     const directory = startupOperation
       ? startupMigrationDirectory(journal, database, startupOperation)
@@ -1010,21 +1010,21 @@ export async function resumeMorkCacheImports(
     throw new Error("Native Unix cache import/receipt APIs are required");
   }
   const checkCancelled = async () => {
-    if (signal?.aborted && !journal.state.cancelled) {
+    if (signal?.aborted && !journal.view.cancelled) {
       await journal.setCancelled(true);
     }
-    if (journal.state.cancelled) {
+    if (journal.view.cancelled) {
       throw new DOMException("Migration cancelled", "AbortError");
     }
   };
-  if (!journal.state.caches?.length) {
+  if (!journal.view.caches?.length) {
     throw new Error("Migration has no explicit cache plan");
   }
-  if (!["import", "validate"].includes(journal.state.stage)) {
+  if (!["import", "validate"].includes(journal.view.stage)) {
     throw new Error("Migration is not at the cache-import stage");
   }
   try {
-    for (const cache of journal.state.caches) {
+    for (const cache of journal.view.caches) {
       await checkCancelled();
       if (cache.requestVersion >= 2) {
         const input = await readBoundMorkFolderCacheInput(
@@ -1107,7 +1107,7 @@ export async function resumeMorkCacheImports(
         : profileLock.QueryInterface(Ci.nsIProfileLock).directory.clone();
       directory.normalize();
       if (
-        !directory.equals(new FileUtils.File(journal.state.profilePath)) ||
+        !directory.equals(new FileUtils.File(journal.view.profilePath)) ||
         database.sourceId !== cache.databaseSourceId
       ) {
         throw new Error("Cache target changed before native import");
@@ -1125,8 +1125,8 @@ export async function resumeMorkCacheImports(
       await checkCancelled();
     }
     if (
-      journal.state.stage == "import" &&
-      [...journal.state.sources, ...(journal.state.books ?? [])].every(
+      journal.view.stage == "import" &&
+      [...journal.view.sources, ...(journal.view.books ?? [])].every(
         unit => unit.state == "imported"
       )
     ) {
@@ -1225,7 +1225,7 @@ export async function readLegacyGlodaMailRecovery(
   ) {
     throw new Error("Native Panorama recovery backend is required");
   }
-  const state = journal.state;
+  const state = journal.view;
   if (
     !["import", "validate", "activate", "complete"].includes(state.stage) ||
     state.sources.some(source => source.state != "imported") ||
@@ -1324,7 +1324,7 @@ export async function readLegacyGlodaMailRecovery(
       }
       if (
         database.sourceId !== databaseSourceId ||
-        JSON.stringify(journal.state) !== before
+        JSON.stringify(journal.view) !== before
       ) {
         throw new Error("Gloda recovery journal/database identity changed");
       }
@@ -1548,11 +1548,11 @@ export function createWindowsPanoramaMigrationTarget(
   }
   if (
     !(journal instanceof MigrationJournal) ||
-    ![4, 6].includes(journal.state.version) ||
+    ![4, 6].includes(journal.view.version) ||
     !["import", "validate", "activate", "complete"].includes(
-      journal.state.stage
+      journal.view.stage
     ) ||
-    !journal.state.backup
+    !journal.view.backup
   ) {
     throw new Error("Windows migration requires a backed-up version4 journal");
   }
@@ -1580,7 +1580,8 @@ function bindPanoramaMigrationTarget(
   resolveFolder,
   profileLock,
   windows,
-  checkStartup = null
+  checkStartup = null,
+  note = undefined
 ) {
   const database = core.QueryInterface(Ci.nsIDatabaseCore);
   if (
@@ -1605,7 +1606,7 @@ function bindPanoramaMigrationTarget(
     if (
       !databaseSourceId ||
       database.sourceId !== databaseSourceId ||
-      journal.state.sources.some(
+      journal.view.sources.some(
         source => source.databaseSourceId !== databaseSourceId
       )
     ) {
@@ -1621,7 +1622,7 @@ function bindPanoramaMigrationTarget(
     }
     const directory = lock.directory.clone();
     if (windows) {
-      const state = journal.state;
+      const state = journal.view;
       const root = state.originalRoots.find(
         item => item.canonicalPath === state.profilePath
       );
@@ -1655,13 +1656,13 @@ function bindPanoramaMigrationTarget(
       throw new Error("Migration profile lock directory is a link");
     }
     directory.normalize();
-    if (!directory.equals(new FileUtils.File(journal.state.profilePath))) {
+    if (!directory.equals(new FileUtils.File(journal.view.profilePath))) {
       throw new Error("Migration profile lock selects another profile");
     }
   };
   const plannedSource = (token, identity) => {
     checkIdentity();
-    const source = journal.state.sources.find(
+    const source = journal.view.sources.find(
       item => item.id === identity.sourceId
     );
     if (
@@ -1680,7 +1681,7 @@ function bindPanoramaMigrationTarget(
     if (!windows) {
       return;
     }
-    const state = journal.state;
+    const state = journal.view;
     const actual = await verifyMigrationBackup(state.backupPath);
     const manifest = await IOUtils.readJSON(actual.path);
     if (
@@ -1707,7 +1708,7 @@ function bindPanoramaMigrationTarget(
         source.physicalIdentity.parentId !== measured.summary.parentId ||
         Object.values(measured).some(
           record =>
-            !journal.state.originalRoots.some(
+            !journal.view.originalRoots.some(
               root =>
                 root.originalPath === record.originalRoot &&
                 root.canonicalPath === record.canonicalRoot &&
@@ -1725,7 +1726,7 @@ function bindPanoramaMigrationTarget(
       }
       return;
     }
-    const roots = [journal.state.profilePath, ...journal.state.mailPaths].map(
+    const roots = [journal.view.profilePath, ...journal.view.mailPaths].map(
       path => new FileUtils.File(path)
     );
     const summary = admittedFolderPath(folder.summaryFile, roots);
@@ -1741,7 +1742,7 @@ function bindPanoramaMigrationTarget(
   };
   const checkedReceipt = (folder, request, receipt) => {
     const result = validateMorkFolderReceipt(request, receipt);
-    if (journal.state.stage == "import" || journal.state.version === 7) {
+    if (journal.view.stage == "import" || journal.view.version === 7) {
       verifyNativeMessageProjection(database, folder, request, result);
     }
     checkIdentity();
@@ -1756,7 +1757,7 @@ function bindPanoramaMigrationTarget(
       prepared = null;
       checkIdentity();
       checkLock();
-      const unit = journal.state.protocolUnits?.find(
+      const unit = journal.view.protocolUnits?.find(
         value => value.token === token
       );
       if (!unit || JSON.stringify(unit.sourceIds) !== JSON.stringify(ids)) {
@@ -1768,7 +1769,7 @@ function bindPanoramaMigrationTarget(
       const entries = [];
       const members = [];
       for (const id of ids) {
-        const source = journal.state.sources.find(value => value.id === id);
+        const source = journal.view.sources.find(value => value.id === id);
         if (
           !source ||
           source.protocol !== "imap" ||
@@ -1797,7 +1798,12 @@ function bindPanoramaMigrationTarget(
         });
         members.push({ folder, source });
       }
-      const request = convertMorkProtocolUnit(entries, token, databaseSourceId);
+      const request = convertMorkProtocolUnit(
+        entries,
+        token,
+        databaseSourceId,
+        note
+      );
       await journal.bindImportUnit(request);
       checkIdentity();
       checkLock();
@@ -1816,7 +1822,7 @@ function bindPanoramaMigrationTarget(
       checkLock();
       if (receipt !== null) {
         const checked = validateMorkProtocolUnitReceipt(request, receipt);
-        if (unit.state !== "imported" || journal.state.version === 7) {
+        if (unit.state !== "imported" || journal.view.version === 7) {
           for (let index = 0; index < members.length; index++) {
             const { folder, source } = members[index];
             checkPaths(folder, source, request.folders[index]);
@@ -1837,7 +1843,7 @@ function bindPanoramaMigrationTarget(
     async importProtocolUnit(token, ids) {
       const pending = prepared;
       prepared = null;
-      const unit = journal.state.protocolUnits?.find(
+      const unit = journal.view.protocolUnits?.find(
         value => value.token === token
       );
       if (
@@ -1856,7 +1862,7 @@ function bindPanoramaMigrationTarget(
       await checkBackup();
       for (let index = 0; index < pending.members.length; index++) {
         const { folder } = pending.members[index];
-        const source = journal.state.sources.find(
+        const source = journal.view.sources.find(
           value => value.id === ids[index]
         );
         if (
@@ -1904,7 +1910,8 @@ function bindPanoramaMigrationTarget(
         ),
         source,
         databaseSourceId,
-        database.folderDB.getFolderFlags(folder.id)
+        database.folderDB.getFolderFlags(folder.id),
+        note
       );
       checkPaths(folder, source, request);
       checkIdentity();
@@ -2018,6 +2025,14 @@ function verifyNativeMessageProjection(database, folder, request, receipt) {
   const news = request.folder.protocol === "nntp";
   const readMask = news ? Ci.nsMsgMessageFlags.Read : 0;
   let incarnation = null;
+  // Looked up once per folder: a large folder has one binding per message.
+  const uids = new Map(
+    (request.imap?.serverUids ?? []).map(binding => [
+      binding.sourceKey,
+      binding.uid,
+    ])
+  );
+  let folderAccount = null;
   for (const message of request.messages) {
     const key = keys.get(message.sourceKey);
     const actual = headers.get(key);
@@ -2082,11 +2097,12 @@ function verifyNativeMessageProjection(database, folder, request, receipt) {
       "keywords"
     );
     properties.delete("keywords"); // Native tags are a field, not a property row.
+    if (!properties.has("account")) {
+      folderAccount ??= persistedAccountKeyForServer(folder.server.key);
+    }
     equal(
       actual.accountKey,
-      properties.has("account")
-        ? expected.accountKey
-        : persistedAccountKeyForServer(folder.server.key),
+      properties.has("account") ? expected.accountKey : folderAccount,
       "accountKey"
     );
     for (const name of [
@@ -2102,14 +2118,12 @@ function verifyNativeMessageProjection(database, folder, request, receipt) {
         properties.set(name, String(expected[name]));
       }
     }
-    const uid = request.imap?.serverUids.find(
-      binding => binding.sourceKey === message.sourceKey
-    );
-    if (uid) {
+    const uid = uids.get(message.sourceKey);
+    if (uid !== undefined) {
       // A classic source uses its old key as UID without a raw property cell.
       // The explicit native binding materializes the canonical hex property.
-      equal(actual.getUint32Property("uidOnServer"), uid.uid, "uidOnServer");
-      properties.set("uidOnServer", uid.uid.toString(16));
+      equal(actual.getUint32Property("uidOnServer"), uid, "uidOnServer");
+      properties.set("uidOnServer", uid.toString(16));
     }
     if (news) {
       properties.set("newsArticleNumber", String(message.sourceKey));
@@ -2217,21 +2231,24 @@ function admittedFolderPath(original, roots) {
  * @param {nsIDatabaseCore} core - Actual startup target.
  * @param {function(string): nsIMsgFolder} resolveFolder - Actual native folders.
  * @param {nsISupports} operation - Native-owned selected startup operation.
+ * @param {function(string, string, number): void} [note] - Told the reason
+ *   code, source ID and count of source data that is not imported.
  * @returns {object} Existing receipt/import methods with native owner checks.
  */
 export function createStartupPanoramaMigrationTarget(
   journal,
   core,
   resolveFolder,
-  operation
+  operation,
+  note
 ) {
   const windows = AppConstants.platform == "win";
   if (
     windows &&
     (!(journal instanceof MigrationJournal) ||
-      journal.state.version !== 7 ||
-      !journal.state.originalRoots?.length ||
-      !journal.state.backup)
+      journal.view.version !== 7 ||
+      !journal.view.originalRoots?.length ||
+      !journal.view.backup)
   ) {
     throw new Error("Windows startup import requires a physical journal7");
   }
@@ -2244,7 +2261,8 @@ export function createStartupPanoramaMigrationTarget(
     resolveFolder,
     null,
     windows,
-    () => startupMigrationDirectory(journal, core, operation)
+    () => startupMigrationDirectory(journal, core, operation),
+    note
   );
 }
 
@@ -2263,10 +2281,10 @@ function startupMigrationDirectory(journal, core, operation) {
   const selected = database.validateProfileStartup(operation);
   if (
     selected.phase !== "target-open" ||
-    selected.profilePath !== journal.state.profilePath ||
+    selected.profilePath !== journal.view.profilePath ||
     !selected.databaseSourceId ||
     selected.databaseSourceId !== database.sourceId ||
-    journal.state.sources.some(
+    journal.view.sources.some(
       source => source.databaseSourceId !== selected.databaseSourceId
     )
   ) {
@@ -2888,6 +2906,7 @@ function captureStartupMigration(signal, nativeAudit) {
     serverSummaries,
     books,
     caches,
+    unreferenced,
     workPath: work.path,
     backupPath,
     backup,
@@ -3345,6 +3364,14 @@ async function finishPanoramaProfileStartup(
   let journal;
   let createdSelection = false;
   let target;
+  // What this migration leaves out on purpose: reason code, then source.
+  const notes = new Map();
+  const note = (code, id, count) => {
+    if (!notes.has(code)) {
+      notes.set(code, new Map());
+    }
+    notes.get(code).set(id, count);
+  };
   try {
     operation = await pending;
     if (captureError) {
@@ -3372,6 +3399,9 @@ async function finishPanoramaProfileStartup(
         throw new Error(
           "Legacy startup migration has no verified closed-writer copy"
         );
+      }
+      if (captured.unreferenced) {
+        note("unreferenced-summaries", "", captured.unreferenced);
       }
       const books = [];
       for (const [index, book] of captured.books.entries()) {
@@ -3502,6 +3532,7 @@ async function finishPanoramaProfileStartup(
               "original cache stays in the backup",
             unboundKeys.length
           );
+          note("obsolete-cache-entries", cache.id, unboundKeys.length);
         }
         const snapshot = await prepareMorkFolderCacheImport(
           journal,
@@ -3520,7 +3551,8 @@ async function finishPanoramaProfileStartup(
         journal,
         database,
         resolveFolder,
-        operation
+        operation,
+        note
       );
       await resumeMorkImports(journal, native, signal);
       if (books.length) {
@@ -3593,6 +3625,9 @@ async function finishPanoramaProfileStartup(
         ? PathUtils.join(captured.workPath, "journal.json")
         : (initial.record?.identity.journalPath ?? null),
     });
+    if (journal) {
+      await writeStartupMigrationReport(captured.workPath, "migrated", notes);
+    }
     return {
       profilePath: selected.profilePath,
       mode: selected.mode,
@@ -3608,6 +3643,7 @@ async function finishPanoramaProfileStartup(
           secondary
         );
       }
+      await writeStartupMigrationReport(captured.workPath, "stopped", notes);
     }
     if (createdSelection) {
       try {
@@ -3645,6 +3681,37 @@ async function finishPanoramaProfileStartup(
     throw error;
   } finally {
     journal?.close();
+  }
+}
+
+/**
+ * Writes what a startup migration did not import beside its journal: reason
+ * codes and counts only, never a name, path or message data. Best effort; the
+ * report does not decide the outcome.
+ *
+ * @param {string} workPath - The migration's work directory.
+ * @param {"migrated"|"stopped"} outcome - How the migration ended.
+ * @param {Map<string, Map<string, number>>} notes - Count per reason code and
+ *   source.
+ */
+async function writeStartupMigrationReport(workPath, outcome, notes) {
+  const path = PathUtils.join(workPath, "report.json");
+  try {
+    await IOUtils.writeJSON(
+      path,
+      {
+        version: 1,
+        outcome,
+        notImported: [...notes].map(([code, sources]) => ({
+          code,
+          sources: sources.size,
+          count: [...sources.values()].reduce((sum, count) => sum + count, 0),
+        })),
+      },
+      { tmpPath: path + ".tmp" }
+    );
+  } catch (error) {
+    console.error("Could not write the startup migration report", error);
   }
 }
 
@@ -3752,10 +3819,10 @@ function startupCacheKeyPlan(keys, bindings) {
  * @returns {Promise<void>} Full matching native mail receipt readback.
  */
 async function validateStartupMigration(journal, native, database, operation) {
-  if (journal.state.stage !== "validate" || journal.state.cancelled) {
+  if (journal.view.stage !== "validate" || journal.view.cancelled) {
     throw new Error("Startup migration imports have not completed");
   }
-  for (const unit of journal.state.protocolUnits ?? []) {
+  for (const unit of journal.view.protocolUnits ?? []) {
     const receipt = await native.findProtocolUnitReceipt(
       unit.token,
       unit.sourceIds
@@ -3765,7 +3832,7 @@ async function validateStartupMigration(journal, native, database, operation) {
     }
     startupMigrationDirectory(journal, database, operation);
   }
-  for (const source of journal.state.sources) {
+  for (const source of journal.view.sources) {
     if (source.protocol === "imap") {
       continue;
     }

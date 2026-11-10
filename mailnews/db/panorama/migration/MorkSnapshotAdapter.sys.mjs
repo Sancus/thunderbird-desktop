@@ -63,6 +63,8 @@ const INT64_PROPERTIES = new Set(["folderSize", "expungedBytes"]);
  * @param {object} source - Journal source with durable token/databaseSourceId.
  * @param {string} databaseSourceId - Actual current core.sourceId.
  * @param {number} folderFlags - Actual current nsIMsgFolder flags.
+ * @param {function(string, string, number): void} [note] - Told the reason
+ *   code, source ID and count of source data that is not imported.
  * @returns {object} Complete native request, including all original raw records.
  * @throws {Error} On identity conflict or unrepresentable required source state.
  */
@@ -70,14 +72,16 @@ export function convertMorkFolderSnapshot(
   input,
   source,
   databaseSourceId,
-  folderFlags
+  folderFlags,
+  note
 ) {
   return convertMorkSnapshot(
     input,
     source,
     databaseSourceId,
     folderFlags,
-    false
+    false,
+    note
   );
 }
 
@@ -89,6 +93,8 @@ export function convertMorkFolderSnapshot(
  * @param {string} databaseSourceId - Current native incarnation.
  * @param {number} folderFlags - Current native folder flags.
  * @param {boolean} imap - Whether to account supported saved IMAP records.
+ * @param {function(string, string, number): void} [note] - Told what is not
+ *   imported.
  * @returns {object} Checked owned request.
  */
 function convertMorkSnapshot(
@@ -96,7 +102,8 @@ function convertMorkSnapshot(
   source,
   databaseSourceId,
   folderFlags,
-  imap
+  imap,
+  note
 ) {
   if (
     (input.version !== 1 &&
@@ -171,7 +178,7 @@ function convertMorkSnapshot(
   request.databaseSourceId = databaseSourceId;
   request.recordsComplete = false;
   request.unhandledRecords = [];
-  request.folderProperties = accountRecords(request, folderFlags, imap);
+  request.folderProperties = accountRecords(request, folderFlags, imap, note);
   request.recordsComplete = true;
   return request;
 }
@@ -185,10 +192,17 @@ function convertMorkSnapshot(
  *   Reader inputs and their persisted journal sources, in source-ID order.
  * @param {string} token - Persisted whole-unit token.
  * @param {string} databaseSourceId - Actual native database incarnation.
+ * @param {function(string, string, number): void} [note] - Told the reason
+ *   code, source ID and count of source data that is not imported.
  * @returns {object} Version3 unit with existing platform-bound member requests.
  * @throws {Error} For an incomplete, ambiguous or conflicting source unit.
  */
-export function convertMorkProtocolUnit(entries, token, databaseSourceId) {
+export function convertMorkProtocolUnit(
+  entries,
+  token,
+  databaseSourceId,
+  note
+) {
   if (
     !Array.isArray(entries) ||
     !entries.length ||
@@ -207,7 +221,8 @@ export function convertMorkProtocolUnit(entries, token, databaseSourceId) {
       source,
       databaseSourceId,
       folderFlags,
-      true
+      true,
+      note
     );
     request.imap.originalFolderURI =
       source.originalFolderURI ?? input.folder.uri;
@@ -1059,8 +1074,9 @@ function validateRetainedWindowsReceipt(request, receipt) {
  * @param {boolean} imap - Accept the saved offline and empty pending tables.
  * @returns {{messageTable: object|undefined, infoTable: object|undefined,
  *   allThreads: object|undefined, offlineTable: object|undefined,
- *   threadTables: Map<number, object>, unifiedHits: object[]}} The selected
- *   tables, thread ID map and cached unified folder hits.
+ *   threadTables: Map<number, object>, unifiedHits: object[],
+ *   pendingRows: number}} The selected tables, thread ID map, cached unified
+ *   folder hits and the count of pending header attribute rows.
  * @throws {Error} If a table has an unsupported or duplicate shape.
  */
 function classifyRecordTables(tables, imap) {
@@ -1068,7 +1084,7 @@ function classifyRecordTables(tables, imap) {
   let infoTable;
   let allThreads;
   let offlineTable;
-  let pendingTable;
+  let pendingRows = 0;
   const threadTables = new Map();
   const unifiedHits = [];
   for (const [key, table] of tables) {
@@ -1108,28 +1124,22 @@ function classifyRecordTables(tables, imap) {
       table.metaRow === null
     ) {
       offlineTable = table;
-    } else if (
-      imap &&
-      table.scope == PENDING &&
-      table.id === 1 &&
-      kind == KIND + "pending" &&
-      !pendingTable &&
-      table.metaRow === null &&
-      table.rows.length === 0
-    ) {
-      // Adding an IMAP header creates this pending-attributes table even when
-      // no pending attributes exist. Nonempty pending state stays unsupported.
-      pendingTable = table;
+    } else if (table.scope == PENDING) {
+      // Attributes nsImapMailDatabase keeps, by Message-ID, for a message that
+      // has not arrived yet (a copy's keywords, a sent message's identity).
+      // Old Thunderbird applies them if such a header is ever added and loses
+      // them when the summary is rebuilt; rows of messages that never arrive
+      // stay for good. Panorama keeps such attributes only with a detached
+      // header, so there is nowhere to import them to. They are counted for
+      // the report and stay in the original summary.
+      pendingRows += table.rows.length;
     } else if (
       table.scope == MESSAGE &&
       kind?.startsWith(UNIFIED_HITS) &&
       table.metaRow === null
     ) {
       unifiedHits.push(table);
-    } else if (
-      (table.scope == OFFLINE || table.scope == PENDING) &&
-      (imap || table.rows.length)
-    ) {
+    } else if (table.scope == OFFLINE && (imap || table.rows.length)) {
       // Pending server work is user data this reader must understand.
       throw new Error("Unsupported Mork structural/offline table: " + key);
     }
@@ -1142,6 +1152,7 @@ function classifyRecordTables(tables, imap) {
     offlineTable,
     threadTables,
     unifiedHits,
+    pendingRows,
   };
 }
 
@@ -1153,9 +1164,11 @@ function classifyRecordTables(tables, imap) {
  * @param {object} request - Owned cloned source input.
  * @param {number} folderFlags - Current folder flags; mismatches need native support.
  * @param {boolean} [imap=false] - Account the typed saved IMAP operation section.
+ * @param {function(string, string, number): void} [note] - Told what is not
+ *   imported.
  * @returns {object[]} Exact text properties with explicit known numeric views.
  */
-function accountRecords(request, folderFlags, imap = false) {
+function accountRecords(request, folderFlags, imap = false, note = null) {
   const rows = new Map();
   for (const row of request.records.rows) {
     const key = rowKey(row);
@@ -1201,10 +1214,11 @@ function accountRecords(request, folderFlags, imap = false) {
   if (!sameKeys([...messages.keys()], request.source.messageKeys)) {
     throw new Error("Incomplete Mork physical source key set");
   }
-  const { messageTable, infoTable, offlineTable } = classifyRecordTables(
-    tables,
-    imap
-  );
+  const { messageTable, infoTable, offlineTable, pendingRows } =
+    classifyRecordTables(tables, imap);
+  if (pendingRows) {
+    note?.("pending-header-attributes", request.sourceId, pendingRows);
+  }
   // The all-headers table and the folder-info row are the index. Only an
   // empty folder's summary may lack the all-headers table; nsMsgDatabase
   // recreates it when it opens one.

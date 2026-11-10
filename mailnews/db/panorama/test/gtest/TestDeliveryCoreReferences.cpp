@@ -10091,26 +10091,29 @@ TEST_F(DeliveryCoreReferences, ImapRawRecordsRejectOtherFlagDifferences) {
                      false, false, Some(pending)));
 }
 
-TEST_F(DeliveryCoreReferences, ImapRawRecordsRefusePendingState) {
+// The pending table holds attributes for a message that has not arrived yet
+// (nsImapMailDatabase). There is no native place for them and old Thunderbird
+// loses them when a summary is rebuilt: its rows refuse nothing. They are not
+// pending server work, which lives in the operations table.
+TEST_F(DeliveryCoreReferences, ImapRawRecordsPendingAttributesRefuseNothing) {
   ASSERT_EQ(NS_OK, Start());
   const auto source = RawImportRecords(false, true, false);
-  for (auto pair :
-       {std::pair{u"pending\"}],\"metaRow\":null,\"rows\":[]",
-                  u"pending\"}],\"metaRow\":null,\"rows\":[\"5001:"
-                  u"ns:msg:db:row:scope:msgs:all\"]"},
-        std::pair{u"pending\"}],\"metaRow\":null",
-                  u"pending\"}],\"metaRow\":\"1:m\""},
-        std::pair{u"pending\"}]",
-                  u"pending\"},{\"k\":\"unknown\",\"v\":\"0\"}]"}}) {
+  for (auto pair : {std::pair{u"pending\"}],\"metaRow\":null,\"rows\":[]",
+                              u"pending\"}],\"metaRow\":null,\"rows\":[\"5001:"
+                              u"ns:msg:db:row:scope:msgs:all\"]"},
+                    std::pair{u"pending\"}],\"metaRow\":null",
+                              u"pending\"}],\"metaRow\":\"1:m\""},
+                    std::pair{u"scope:pending:all", u"scope:foreign:all"}}) {
     auto changed = source;
     ASSERT_NE(kNotFound, changed.Find(pair.first));
     changed.ReplaceSubstring(pair.first, pair.second);
-    EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED, CheckRawImport(changed));
+    EXPECT_EQ(NS_OK, CheckRawImport(changed));
   }
-  // A table in a scope no reader knows holds no pending state.
-  auto foreign = source;
-  foreign.ReplaceSubstring(u"scope:pending:all", u"scope:foreign:all");
-  EXPECT_EQ(NS_OK, CheckRawImport(foreign));
+  // A table parameter no Mork writer produces is still refused.
+  auto unknown = source;
+  unknown.ReplaceSubstring(u"pending\"}]",
+                           u"pending\"},{\"k\":\"unknown\",\"v\":\"0\"}]");
+  EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED, CheckRawImport(unknown));
 }
 
 // A thread's metadata row caches counts and a newest date. Old Thunderbird

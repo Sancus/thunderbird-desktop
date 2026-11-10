@@ -52,6 +52,7 @@ const openJournals = new Set();
 export class MigrationJournal {
   #path;
   #state;
+  #view = null;
   #busy = false;
   #failed = false;
   #closed = false;
@@ -250,6 +251,19 @@ export class MigrationJournal {
   /** @returns {object} Owned copy; callers cannot change persisted progress. */
   get state() {
     return structuredClone(this.#state);
+  }
+
+  /**
+   * The same progress for callers that only read it: one deeply frozen
+   * snapshot per committed revision, shared by every reader. The state holds a
+   * key map per imported folder and is read many times per folder; an owned
+   * copy per read made a large profile's import quadratic.
+   *
+   * @returns {object} Read-only state of the last committed revision.
+   */
+  get view() {
+    this.#view ??= deepFreeze(structuredClone(this.#state));
+    return this.#view;
   }
 
   /** Releases this in-process writer. The caller retains the profile lock. */
@@ -1095,6 +1109,7 @@ export class MigrationJournal {
         lease?.close();
       }
       this.#state = next;
+      this.#view = null;
     } finally {
       this.#busy = false;
     }
@@ -2167,6 +2182,18 @@ export class MigrationJournal {
       throw new Error("Migration stage skips incomplete imports");
     }
   }
+}
+
+/**
+ * @param {*} value - Plain JSON state.
+ * @returns {*} The same value, frozen with everything it holds.
+ */
+function deepFreeze(value) {
+  if (value && typeof value == "object" && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    Object.values(value).forEach(deepFreeze);
+  }
+  return value;
 }
 
 /**

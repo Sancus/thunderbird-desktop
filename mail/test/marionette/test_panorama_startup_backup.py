@@ -1261,10 +1261,11 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             self.profile / "folderCache.json",
             {spelled: {"folderName": "Cache only"}}, spelled, [])
 
-    def create_legacy_imap_source(self):
+    def create_legacy_imap_source(self, pending=False):
         """Create genuine root and UID-bearing child summaries with legacy APIs."""
         self.clean_profile(False)
         source = self.marionette.execute_script("""
+            const [pending] = arguments;
             const { MailServices } = ChromeUtils.importESModule(
               'resource:///modules/MailServices.sys.mjs');
             Services.io.offline = true;
@@ -1296,6 +1297,12 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             header.setUint32Property('uidOnServer', 42);
             header.setStringProperty('s526-custom', 'imap-retained');
             database.addNewHdrToDB(header, false);
+            if (pending) {
+              // What a copy into this folder leaves until its message arrives,
+              // and for good when it never does.
+              database.setAttributeOnPendingHdr(header, 'keywords', 's526-later');
+              database.setUint32AttributeOnPendingHdr(header, 'flags', 4);
+            }
             database.summaryValid = true;
             database.commit(Ci.nsMsgDBCommitType.kLargeCommit);
             Services.prefs.savePrefFile(null);
@@ -1306,8 +1313,44 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
               folderName: folder.name, onlineName: imap.onlineName,
               hierDelim: imap.hierarchyDelimiter.charCodeAt(0).toString(16),
               boxFlags: '0'};
-        """)
+        """, script_args=[pending])
         return source
+
+    def test_migratesImapSummaryWithPendingHeaderAttributes(self):
+        """Attributes kept for a message that has not arrived yet have no
+        native place: the folder migrates, the report counts them and the
+        original summary keeps them. All data is fabricated."""
+        source = self.create_legacy_imap_source(True)
+        self.stop_application()
+        summary = Path(source["summary"])
+        original = summary.read_bytes()
+        self.assertIn(b"ns:msg:db:row:scope:pending:all", original)
+        self.assertIn(b"s526-later", original)
+        self.start_same_profile(True)
+        selected = self.selection()
+        self.assertEqual("migrated", selected["record"]["origin"])
+        messages = self.marionette.execute_script("""
+            const { MailServices } = ChromeUtils.importESModule(
+              'resource:///modules/MailServices.sys.mjs');
+            const folder = MailServices.accounts.getIncomingServer(arguments[0])
+              .rootFolder.getChildNamed('INBOX');
+            return [...folder.msgDatabase.enumerateMessages()].map(header => ({
+              id: header.messageId, uid: header.getUint32Property('uidOnServer'),
+              keywords: header.getStringProperty('keywords')}));
+        """, script_args=[source["serverKey"]])
+        self.assertEqual([{"id": "imap-activation-s526@invalid", "uid": 42,
+                           "keywords": ""}], messages)
+        self.assertEqual(original, summary.read_bytes())
+        report = json.loads(
+            (Path(selected["record"]["identity"]["journalPath"]).parent /
+             "report.json").read_text(encoding="utf-8"))
+        self.assertEqual(1, report["version"])
+        self.assertEqual("migrated", report["outcome"])
+        self.assertIn({"code": "pending-header-attributes", "sources": 1,
+                       "count": 1}, report["notImported"])
+        self.stop_application()
+        self.start_same_profile(True)
+        self.assertEqual(selected["sourceId"], self.selection()["sourceId"])
 
     def test_migratesNativeImapUidAndCacheThenReuses(self):
         source = self.create_legacy_imap_source()

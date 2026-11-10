@@ -5642,13 +5642,12 @@ nsresult CheckFullImportRecords(JSContext* cx, JS::Handle<JSObject*> request,
                kind == "ns:msg:db:table:kind:ops"_ns && !offlineTable &&
                table.meta.IsEmpty()) {
       offlineTable = &table;
-    } else if (imap && table.scope == "ns:msg:db:row:scope:pending:all"_ns &&
-               table.id == 1 && kind == "ns:msg:db:table:kind:pending"_ns &&
-               table.meta.IsEmpty() && table.members.IsEmpty()) {
-      // Adding an IMAP header creates this pending-attributes table even when
-      // no pending attributes exist. Nonempty pending state stays unsupported.
-    } else if ((table.scope == "ns:msg:db:row:scope:ops:all"_ns ||
-                table.scope == "ns:msg:db:row:scope:pending:all"_ns) &&
+    } else if (table.scope == "ns:msg:db:row:scope:pending:all"_ns) {
+      // Attributes nsImapMailDatabase keeps for a message that has not arrived
+      // yet. Old Thunderbird loses them when a summary is rebuilt, and
+      // Panorama keeps such attributes only with a detached header: there is
+      // nowhere to import them to. The script reports their count.
+    } else if (table.scope == "ns:msg:db:row:scope:ops:all"_ns &&
                (imap || !table.members.IsEmpty())) {
       // Pending server work is user data this reader must understand.
       return NS_ERROR_NOT_IMPLEMENTED;

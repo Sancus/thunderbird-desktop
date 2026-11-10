@@ -1165,11 +1165,34 @@ add_task(async function test_imapUnitRejectsUnknownOrAmbiguousBinding() {
   pendingTable.rows.push(
     pendingMember.rows[0].id + ":" + pendingMember.rows[0].scope
   );
+  // Attributes kept for a message that has not arrived yet have no native
+  // place. They refuse nothing and are reported by count, never dropped
+  // unseen.
+  const notes = [];
+  Assert.equal(
+    convertMorkProtocolUnit(
+      pendingState,
+      "snapshot-imap-refusal",
+      database.sourceId,
+      (...note) => notes.push(note)
+    ).folders.length,
+    entries.length
+  );
+  Assert.deepEqual(notes, [
+    ["pending-header-attributes", pendingState[0].source.id, 1],
+  ]);
+  // Pending server work in the operations table stays exact.
+  const foreignWork = structuredClone(entries);
+  foreignWork[0].input.records.tables.push({
+    id: 9,
+    scope: "ns:msg:db:row:scope:ops:all",
+    cells: [{ k: "k", v: "ns:msg:db:table:kind:other" }],
+    metaRow: null,
+    rows: [],
+  });
   Assert.throws(
-    () => convertUnit(pendingState),
-    error =>
-      error.message ===
-      "Unsupported Mork structural/offline table: 1:ns:msg:db:row:scope:pending:all"
+    () => convertUnit(foreignWork),
+    /Unsupported Mork structural\/offline table: 9:ns:msg:db:row:scope:ops:all/
   );
   const unread = structuredClone(entries);
   const append = unread.find(entry => entry.source.id == "MigrationAppend");

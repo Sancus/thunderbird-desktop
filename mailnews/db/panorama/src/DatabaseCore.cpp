@@ -9484,23 +9484,46 @@ bool StartupMailDataName(const nsACString& name) {
 }
 nsresult StartupConfiguredPath(nsIPrefBranch* prefs, const nsACString& branch,
                                nsIFile** output);
+// The server branches the account manager loads, with a configured directory.
+// LoadAccounts creates only the server each listed account names. Any other
+// mail.server.* branch is the leftover of a removed account: Thunderbird never
+// reads it, even when it still names a directory (possibly another server's).
+nsresult StartupAccountServerBranches(nsIPrefBranch* prefs,
+                                      nsTArray<nsCString>& branches) {
+  for (const char* list :
+       {"mail.accountmanager.accounts", "mail.accountmanager.appendaccounts"}) {
+    nsAutoCString accounts;
+    Preferences::GetCString(list, accounts);
+    nsTArray<nsCString> keys;
+    ParseString(accounts, ',', keys);
+    for (const auto& account : keys) {
+      nsAutoCString server;
+      Preferences::GetCString(
+          nsCString("mail.account."_ns + account + ".server"_ns).get(), server);
+      if (server.IsEmpty()) continue;
+      nsCString branch("mail.server."_ns + server + "."_ns);
+      if (branches.Contains(branch)) continue;
+      int32_t direct, relative;
+      MOZ_TRY(prefs->GetPrefType(nsCString(branch + "directory"_ns).get(),
+                                 &direct));
+      MOZ_TRY(prefs->GetPrefType(nsCString(branch + "directory-rel"_ns).get(),
+                                 &relative));
+      if (direct == nsIPrefBranch::PREF_INVALID &&
+          relative == nsIPrefBranch::PREF_INVALID)
+        continue;
+      branches.AppendElement(std::move(branch));
+    }
+  }
+  return NS_OK;
+}
 // Every configured server root, as StartupConfiguredRoots reads it.
 nsresult StartupConfiguredRootFiles(nsTArray<nsCOMPtr<nsIFile>>& roots) {
   nsCOMPtr<nsIPrefBranch> prefs =
       do_GetService("@mozilla.org/preferences-service;1");
   NS_ENSURE_TRUE(prefs, NS_ERROR_NOT_AVAILABLE);
-  nsTArray<nsCString> names;
-  MOZ_TRY(prefs->GetChildList("mail.server.", names));
-  nsTHashSet<nsCString> servers;
-  for (const auto& name : names) {
-    if (!StringEndsWith(name, ".directory"_ns) &&
-        !StringEndsWith(name, ".directory-rel"_ns))
-      continue;
-    int32_t dot = name.FindChar('.', 12);
-    NS_ENSURE_TRUE(dot > 12, NS_ERROR_FILE_CORRUPTED);
-    nsCString branch(Substring(name, 0, dot + 1));
-    if (servers.Contains(branch)) continue;
-    servers.Insert(branch);
+  nsTArray<nsCString> branches;
+  MOZ_TRY(StartupAccountServerBranches(prefs, branches));
+  for (const auto& branch : branches) {
     nsCOMPtr<nsIFile> root;
     MOZ_TRY(StartupConfiguredPath(prefs, branch, getter_AddRefs(root)));
     roots.AppendElement(std::move(root));
@@ -9747,19 +9770,10 @@ nsresult StartupConfiguredRoots(
   nsCOMPtr<nsIPrefBranch> prefs =
       do_GetService("@mozilla.org/preferences-service;1");
   NS_ENSURE_TRUE(prefs, NS_ERROR_NOT_AVAILABLE);
-  nsTArray<nsCString> names;
-  MOZ_TRY(prefs->GetChildList("mail.server.", names));
-  nsTHashSet<nsCString> servers;
+  nsTArray<nsCString> branches;
+  MOZ_TRY(StartupAccountServerBranches(prefs, branches));
   nsTArray<nsCString> external;
-  for (const auto& name : names) {
-    if (!StringEndsWith(name, ".directory"_ns) &&
-        !StringEndsWith(name, ".directory-rel"_ns))
-      continue;
-    int32_t dot = name.FindChar('.', 12);
-    NS_ENSURE_TRUE(dot > 12, NS_ERROR_FILE_CORRUPTED);
-    nsCString branch(Substring(name, 0, dot + 1));
-    if (servers.Contains(branch)) continue;
-    servers.Insert(branch);
+  for (const auto& branch : branches) {
     nsCOMPtr<nsIFile> root;
     MOZ_TRY(StartupConfiguredPath(prefs, branch, getter_AddRefs(root)));
     MOZ_TRY(StartupAdmitMailRoot(profile, root, external));
@@ -9788,6 +9802,55 @@ nsresult StartupConfiguredRoots(
     }
   }
   if (admitted) *admitted = std::move(external);
+  return NS_OK;
+}
+// Mail data no account references: a summary, or any file in a mail tree,
+// outside every account server root and no root summary either. A removed
+// account or a copied profile leaves such files and Thunderbird never opens
+// them. They still select a migration, never an empty initialization, but are
+// no import input: each stays in place and must be unchanged in the complete
+// backup (StartupUnreferencedRetained).
+nsresult StartupSetAsideUnreferenced(nsTArray<nsCString>& inventory,
+                                     nsTArray<nsCString>& unreferenced) {
+  nsTArray<nsCOMPtr<nsIFile>> roots;
+  MOZ_TRY(StartupConfiguredRootFiles(roots));
+  nsTHashSet<nsCString> rootSummaries;
+  for (const auto& root : roots) {
+    nsCString path;
+    MOZ_TRY(GetComparablePath(root, path));
+    rootSummaries.Insert(path + ".msf"_ns);
+  }
+  nsTArray<nsCString> referenced;
+  for (auto& path : inventory) {
+    bool keep = StringEndsWith(path, ".mab"_ns) ||
+                StringEndsWith(path, kCachePanaceaLeaf) ||
+                StringEndsWith(path, kCacheJSONLeaf) ||
+                rootSummaries.Contains(path);
+    if (!keep) {
+      nsCOMPtr<nsIFile> file;
+      MOZ_TRY(NewComparableFile(path, getter_AddRefs(file)));
+      for (const auto& root : roots) {
+        bool inside;
+        MOZ_TRY(root->Contains(file, &inside));
+        if ((keep = inside)) break;
+      }
+    }
+    (keep ? referenced : unreferenced).AppendElement(std::move(path));
+  }
+  inventory = std::move(referenced);
+  return NS_OK;
+}
+nsresult StartupUnreferencedRetained(ProfileStartupOperation& operation,
+                                     const nsTArray<nsCString>& unreferenced) {
+  for (const auto& path : unreferenced) {
+    nsCOMPtr<nsIFile> file;
+    MOZ_TRY(StartupContainedMail(operation, path, getter_AddRefs(file)));
+    auto saved = operation.backupFiles.Lookup(path);
+    NS_ENSURE_TRUE(saved, NS_ERROR_NOT_AVAILABLE);
+    nsCString actual;
+    MOZ_TRY(StartupHash(file, actual));
+    NS_ENSURE_TRUE(saved.Data() == actual, NS_ERROR_NOT_AVAILABLE);
+  }
   return NS_OK;
 }
 nsresult StartupStores(ProfileStartupOperation& operation,
@@ -13931,6 +13994,8 @@ nsresult DatabaseCore::OpenProfileStartup(JSContext* cx,
       // Physical store files are accounted by the source store, never imported
       // as a remote hierarchy or substituted for an original summary.
       // Inventory paths use the platform separator (GetComparablePath).
+      nsTArray<nsCString> unreferenced;
+      MOZ_TRY(StartupSetAsideUnreferenced(inventory, unreferenced));
       for (const auto& path : inventory) {
         if (StringEndsWith(path, ".msf"_ns) ||
             StringEndsWith(path, ".mab"_ns) ||
@@ -13939,6 +14004,7 @@ nsresult DatabaseCore::OpenProfileStartup(JSContext* cx,
           NS_ENSURE_TRUE(paths.Contains(path), NS_ERROR_NOT_AVAILABLE);
         }
       }
+      MOZ_TRY(StartupUnreferencedRetained(operation, unreferenced));
       MOZ_TRY(StartupStores(operation, inventory, paths));
       NS_ENSURE_FALSE(paths.IsEmpty(), NS_ERROR_NOT_AVAILABLE);
     }
@@ -15863,6 +15929,9 @@ nsresult DatabaseCore::CheckProfileActivation(
                            &operation.retiredPaths));
   MOZ_TRY(StartupConfiguredRoots(operation.profile, finalInventory, nullptr,
                                  &operation.retiredPaths));
+  nsTArray<nsCString> unreferenced;
+  MOZ_TRY(StartupSetAsideUnreferenced(finalInventory, unreferenced));
+  MOZ_TRY(StartupUnreferencedRetained(operation, unreferenced));
   for (const auto& path : finalInventory) {
     if (StringEndsWith(path, ".msf"_ns) || StringEndsWith(path, ".mab"_ns) ||
         StringEndsWith(path, kCachePanaceaLeaf) ||

@@ -16,6 +16,39 @@ const BACKUP_VERSION = AppConstants.platform == "win" ? 3 : 1;
 const PROFILE_LOCKS = new Set(["parent.lock", ".parentlock", "lock"]);
 
 /**
+ * The servers the account manager loads, with a persisted directory: only the
+ * server each listed account names (nsMsgAccountManager::LoadAccounts). Any
+ * other mail.server.* branch is the leftover of a removed account, which
+ * Thunderbird never reads even when it still names a directory.
+ *
+ * @returns {string[]} Sorted server keys, without initializing any server.
+ */
+export function collectAccountServerKeys() {
+  const keys = new Set();
+  for (const list of [
+    "mail.accountmanager.accounts",
+    "mail.accountmanager.appendaccounts",
+  ]) {
+    for (const account of Services.prefs.getCharPref(list, "").split(",")) {
+      const key =
+        account &&
+        Services.prefs.getCharPref("mail.account." + account + ".server", "");
+      if (
+        key &&
+        ["directory", "directory-rel"].some(
+          name =>
+            Services.prefs.getPrefType("mail.server." + key + "." + name) !=
+            Ci.nsIPrefBranch.PREF_INVALID
+        )
+      ) {
+        keys.add(key);
+      }
+    }
+  }
+  return [...keys].sort();
+}
+
+/**
  * Collects persisted profile/server storage paths without initializing stores.
  * Does not call localPath/getFileValue, which can create directories or prefs.
  * Relative descriptors take precedence, matching existing account behavior.
@@ -23,14 +56,8 @@ const PROFILE_LOCKS = new Set(["parent.lock", ".parentlock", "lock"]);
  * @returns {{profilePath: string, mailPaths: string[]}} Configured source roots.
  */
 export function collectMigrationRoots() {
-  const branches = new Set();
-  for (const name of Services.prefs.getChildList("mail.server.")) {
-    const match = /^(mail\.server\..+)\.directory(?:-rel)?$/.exec(name);
-    if (match && match[1] != "mail.server.default") {
-      branches.add(match[1]);
-    }
-  }
-  const mailPaths = [...branches].sort().map(branch => {
+  const branches = collectAccountServerKeys().map(key => "mail.server." + key);
+  const mailPaths = branches.map(branch => {
     const relative = branch + ".directory-rel";
     if (Services.prefs.getPrefType(relative) != Ci.nsIPrefBranch.PREF_INVALID) {
       return Services.prefs.getComplexValue(relative, Ci.nsIRelativeFilePref)

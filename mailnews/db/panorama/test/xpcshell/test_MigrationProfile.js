@@ -955,6 +955,10 @@ async function checkStartupTargetFailure(failure) {
   const branch = "mail.server.startupOpenFailure.";
   const hadEnabled = Services.prefs.prefHasUserValue("mail.panorama.enabled");
   const enabled = Services.prefs.getBoolPref("mail.panorama.enabled", false);
+  const accounts = Services.prefs.getCharPref(
+    "mail.accountmanager.accounts",
+    ""
+  );
   Assert.ok(!(await IOUtils.exists(work)));
   Assert.ok(!(await IOUtils.exists(selector)));
   Assert.ok(!(await IOUtils.exists(databasePath)));
@@ -1046,6 +1050,15 @@ async function checkStartupTargetFailure(failure) {
       new FileUtils.File(directory)
     );
     Services.prefs.setCharPref(branch + "type", "none");
+    // The account manager loads only a server some listed account names.
+    Services.prefs.setCharPref(
+      "mail.account.startupOpenFailure.server",
+      "startupOpenFailure"
+    );
+    Services.prefs.setCharPref(
+      "mail.accountmanager.accounts",
+      [accounts, "startupOpenFailure"].filter(Boolean).join(",")
+    );
     await Assert.rejects(
       startPanoramaProfileAtStartup(controller.signal),
       error =>
@@ -1095,6 +1108,12 @@ async function checkStartupTargetFailure(failure) {
     moduleGlobal.Cc = originalCc;
     Assert.strictEqual(moduleGlobal.Cc, originalCc);
     Services.prefs.deleteBranch(branch);
+    Services.prefs.deleteBranch("mail.account.startupOpenFailure.");
+    if (accounts) {
+      Services.prefs.setCharPref("mail.accountmanager.accounts", accounts);
+    } else {
+      Services.prefs.clearUserPref("mail.accountmanager.accounts");
+    }
     if (hadEnabled) {
       Services.prefs.setBoolPref("mail.panorama.enabled", enabled);
     } else {

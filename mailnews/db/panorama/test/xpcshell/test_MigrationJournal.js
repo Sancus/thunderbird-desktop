@@ -585,6 +585,10 @@ add_task(async function test_inventoryReadsPathsWithoutCreatingStores() {
   const relativeName = "not-created-\u90ae\u4ef6-e\u0301";
   const relative = PathUtils.join(profile.path, relativeName);
   const databasePath = PathUtils.join(profile.path, "panorama.sqlite");
+  const accounts = Services.prefs.getCharPref(
+    "mail.accountmanager.accounts",
+    ""
+  );
   Assert.ok(!(await IOUtils.exists(databasePath)));
   try {
     Services.prefs.setComplexValue(
@@ -594,6 +598,23 @@ add_task(async function test_inventoryReadsPathsWithoutCreatingStores() {
     );
     const descriptor = Services.prefs.getStringPref(branch + ".directory");
     let roots = collectMigrationRoots();
+    Assert.ok(
+      !roots.mailPaths.includes(missing),
+      "A branch no listed account names is a removed account's leftover"
+    );
+    Services.prefs.setCharPref(
+      "mail.account.migrationInventory.server",
+      "migrationInventory"
+    );
+    Assert.ok(
+      !collectMigrationRoots().mailPaths.includes(missing),
+      "An account outside the account list is never loaded either"
+    );
+    Services.prefs.setCharPref(
+      "mail.accountmanager.accounts",
+      [accounts, "migrationInventory"].filter(Boolean).join(",")
+    );
+    roots = collectMigrationRoots();
     Assert.equal(roots.profilePath, profile.path);
     Assert.ok(roots.mailPaths.includes(missing));
     Assert.ok(!Services.prefs.prefHasUserValue(branch + ".directory-rel"));
@@ -619,6 +640,12 @@ add_task(async function test_inventoryReadsPathsWithoutCreatingStores() {
     Assert.ok(!(await IOUtils.exists(databasePath)));
   } finally {
     Services.prefs.deleteBranch(branch + ".");
+    Services.prefs.deleteBranch("mail.account.migrationInventory.");
+    if (accounts) {
+      Services.prefs.setCharPref("mail.accountmanager.accounts", accounts);
+    } else {
+      Services.prefs.clearUserPref("mail.accountmanager.accounts");
+    }
   }
 });
 

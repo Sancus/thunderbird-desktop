@@ -2512,10 +2512,13 @@ function captureStartupMigration(signal, nativeAudit) {
   ) {
     return { profilePath: profile.path };
   }
-  const { collectMigrationRoots, createMigrationBackupAtStartup } =
-    ChromeUtils.importESModule(
-      "resource:///modules/panorama/MigrationBackup.sys.mjs"
-    );
+  const {
+    collectAccountServerKeys,
+    collectMigrationRoots,
+    createMigrationBackupAtStartup,
+  } = ChromeUtils.importESModule(
+    "resource:///modules/panorama/MigrationBackup.sys.mjs"
+  );
   if (AppConstants.platform === "win") {
     respellWindowsServerRoots();
   }
@@ -2553,14 +2556,7 @@ function captureStartupMigration(signal, nativeAudit) {
     externalRoots.push(directory);
   }
   const servers = [];
-  const branches = new Set();
-  for (const name of Services.prefs.getChildList("mail.server.")) {
-    const match = /^mail\.server\.([^.]+)\.directory(?:-rel)?$/.exec(name);
-    if (match && match[1] !== "default") {
-      branches.add(match[1]);
-    }
-  }
-  for (const key of [...branches].sort()) {
+  for (const key of collectAccountServerKeys()) {
     const branch = "mail.server." + key + ".";
     const directory = Services.prefs.prefHasUserValue(branch + "directory-rel")
       ? Services.prefs.getComplexValue(
@@ -2624,6 +2620,7 @@ function captureStartupMigration(signal, nativeAudit) {
   const serverSummaries = [];
   const books = [];
   const caches = [];
+  let unreferenced = 0;
   for (const file of files) {
     if (file.leafName.endsWith(".msf")) {
       const matches = servers.filter(server =>
@@ -2649,6 +2646,13 @@ function captureStartupMigration(signal, nativeAudit) {
           storeContractID: server.storeContractID,
           storeType: server.storeType,
         });
+        continue;
+      }
+      if (!matches.length && !rootMatches.length) {
+        // No account's server holds this summary: a removed account or a
+        // copied profile left it and Thunderbird never opens it. It is no
+        // migration input; it stays in place and in the complete backup.
+        unreferenced++;
         continue;
       }
       if (matches.length !== 1 || rootMatches.length) {
@@ -2695,6 +2699,13 @@ function captureStartupMigration(signal, nativeAudit) {
         path: file.path,
       });
     }
+  }
+  if (unreferenced) {
+    console.warn(
+      "Panorama migration leaves summaries of no current account in place; " +
+        "they stay in the backup",
+      unreferenced
+    );
   }
   const activeJSON = caches.find(
     cache => PathUtils.filename(cache.path) === "folderCache.json"
@@ -3006,15 +3017,12 @@ function startupEntryExists(file) {
  * respell its own ProfD.
  */
 function respellWindowsServerRoots() {
-  const branches = new Set();
-  for (const name of Services.prefs.getChildList("mail.server.")) {
-    const match = /^(mail\.server\.[^.]+\.)directory(?:-rel)?$/.exec(name);
-    if (match && match[1] !== "mail.server.default.") {
-      branches.add(match[1]);
-    }
-  }
+  const { collectAccountServerKeys } = ChromeUtils.importESModule(
+    "resource:///modules/panorama/MigrationBackup.sys.mjs"
+  );
   let changed = false;
-  for (const branch of [...branches].sort()) {
+  for (const key of collectAccountServerKeys()) {
+    const branch = "mail.server." + key + ".";
     const relative = Services.prefs.prefHasUserValue(branch + "directory-rel");
     const directory = relative
       ? Services.prefs.getComplexValue(

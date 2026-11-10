@@ -50,6 +50,13 @@ class TestPanoramaStartupBackup(MarionetteTestCase):
         self.marionette.set_pref(name, value)
         self.changed_prefs[name] = value
 
+    def register_server(self, key):
+        """List an account naming a persisted server, as the account manager does."""
+        accounts = self.marionette.get_pref("mail.accountmanager.accounts") or ""
+        self.set_pref("mail.account." + key + ".server", key)
+        self.set_pref("mail.accountmanager.accounts",
+                      ",".join(value for value in [accounts, key] if value))
+
     def stop(self):
         """Close ordinary application writers through the normal test runner."""
         self.marionette.execute_script("Services.prefs.savePrefFile(null);")
@@ -123,6 +130,8 @@ class TestPanoramaStartupBackup(MarionetteTestCase):
         """, script_args=[str(maildir)])
         self.set_pref(f"mail.server.{key}dir.directory-rel", relative)
         self.set_pref(f"mail.server.{key}dir.type", "imap")
+        self.register_server(f"{key}box")
+        self.register_server(f"{key}dir")
         expected = {
             self.source: hashlib.sha256(self.source.read_bytes()).hexdigest(),
             mbox / "Inbox": hashlib.sha256((mbox / "Inbox").read_bytes()).hexdigest(),
@@ -249,6 +258,8 @@ class TestPanoramaStartupBackup(MarionetteTestCase):
         self.set_pref(f"mail.server.{key}box.type", "imap")
         self.set_pref(f"mail.server.{key}dir.directory", str(maildir))
         self.set_pref(f"mail.server.{key}dir.type", "imap")
+        self.register_server(f"{key}box")
+        self.register_server(f"{key}dir")
         expected = {
             self.source: self.source.read_bytes(),
             mbox / "Inbox": (mbox / "Inbox").read_bytes(),
@@ -1333,27 +1344,127 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             "Sent": {"personal": False, "messages": self.SENT_MESSAGES},
             "Drafts": {"personal": False, "messages": []}})
 
-    def test_nativeImapRootSummaryRefusesUnknownAndMessageData(self):
-        for case in ["message-data", "unknown-sibling"]:
-            source = self.create_legacy_imap_source()
+    def test_nativeImapRootSummaryRefusesMessageData(self):
+        source = self.create_legacy_imap_source()
+        self.stop_application()
+        summary = Path(source["summary"])
+        root_summary = Path(source["rootSummary"])
+        # Use genuine original message-bearing Mork, not invented rows.
+        root_summary.write_bytes(summary.read_bytes())
+        self.assert_startup_refuses([summary, root_summary], absent=[
+            self.profile / "panorama.sqlite",
+            self.profile / "panorama-profile.json",
+        ])
+        work = self.profile.parent / ("panorama-migration-" + self.profile.name)
+        if work.exists():
+            self.created_work.add(work)
+
+    def test_rootSummaryOfNoAccountBesideImapRootStaysInPlace(self):
+        """A removed account leaves its root summary beside the current ones."""
+        source = self.create_legacy_imap_source()
+        self.stop_application()
+        summary = Path(source["summary"])
+        root_summary = Path(source["rootSummary"])
+        unknown = root_summary.with_name("unconfigured-root.msf")
+        original = root_summary.read_bytes()
+        unknown.write_bytes(original)
+        self.write_legacy_cache([{"key": str(summary), **{
+            name: source[name] for name in
+            ["flags", "folderName", "onlineName", "hierDelim", "boxFlags"]}}])
+        self.start_same_profile(True)
+        selected = self.selection()
+        identity = selected["record"]["identity"]
+        self.assertEqual("migrated", selected["record"]["origin"])
+        self.assertEqual(1, len(identity["imports"]))
+        self.assertEqual(1, len(identity["serverSummaries"]))
+        self.assertEqual("server-summary:" + root_summary.relative_to(self.profile).as_posix(),
+                         identity["serverSummaries"][0]["sourceId"])
+        backup = Path(identity["backup"]["path"])
+        self.assertEqual(original, unknown.read_bytes())
+        self.assertEqual(original, (backup.parent / "root-0" /
+                                    unknown.relative_to(self.profile)).read_bytes())
+
+    def test_migratesBesideMailOfRemovedAccounts(self):
+        """Mail no current account references stays in place and is not imported.
+
+        A removed account leaves its directory, summaries, stores and often its
+        whole mail.server branch behind; Thunderbird never opens them again.
+        """
+        self.clean_profile(False)
+        source = self.create_legacy_message("mbox")
+        self.stop_application()
+        root = Path(source["root"]).resolve()
+        genuine = Path(source["summary"]).read_bytes()
+        store = (root / source["name"]).read_bytes()
+        removed = self.profile / "ImapMail" / "removed.invalid"
+        local = self.profile / "Mail" / "removed-local"
+        leftovers = {
+            # A removed IMAP account: root summary, folders and an offline store.
+            removed.with_name("removed.invalid.msf"): genuine,
+            removed / "INBOX.msf": genuine,
+            removed / "INBOX": store,
+            removed / "Parent.sbd" / "Child.msf": genuine,
+            removed / "msgFilterRules.dat": b'version="9"\nlogging="no"\n',
+            # A store whose summary is gone, and a summary without its store.
+            local / "Archive": store,
+            local / "Sent.msf": genuine,
+        }
+        for path, data in leftovers.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        self.marionette.instance.profile.set_preferences({
+            # The removed account's branch still names its directory.
+            "mail.server.serverGone1.type": "imap",
+            "mail.server.serverGone1.hostname": "removed.invalid",
+            "mail.server.serverGone1.userName": "nobody",
+            "mail.server.serverGone1.directory-rel": "[ProfD]ImapMail/removed.invalid",
+            # Another leftover branch names the directory a current account uses.
+            "mail.server.serverGone2.type": "imap",
+            "mail.server.serverGone2.hostname": "reused.invalid",
+            "mail.server.serverGone2.userName": "nobody",
+            "mail.server.serverGone2.directory-rel":
+                "[ProfD]" + root.relative_to(self.profile).as_posix(),
+            # A branch from a copied profile names a directory absent here.
+            "mail.server.serverGone3.type": "pop3",
+            "mail.server.serverGone3.hostname": "copied.invalid",
+            "mail.server.serverGone3.userName": "nobody",
+            "mail.server.serverGone3.directory":
+                str(self.profile.parent / "absent-profile" / "Mail" / "copied.invalid"),
+        })
+        self.start_same_profile(True)
+        selected = self.selection()
+        record = selected["record"]
+        self.assertEqual("migrated", record["origin"])
+        self.assertTrue(record["identity"]["imports"])
+        headers = self.assert_message_after_activation(source)
+
+        def folders():
+            return self.marionette.execute_script("""
+                const { MailServices } = ChromeUtils.importESModule(
+                  'resource:///modules/MailServices.sys.mjs');
+                return MailServices.accounts.allServers.flatMap(server =>
+                  [server.rootFolder, ...server.rootFolder.descendants].map(
+                    folder => folder.URI));
+            """)
+
+        current = folders()
+        self.assertFalse([uri for uri in current
+                          if "removed" in uri or "reused" in uri or "copied" in uri])
+        backup = Path(record["identity"]["backup"]["path"])
+        for path, data in leftovers.items():
+            self.assertEqual(data, path.read_bytes(), "Unreferenced mail stays in place")
+            archived = backup.parent / "root-0" / path.relative_to(self.profile)
+            self.assertEqual(data, archived.read_bytes())
+        for _ in range(2):
             self.stop_application()
-            summary = Path(source["summary"])
-            root_summary = Path(source["rootSummary"])
-            files = [summary, root_summary]
-            if case == "message-data":
-                # Use genuine original message-bearing Mork, not invented rows.
-                root_summary.write_bytes(summary.read_bytes())
-            else:
-                unknown = root_summary.with_name("unconfigured-root.msf")
-                unknown.write_bytes(root_summary.read_bytes())
-                files.append(unknown)
-            self.assert_startup_refuses(files, absent=[
-                self.profile / "panorama.sqlite",
-                self.profile / "panorama-profile.json",
-            ])
-            work = self.profile.parent / ("panorama-migration-" + self.profile.name)
-            if work.exists():
-                self.created_work.add(work)
+            selector = (self.profile / "panorama-profile.json").read_bytes()
+            self.start_same_profile(True)
+            self.assertEqual(selected["sourceId"], self.selection()["sourceId"])
+            self.assertEqual(headers, self.assert_message_after_activation(source))
+            self.assertEqual(current, folders())
+            self.assertEqual(selector, (self.profile / "panorama-profile.json").read_bytes())
+            for path, data in leftovers.items():
+                self.assertEqual(data, path.read_bytes())
 
     def test_invalidActiveJsonCacheNeverFallsBackToMork(self):
         for case in ["malformed", "array", "negativeFlags", "objectName"]:

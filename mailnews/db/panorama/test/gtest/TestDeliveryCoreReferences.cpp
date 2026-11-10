@@ -10253,10 +10253,10 @@ TEST_F(DeliveryCoreReferences,
   ASSERT_EQ(NS_OK, root->Create(nsIFile::DIRECTORY_TYPE, 0700));
   nsTArray<nsCOMPtr<nsIFile>> roots;
   roots.AppendElement(root);
-  auto rule = [&](nsIFile* file, const char* name, bool mailTree,
-                  nsresult status) {
+  auto rule = [&](const nsCOMPtr<nsIFile>& file, const char* name,
+                  bool mailTree, nsresult status) {
     bool vanished = true;
-    EXPECT_EQ(NS_OK, StartupVanishedEntry(file, nsDependentCString(name),
+    EXPECT_EQ(NS_OK, StartupVanishedEntry(file.get(), nsDependentCString(name),
                                           mailTree, status, roots, vanished))
         << name;
     return vanished;
@@ -10297,9 +10297,10 @@ TEST_F(DeliveryCoreReferences,
   EXPECT_FALSE(rule(inside, "store.tmp", false, gone));
   // Without the configured roots nothing is ever skipped.
   bool vanished = true;
-  EXPECT_EQ(NS_OK, StartupVanishedEntry(
-                       child("session-state.tmp"), "session-state.tmp"_ns,
-                       false, gone, nsTArray<nsCOMPtr<nsIFile>>(), vanished));
+  nsCOMPtr<nsIFile> unlisted = child("session-state.tmp");
+  EXPECT_EQ(NS_OK,
+            StartupVanishedEntry(unlisted, "session-state.tmp"_ns, false, gone,
+                                 nsTArray<nsCOMPtr<nsIFile>>(), vanished));
   EXPECT_TRUE(vanished) << "An empty configured-root list is still a list";
 }
 

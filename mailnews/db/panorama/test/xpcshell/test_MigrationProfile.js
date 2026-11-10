@@ -1079,8 +1079,8 @@ async function checkStartupTargetFailure(failure) {
       Assert.ok(await IOUtils.exists(databasePath));
       Assert.equal(
         (await getMigrationProfileState(profilePath)).state,
-        "restore-required",
-        "A created target always requires recovery"
+        "prepared",
+        "A target that never activated stays prepared; the next start sets it aside"
       );
     } else {
       Assert.ok(!(await IOUtils.exists(databasePath)));

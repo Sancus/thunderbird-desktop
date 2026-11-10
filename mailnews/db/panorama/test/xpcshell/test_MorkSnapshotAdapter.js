@@ -860,11 +860,11 @@ add_task(async function test_genuinePropertyImportFailureRetryAndCopy() {
   const count = messageDB.totalCount;
   const connection = database.connectionForTests;
   const trigger =
+    // An import writes a new message's properties before its row, so the
+    // failure cannot be tied to the folder through the message row. Only
+    // this import writes the fixture's own property while the trigger exists.
     "CREATE TEMP TRIGGER fail_imported_property BEFORE INSERT ON message_properties " +
-    "WHEN NEW.name = 'Case' AND EXISTS (SELECT 1 FROM messages " +
-    "WHERE id = NEW.id AND folderId = " +
-    propertyFolder.id +
-    ") " +
+    "WHEN NEW.name = 'Case' " +
     "BEGIN SELECT RAISE(ABORT, 'S3-02 property write failure'); END";
   connection.executeSimpleSQL(trigger);
   try {

@@ -10265,10 +10265,10 @@ TEST_F(DeliveryCoreReferences, ImapRawRecordsAcceptUnindexedLiveThread) {
       u"");
   ASSERT_NE(changed, absent);
   EXPECT_EQ(NS_OK, CheckRawImport(absent));
-  // A detached subject row must still be exact.
+  // A detached subject row is a leftover of the derived index too.
   changed.ReplaceSubstring(u"threadSubject\",\"v\":\"live",
                            u"threadSubject\",\"v\":\"other");
-  EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED, CheckRawImport(changed));
+  EXPECT_EQ(NS_OK, CheckRawImport(changed));
 }
 
 TEST_F(DeliveryCoreReferences, RawRecordsAccountUnifiedFolderHits) {
@@ -25165,14 +25165,23 @@ TEST_F(DeliveryCoreReferences,
   Stop();
   int64_t before;
   ASSERT_EQ(NS_OK, mFile->GetFileSize(&before));
+  // The migration that wrote it never activated: its database is not reused.
+  // The attempt is set aside whole and startup selects as if it had not run.
   ASSERT_EQ(NS_OK, ArmSelectedStartup());
   nsCString selected;
-  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DescribeStartup(selected));
-  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, OpenStartup("reuse"));
-  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, DatabaseCore::CheckAccountStartup());
+  ASSERT_EQ(NS_OK, DescribeStartup(selected));
+  EXPECT_EQ(kNotFound, selected.Find("\"mode\":\"reuse\""));
+  EXPECT_TRUE(NS_FAILED(OpenStartup("reuse")));
   EXPECT_FALSE(mConnection);
+  bool exists;
+  ASSERT_EQ(NS_OK, mFile->Exists(&exists));
+  EXPECT_FALSE(exists);
+  nsCOMPtr<nsIFile> aside;
+  ASSERT_EQ(NS_OK, StartupFixtureWork(getter_AddRefs(aside)));
+  ASSERT_EQ(NS_OK,
+            aside->AppendRelativeNativePath("incomplete-1/panorama.sqlite"_ns));
   int64_t after;
-  ASSERT_EQ(NS_OK, mFile->GetFileSize(&after));
+  ASSERT_EQ(NS_OK, aside->GetFileSize(&after));
   EXPECT_EQ(before, after);
 }
 

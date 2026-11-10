@@ -978,7 +978,10 @@ add_task(async function test_viewIsOneFrozenSnapshotPerRevision() {
   Assert.throws(() => {
     first.sources[0].state = "imported";
   }, TypeError);
-  Assert.throws(() => first.sources.push({}), TypeError);
+  Assert.throws(
+    () => first.sources.push({}),
+    error => error.name == "TypeError"
+  );
   const backup = await createMigrationBackup(
     plan.profilePath,
     plan.mailPaths,

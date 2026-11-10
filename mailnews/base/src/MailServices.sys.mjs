@@ -50,12 +50,27 @@ XPCOMUtils.defineLazyServiceGetter(
   Ci.nsIMsgMailSession
 );
 
-XPCOMUtils.defineLazyServiceGetter(
-  MailServices,
-  "accounts",
-  "@mozilla.org/messenger/account-manager;1",
-  Ci.nsIMsgAccountManager
-);
+// The account manager cannot be created while a selected Panorama profile is
+// still starting, and a migration can make that last minutes. A lazy getter
+// that fails once stays undefined for the whole session, which left the mail
+// window without accounts after the migration. This getter fails each time
+// until the service exists and keeps it from then on.
+Object.defineProperty(MailServices, "accounts", {
+  configurable: true,
+  enumerable: true,
+  get() {
+    const value = Cc["@mozilla.org/messenger/account-manager;1"].getService(
+      Ci.nsIMsgAccountManager
+    );
+    Object.defineProperty(MailServices, "accounts", {
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value,
+    });
+    return value;
+  },
+});
 
 XPCOMUtils.defineLazyServiceGetter(
   MailServices,

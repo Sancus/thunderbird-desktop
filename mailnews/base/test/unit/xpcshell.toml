@@ -118,6 +118,9 @@ tags = ["virtualfolders"]
 
 ["test_mailServices.js"]
 
+["test_mailServicesAccountsRetry.js"]
+head = ""
+
 ["test_mailstoreConverter.js"]
 
 ["test_mimemaltdetach.js"]

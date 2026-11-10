@@ -1371,13 +1371,15 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             const root = server.rootFolder.QueryInterface(Ci.nsIMsgImapMailFolder);
             const folders = {};
             // [path below the root, cached delimiter, messages]
-            for (const [path, cached, count] of [
+            for (const [path, cached, count, lookedUp] of [
               ['INBOX', '.', 2],
               ['INBOX/Sent', '.', 1],
               ['INBOX/Kept', '^', 1],
               ['user', '^', 0],
               ['user/team', '^', 0],
               ['user/team/INBOX', '.', 1],
+              // Only looked up by the client: Thunderbird hashes this file name.
+              ['INBOX/Looked: up', '^', 0, true],
             ]) {
               let folder = server.rootFolder;
               for (const part of path.split('/')) {
@@ -1400,6 +1402,12 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
                 header.setUint32Property('uidOnServer', key);
                 database.addNewHdrToDB(header, false);
               }
+              if (lookedUp) {
+                // The server never listed it: it has no box state at all.
+                folder.clearFlag(Ci.nsMsgFolderFlags.ImapBox |
+                  Ci.nsMsgFolderFlags.ImapPersonal);
+                database.dBFolderInfo.flags = folder.flags;
+              }
               database.summaryValid = true;
               database.commit(Ci.nsMsgDBCommitType.kLargeCommit);
               database.forceClosed();
@@ -1418,6 +1426,11 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         self.assertEqual(root / "INBOX.sbd" / "Kept.msf", Path(folders["INBOX/Kept"]["summary"]))
         self.assertEqual(root / "user.sbd" / "team.sbd" / "INBOX.msf",
                          Path(folders["user/team/INBOX"]["summary"]))
+        looked_up = Path(folders["INBOX/Looked: up"]["summary"])
+        self.assertEqual(root / "INBOX.sbd", looked_up.parent)
+        self.assertNotEqual("Looked: up.msf", looked_up.name)
+        self.assertFalse(int(folders["INBOX/Looked: up"]["flags"], 16) & 0x2000)
+        self.assertFalse(looked_up.with_suffix("").exists())
         originals = {path: Path(folder["summary"]).read_bytes()
                      for path, folder in folders.items()}
         self.write_legacy_cache([{"key": folder["summary"], **{
@@ -1434,7 +1447,7 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
                 const state = {};
                 for (const folder of root.descendants) {
                   const imap = folder.QueryInterface(Ci.nsIMsgImapMailFolder);
-                  state[folder.URI.slice(root.URI.length + 1)] = {
+                  state[decodeURIComponent(folder.URI.slice(root.URI.length + 1))] = {
                     onlineName: imap.onlineName,
                     delimiter: imap.hierarchyDelimiter,
                     messages: [...folder.msgDatabase.enumerateMessages()].map(

@@ -154,6 +154,8 @@ struct StartupMailSource {
   char delimiter = 0;
   // An IMAP name of several levels whose delimiter was never learned.
   bool unlisted = false;
+  // A never-listed IMAP folder whose summary has Thunderbird's own file name.
+  bool legacyLeaf = false;
 };
 
 struct StartupServerSummary {
@@ -9859,6 +9861,30 @@ bool StartupUnknownDelimiter(char delimiter) {
   return delimiter == kOnlineHierarchySeparatorUnknown ||
          delimiter == kOnlineHierarchySeparatorNil;
 }
+// Thunderbird names the files of a folder by its own hashing rule when the
+// name cannot be a file name, and the folder-cache entry keyed by that summary
+// names the folder. A folder it only looked up (a junk or filter target the
+// server never listed) has no delimiter, no box state and no offline store, so
+// no body depends on that file name: it is placed by its directory and keeps
+// the summary it has. A listed or stored folder with such a name stays
+// refused; its store would need a retained path.
+nsresult StartupLegacyNamedImapLeaf(nsIFile* expected,
+                                    const StartupMailSource& source,
+                                    bool& legacy) {
+  legacy = false;
+  if (!StartupUnknownDelimiter(source.delimiter) || source.boxFlags)
+    return NS_OK;
+  nsCOMPtr<nsIFile> actual, expectedParent, actualParent;
+  MOZ_TRY(NewComparableFile(source.storePath, getter_AddRefs(actual)));
+  MOZ_TRY(expected->GetParent(getter_AddRefs(expectedParent)));
+  MOZ_TRY(actual->GetParent(getter_AddRefs(actualParent)));
+  NS_ENSURE_TRUE(expectedParent && actualParent, NS_ERROR_FILE_INVALID_PATH);
+  bool same, stored;
+  MOZ_TRY(expectedParent->Equals(actualParent, &same));
+  MOZ_TRY(actual->Exists(&stored));
+  legacy = same && !stored;
+  return NS_OK;
+}
 // An IMAP folder whose delimiter Thunderbird never learned keeps the sentinel
 // in the folder cache while its summary keeps the whole online name (a copied
 // profile, a namespace placeholder, a folder never listed again). Thunderbird
@@ -9898,7 +9924,14 @@ nsresult StartupPlaceUnlistedImap(nsTArray<StartupMailSource>& sources) {
         MOZ_TRY(physical->Append(EncodeFilename(leaf)));
         nsCString expected;
         MOZ_TRY(GetComparablePath(physical, expected));
-        if (expected != source.storePath) continue;
+        if (expected != source.storePath) {
+          bool legacy;
+          MOZ_TRY(StartupLegacyNamedImapLeaf(physical, source, legacy));
+          if (!legacy ||
+              (source.originalFlags.valueOr(0) & nsMsgFolderFlags::ImapBox))
+            continue;
+          source.legacyLeaf = true;
+        }
         source.canonicalPath = parent.canonicalPath + "/"_ns + leaf;
         progress = true;
         break;
@@ -12459,7 +12492,11 @@ nsresult DatabaseCore::ReadStartupMailSource(JSContext* cx,
   }
   nsCString expectedStore;
   MOZ_TRY(GetComparablePath(physical, expectedStore));
-  NS_ENSURE_TRUE(expectedStore == output.storePath, NS_ERROR_NOT_IMPLEMENTED);
+  if (expectedStore != output.storePath) {
+    // The caller reads the retained folder word and requires it boxless.
+    MOZ_TRY(StartupLegacyNamedImapLeaf(physical, output, output.legacyLeaf));
+    NS_ENSURE_TRUE(output.legacyLeaf, NS_ERROR_NOT_IMPLEMENTED);
+  }
   return NS_OK;
 }
 
@@ -13969,6 +14006,9 @@ nsresult DatabaseCore::OpenProfileStartup(JSContext* cx,
           }
         }
         NS_ENSURE_TRUE(seenInfo, NS_ERROR_NOT_IMPLEMENTED);
+        NS_ENSURE_TRUE(!native.legacyLeaf || !(native.originalFlags.valueOr(0) &
+                                               nsMsgFolderFlags::ImapBox),
+                       NS_ERROR_NOT_IMPLEMENTED);
         nsCString measured;
         MOZ_TRY(StartupHash(summary, measured));
         NS_ENSURE_TRUE(measured == native.hash, NS_ERROR_NOT_AVAILABLE);
@@ -14409,9 +14449,7 @@ nsresult DatabaseCore::BuildStartupFolders() {
     MOZ_TRY(provider->CreateClientSubfolderInfo(
         source->canonicalPath, source->delimiter, int32_t(source->boxFlags),
         true));
-    if (source->unlisted) {
-      // The provider joined the name with the sentinel. The retained name
-      // keeps the separator the server used; children are created after it.
+    if (source->unlisted || source->legacyLeaf) {
       nsCOMPtr<nsIMsgFolder> folder = root.Data();
       for (const auto& part : source->canonicalPath.Split('/')) {
         nsCOMPtr<nsIMsgFolder> child;
@@ -14419,9 +14457,21 @@ nsresult DatabaseCore::BuildStartupFolders() {
         NS_ENSURE_TRUE(child, NS_ERROR_NOT_AVAILABLE);
         folder = child;
       }
-      nsCOMPtr<nsIMsgImapMailFolder> placed = do_QueryInterface(folder);
-      NS_ENSURE_TRUE(placed, NS_ERROR_NOT_AVAILABLE);
-      MOZ_TRY(placed->SetOnlineName(source->onlineName));
+      if (source->unlisted) {
+        // The provider joined the name with the sentinel. The retained name
+        // keeps the separator the server used; children are created after it.
+        nsCOMPtr<nsIMsgImapMailFolder> placed = do_QueryInterface(folder);
+        NS_ENSURE_TRUE(placed, NS_ERROR_NOT_AVAILABLE);
+        MOZ_TRY(placed->SetOnlineName(source->onlineName));
+      }
+      if (source->legacyLeaf) {
+        // This migration reads the summary Thunderbird named; nothing is
+        // stored under either name. The wrapper is retained like a local one.
+        nsCOMPtr<nsIFile> path;
+        MOZ_TRY(NewComparableFile(source->storePath, getter_AddRefs(path)));
+        MOZ_TRY(folder->SetFilePath(path));
+        operation.localFolders.AppendElement(folder);
+      }
     }
   }
   nsTHashSet<uint64_t> ids;

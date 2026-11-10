@@ -6132,18 +6132,14 @@ nsresult ImportImapUnitRequest(
                     NS_ERROR_INVALID_ARG);
     sourceIds.InsertOrUpdate(member.snapshot.identity.sourceId, true);
     uris.InsertOrUpdate(member.uri, true);
-    // The digest is measured from the real provider stream, never supplied by
-    // the semantic test ledger or inferred from the header's message size.
+    // A message body is never read: the migration imports the index and the
+    // offline stores stay in place, measured as whole files by the index
+    // backup. A token that no longer finds a body is what it is in old
+    // Thunderbird too, which then fetches the message again.
     for (const auto& row : member.snapshot.messages) {
       bool token = row.header.storeToken && !row.header.storeToken->IsEmpty();
       NS_ENSURE_TRUE(!(row.header.flags & nsMsgMessageFlags::Offline) || token,
                      NS_ERROR_NOT_AVAILABLE);
-      if (token) {
-        ImapImportBody body;
-        body.sourceKey = row.sourceKey;
-        MOZ_TRY(MeasureImapImportBody(member, row.header, body));
-        member.bodies.AppendElement(std::move(body));
-      }
     }
     admissions.AppendElement(std::move(admission));
   }

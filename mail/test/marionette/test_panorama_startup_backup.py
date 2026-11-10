@@ -1261,11 +1261,11 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             self.profile / "folderCache.json",
             {spelled: {"folderName": "Cache only"}}, spelled, [])
 
-    def create_legacy_imap_source(self, pending=False):
+    def create_legacy_imap_source(self, pending=False, offline=False):
         """Create genuine root and UID-bearing child summaries with legacy APIs."""
         self.clean_profile(False)
         source = self.marionette.execute_script("""
-            const [pending] = arguments;
+            const [pending, offline] = arguments;
             const { MailServices } = ChromeUtils.importESModule(
               'resource:///modules/MailServices.sys.mjs');
             Services.io.offline = true;
@@ -1296,6 +1296,11 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             header.subject = 'Original IMAP startup migration';
             header.setUint32Property('uidOnServer', 42);
             header.setStringProperty('s526-custom', 'imap-retained');
+            if (offline) {
+              // An offline copy whose token finds no message in the store.
+              header.orFlags(Ci.nsMsgMessageFlags.Offline);
+              header.storeToken = '4096';
+            }
             database.addNewHdrToDB(header, false);
             if (pending) {
               // What a copy into this folder leaves until its message arrives,
@@ -1308,13 +1313,46 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             Services.prefs.savePrefFile(null);
             return {serverKey: server.key, root: file.path,
               rootSummary: server.rootFolder.summaryFile.path,
-              summary: folder.summaryFile.path,
+              summary: folder.summaryFile.path, store: folder.filePath.path,
               flags: (database.dBFolderInfo.flags >>> 0).toString(16),
               folderName: folder.name, onlineName: imap.onlineName,
               hierDelim: imap.hierarchyDelimiter.charCodeAt(0).toString(16),
               boxFlags: '0'};
-        """, script_args=[pending])
+        """, script_args=[pending, offline])
         return source
+
+    def test_migratesImapOfflineMessageWithoutReadingItsStore(self):
+        """The migration imports the index and never reads a message body. An
+        offline token that finds no message in its store refuses nothing, as
+        in old Thunderbird, which fetches such a message again. All data is
+        fabricated."""
+        source = self.create_legacy_imap_source(offline=True)
+        self.stop_application()
+        summary = Path(source["summary"])
+        store = Path(source["store"])
+        garbage = b"no mbox separator anywhere in this offline store " * 8
+        store.write_bytes(garbage)
+        original = summary.read_bytes()
+        self.start_same_profile(True)
+        selected = self.selection()
+        self.assertEqual("migrated", selected["record"]["origin"])
+        messages = self.marionette.execute_script("""
+            const { MailServices } = ChromeUtils.importESModule(
+              'resource:///modules/MailServices.sys.mjs');
+            const folder = MailServices.accounts.getIncomingServer(arguments[0])
+              .rootFolder.getChildNamed('INBOX');
+            return [...folder.msgDatabase.enumerateMessages()].map(header => ({
+              id: header.messageId, token: header.storeToken,
+              offline: !!(header.flags & Ci.nsMsgMessageFlags.Offline)}));
+        """, script_args=[source["serverKey"]])
+        self.assertEqual([{"id": "imap-activation-s526@invalid", "token": "4096",
+                           "offline": True}], messages)
+        self.assertEqual(garbage, store.read_bytes())
+        self.assertEqual(original, summary.read_bytes())
+        self.stop_application()
+        self.start_same_profile(True)
+        self.assertEqual(selected["sourceId"], self.selection()["sourceId"])
+        self.assertEqual(garbage, store.read_bytes())
 
     def test_migratesImapSummaryWithPendingHeaderAttributes(self):
         """Attributes kept for a message that has not arrived yet have no

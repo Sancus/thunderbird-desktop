@@ -8900,10 +8900,8 @@ nsresult MessageDatabase::SetMessageProperty(nsMsgKey aKey,
   return NS_OK;
 }
 
-namespace {
-template <typename Bind>
-nsresult WriteImportedProperty(nsMsgKey key, const nsACString& name,
-                               Bind&& bind) {
+nsresult MessageDatabase::ImportedPropertyStatement(
+    nsMsgKey key, const nsACString& name, mozIStorageStatement** output) {
   NS_ENSURE_TRUE(!name.EqualsLiteral("keywords") &&
                      !IsNewsBindingProperty(name) &&
                      !name.EqualsLiteral(kAcceptedAppendObservationProperty),
@@ -8917,27 +8915,29 @@ nsresult WriteImportedProperty(nsMsgKey key, const nsACString& name,
       "REPLACE INTO message_properties (id, name, value) "
       "VALUES (:id, :name, :value)"_ns,
       getter_AddRefs(stmt)));
-  mozStorageStatementScoper scoper(stmt);
   MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
   MOZ_TRY(stmt->BindUTF8StringByName("name"_ns, name));
-  MOZ_TRY(bind(stmt));
-  return stmt->Execute();
+  stmt.forget(output);
+  return NS_OK;
 }
-}  // namespace
 
 nsresult MessageDatabase::WriteImportedMessageProperty(
     nsMsgKey key, const nsACString& name, const nsACString& value) {
-  return WriteImportedProperty(key, name, [&](mozIStorageStatement* stmt) {
-    return stmt->BindUTF8StringByName("value"_ns, value);
-  });
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(ImportedPropertyStatement(key, name, getter_AddRefs(stmt)));
+  mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(stmt->BindUTF8StringByName("value"_ns, value));
+  return stmt->Execute();
 }
 
 nsresult MessageDatabase::WriteImportedMessageProperty(nsMsgKey key,
                                                        const nsACString& name,
                                                        uint32_t value) {
-  return WriteImportedProperty(key, name, [&](mozIStorageStatement* stmt) {
-    return stmt->BindInt64ByName("value"_ns, value);
-  });
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(ImportedPropertyStatement(key, name, getter_AddRefs(stmt)));
+  mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("value"_ns, value));
+  return stmt->Execute();
 }
 
 NS_IMETHODIMP_(void)

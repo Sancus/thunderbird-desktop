@@ -830,6 +830,8 @@ class MessageDatabase : public nsIMessageDatabase {
                                         const nsACString& value);
   nsresult WriteImportedMessageProperty(nsMsgKey key, const nsACString& name,
                                         uint32_t value);
+  nsresult ImportedPropertyStatement(nsMsgKey key, const nsACString& name,
+                                     mozIStorageStatement** output);
 
   // Stored published membership; never opens a stopped/replaced core.
   // Reads a caller transaction without owning it; errors leave exists

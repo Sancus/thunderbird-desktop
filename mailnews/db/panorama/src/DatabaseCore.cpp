@@ -9510,7 +9510,7 @@ nsresult StartupAccountServerBranches(nsIPrefBranch* prefs,
       if (server.IsEmpty()) continue;
       nsCString branch("mail.server."_ns + server + "."_ns);
       if (branches.Contains(branch)) continue;
-      int32_t direct, relative;
+      nsIPrefBranch::PreferenceType direct, relative;
       MOZ_TRY(prefs->GetPrefType(nsCString(branch + "directory"_ns).get(),
                                  &direct));
       MOZ_TRY(prefs->GetPrefType(nsCString(branch + "directory-rel"_ns).get(),

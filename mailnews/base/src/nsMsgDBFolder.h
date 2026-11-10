@@ -208,6 +208,9 @@ class nsMsgDBFolder : public nsSupportsWeakReference,
                                  uint64_t folderId, uint32_t beforeFlags);
   // Core calls this only after committing all folders, without callbacks.
   void PublishCacheImportFlags(uint32_t committedFlags);
+  // With them, the pending totals the same import committed, when it did.
+  void PublishCacheImportPending(const mozilla::Maybe<int64_t>& total,
+                                 const mozilla::Maybe<int64_t>& unread);
 
  protected:
   // The canonical local EmptyTrash caller scopes this only while deleting a

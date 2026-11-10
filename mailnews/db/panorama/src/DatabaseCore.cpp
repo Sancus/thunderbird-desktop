@@ -8485,11 +8485,17 @@ nsresult DatabaseCore::ImportFolderCacheMetadataV2(
   for (auto& plan : plans) {
     plan.wrapper->PublishCacheImportFlags(plan.afterFlags);
     // A wrapper that was already live counted its folder before the cache's
-    // pending totals were committed. Without this the first session shows
+    // pending totals were committed. Without them the first session shows
     // fewer messages than every later one.
-    if (NS_FAILED(plan.wrapper->ReadDBFolderCounts())) {
-      NS_WARNING("Live folder counts not refreshed after cache import");
+    Maybe<int64_t> pendingTotal, pendingUnread;
+    for (const auto& write : plan.writes) {
+      if (!write.integer) continue;
+      // Written as the unsigned word of a signed count (see above).
+      const int64_t count = int32_t(uint32_t(*write.integer));
+      if (write.name == "totPendingMsgs"_ns) pendingTotal = Some(count);
+      if (write.name == "unreadPendingMsgs"_ns) pendingUnread = Some(count);
     }
+    plan.wrapper->PublishCacheImportPending(pendingTotal, pendingUnread);
   }
   output.set(prepared);
   return NS_OK;

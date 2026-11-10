@@ -1864,6 +1864,10 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         looked_up = Path(folders["INBOX/Looked: up"]["summary"])
         self.assertEqual(root / "INBOX.sbd", looked_up.parent)
         self.assertNotEqual("Looked: up.msf", looked_up.name)
+        # The fixture must be what the rule is about: a folder that was only
+        # looked up has no offline store beside its summary.
+        self.assertFalse(looked_up.with_suffix("").exists(),
+                         "The looked-up folder of this fixture has a store file")
         self.assertFalse(int(folders["INBOX/Looked: up"]["flags"], 16) & 0x2000)
         self.assertFalse(looked_up.with_suffix("").exists())
         originals = {path: Path(folder["summary"]).read_bytes()

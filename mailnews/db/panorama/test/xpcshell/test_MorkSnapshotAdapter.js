@@ -1302,6 +1302,76 @@ add_task(async function test_savedFolderAddressesMatchInUnescapedForm() {
   }
 });
 
+// Before operations recorded their UID, a queued move or copy named its
+// message by key alone and playback took the UID from that key. In a classic
+// summary the key is the UID. A summary whose headers carry an explicit UID
+// never takes a key for one.
+add_task(async function test_operationWithoutUidUsesItsKeyInAClassicSummary() {
+  const OPS = "ns:msg:db:row:scope:ops:all";
+  const MOVED =
+    Ci.nsIMsgOfflineImapOperation.kMsgMoved |
+    Ci.nsIMsgOfflineImapOperation.kMsgCopy;
+  const entries = await genuineImapEntries();
+  const convertUnit = () =>
+    convertMorkProtocolUnit(entries, "snapshot-imap-old", database.sourceId);
+  // A pending move or copy whose own header is gone.
+  let found;
+  for (const [index, member] of convertUnit().folders.entries()) {
+    const op = member.imap.operations.find(
+      value =>
+        value.payload.operation & MOVED &&
+        value.payload.sourceUid &&
+        !member.source.messageKeys.includes(value.sourceKey)
+    );
+    if (op && !found) {
+      found = { index, key: op.sourceKey, uri: member.imap.originalFolderURI };
+    }
+  }
+  Assert.ok(found, "The fixture has a pending move whose header is gone");
+  const dropCell = (cells, name) => {
+    const at = cells.findIndex(cell => cell.k == name);
+    if (at >= 0) {
+      cells.splice(at, 1);
+    }
+    return at >= 0;
+  };
+  // As an older Thunderbird wrote them: no operation records a UID.
+  for (const entry of entries) {
+    for (const row of entry.input.records.rows) {
+      if (row.scope == OPS) {
+        dropCell(row.cells, "srcUid");
+      }
+    }
+  }
+  const explicit = entries[found.index].input.messages.some(message =>
+    message.header.extras.some(cell => cell.k == "uidOnServer")
+  );
+  if (explicit) {
+    Assert.throws(
+      convertUnit,
+      /Unresolved Mork offline server UID/,
+      "A key is never taken for a UID beside explicit UIDs"
+    );
+    // The same member as a classic summary: its keys are its UIDs.
+    const input = entries[found.index].input;
+    for (const row of input.records.rows) {
+      if (row.scope == "ns:msg:db:row:scope:msgs:all") {
+        dropCell(row.cells, "uidOnServer");
+      }
+    }
+    for (const message of input.messages) {
+      dropCell(message.header.extras, "uidOnServer");
+    }
+  }
+  const member = convertUnit().folders[found.index];
+  Assert.ok(
+    member.imap.serverUids.some(
+      binding => binding.sourceKey == found.key && binding.uid == found.key
+    ),
+    "The operation's key is its UID"
+  );
+});
+
 add_task(async function test_imapUnitRejectsUnknownOrAmbiguousBinding() {
   const entries = await genuineImapEntries();
   const convertUnit = values =>

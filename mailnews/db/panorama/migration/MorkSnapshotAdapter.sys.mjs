@@ -21,6 +21,8 @@ const INFO = "ns:msg:db:row:scope:dbfolderinfo:all";
 const KIND = "ns:msg:db:table:kind:";
 const OFFLINE = "ns:msg:db:row:scope:ops:all";
 const PENDING = "ns:msg:db:row:scope:pending:all";
+// nsImapMailFolder's kIdStartOfFake: keys from here on are pseudo headers.
+const FIRST_PSEUDO_KEY = 0xffffff80;
 // nsMsgDatabase caches a unified folder's hits in a message-scope table named
 // by that folder's URI. Panorama does not migrate unified folders.
 const UNIFIED_HITS = "mailbox://nobody@smart%20mailboxes/";
@@ -971,16 +973,40 @@ function accountImapRecords(request, info, table, rows) {
       throw new Error("Mork pending message has no captured finished body");
     }
   }
+  // An operation written before operations recorded their UID (srcUid) names
+  // its message by key alone. Old playback took the UID from that key
+  // (UidsFromMsgKeys), and in a classic summary, whose headers carry no
+  // uidOnServer, the key is the UID. A pseudo key never is.
+  const classic = !request.messages.some(message =>
+    rows.get(message.sourceKey + ":" + MESSAGE).cells.has("uidOnServer")
+  );
+  const serverActions =
+    Ci.nsIMsgOfflineImapOperation.kFlagsChanged |
+    Ci.nsIMsgOfflineImapOperation.kMsgMoved |
+    Ci.nsIMsgOfflineImapOperation.kMsgCopy |
+    Ci.nsIMsgOfflineImapOperation.kDeletedMsg |
+    Ci.nsIMsgOfflineImapOperation.kMsgMarkedDeleted |
+    Ci.nsIMsgOfflineImapOperation.kAddKeywords |
+    Ci.nsIMsgOfflineImapOperation.kRemoveKeywords;
   for (const op of operations) {
     if (
-      !request.source.messageKeys.includes(op.sourceKey) &&
-      !Object.hasOwn(op.payload, "sourceFolderURI") &&
-      op.payload.sourceUid
+      request.source.messageKeys.includes(op.sourceKey) ||
+      Object.hasOwn(op.payload, "sourceFolderURI")
     ) {
+      continue;
+    }
+    const uid =
+      op.payload.sourceUid ||
+      (classic &&
+      op.payload.operation & serverActions &&
+      op.sourceKey < FIRST_PSEUDO_KEY
+        ? op.sourceKey
+        : 0);
+    if (uid) {
       if (!uidValidity.present || !uidValidity.value) {
         throw new Error("Mork operation-only UID has no captured epoch");
       }
-      serverUids.push({ sourceKey: op.sourceKey, uid: op.payload.sourceUid });
+      serverUids.push({ sourceKey: op.sourceKey, uid });
     }
   }
   return { version: 1, uidValidity, serverUids, operations };

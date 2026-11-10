@@ -6266,6 +6266,11 @@ nsresult ImportImapUnitRequest(
         if (op.sourceKey == uid.sourceKey &&
             op.payload.sourceFolderURI.IsEmpty()) {
           evidence |= op.payload.sourceUid == uid.uid;
+          // An operation written before operations recorded their UID names
+          // its message by key alone; old playback took the UID from that
+          // key, which in a classic summary is the UID. A pseudo key is not.
+          evidence |= !op.payload.sourceUid && uid.uid == uid.sourceKey &&
+                      uid.sourceKey < 0xffffff80;
         }
       }
       for (const auto& other : unit.folders) {

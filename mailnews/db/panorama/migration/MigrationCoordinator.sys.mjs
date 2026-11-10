@@ -45,7 +45,6 @@ const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
   withMigrationAddressBookPublication:
     "resource:///modules/AddrBookManager.sys.mjs",
-  MailServices: "resource:///modules/MailServices.sys.mjs",
   SQLiteDirectory: "resource:///modules/SQLiteDirectory.sys.mjs",
   readLegacyGlodaMail:
     "resource:///modules/panorama/LegacyGlodaMailReader.sys.mjs",
@@ -1954,6 +1953,32 @@ function bindPanoramaMigrationTarget(
 }
 
 /**
+ * The account a header without its own account cell belongs to: the first
+ * listed account that names the folder's server, as
+ * nsMsgAccountManager::FindAccountForServer finds it. Read from the persisted
+ * preferences, because the account manager service is not available to
+ * script while the selected profile is still starting.
+ *
+ * @param {string} serverKey - The folder's server key.
+ * @returns {string} Account key, or "" when no listed account names it.
+ */
+function persistedAccountKeyForServer(serverKey) {
+  return (
+    Services.prefs
+      .getCharPref("mail.accountmanager.accounts", "")
+      .split(",")
+      .find(
+        account =>
+          account &&
+          Services.prefs.getCharPref(
+            "mail.account." + account + ".server",
+            ""
+          ) === serverKey
+      ) ?? ""
+  );
+}
+
+/**
  * Reads the supported native message projection before an import checkpoint.
  * Uses only the complete committed physical-key map and actual folder. Every
  * public property name/value is checked, including derived body-field aliases.
@@ -2061,7 +2086,7 @@ function verifyNativeMessageProjection(database, folder, request, receipt) {
       actual.accountKey,
       properties.has("account")
         ? expected.accountKey
-        : lazy.MailServices.accounts.findAccountForServer(folder.server).key,
+        : persistedAccountKeyForServer(folder.server.key),
       "accountKey"
     );
     for (const name of [

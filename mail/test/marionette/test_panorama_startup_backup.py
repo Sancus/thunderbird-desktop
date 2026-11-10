@@ -906,6 +906,14 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             const reply = add('derived-reply', 'Re: Watched thread', 'derived-root');
             add('derived-other', 'Another thread', null);
             const database = folder.msgDatabase;
+            // A header without its own account cell belongs to the account
+            // of its folder's server.
+            const bare = database.createNewHdr(0x7000);
+            bare.messageId = 'derived-bare@invalid';
+            bare.subject = 'No account cell';
+            bare.author = 'source@example.invalid';
+            bare.date = Date.UTC(2026, 10, 5) * 1000;
+            database.addNewHdrToDB(bare, true);
             database.markThreadWatched(
               database.getThreadContainingMsgHdr(first), first.messageKey, true, null);
             // What real summaries leave stale: a parent that no longer exists
@@ -920,7 +928,7 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         """)
         self.stop_application()
         self.assertTrue(source["watched"])
-        self.assertEqual(43, source["count"], "The fixture's cached count is stale")
+        self.assertEqual(44, source["count"], "The fixture's cached count is stale")
         original = Path(source["summary"]).read_bytes()
 
         def state():
@@ -937,6 +945,8 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
                 const other = headers['derived-other@invalid'];
                 return {
                   subjects: Object.values(headers).map(h => h.subject).sort(),
+                  bareAccount: headers['derived-bare@invalid'].accountKey ===
+                    MailServices.accounts.findAccountForServer(folder.server).key,
                   total: folder.getTotalMessages(false),
                   watched: database.isWatched(first.messageKey),
                   otherWatched: database.isWatched(other.messageKey),
@@ -947,8 +957,10 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
             """, script_args=[source["serverKey"]])
 
         expected = {
-            "subjects": ["Another thread", "Re: Watched thread", "Watched thread"],
-            "total": 3, "watched": True, "otherWatched": False,
+            "subjects": ["Another thread", "No account cell", "Re: Watched thread",
+                         "Watched thread"],
+            "bareAccount": True,
+            "total": 4, "watched": True, "otherWatched": False,
             "sameThread": True, "below": True, "otherThread": True,
         }
         self.start_same_profile(True)

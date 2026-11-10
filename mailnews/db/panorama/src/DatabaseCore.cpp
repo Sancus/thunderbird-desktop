@@ -8482,8 +8482,15 @@ nsresult DatabaseCore::ImportFolderCacheMetadataV2(
                          "Cache reconciliation rollback failed");
     return rv;
   }
-  for (auto& plan : plans)
+  for (auto& plan : plans) {
     plan.wrapper->PublishCacheImportFlags(plan.afterFlags);
+    // A wrapper that was already live counted its folder before the cache's
+    // pending totals were committed. Without this the first session shows
+    // fewer messages than every later one.
+    if (NS_FAILED(plan.wrapper->ReadDBFolderCounts())) {
+      NS_WARNING("Live folder counts not refreshed after cache import");
+    }
+  }
   output.set(prepared);
   return NS_OK;
 }

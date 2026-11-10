@@ -1243,6 +1243,65 @@ add_task(async function test_staleMoveResultsAreLeftOut() {
   Assert.deepEqual(convertUnit(), request);
 });
 
+// Older summaries save a folder address with characters left as they are
+// that the folder's own address escapes (a space). Old Thunderbird resolves a
+// saved address by its unescaped path names: both spellings are one folder.
+add_task(async function test_savedFolderAddressesMatchInUnescapedForm() {
+  const OPS = "ns:msg:db:row:scope:ops:all";
+  const entries = await genuineImapEntries();
+  const bindings = request =>
+    request.folders.map(member =>
+      member.imap.operations.map(op => [
+        op.sourceKey,
+        op.source,
+        op.destination,
+        op.copies,
+      ])
+    );
+  const expected = convertMorkProtocolUnit(
+    entries,
+    "snapshot-imap-address",
+    database.sourceId
+  );
+  const saved = new Map();
+  for (const entry of entries) {
+    for (const row of entry.input.records.rows) {
+      for (const cell of row.scope == OPS ? row.cells : []) {
+        if (["srcFolderURI", "moveDest", "copyDests"].includes(cell.k)) {
+          // Another spelling of the same address: one escaped letter.
+          const respelled = cell.v.replace(/\/Migration/g, "/%4digration");
+          if (respelled != cell.v) {
+            saved.set(cell.v, respelled);
+            cell.v = respelled;
+          }
+        }
+      }
+    }
+  }
+  Assert.greater(saved.size, 0, "The fixture saves folder addresses");
+  const request = convertMorkProtocolUnit(
+    entries,
+    "snapshot-imap-address",
+    database.sourceId
+  );
+  Assert.deepEqual(bindings(request), bindings(expected));
+  for (const member of request.folders) {
+    Assert.ok(!Object.hasOwn(member.source, "omittedMessageKeys"));
+    for (const op of member.imap.operations) {
+      for (const uri of [
+        op.payload.sourceFolderURI,
+        op.payload.destinationFolderURI,
+        ...(op.payload.copyDestinations ?? []),
+      ]) {
+        Assert.ok(
+          uri === undefined || !uri.includes("/Migration"),
+          "The saved text itself is kept as it is"
+        );
+      }
+    }
+  }
+});
+
 add_task(async function test_imapUnitRejectsUnknownOrAmbiguousBinding() {
   const entries = await genuineImapEntries();
   const convertUnit = values =>

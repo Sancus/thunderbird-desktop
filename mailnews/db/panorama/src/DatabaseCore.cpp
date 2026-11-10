@@ -327,6 +327,15 @@ bool StartupAliasAboveProfile(nsIFile* entry) {
   }
   return false;
 }
+// Whether two folder addresses name one folder. Older summaries save an
+// address with characters left as they are (a space) that the folder's own
+// address escapes; old Thunderbird resolves a saved address by its unescaped
+// path names, so both spellings are the same folder.
+bool SameFolderAddress(const nsACString& left, const nsACString& right) {
+  nsAutoCString first, second;
+  return left == right ||
+         NS_UnescapeURL(left, 0, first) == NS_UnescapeURL(right, 0, second);
+}
 nsresult StartupDirectory(nsIFile* file, nsACString& path) {
   NS_ENSURE_TRUE(file, NS_ERROR_INVALID_ARG);
   bool directory, linked;
@@ -3632,7 +3641,7 @@ nsresult DatabaseCore::ImportImapUnit(
           MOZ_TRY(resolve(*original.source, physical, index));
           const auto& from = input.folders[index];
           if (!op.sourceFolderURI.IsEmpty()) {
-            NS_ENSURE_TRUE(op.sourceFolderURI == from.uri &&
+            NS_ENSURE_TRUE(SameFolderAddress(op.sourceFolderURI, from.uri) &&
                                op.sourceKey == original.source->sourceKey,
                            NS_ERROR_NOT_AVAILABLE);
             op.sourceKey = physical.key;
@@ -3673,7 +3682,8 @@ nsresult DatabaseCore::ImportImapUnit(
           PendingDestination dest;
           uint32_t index;
           MOZ_TRY(resolve(*original.destination, dest, index));
-          NS_ENSURE_TRUE(op.destinationFolderURI == input.folders[index].uri,
+          NS_ENSURE_TRUE(SameFolderAddress(op.destinationFolderURI,
+                                           input.folders[index].uri),
                          NS_ERROR_NOT_AVAILABLE);
           if (op.operation & (nsIMsgOfflineImapOperation::kMsgMoved |
                               nsIMsgOfflineImapOperation::kAppendDraft |
@@ -3695,7 +3705,8 @@ nsresult DatabaseCore::ImportImapUnit(
           PendingDestination dest;
           uint32_t index;
           MOZ_TRY(resolve(*original.copies[n], dest, index));
-          NS_ENSURE_TRUE(op.copyDestinations[n] == input.folders[index].uri,
+          NS_ENSURE_TRUE(SameFolderAddress(op.copyDestinations[n],
+                                           input.folders[index].uri),
                          NS_ERROR_NOT_AVAILABLE);
           op.copyDestinationBindings.AppendElement(Some(dest));
         }
@@ -6138,7 +6149,7 @@ nsresult ImportImapUnitRequest(
   }
   auto memberFor = [&](const nsACString& uri) -> ImapImportFolder* {
     for (auto& member : unit.folders)
-      if (member.uri == uri) return &member;
+      if (SameFolderAddress(member.uri, uri)) return &member;
     return nullptr;
   };
   auto ref = [](const ImapImportFolder& member, nsMsgKey key) {
@@ -6150,7 +6161,7 @@ nsresult ImportImapUnitRequest(
     auto* target = memberFor(uri);
     NS_ENSURE_TRUE(target, NS_ERROR_NOT_AVAILABLE);
     for (const auto& candidate : target->operations) {
-      if (candidate.payload.sourceFolderURI == origin.uri &&
+      if (SameFolderAddress(candidate.payload.sourceFolderURI, origin.uri) &&
           candidate.payload.sourceKey == key) {
         NS_ENSURE_FALSE(output, NS_ERROR_NOT_AVAILABLE);
         NS_ENSURE_TRUE(candidate.payload.operation &
@@ -6192,8 +6203,9 @@ nsresult ImportImapUnitRequest(
         if (payload.operation & (nsIMsgOfflineImapOperation::kAppendDraft |
                                  nsIMsgOfflineImapOperation::kAppendTemplate |
                                  nsIMsgOfflineImapOperation::kMoveResult)) {
-          NS_ENSURE_TRUE(payload.destinationFolderURI == member.uri,
-                         NS_ERROR_NOT_AVAILABLE);
+          NS_ENSURE_TRUE(
+              SameFolderAddress(payload.destinationFolderURI, member.uri),
+              NS_ERROR_NOT_AVAILABLE);
           expected = ref(member, op.sourceKey);
         } else if (payload.operation & nsIMsgOfflineImapOperation::kMsgMoved) {
           MOZ_TRY(counterpart(member, op.sourceKey,
@@ -6258,7 +6270,7 @@ nsresult ImportImapUnitRequest(
       }
       for (const auto& other : unit.folders) {
         for (const auto& op : other.operations) {
-          if (op.payload.sourceFolderURI == member.uri &&
+          if (SameFolderAddress(op.payload.sourceFolderURI, member.uri) &&
               op.payload.sourceKey == uid.sourceKey) {
             NS_ENSURE_TRUE(
                 !op.payload.sourceUid || op.payload.sourceUid == uid.uid,

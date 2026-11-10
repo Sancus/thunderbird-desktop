@@ -213,6 +213,33 @@ function convertMorkSnapshot(
 }
 
 /**
+ * The form in which a folder address saved with an offline operation is
+ * compared. Older summaries hold addresses with characters left as they are
+ * (a space) that the folder's own address escapes. Old Thunderbird resolves a
+ * saved address by its unescaped path names, so both spellings are one folder.
+ *
+ * @param {string} uri - Saved or current folder address.
+ * @returns {string} Its unescaped form; the address itself when it does not
+ *   unescape.
+ */
+function folderAddress(uri) {
+  try {
+    return decodeURIComponent(uri);
+  } catch (error) {
+    return uri;
+  }
+}
+
+/**
+ * @param {string} left - Folder address.
+ * @param {string} right - Folder address.
+ * @returns {boolean} Whether both name one folder (folderAddress).
+ */
+function sameFolder(left, right) {
+  return folderAddress(left) === folderAddress(right);
+}
+
+/**
  * An offline move or copy shows its message in the destination folder at
  * once: a pseudo header with a "move result" operation that names the source
  * folder and key. The server work itself is the source folder's operation.
@@ -250,14 +277,14 @@ function staleMoveResults(entries) {
           sourceFolderURI: text("srcFolderURI"),
           sourceMessageKey: parseInt(cell("srcMsgKey") ?? "", 16),
           destinations: [
-            text("moveDest"),
+            text("moveDest") ?? "",
             ...(text("copyDests") ?? "").split("\u0001"),
-          ],
+          ].map(folderAddress),
         });
       }
     }
     return {
-      uri: source.originalFolderURI ?? input.folder.uri,
+      address: folderAddress(source.originalFolderURI ?? input.folder.uri),
       omitted: source.omittedMessageKeys ?? [],
       operations,
     };
@@ -275,12 +302,12 @@ function staleMoveResults(entries) {
           !folder.omitted.includes(result.key) &&
           !folders.some(
             origin =>
-              origin.uri === result.sourceFolderURI &&
+              origin.address === folderAddress(result.sourceFolderURI) &&
               origin.operations.some(
                 operation =>
                   operation.key === result.sourceMessageKey &&
                   operation.operation & moved &&
-                  operation.destinations.includes(folder.uri)
+                  operation.destinations.includes(folder.address)
               )
           )
       )
@@ -360,13 +387,13 @@ export function convertMorkProtocolUnit(
       typeof uri != "string" ||
       !uri ||
       uri.includes("\0") ||
-      uris.has(uri)
+      uris.has(folderAddress(uri))
     ) {
       throw new Error("Duplicate or invalid Mork protocol folder identity");
     }
     sources.add(folder.sourceId);
     destinations.add(folder.folder.id);
-    uris.set(uri, folder);
+    uris.set(folderAddress(uri), folder);
   }
   const keyOf = (folder, key) => {
     if (
@@ -382,7 +409,7 @@ export function convertMorkProtocolUnit(
     for (const operation of folder.imap.operations) {
       const payload = operation.payload;
       if (Object.hasOwn(payload, "sourceFolderURI")) {
-        const origin = uris.get(payload.sourceFolderURI);
+        const origin = uris.get(folderAddress(payload.sourceFolderURI));
         if (!origin || !Object.hasOwn(payload, "sourceMessageKey")) {
           throw new Error("Unresolved Mork offline source folder/key");
         }
@@ -409,7 +436,7 @@ export function convertMorkProtocolUnit(
         }
       }
       if (operation.source) {
-        const origin = uris.get(payload.sourceFolderURI);
+        const origin = uris.get(folderAddress(payload.sourceFolderURI));
         const originating = origin.imap.operations.find(
           value => value.sourceKey === payload.sourceMessageKey
         );
@@ -420,13 +447,10 @@ export function convertMorkProtocolUnit(
             (Ci.nsIMsgOfflineImapOperation.kMsgCopy |
               Ci.nsIMsgOfflineImapOperation.kMsgMoved)
           ) ||
-          !(
-            originating.payload.copyDestinations?.includes(
-              folder.imap.originalFolderURI
-            ) ||
-            originating.payload.destinationFolderURI ===
-              folder.imap.originalFolderURI
-          )
+          ![
+            originating.payload.destinationFolderURI ?? "",
+            ...(originating.payload.copyDestinations ?? []),
+          ].some(uri => sameFolder(uri, folder.imap.originalFolderURI))
         ) {
           throw new Error("Unresolved Mork offline counterpart operation");
         }
@@ -449,14 +473,17 @@ export function convertMorkProtocolUnit(
         throw new Error("Mork pending operation has no captured destination");
       }
       const findCounterpart = uri => {
-        const destination = uris.get(uri);
+        const destination = uris.get(folderAddress(uri));
         if (!destination) {
           throw new Error("Unresolved Mork offline destination folder");
         }
         const candidates = destination.imap.operations.filter(
           candidate =>
-            candidate.payload.sourceFolderURI ===
-              folder.imap.originalFolderURI &&
+            candidate.payload.sourceFolderURI !== undefined &&
+            sameFolder(
+              candidate.payload.sourceFolderURI,
+              folder.imap.originalFolderURI
+            ) &&
             candidate.payload.sourceMessageKey === operation.sourceKey
         );
         if (candidates.length !== 1) {
@@ -484,7 +511,12 @@ export function convertMorkProtocolUnit(
           (Ci.nsIMsgOfflineImapOperation.kAppendDraft |
             Ci.nsIMsgOfflineImapOperation.kAppendTemplate)
         ) {
-          if (payload.destinationFolderURI !== folder.imap.originalFolderURI) {
+          if (
+            !sameFolder(
+              payload.destinationFolderURI,
+              folder.imap.originalFolderURI
+            )
+          ) {
             throw new Error("Mork queued APPEND has an unresolved body owner");
           }
           operation.destination = keyOf(folder, operation.sourceKey);
@@ -495,7 +527,10 @@ export function convertMorkProtocolUnit(
         } else if (
           payload.operation & Ci.nsIMsgOfflineImapOperation.kMoveResult &&
           operation.source &&
-          payload.destinationFolderURI === folder.imap.originalFolderURI
+          sameFolder(
+            payload.destinationFolderURI,
+            folder.imap.originalFolderURI
+          )
         ) {
           operation.destination = keyOf(folder, operation.sourceKey);
         } else {

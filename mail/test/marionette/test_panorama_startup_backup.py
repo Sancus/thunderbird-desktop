@@ -3051,7 +3051,6 @@ class TestPanoramaStartupActivation(MarionetteTestCase):
         source = self.create_legacy_folders(3)
         self.stop_application()
         summaries = [Path(folder["summary"]) for folder in source["folders"]]
-        originals = {path: path.read_bytes() for path in summaries}
         work = self.profile.parent / ("panorama-migration-" + self.profile.name)
         self.created_work.add(work)
         selector = self.profile / "panorama-profile.json"

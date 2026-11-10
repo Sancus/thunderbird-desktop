@@ -14324,20 +14324,21 @@ nsresult DatabaseCore::BuildStartupFolders() {
     MOZ_TRY(folder->GetId(&id));
     NS_ENSURE_TRUE(id && !ids.Contains(id), NS_ERROR_NOT_AVAILABLE);
     ids.Insert(id);
-    if (source.originalFlags) {
+    // Legacy discovery marks every local store folder Mail each time it loads
+    // it. The word in its summary can predate that or be absent altogether (a
+    // maildir POP3 Inbox), and native discovery of an existing folder does not
+    // add the flag. It is a mail folder.
+    const bool localStore = StartupLocalProtocol(source.protocol);
+    if (source.originalFlags || localStore) {
       // Public GetFlags opens a message database and reads counts/new state.
       // Startup admits only metadata until the complete import is ready.
       uint32_t before = MOZ_TRY(mFolderDatabase->GetFolderFlags(id));
+      const uint32_t retained = source.originalFlags.valueOr(before);
       const uint32_t wanted =
           source.protocol == "imap"_ns
-              ? (*source.originalFlags & ~nsMsgFolderFlags::OfflineEvents) |
+              ? (retained & ~nsMsgFolderFlags::OfflineEvents) |
                     (before & nsMsgFolderFlags::OfflineEvents)
-          // Legacy discovery marks every local store folder Mail each
-          // time it loads it; the copy of the word in the summary can
-          // predate that (a maildir POP3 Inbox). It is a mail folder.
-          : StartupLocalProtocol(source.protocol)
-              ? *source.originalFlags | nsMsgFolderFlags::Mail
-              : *source.originalFlags;
+              : retained | (localStore ? nsMsgFolderFlags::Mail : 0);
       const uint32_t protocolMask =
           nsMsgFolderFlags::Newsgroup | nsMsgFolderFlags::Virtual |
           nsMsgFolderFlags::ImapBox | nsMsgFolderFlags::ImapPersonal |
